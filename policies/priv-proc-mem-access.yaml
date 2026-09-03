@@ -27,9 +27,20 @@ spec:
   # global symbol on this kernel (`T proc_mem_open` in /proc/kallsyms), unlike the
   # static mem_open/environ_open/auxv_open. Prototype from vmlinux BTF:
   #   struct mm_struct *proc_mem_open(struct inode *inode, unsigned int mode)
-  # arg 1 is the PTRACE_MODE_* the caller asked for (1 = READ, 2 = ATTACH); it is
-  # captured for evidence but not filtered on, because every call here is already
-  # "someone is opening another process's memory image".
+  # arg 1 is the PTRACE_MODE_* the caller asked for (1 = READ, 2 = ATTACH), and it
+  # MUST be filtered on. The earlier claim here — that every call is already
+  # "someone is opening another process's memory image" — was wrong, and it cost a
+  # second round of noise: 1200 alerts/hour on an idle desktop (2026-09-03).
+  # environ_open() and auxv_open() land in proc_mem_open too, with PTRACE_MODE_READ,
+  # and reading your OWN /proc/self/environ is something half of userland does at
+  # startup — starship, zoxide, mise, pgrep and every systemd generator turned up in
+  # the alert list. Only mem_open() asks for PTRACE_MODE_ATTACH (2), so Mask 2 is
+  # exactly "/proc/<pid>/mem was opened" and nothing else.
+  #
+  # Cross-process environ reads are a real credential vector and are NOT dropped:
+  # they moved to cred-proc-environ-read.yaml, which hooks the file open so the path
+  # — and therefore the target pid — is visible, and moatd drops the self-reads that
+  # are all of the noise here.
   #
   # This replaces the earlier LSM ptrace_access_check + Mask 1 shape, which fired on
   # every /proc/<pid>/stat and cmdline read (pkill alone: 612 events; plus pipewire,
@@ -41,7 +52,11 @@ spec:
     - index: 1
       type: "uint32"
     selectors:
-    - matchBinaries:
+    - matchArgs:
+      - index: 1
+        operator: "Mask"
+        values: ["2"]        # PTRACE_MODE_ATTACH: mem_open only, not environ/auxv
+      matchBinaries:
       - operator: "NotIn"
         values:
         - "/usr/bin/gdb"

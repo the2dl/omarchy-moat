@@ -1,0 +1,68 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-cred-proc-environ-read
+  annotations:
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "Another process's environment read through /proc"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,ignore"
+    moat.omarchy/why: >-
+      A process's environment holds what it was handed at launch: AWS_SECRET_ACCESS_KEY,
+      GITHUB_TOKEN, ANTHROPIC_API_KEY, database URLs with the password inline. Reading
+      /proc/<pid>/environ of a process you did not start lifts all of it in one read,
+      leaves the target untouched, and needs no debugger and no disk access.
+    moat.omarchy/expected: >-
+      Almost nothing. Process viewers that show a full environment (htop's
+      environment pane, some of ps's modes) do this on demand. Reading your OWN
+      environment is not this rule - moatd drops the self-reads that make up
+      essentially all of the traffic on this path.
+    moat.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  # Deliberately the file hook rather than proc_mem_open, even though both fire for
+  # /proc/<pid>/environ. proc_mem_open takes (inode, mode) and the inode does not
+  # give us the target pid, so a policy there cannot tell "read my own environment"
+  # (half of userland, on every startup) from "read someone else's" (credential
+  # theft). The path does carry the pid, so hooking the open makes the distinction
+  # expressible - in moatd, where NOTES section 3 says path-vs-path comparisons
+  # belong. See rules/self_proc_read.rs.
+  #
+  # A kprobe and not an LSM hook: the LSM trampoline caps at 19 policies per hook
+  # and file_post_open is the busiest one we have. See NOTES section 3.
+  kprobes:
+  - call: "security_file_post_open"
+    syscall: false
+    message: "Another process's environment opened through /proc"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/htop"
+        - "/usr/bin/btop"
+        - "/usr/bin/ps"
+        - "/usr/bin/gdb"
+        - "/usr/bin/lldb"
+        - "/usr/lib/systemd/systemd-coredump"
+      matchArgs:
+      # Postfix only, deliberately: filtering index 0 twice in one selector is
+      # UNVERIFIED at runtime (NOTES section 2), and the "/proc/<pid>/" half of the
+      # shape has to be re-checked in moatd anyway to extract the target pid. So the
+      # kernel does the cheap cut and moatd does the exact one.
+      - index: 0
+        operator: "Postfix"
+        values: ["/environ"]
+      - index: 1
+        operator: "Mask"
+        values: ["4"]        # MAY_READ
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"
