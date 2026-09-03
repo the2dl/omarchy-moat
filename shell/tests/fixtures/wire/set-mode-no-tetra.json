@@ -4,10 +4,6 @@
   "policies": 32,
   "failed": [
     {
-      "policy": "moat-ai-cli-in-pkg-subtree",
-      "error": "No such file or directory (os error 2)"
-    },
-    {
       "policy": "moat-cred-ai-credentials-read",
       "error": "No such file or directory (os error 2)"
     },
@@ -48,7 +44,7 @@
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "moat-net-pkg-subtree-egress",
+      "policy": "moat-net-suspicious-port-egress",
       "error": "No such file or directory (os error 2)"
     },
     {
@@ -68,11 +64,27 @@
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "moat-persist-desktop-config-write",
+      "policy": "moat-persist-desktop-entry-write",
       "error": "No such file or directory (os error 2)"
     },
     {
       "policy": "moat-persist-git-hook-write",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "moat-persist-hypr-config-write",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "moat-persist-omarchy-hooks-write",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "moat-persist-omarchy-menu-extension-write",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "moat-persist-omarchy-plugin-write",
       "error": "No such file or directory (os error 2)"
     },
     {
@@ -81,18 +93,6 @@
     },
     {
       "policy": "moat-persist-system-unit-write",
-      "error": "No such file or directory (os error 2)"
-    },
-    {
-      "policy": "moat-pkg-subtree-downloader",
-      "error": "No such file or directory (os error 2)"
-    },
-    {
-      "policy": "moat-pkg-subtree-interpreter-spawn",
-      "error": "No such file or directory (os error 2)"
-    },
-    {
-      "policy": "moat-pkg-subtree-netcat-exec",
       "error": "No such file or directory (os error 2)"
     },
     {
@@ -132,6 +132,6 @@
       "error": "No such file or directory (os error 2)"
     }
   ],
-  "tetra": "/var/lib/moat/no-such-tetra",
+  "tetra": "/usr/bin/tetra",
   "ok": true
 }

@@ -1,0 +1,58 @@
+# /etc/moat/allowlist.d/omarchy-default.toml — shipped baseline (LEARNING §8).
+#
+# Reviewed once by a human, shipped in the package, replaced on upgrade. It
+# belongs to the package, so `moatctl allowlist` reports every entry here as
+# `source: shipped` and `removable: false`, and `moatctl unignore --file
+# omarchy-default.toml` refuses. To override one, add a narrower rule of your
+# own to user.toml, or use `moatctl ignore`.
+#
+# Every entry carries a comment saying which actor, which rule, and why it is
+# benign — that is the rule for this file, not a convention.
+#
+# ---------------------------------------------------------------------------
+# moat's own build and tests are not incidents (BASELINE §5)
+# ---------------------------------------------------------------------------
+#
+# The daemon's test suite proves its rules against real processes: it copies
+# `sleep` to `<tmpdir>/nc` and executes it to show that the netcat rule fires
+# and that enforce mode kills, and it executes small helpers from temp
+# directories. On the machine that develops moat, `cargo test` would therefore
+# raise a critical alert every run — which is exactly how a security tool
+# teaches its owner to ignore it.
+#
+# The scope is deliberately as narrow as it can be written:
+#
+#   * the exe glob is `/tmp/.tmp*/…`, the shape `tempfile::tempdir()` produces,
+#     never `/tmp/*`;
+#   * the basename is `nc` or `moat-*`, the only names the suite uses;
+#   * `parent` must be a cargo test runner — `*/target/*/deps/moatd-*` is the
+#     hashed test binary cargo builds, which nothing else on the machine is.
+#
+# All three must match (CONTRACT §6.3: every field present must match), so a
+# real dropper in /tmp, or the same binary run from a shell, still alerts.
+
+# `cargo test` executes a copied `sleep` named `nc` from a tempdir to prove the
+# exec-from-tmpfs rule fires and that enforce mode kills it.
+[[rule]]
+name = "moat-exec-untrusted-tmpfs"
+exe = "/tmp/.tmp*/nc"
+parent = "*/target/*/deps/moatd-*"
+
+# The same suite executes its own helpers (`moat-*`) out of a tempdir.
+[[rule]]
+name = "moat-exec-untrusted-tmpfs"
+exe = "/tmp/.tmp*/moat-*"
+parent = "*/target/*/deps/moatd-*"
+
+# The netcat rule is the one those tests exist to exercise: a fake `nc` under a
+# cargo test runner is the test, not an install script opening a shell.
+[[rule]]
+name = "moat-pkg-subtree-netcat-exec"
+exe = "/tmp/.tmp*/nc"
+parent = "*/target/*/deps/moatd-*"
+
+# ...and the same for the suite's own helpers.
+[[rule]]
+name = "moat-pkg-subtree-netcat-exec"
+exe = "/tmp/.tmp*/moat-*"
+parent = "*/target/*/deps/moatd-*"

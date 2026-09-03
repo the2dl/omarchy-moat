@@ -50,8 +50,11 @@ BarWidget {
   function _syncSettings() {
     if (!service) return
     service.minNotifySeverity = setting("minNotifySeverity", "high")
+    service.notifyCooldownMinutes = Number(setting("notifyCooldownMinutes", 10))
     service.pollSeconds = Number(setting("pollSeconds", 10))
     service.showCountBadge = setting("showCountBadge", true) === true
+    service.showSuppressed = setting("showSuppressed", false) === true
+    service.weeklyDigest = setting("weeklyDigest", true) === true
   }
 
   onSettingsChanged: _syncSettings()

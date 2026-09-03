@@ -1,0 +1,68 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-persist-omarchy-menu-extension-write
+  annotations:
+    moat.omarchy/severity: "low"
+    moat.omarchy/title: "Omarchy menu extension written by a non-editor"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "quarantine,ignore"
+    moat.omarchy/why: >-
+      Menu extensions in ~/.config/omarchy/extensions add entries to the Omarchy menu,
+      and each entry runs a command when you click it. It is persistence that needs one
+      click rather than a login, which is why this is low and not high.
+    moat.omarchy/expected: >-
+      Your editor adding a menu entry, and the omarchy-* helper scripts (suppressed
+      in-kernel by the first selector).
+    moat.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  - hook: "file_post_open"
+    message: "Omarchy menu extension opened for writing"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int"
+    selectors:
+    - matchBinaries:
+      - operator: "Prefix"
+        values:
+        - "/usr/bin/omarchy-"
+        - "/usr/share/omarchy/"
+      matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "{{HOME}}/.config/omarchy/extensions/"
+      - index: 1
+        operator: "Mask"
+        values: ["2"]
+      matchActions:
+      - action: NoPost
+    - matchBinaries:
+      - operator: "NotPostfix"
+        values:
+        - "/nvim"
+        - "/vim"
+        - "/nano"
+        - "/emacs"
+        - "/code"
+        - "/zed"
+        - "/hx"
+        - "/kate"
+      matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "{{HOME}}/.config/omarchy/extensions/"
+      - index: 1
+        operator: "Mask"
+        values: ["2"]
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

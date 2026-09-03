@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use crate::event::{ExecEvent, ExitEvent, Process};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProcInfo {
     pub exec_id: String,
     pub pid: u32,
@@ -27,6 +27,9 @@ pub struct ProcInfo {
     pub exited_at: Option<u64>,
     /// `process_exit.signal`, the only proof that a kill actually happened.
     pub exit_signal: Option<String>,
+    /// Set when `exe` is not what the kernel reported: a `/proc/self/fd/<n>`
+    /// binary we resolved (or failed to). Shown as evidence on every alert.
+    pub exe_note: Option<String>,
 }
 
 impl ProcInfo {
@@ -74,11 +77,17 @@ impl ProcTable {
             parent_exec_id: p.parent_exec_id.clone().filter(|s| !s.is_empty()),
             exited_at: None,
             exit_signal: None,
+            exe_note: None,
         };
         match self.map.get_mut(&exec_id) {
             Some(existing) => {
                 // Never let a sparse `parent` block blank out a full record.
                 if !info.exe.is_empty() {
+                    // A re-reported binary invalidates any resolution note we
+                    // had for the previous one.
+                    if existing.exe != info.exe {
+                        existing.exe_note = None;
+                    }
                     existing.exe = info.exe;
                 }
                 if !info.args.is_empty() {
@@ -108,7 +117,33 @@ impl ProcTable {
         if let Some(p) = &ev.parent {
             self.observe(p);
         }
-        ev.process.as_ref().and_then(|p| self.observe(p))
+        let id = ev.process.as_ref().and_then(|p| self.observe(p))?;
+        self.resolve_fd_binary(&id, None);
+        Some(id)
+    }
+
+    /// Fix up a `/proc/self/fd/<n>` binary in place, from the hook's exec'd-file
+    /// argument when there is one, otherwise the parent's argument 0. A no-op
+    /// for every normal process.
+    pub fn resolve_fd_binary(&mut self, exec_id: &str, binprm: Option<&str>) {
+        let Some(me) = self.map.get(exec_id) else {
+            return;
+        };
+        if !crate::util::is_proc_self_fd(&me.exe) {
+            return;
+        }
+        let reported = me.exe.clone();
+        let parent_args = me
+            .parent_exec_id
+            .clone()
+            .and_then(|p| self.map.get(&p))
+            .map(|p| p.args.clone());
+        let (exe, note) =
+            crate::util::resolve_exec_binary(&reported, binprm, parent_args.as_deref());
+        if let Some(me) = self.map.get_mut(exec_id) {
+            me.exe = exe;
+            me.exe_note = note;
+        }
     }
 
     /// Returns the exec_id that exited, if we could identify it.
@@ -126,6 +161,19 @@ impl ProcTable {
 
     pub fn get(&self, exec_id: &str) -> Option<&ProcInfo> {
         self.map.get(exec_id)
+    }
+
+    /// The most recently started process with this pid.
+    ///
+    /// Alerts on disk carry pids, not exec_ids (the exec_id is deliberately not
+    /// serialised), so this is how `bundle.md` puts args and cwd back on an
+    /// ancestry the alert recorded as pid + exe only. Pids are reused, hence
+    /// "most recently started" rather than "the one".
+    pub fn find_by_pid(&self, pid: u32) -> Option<&ProcInfo> {
+        self.map
+            .values()
+            .filter(|p| p.pid == pid)
+            .max_by(|a, b| a.start_time.cmp(&b.start_time))
     }
 
     /// Nearest ancestor first, self excluded, capped at `max_depth`. Cycles
@@ -232,6 +280,26 @@ mod tests {
     }
 
     #[test]
+    fn a_pid_lookup_finds_the_newest_process_with_that_pid() {
+        let t = feed();
+        assert_eq!(t.find_by_pid(41233).unwrap().exec_id, NODE);
+        assert!(t.find_by_pid(999_999).is_none());
+
+        // A recycled pid resolves to the later start time.
+        let mut t2 = ProcTable::new(8, 60);
+        for (id, start) in [("old", "2026-09-03T10:00:00.000000000Z"), ("new", "2026-09-03T18:00:00.000000000Z")] {
+            t2.observe(&Process {
+                exec_id: Some(id.into()),
+                pid: Some(42),
+                binary: Some(format!("/bin/{}", id)),
+                start_time: Some(start.into()),
+                ..Default::default()
+            });
+        }
+        assert_eq!(t2.find_by_pid(42).unwrap().exec_id, "new");
+    }
+
+    #[test]
     fn depth_is_capped() {
         let mut t = ProcTable::new(3, 60);
         for i in 0..10u32 {
@@ -269,6 +337,42 @@ mod tests {
         assert!(t.get(NODE).is_some(), "still inside the 60 s window");
         t.prune(1_100);
         assert!(t.get(NODE).is_none(), "pruned after the window");
+    }
+
+    #[test]
+    fn a_proc_self_fd_binary_is_resolved_from_the_parent_arguments() {
+        let mut t = ProcTable::new(8, 60);
+        t.observe(&Process {
+            exec_id: Some("e-sh".into()),
+            pid: Some(100),
+            binary: Some("/usr/bin/sh".into()),
+            arguments: Some("/tmp/.x9k --quiet".into()),
+            ..Default::default()
+        });
+        let ev = ExecEvent {
+            process: Some(Process {
+                exec_id: Some("e-fd".into()),
+                pid: Some(101),
+                binary: Some("/proc/self/fd/9".into()),
+                parent_exec_id: Some("e-sh".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        t.on_exec(&ev);
+        let p = t.get("e-fd").unwrap();
+        assert_eq!(p.exe, "/tmp/.x9k");
+        assert!(p.exe_note.as_ref().unwrap().contains("/proc/self/fd/9"));
+
+        // A hook that carries the exec'd file wins over the parent guess.
+        t.observe(&Process {
+            exec_id: Some("e-fd".into()),
+            binary: Some("/proc/self/fd/9".into()),
+            parent_exec_id: Some("e-sh".into()),
+            ..Default::default()
+        });
+        t.resolve_fd_binary("e-fd", Some("/home/dan/proj/payload"));
+        assert_eq!(t.get("e-fd").unwrap().exe, "/home/dan/proj/payload");
     }
 
     #[test]

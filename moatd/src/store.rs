@@ -90,6 +90,35 @@ impl AlertStore {
         self.write_line(&line)
     }
 
+    /// LEARNING §3: an install receipt is its own line kind,
+    /// `{"v":1,"receipt":{…}}`. It shares the file with the alerts so the
+    /// timeline is one stream, and `parse_record` returns `None` for it, so no
+    /// reader can mistake it for an alert or count it in the badge.
+    pub fn append_receipt(&mut self, r: &crate::receipt::Receipt) -> std::io::Result<()> {
+        let line = serde_json::to_string(&r.line())?;
+        self.write_line(&line)
+    }
+
+    /// Every receipt, oldest first.
+    pub fn receipts(&self) -> Vec<crate::receipt::Receipt> {
+        let mut out = Vec::new();
+        for p in [&self.rotated, &self.path] {
+            let Ok(text) = std::fs::read_to_string(p) else {
+                continue;
+            };
+            for line in text.lines() {
+                // Cheap pre-filter: most lines are alerts.
+                if !line.contains("\"receipt\"") {
+                    continue;
+                }
+                if let Ok(r) = serde_json::from_str::<crate::receipt::ReceiptLine>(line) {
+                    out.push(r.receipt);
+                }
+            }
+        }
+        out
+    }
+
     /// Every alert, updates folded, oldest first. ULIDs sort chronologically so
     /// the map order is the timeline.
     pub fn load(&self) -> Vec<Alert> {
@@ -120,13 +149,17 @@ impl AlertStore {
     }
 
     /// Unacked counts by severity, for `status`.
+    ///
+    /// Suppressed alerts (an allowlist or baseline entry matched) are recorded
+    /// but never counted — BASELINE §8. A demoted rule is *not* suppressed; it
+    /// carries `surface: "timeline"` and the plugin keeps it out of the badge.
     pub fn unacked(&self) -> BTreeMap<String, u64> {
         let mut counts: BTreeMap<String, u64> = ["critical", "high", "medium", "low"]
             .iter()
             .map(|s| (s.to_string(), 0))
             .collect();
         for a in self.load() {
-            if !a.acked {
+            if !a.acked && !a.is_suppressed() {
                 *counts.entry(a.severity.clone()).or_insert(0) += 1;
             }
         }
@@ -213,6 +246,61 @@ mod tests {
         assert_eq!(c["critical"], 1);
         assert_eq!(c["high"], 0);
         assert_eq!(c["low"], 0);
+    }
+
+    #[test]
+    fn a_suppressed_alert_is_stored_but_never_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store(dir.path(), 1 << 20);
+        let mut a = demo_alert("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        a.severity = "critical".into();
+        a.suppressed_by = Some("baseline.toml#2".into());
+        s.append_alert(&a).unwrap();
+        assert_eq!(s.load().len(), 1, "it is on the timeline");
+        assert_eq!(s.unacked()["critical"], 0, "and out of the badge");
+
+        // Suppression can also arrive as an update line.
+        let mut b = demo_alert("01BBBBBBBBBBBBBBBBBBBBBBBB");
+        b.severity = "high".into();
+        s.append_alert(&b).unwrap();
+        assert_eq!(s.unacked()["high"], 1);
+        s.append_update(&UpdateLine::new(&b.id).set("suppressed_by", Value::from("user.toml#1")))
+            .unwrap();
+        assert_eq!(s.unacked()["high"], 0);
+    }
+
+    /// Receipts live in the same file and must be invisible to every alert
+    /// reader: not in `load()`, not in `unacked()`, never a badge.
+    #[test]
+    fn receipts_share_the_file_without_ever_looking_like_alerts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store(dir.path(), 1 << 20);
+        let mut a = demo_alert("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        a.severity = "critical".into();
+        s.append_alert(&a).unwrap();
+
+        let mut t = crate::receipt::Tracker::default();
+        let root = crate::proctable::ProcInfo {
+            exec_id: "e".into(),
+            pid: 41201,
+            uid: 1000,
+            exe: "/usr/bin/npm".into(),
+            args: "install".into(),
+            cwd: "/home/dan/app".into(),
+            start_time: crate::util::rfc3339_of(1_000),
+            ..Default::default()
+        };
+        t.ensure(&root, 1_000);
+        let r = t.finish(&root, Some(0), 1_041);
+        s.append_receipt(&r).unwrap();
+        s.append_alert(&demo_alert("01BBBBBBBBBBBBBBBBBBBBBBBB")).unwrap();
+
+        assert_eq!(s.load().len(), 2, "the receipt is not an alert");
+        assert_eq!(s.unacked()["critical"], 1);
+        let got = s.receipts();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].root_exe, "/usr/bin/npm");
+        assert_eq!(got[0].duration_s, 41);
     }
 
     #[test]

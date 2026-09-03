@@ -11,16 +11,42 @@
 //!
 //! Note on shells: a bare `sh`/`bash` in the chain does *not* count as
 //! interactive, because `npm` spawns one for every lifecycle script.
+//!
+//! Two things the first live run taught this rule:
+//!
+//! * **Omarchy runs agents headlessly itself.**
+//!   `/usr/share/omarchy/bin/omarchy-agent-usage-*` invoke `codex` and `claude`
+//!   with no terminal, which is precisely the shape being detected. Ancestors
+//!   matching `ai.headless_allowed_parents` therefore silence the rule. The
+//!   globs are matched against each ancestor's binary *and* its arguments,
+//!   because a shebang script is reported as `binary: /usr/bin/bash` with the
+//!   script path in `arguments`.
+//! * **A mise shim launch is one launch, not two.** `~/.local/share/mise/shims/claude`
+//!   execs `…/installs/…/bin/claude`; alerting on both would double every
+//!   agent start. The shim exec is skipped and the real binary is the one that
+//!   alerts, so the alert names a path you can act on.
 
 use crate::config::Config;
 use crate::event::ExecEvent;
 use crate::explain::Finding;
 use crate::policy::PolicyMeta;
+use crate::rules::pkgtree;
 use crate::rules::{
-    meta, pkg_ancestor, RuleCtx, UserRule, AI_CLIS, INTERACTIVE, INTERPRETERS, LOGIN_SHELLS,
+    chain_matches_globs, meta, RuleCtx, UserRule, AI_CLIS, INTERACTIVE, INTERPRETERS, LOGIN_SHELLS,
     SKIP_PERMISSION_FLAGS,
 };
 use crate::util::basename;
+
+/// `~/.local/share/mise/shims/claude`, `~/.asdf/shims/node`: a launcher that
+/// immediately execs the real binary. Alerting on it as well as on what it
+/// execs turns one launch into two alerts.
+pub fn is_version_manager_shim(exe: &str) -> bool {
+    std::path::Path::new(exe)
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|d| d == "shims")
+        .unwrap_or(false)
+}
 
 pub const ID: &str = "moat-x-ai-cli-headless";
 
@@ -62,6 +88,15 @@ impl UserRule for AiCliHeadless {
         if !AI_CLIS.contains(&comm) {
             return Vec::new();
         }
+        // The shim is about to exec the real binary; let that one speak.
+        if is_version_manager_shim(&proc.exe) {
+            log::debug!("{}: skipping shim exec {}", ID, proc.exe);
+            return Vec::new();
+        }
+        if let Some(hit) = chain_matches_globs(ctx.table, exec_id, &ctx.cfg.ai.headless_allowed_parents) {
+            log::debug!("{}: allowed by ai.headless_allowed_parents ({})", ID, hit);
+            return Vec::new();
+        }
 
         let chain = ctx.table.ancestry(exec_id);
         let flag = SKIP_PERMISSION_FLAGS
@@ -72,7 +107,7 @@ impl UserRule for AiCliHeadless {
             .filter(|p| INTERPRETERS.contains(&p.comm()))
             .cloned()
             .cloned();
-        let pkg = pkg_ancestor(ctx.table, exec_id);
+        let pkg = pkgtree::pkg_root_for(ctx.table, exec_id).cloned();
 
         // A terminal, tmux/ssh session or editor means a human is there. A bare
         // shell counts too — but only outside a package-manager subtree, since
@@ -148,11 +183,14 @@ mod tests {
     use crate::proctable::ProcTable;
 
     fn run(table: &ProcTable, exec_id: &str) -> Vec<Finding> {
-        let cfg = cfg();
+        run_with(&cfg(), table, exec_id)
+    }
+
+    fn run_with(cfg: &Config, table: &ProcTable, exec_id: &str) -> Vec<Finding> {
         let feeds = Feeds::default();
         let homes = vec!["/home/dan".to_string()];
         let ctx = RuleCtx {
-            cfg: &cfg,
+            cfg,
             table,
             feeds: &feeds,
             homes: &homes,
@@ -233,6 +271,70 @@ mod tests {
         assert!(arg_present("--yolo=true", "--yolo"));
         assert!(!arg_present("-p \"do not use --yolo\"", "--yolo"));
         assert!(!arg_present("--yolo-dry-run", "--yolo"));
+    }
+
+    /// Omarchy's own usage reporters run `codex`/`claude` with no terminal at
+    /// all — exactly the shape this rule looks for. They were the loudest false
+    /// positive of the first live run.
+    fn usage_reporter_chain(script: &str, cli: &str) -> ProcTable {
+        let mut t = ProcTable::new(8, 60);
+        t.observe(&proc("e-sd", 1, "/usr/lib/systemd/systemd", "", None));
+        t.observe(&proc("e-script", 5000, script, "--json", Some("e-sd")));
+        t.observe(&proc("e-cli", 5001, cli, "exec 'summarise'", Some("e-script")));
+        t
+    }
+
+    #[test]
+    fn omarchy_agent_usage_scripts_are_allowed_by_default() {
+        for script in [
+            "/usr/share/omarchy/bin/omarchy-agent-usage-daily",
+            "/usr/share/omarchy/bin/omarchy-agent-usage-weekly",
+        ] {
+            let t = usage_reporter_chain(script, "/usr/bin/codex");
+            assert!(run(&t, "e-cli").is_empty(), "{} must be silent by default", script);
+        }
+
+        // Empty the list and the rule fires again: this is a config allowance,
+        // not a hardcoded exemption.
+        let t = usage_reporter_chain(
+            "/usr/share/omarchy/bin/omarchy-agent-usage-daily",
+            "/usr/bin/codex",
+        );
+        let mut c = cfg();
+        c.ai.headless_allowed_parents.clear();
+        assert_eq!(run_with(&c, &t, "e-cli").len(), 1);
+    }
+
+    #[test]
+    fn an_unrelated_omarchy_script_is_not_allowed() {
+        let t = usage_reporter_chain("/usr/share/omarchy/bin/omarchy-update", "/usr/bin/claude");
+        assert_eq!(run(&t, "e-cli").len(), 1, "only the usage reporters are allowed");
+    }
+
+    /// A mise launch is `shims/claude` -> `installs/…/bin/claude`. One alert.
+    #[test]
+    fn a_mise_shim_chain_yields_one_alert() {
+        let mut t = table_headless();
+        t.observe(&proc(
+            "e-shim",
+            41300,
+            "/home/dan/.local/share/mise/shims/claude",
+            "-p hi",
+            Some("e-node"),
+        ));
+        t.observe(&proc(
+            "e-real",
+            41300,
+            "/home/dan/.local/share/mise/installs/npm-anthropic-ai-claude-code/2.0.1/bin/claude",
+            "-p hi",
+            Some("e-shim"),
+        ));
+        assert!(run(&t, "e-shim").is_empty(), "the shim is not the launch");
+        let f = run(&t, "e-real");
+        assert_eq!(f.len(), 1);
+        assert!(f[0].proc.exe.contains("/installs/"), "the alert names the real binary");
+        assert!(is_version_manager_shim("/home/dan/.local/share/mise/shims/claude"));
+        assert!(!is_version_manager_shim("/usr/bin/claude"));
     }
 
     #[test]

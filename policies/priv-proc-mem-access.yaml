@@ -4,24 +4,39 @@ metadata:
   name: moat-priv-proc-mem-access
   annotations:
     moat.omarchy/severity: "medium"
-    moat.omarchy/title: "Another process's memory or maps read through /proc"
+    moat.omarchy/title: "Another process's memory, environment or auxv opened through /proc"
     moat.omarchy/enforce: "none"
     moat.omarchy/actions: "kill,ignore"
     moat.omarchy/why: >-
-      /proc/<pid>/mem and /proc/<pid>/maps give a reader the plaintext of another
-      process: session cookies, decrypted vault entries, ssh-agent keys. The read goes
-      through the same ptrace access check as a debugger attach, in read mode.
+      Opening /proc/<pid>/mem, /proc/<pid>/environ or /proc/<pid>/auxv hands the reader
+      the plaintext of another process - session cookies, decrypted vault entries,
+      ssh-agent keys, and the tokens passed to it in its environment. This is the
+      fileless half of credential theft, and nothing on a desktop does it routinely
+      except a debugger.
     moat.omarchy/expected: >-
-      Process viewers and profilers - htop, btop, ps, top, lsof, perf, the GNOME/KDE
-      system monitors - whenever they inspect processes you own.
+      Debuggers and crash handling: gdb, lldb, strace, perf and systemd-coredump, which
+      are allowlisted. A profiler or crash reporter not in that list will fire.
     moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"
     value: "monitor"
-  lsmhooks:
-  - hook: "ptrace_access_check"
-    message: "ptrace read access to another process requested"
+  kprobes:
+  # proc_mem_open() is the shared open path for /proc/<pid>/{mem,environ,auxv}
+  # (fs/proc/base.c: mem_open, environ_open and auxv_open all call it). It is a
+  # global symbol on this kernel (`T proc_mem_open` in /proc/kallsyms), unlike the
+  # static mem_open/environ_open/auxv_open. Prototype from vmlinux BTF:
+  #   struct mm_struct *proc_mem_open(struct inode *inode, unsigned int mode)
+  # arg 1 is the PTRACE_MODE_* the caller asked for (1 = READ, 2 = ATTACH); it is
+  # captured for evidence but not filtered on, because every call here is already
+  # "someone is opening another process's memory image".
+  #
+  # This replaces the earlier LSM ptrace_access_check + Mask 1 shape, which fired on
+  # every /proc/<pid>/stat and cmdline read (pkill alone: 612 events; plus pipewire,
+  # journald, Hyprland and chrome) and was pure noise.
+  - call: "proc_mem_open"
+    syscall: false
+    message: "Another process's memory, environment or auxv opened through /proc"
     args:
     - index: 1
       type: "uint32"
@@ -29,27 +44,12 @@ spec:
     - matchBinaries:
       - operator: "NotIn"
         values:
-        - "/usr/bin/htop"
-        - "/usr/bin/btop"
-        - "/usr/bin/ps"
-        - "/usr/bin/top"
-        - "/usr/bin/lsof"
-        - "/usr/bin/fuser"
-        - "/usr/bin/pgrep"
-        - "/usr/bin/pidof"
-        - "/usr/bin/perf"
         - "/usr/bin/gdb"
         - "/usr/bin/lldb"
         - "/usr/bin/strace"
-        - "/usr/bin/gnome-system-monitor"
-        - "/usr/bin/plasma-systemmonitor"
+        - "/usr/bin/perf"
         - "/usr/lib/systemd/systemd-coredump"
-        - "/usr/lib/systemd/systemd"
-      matchArgs:
-      - index: 1
-        operator: "Mask"
-        values: ["1"]
       matchActions:
       - action: Post
-        rateLimit: "300s"
+        rateLimit: "60s"
         rateLimitScope: "process"

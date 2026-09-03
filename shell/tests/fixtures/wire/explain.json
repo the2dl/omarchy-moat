@@ -1,95 +1,150 @@
 {
   "alert": {
     "v": 1,
-    "id": "01M1M5XHBZTEYJ03KHCF0R5P32",
-    "ts": "2026-09-03T17:43:56.543Z",
-    "severity": "high",
-    "rule": "moat-cred-ssh-private-key-read",
+    "id": "01M1ME4KXMXWCDBX4X95MYS51V",
+    "ts": "2026-09-03T20:07:37.144Z",
+    "severity": "critical",
+    "rule": "moat-cred-cloud-credentials-read",
     "family": "cred",
-    "title": "Private SSH key read by an unexpected program",
-    "summary": "node (pid 5233) read /home/moattest/.ssh/id_ed25519. Parent chain: fish -> npm -> sh -> node.",
+    "title": "Cloud or cluster credentials read by an unexpected program",
+    "summary": "node (pid 3947803) read /home/moattest/.aws/credentials. Parent chain: alacritty -> fish -> node -> sh -> node.",
     "process": {
-      "pid": 5233,
+      "pid": 3947803,
       "uid": 1000,
       "exe": "/usr/bin/node",
       "args": "/home/moattest/proj/node_modules/evil/setup.mjs",
       "cwd": "/home/moattest/proj",
-      "start_ts": "2026-09-03T17:43:36.538Z",
+      "start_ts": "2026-09-03T20:07:01.037Z",
       "ancestry": [
         {
-          "pid": 5230,
+          "pid": 30007,
           "exe": "/usr/bin/sh"
         },
         {
-          "pid": 5201,
-          "exe": "/usr/bin/npm"
+          "pid": 30006,
+          "exe": "/usr/bin/node"
         },
         {
-          "pid": 5100,
+          "pid": 30005,
           "exe": "/usr/bin/fish"
+        },
+        {
+          "pid": 30001,
+          "exe": "/usr/bin/alacritty"
         }
       ]
     },
     "file": {
-      "path": "/home/moattest/.ssh/id_ed25519",
+      "path": "/home/moattest/.aws/credentials",
       "sha256": null
     },
     "rotate": [
-      "ssh-key"
+      "aws-key",
+      "gcp-token",
+      "azure-token",
+      "kubeconfig"
     ],
     "explain": {
-      "what": "node read your private SSH key (id_ed25519).",
-      "why": "Private keys are the first thing npm and PyPI stealers read; only ssh, git and a few backup tools ever need them, and a key that leaves the machine gives an attacker every host and forge you can reach.",
+      "what": "node read your AWS credentials (credentials).",
+      "why": "A long-lived AWS access key or a kubeconfig is worth more than the laptop it sits on; stealer payloads in build dependencies read these files first because they are always at the same path.",
       "evidence": [
-        "hook: file_post_open on /home/moattest/.ssh/id_ed25519 (read)",
-        "process: /usr/bin/node pid 5233 uid 1000 args /home/moattest/proj/node_modules/evil/setup.mjs",
-        "ancestry: fish -> npm -> sh -> node (cwd /home/moattest/proj)",
-        "policy message: Private SSH key opened for reading",
-        "policy action: KPROBE_ACTION_SIGKILL (mode monitor; a kill is only recorded once process_exit reports SIGKILL)",
-        "not in allowlist: none of the 0 rule(s) in /etc/moat/allowlist.d matches exe=/usr/bin/node file=/home/moattest/.ssh/id_ed25519"
+        "hook: file_post_open on /home/moattest/.aws/credentials (read)",
+        "process: /usr/bin/node pid 3947803 uid 1000 args /home/moattest/proj/node_modules/evil/setup.mjs",
+        "ancestry: alacritty -> fish -> node -> sh -> node (cwd /home/moattest/proj)",
+        "actor: user (an interpreter takes the provenance of its script, /home/moattest/proj/node_modules/evil/setup.mjs)",
+        "context: pkg-install",
+        "rarity: rare — /usr/bin/node has read /home/moattest/.aws: seen 2 times since 2026-09-03",
+        "severity: high → critical: pkg-install context: node/python reads ~/.aws/credentials, ~/.config/gh/hosts.yml [matrix row cred-cloud-read]",
+        "policy message: Cloud or cluster credential file opened for reading",
+        "policy action: KPROBE_ACTION_POST (mode monitor; a kill is only recorded once process_exit reports SIGKILL)",
+        "context: pkg-install — inside a `node` subtree (matched on argument `npm-cli.js`); a package install is never downgraded",
+        "not in allowlist: none of the 0 rule(s) in /etc/moat/allowlist.d matches exe=/usr/bin/node file=/home/moattest/.aws/credentials"
       ],
-      "expected": "Backup tools (restic, borg), IDE git integrations, ansible/terraform runs, and custom scripts that call an ssh library instead of the ssh binary.",
+      "expected": "The devops toolchain, all allowlisted: aws, gcloud, az, kubectl, helm, k9s, terraform, tofu, pulumi, ansible, sam, minikube, kind, flyctl, wrangler, vercel, netlify, doctl, and docker/podman against a cloud registry. Node- and python-based SDK scripts are deliberately NOT allowlisted (a stealer is a node or python script), so boto3 in your own script, an IDE cloud plugin or a direnv/aws-vault wrapper will fire.",
       "if_expected": {
         "hint": "exe",
         "options": [
           {
             "scope": "exe",
-            "cmd": "moatctl ignore 01M1M5XHBZTEYJ03KHCF0R5P32 --scope exe",
-            "line": "[[rule]]\nname = \"moat-cred-ssh-private-key-read\"\nexe = \"/usr/bin/node\"\n"
+            "cmd": "moatctl ignore 01M1ME4KXMXWCDBX4X95MYS51V --scope exe",
+            "line": "[[rule]]\nname = \"moat-cred-cloud-credentials-read\"\nexe = \"/usr/bin/node\"\n"
           },
           {
             "scope": "exe+file",
-            "cmd": "moatctl ignore 01M1M5XHBZTEYJ03KHCF0R5P32 --scope exe+file",
-            "line": "[[rule]]\nname = \"moat-cred-ssh-private-key-read\"\nexe = \"/usr/bin/node\"\nfile = \"/home/moattest/.ssh/id_ed25519\"\n"
+            "cmd": "moatctl ignore 01M1ME4KXMXWCDBX4X95MYS51V --scope exe+file",
+            "line": "[[rule]]\nname = \"moat-cred-cloud-credentials-read\"\nexe = \"/usr/bin/node\"\nfile = \"/home/moattest/.aws/credentials\"\n"
           },
           {
             "scope": "parent",
-            "cmd": "moatctl ignore 01M1M5XHBZTEYJ03KHCF0R5P32 --scope parent",
-            "line": "[[rule]]\nname = \"moat-cred-ssh-private-key-read\"\nparent = \"/usr/bin/sh\"\n"
+            "cmd": "moatctl ignore 01M1ME4KXMXWCDBX4X95MYS51V --scope parent",
+            "line": "[[rule]]\nname = \"moat-cred-cloud-credentials-read\"\nparent = \"/usr/bin/sh\"\n"
           },
           {
             "scope": "rule",
-            "cmd": "moatctl ignore 01M1M5XHBZTEYJ03KHCF0R5P32 --scope rule",
-            "line": "[[rule]]\nname = \"moat-cred-ssh-private-key-read\"\n"
+            "cmd": "moatctl ignore 01M1ME4KXMXWCDBX4X95MYS51V --scope rule",
+            "line": "[[rule]]\nname = \"moat-cred-cloud-credentials-read\"\n"
           }
         ],
         "file": "/etc/moat/allowlist.d/user.toml"
       },
       "next": [
         "If you did not expect this: stop it now with `moatctl kill <id>` (kills the recorded process tree), and `moatctl quarantine <id>` to move the file out of reach.",
-        "Rotate the SSH key: `ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519`, then replace the public key on GitHub (`gh ssh-key add`), on every host in ~/.ssh/config, and in any cloud console that pinned it.",
-        "Check what was installed: diff the lockfile (`git diff -- package-lock.json pnpm-lock.yaml uv.lock Cargo.lock`) and read the new package's install/postinstall script before you run anything else.",
+        "Run `aws iam create-access-key`, update ~/.aws/credentials, then `aws iam delete-access-key --access-key-id <old>`. Check CloudTrail for use you did not make.",
+        "Run `gcloud auth revoke --all`, delete ~/.config/gcloud/application_default_credentials.json, and rotate any service-account key the file named in the Google Cloud console.",
+        "Run `az logout` and `az account clear` (this drops ~/.azure/msal_token_cache.json), then sign in again and revoke any service-principal secret that was cached.",
+        "Rotate the cluster credential in ~/.kube/config (client cert, token, or exec-plugin credential) and check every path in $KUBECONFIG.",
         "If this was you, run one of the ignore commands above; otherwise `moatctl ack <id>` once you have finished checking."
       ]
     },
-    "action_taken": "killed",
+    "action_taken": "none",
     "actions": [
       "kill",
       "quarantine",
       "ignore"
     ],
-    "acked": true,
-    "mode": "monitor"
+    "acked": false,
+    "mode": "monitor",
+    "actor": {
+      "provenance": "user",
+      "script": "/home/moattest/proj/node_modules/evil/setup.mjs"
+    },
+    "context": "pkg-install",
+    "severity_base": "high",
+    "severity_reason": "high → critical: pkg-install context: node/python reads ~/.aws/credentials, ~/.config/gh/hosts.yml",
+    "surface": "alerts",
+    "suppressed_by": null,
+    "rarity": "rare",
+    "rarity_text": "/usr/bin/node has read /home/moattest/.aws: seen 2 times since 2026-09-03",
+    "incident": {
+      "dir": "/var/lib/moat/incidents/01M1ME4KXMXWCDBX4X95MYS51V",
+      "files": [
+        {
+          "name": "file/node",
+          "size": 47416,
+          "sha256": "9625c74169aa65857a76c5db03fa0dff8ba7a211e69fb72ef388d4f37abd355f"
+        },
+        {
+          "name": "net.txt",
+          "size": 219,
+          "sha256": "de7601eaf2dea922fb069cbff2b8e76dab7be1f6fe8cbd3122ad1f344c8466d5"
+        },
+        {
+          "name": "pkg.json",
+          "size": 136,
+          "sha256": "0b9830da5cfb0291526379b77593b15d9ea84d28186b7bf2646e50e3e4f9ff12"
+        },
+        {
+          "name": "process.json",
+          "size": 14168,
+          "sha256": "dcbbbb6a4293db3f586cbf823dcc86f8f9f2bd6bbfe01ab5a92c4c12317127c7"
+        },
+        {
+          "name": "tree.txt",
+          "size": 633,
+          "sha256": "9ad88da1a25712eb67e693b14cc091854c30c176d7ab4194aafe19c3ee18dd0c"
+        }
+      ]
+    }
   },
   "ok": true
 }

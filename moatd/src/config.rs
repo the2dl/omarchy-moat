@@ -2,6 +2,7 @@
 //! be overridden on the command line, which is what makes dev mode (no root, no
 //! `/etc`, no `/run`) work: see `dev-run.sh`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,11 @@ pub struct Paths {
     pub feeds_bin: PathBuf,
     /// Where human users are discovered for `{{HOME}}` expansion.
     pub passwd: PathBuf,
+    /// The local pacman database, parsed for provenance (BASELINE §1). Its
+    /// mtime is the "a pacman transaction happened" signal.
+    pub pacman_local: PathBuf,
+    /// Used exactly once per pacman transaction, for `pacman -Sl <repos>`.
+    pub pacman: PathBuf,
 }
 
 impl Default for Paths {
@@ -57,6 +63,8 @@ impl Default for Paths {
             tetra: d("/usr/bin/tetra"),
             feeds_bin: d("/usr/bin/moat-feeds"),
             passwd: d("/etc/passwd"),
+            pacman_local: d("/var/lib/pacman/local"),
+            pacman: d("/usr/bin/pacman"),
         }
     }
 }
@@ -80,15 +88,36 @@ impl Paths {
     pub fn user_allowlist(&self) -> PathBuf {
         self.allowlist_dir.join("user.toml")
     }
+    /// Where the learning window and accepted proposals write (BASELINE §3).
+    pub fn baseline_allowlist(&self) -> PathBuf {
+        self.allowlist_dir.join("baseline.toml")
+    }
+    pub fn rarity_file(&self) -> PathBuf {
+        self.state_dir.join("rarity.json")
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Severity names in the order the incident threshold compares them.
+pub fn severity_at_least(sev: &str, min: &str) -> bool {
+    // `never` is the off switch: nothing is ever at least "never".
+    if min == "never" {
+        return false;
+    }
+    crate::alert::severity_rank(sev) >= crate::alert::severity_rank(min)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuleToggles {
     pub ai_cli_headless: bool,
     pub pkg_egress: bool,
     pub new_exec_ioc: bool,
     pub mass_read: bool,
+    /// The four rules that replaced the deleted `pkg` kernel policies.
+    pub pkg_subtree_interpreter_spawn: bool,
+    pub pkg_subtree_downloader: bool,
+    pub pkg_subtree_netcat_exec: bool,
+    pub ai_cli_in_pkg_subtree: bool,
 }
 
 impl Default for RuleToggles {
@@ -98,6 +127,33 @@ impl Default for RuleToggles {
             pkg_egress: true,
             new_exec_ioc: true,
             mass_read: true,
+            pkg_subtree_interpreter_spawn: true,
+            pkg_subtree_downloader: true,
+            pkg_subtree_netcat_exec: true,
+            ai_cli_in_pkg_subtree: true,
+        }
+    }
+}
+
+/// AI-CLI specific tuning. Separate from `[rules]` because it is not a toggle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AiConfig {
+    /// Globs matched against every ancestor's binary **and** each of its
+    /// arguments. A match means "this launch is one of yours" and
+    /// `moat-x-ai-cli-headless` stays quiet.
+    ///
+    /// Omarchy's own usage reporters run `codex` and `claude` headlessly by
+    /// design, which is exactly what the rule looks for, so they ship allowed.
+    pub headless_allowed_parents: Vec<String>,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            headless_allowed_parents: vec![
+                "/usr/share/omarchy/bin/omarchy-agent-usage-*".into(),
+            ],
         }
     }
 }
@@ -172,6 +228,137 @@ impl Default for NetConfig {
     }
 }
 
+/// BASELINE §7. Turning the whole section off is a matter of
+/// `provenance_downgrade = false` plus `learning_days = 0`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BaselineConfig {
+    /// Repos whose signature we trust. AUR builds are in none of them, by
+    /// design: that is the whole point after the 2026 AUR incidents.
+    pub trusted_repos: Vec<String>,
+    /// Days after `installed_at` during which learned entries auto-apply.
+    pub learning_days: u64,
+    /// Distinct days a tuple must recur on before it can be learned/proposed.
+    pub learn_min_days: usize,
+    /// Alerts from one rule in a rolling 24 h before it is demoted.
+    pub noisy_rule_per_day: u64,
+    /// Section 2: let an official actor take one step off a severity.
+    pub provenance_downgrade: bool,
+}
+
+impl Default for BaselineConfig {
+    fn default() -> Self {
+        Self {
+            trusted_repos: vec![
+                "core".into(),
+                "extra".into(),
+                "multilib".into(),
+                "omarchy".into(),
+            ],
+            learning_days: 7,
+            learn_min_days: 3,
+            noisy_rule_per_day: 20,
+            provenance_downgrade: true,
+        }
+    }
+}
+
+/// LEARNING §6: the rarity counters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LearningConfig {
+    /// A sighting's weight halves this often.
+    pub half_life_days: f64,
+    /// Under this many total sightings a tuple is `rare`.
+    pub rare_max_count: u64,
+    /// Nothing in this many days puts a tuple back to `rare`.
+    pub rare_max_age_days: u64,
+}
+
+impl Default for LearningConfig {
+    fn default() -> Self {
+        Self {
+            half_life_days: 30.0,
+            rare_max_count: 3,
+            rare_max_age_days: 14,
+        }
+    }
+}
+
+/// LEARNING §6 `[analysis]`: where bundles live and how the user's agent is
+/// launched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AnalysisConfig {
+    /// Per-agent extra flags, e.g. `{ claude = ["--permission-mode", "plan"] }`.
+    ///
+    /// **Advisory only on this Omarchy.** `omarchy-agent` accepts exactly
+    /// `--inline`, `--pick` and `--prompt` and hard-codes each agent's own
+    /// flags, so there is no pass-through and no environment variable to use;
+    /// `moatctl analyze` prints the equivalent direct command instead of
+    /// silently dropping them. See README §10.3.
+    pub agent_args: BTreeMap<String, Vec<String>>,
+    /// Bundles and incident snapshots: `<bundle_dir>/<alert id>/`.
+    pub bundle_dir: PathBuf,
+}
+
+impl Default for AnalysisConfig {
+    fn default() -> Self {
+        let mut agent_args = BTreeMap::new();
+        agent_args.insert(
+            "claude".to_string(),
+            vec!["--permission-mode".to_string(), "plan".to_string()],
+        );
+        Self {
+            agent_args,
+            bundle_dir: d("/var/lib/moat/incidents"),
+        }
+    }
+}
+
+/// LEARNING §4 `[incidents]`: the snapshot taken before anything is killed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IncidentsConfig {
+    /// Alerts at or above this severity are captured. `critical` narrows it;
+    /// `never` switches capture off entirely.
+    pub snapshot_min_severity: String,
+    pub retain_days: u64,
+    pub retain_max: usize,
+}
+
+impl Default for IncidentsConfig {
+    fn default() -> Self {
+        Self {
+            snapshot_min_severity: "high".into(),
+            retain_days: 30,
+            retain_max: 200,
+        }
+    }
+}
+
+/// LEARNING §5 `[digest]`: the one scheduled notification moat ever sends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DigestConfig {
+    /// First-boot value; `moatctl set digest on|off` persists over it.
+    pub enabled: bool,
+    /// `monday` … `sunday`.
+    pub weekday: String,
+    /// Local hour, 0-23.
+    pub hour: u32,
+}
+
+impl Default for DigestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            weekday: "monday".into(),
+            hour: 9,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -183,6 +370,12 @@ pub struct Config {
     pub rules: RuleToggles,
     pub thresholds: Thresholds,
     pub net: NetConfig,
+    pub ai: AiConfig,
+    pub baseline: BaselineConfig,
+    pub learning: LearningConfig,
+    pub analysis: AnalysisConfig,
+    pub incidents: IncidentsConfig,
+    pub digest: DigestConfig,
 }
 
 impl Default for Config {
@@ -194,6 +387,12 @@ impl Default for Config {
             rules: RuleToggles::default(),
             thresholds: Thresholds::default(),
             net: NetConfig::default(),
+            ai: AiConfig::default(),
+            baseline: BaselineConfig::default(),
+            learning: LearningConfig::default(),
+            analysis: AnalysisConfig::default(),
+            incidents: IncidentsConfig::default(),
+            digest: DigestConfig::default(),
         }
     }
 }
@@ -259,5 +458,94 @@ mod tests {
         let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("etc/moat.toml");
         let c = Config::load(&p).expect("etc/moat.toml must parse");
         assert_eq!(c.group, "moat");
+    }
+
+    /// The shipped file is the documentation. A rule with no toggle in it, or a
+    /// toggle whose shipped value disagrees with the built-in default, is a
+    /// user reading one thing and getting another.
+    #[test]
+    fn the_shipped_config_documents_every_key_and_agrees_with_the_defaults() {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("etc/moat.toml");
+        let text = std::fs::read_to_string(&p).unwrap();
+        let shipped: toml::Value = toml::from_str(&text).unwrap();
+        let defaults = toml::Value::try_from(Config::default()).unwrap();
+
+        for section in [
+            "rules", "ai", "thresholds", "net", "baseline", "learning", "analysis", "incidents",
+            "digest",
+        ] {
+            let want = defaults.get(section).unwrap().as_table().unwrap();
+            let got = shipped
+                .get(section)
+                .unwrap_or_else(|| panic!("etc/moat.toml has no [{}] section", section))
+                .as_table()
+                .unwrap();
+            for key in want.keys() {
+                assert!(
+                    got.contains_key(key),
+                    "etc/moat.toml does not document {}.{}",
+                    section,
+                    key
+                );
+            }
+        }
+        // And the values that are meant to be defaults really are.
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.rules, RuleToggles::default(), "a shipped toggle disagrees with its default");
+        assert_eq!(
+            c.ai.headless_allowed_parents,
+            AiConfig::default().headless_allowed_parents
+        );
+        assert_eq!(
+            c.ai.headless_allowed_parents,
+            vec!["/usr/share/omarchy/bin/omarchy-agent-usage-*"]
+        );
+        assert_eq!(c.baseline, BaselineConfig::default(), "a shipped baseline key drifted");
+        assert_eq!(c.learning, LearningConfig::default(), "a shipped learning key drifted");
+        assert_eq!(c.analysis, AnalysisConfig::default(), "a shipped analysis key drifted");
+        assert_eq!(c.incidents, IncidentsConfig::default(), "a shipped incidents key drifted");
+        assert_eq!(c.digest, DigestConfig::default(), "a shipped digest key drifted");
+    }
+
+    /// LEARNING §6 publishes these values; the plugin and the docs quote them.
+    #[test]
+    fn the_analysis_incident_and_digest_defaults_are_the_ones_the_doc_publishes() {
+        let a = AnalysisConfig::default();
+        assert_eq!(a.bundle_dir, PathBuf::from("/var/lib/moat/incidents"));
+        assert_eq!(
+            a.agent_args.get("claude").map(|v| v.as_slice()),
+            Some(["--permission-mode".to_string(), "plan".to_string()].as_slice())
+        );
+        let i = IncidentsConfig::default();
+        assert_eq!(i.snapshot_min_severity, "high");
+        assert_eq!(i.retain_days, 30);
+        assert_eq!(i.retain_max, 200);
+        let g = DigestConfig::default();
+        assert!(g.enabled);
+        assert_eq!(g.weekday, "monday");
+        assert_eq!(g.hour, 9);
+    }
+
+    #[test]
+    fn the_snapshot_threshold_compares_by_rank_and_never_switches_it_off() {
+        assert!(severity_at_least("critical", "high"));
+        assert!(severity_at_least("high", "high"));
+        assert!(!severity_at_least("medium", "high"));
+        assert!(severity_at_least("medium", "low"));
+        assert!(!severity_at_least("critical", "never"));
+    }
+
+    #[test]
+    fn the_baseline_defaults_are_the_ones_the_doc_publishes() {
+        let b = BaselineConfig::default();
+        assert_eq!(b.trusted_repos, ["core", "extra", "multilib", "omarchy"]);
+        assert_eq!(b.learning_days, 7);
+        assert_eq!(b.learn_min_days, 3);
+        assert_eq!(b.noisy_rule_per_day, 20);
+        assert!(b.provenance_downgrade);
+        let l = LearningConfig::default();
+        assert_eq!(l.half_life_days, 30.0);
+        assert_eq!(l.rare_max_count, 3);
+        assert_eq!(l.rare_max_age_days, 14);
     }
 }

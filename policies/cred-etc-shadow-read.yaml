@@ -13,8 +13,11 @@ metadata:
       password hashes; anything else reading them is either already root and dumping
       them for offline cracking, or a misconfigured file mode you want to know about.
     moat.omarchy/expected: >-
-      Almost never. A screen locker, display manager or PAM module not in the allowlist,
-      or a backup of /etc run as root.
+      The user database service reads it constantly: systemd-userdbd and the
+      systemd-userwork workers it forks opened /etc/shadow seven times in fifteen
+      seconds on a normal login, and sddm-helper reads it on every unlock. Beyond those,
+      a screen locker, display manager or PAM module not in the allowlist, or a backup
+      of /etc run as root.
     moat.omarchy/fp-hint: "exe"
 spec:
   options:
@@ -54,6 +57,9 @@ spec:
         - "/usr/bin/systemd-sysusers"
         - "/usr/lib/systemd/systemd"
         - "/usr/lib/systemd/systemd-homed"
+        - "/usr/lib/systemd/systemd-userdbd"
+        - "/usr/lib/systemd/systemd-userwork"
+        - "/usr/lib/sddm/sddm-helper"
         - "/usr/lib/polkit-1/polkit-agent-helper-1"
         - "/usr/bin/hyprlock"
         - "/usr/bin/swaylock"

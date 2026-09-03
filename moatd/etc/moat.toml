@@ -56,6 +56,16 @@ feeds_bin = "/usr/bin/moat-feeds"
 # are discovered for {{HOME}} expansion.
 passwd = "/etc/passwd"
 
+# The local pacman database, parsed once for provenance (BASELINE §1). Its
+# mtime is also the "a pacman transaction happened" signal: that is when the
+# database is re-read and learned baseline entries are re-checked.
+pacman_local = "/var/lib/pacman/local"
+
+# Called once per pacman transaction, for `pacman -Sl <trusted repos>`. Repo
+# membership is the one fact the local database does not record. Nothing here
+# ever shells out per event.
+pacman = "/usr/bin/pacman"
+
 [rules]
 # Userland rules (`moat-x-*`) — the detections a TracingPolicy cannot
 # express. Each can be turned off independently.
@@ -75,6 +85,43 @@ new_exec_ioc = true
 
 # One process reading many distinct files under $HOME dotdirs in seconds.
 mass_read = true
+
+# The four rules below replaced the `pkg` kernel policies of the same names.
+# Tetragon's `matchParentBinaries … followChildren` matched processes with no
+# package manager in their ancestry at all (quickshell -> bash, Xwayland -> bash,
+# make under cmake), so the "is this inside a package install?" decision moved
+# into moatd, where the process table has exact ancestry and the real argv.
+# The rule ids and severities did not change.
+
+# A shell or interpreter exec'ing inside a package-manager subtree. Low, and
+# folded to one alert per install — it is a timeline signal, not an incident.
+pkg_subtree_interpreter_spawn = true
+
+# curl/wget/base64/openssl (or python -c/-m and node -e with a URL) inside a
+# package-manager subtree. High.
+pkg_subtree_downloader = true
+
+# nc/ncat/netcat/socat/telnet inside a package-manager subtree. Critical, and
+# the one rule moatd enforces itself: in `enforce` mode it SIGKILLs the process
+# after re-checking its start time. Monitor mode never kills.
+pkg_subtree_netcat_exec = true
+
+# claude/codex/gemini/opencode/q/amp started from inside an install. High.
+ai_cli_in_pkg_subtree = true
+
+[ai]
+# Ancestors that are allowed to launch an AI CLI without a terminal, as globs.
+# Matched against each ancestor's binary AND each of its arguments, so a shebang
+# script (reported as `binary: /usr/bin/bash` with the script in `arguments`)
+# still matches.
+#
+# Omarchy's own usage reporters run `codex` and `claude` headlessly by design,
+# which is exactly the shape `moat-x-ai-cli-headless` looks for, so they ship
+# allowed. Add your own cron jobs and CI wrappers here rather than turning the
+# rule off.
+headless_allowed_parents = [
+  "/usr/share/omarchy/bin/omarchy-agent-usage-*",
+]
 
 [thresholds]
 # Same rule + exe + file inside this many seconds folds into one alert with a
@@ -122,3 +169,118 @@ allow_private = true
 
 # Severity for a pkg-egress hit: critical | high | medium | low.
 egress_severity = "medium"
+
+[baseline]
+# Baselining (docs/BASELINE.md). The product requirement behind this section:
+# a quiet day produces zero notifications. 500 alerts a day means the user
+# turns it off, so every alert here is a specific (rule, actor) decision the
+# user can see, explain and reverse — never a blanket allowlist.
+
+# Repos whose signature makes a package-owned binary `official`. AUR builds are
+# in none of them by design: the June 2026 AUR wave installed pacman-owned
+# binaries, so "pacman owns it" is not trust. Add a repo you actually trust.
+trusted_repos = ["core", "extra", "multilib", "omarchy"]
+
+# Days after the first run during which a recurring, official, medium/low
+# pattern is written straight to allowlist.d/baseline.toml. After the window it
+# becomes a proposal instead (`moatctl baseline list`). Restart the window with
+# `moatctl baseline relearn --days N` after a new job or a new toolchain.
+learning_days = 7
+
+# Distinct days a (rule, actor, parent, dir) tuple must recur on before it can
+# be learned or proposed. Three days is "this is how the machine works", not
+# "this happened twice this afternoon".
+learn_min_days = 3
+
+# Alerts from one rule in a rolling 24 h before the noise guard demotes it to
+# the timeline. The rule is never switched off: it keeps writing to
+# alerts.jsonl, one `moat-x-noisy-rule` alert names the top five tuples, and the
+# demotion clears itself after 24 quiet hours.
+noisy_rule_per_day = 20
+
+# BASELINE §2: let an official actor take one step off persist/priv/exec/net.
+# cred, rootkit and shell never move — an official binary reading your SSH key
+# is still worth a look — and a `pkg-install` context is never downgraded at all.
+provenance_downgrade = true
+
+[learning]
+# Rarity counters (docs/LEARNING-AND-ANALYSIS.md §1). Not a model: four decayed
+# per-tuple counters that answer "has this happened on this machine before".
+# Rarity never changes a severity on its own; it is evidence, and a tuple must
+# be `common` before the baseline will propose it.
+
+# A sighting's weight halves this often. Raw totals never decay, so
+# "seen 41 times since Aug 12" stays honest.
+half_life_days = 30
+
+# Under this many total sightings a tuple reads as `rare`.
+rare_max_count = 3
+
+# Nothing in this many days puts a tuple back to `rare`.
+rare_max_age_days = 14
+
+[analysis]
+# docs/LEARNING-AND-ANALYSIS.md §2: hand an alert to the user's own agent.
+#
+# `moatctl analyze <id>` (and the panel's "Analyze with <agent>" button) writes
+# <bundle_dir>/<alert id>/bundle.md and launches
+#   omarchy-agent --prompt "<fixed preamble naming that path>"
+# The preamble, not the bundle, is the prompt: the agent opens the file itself,
+# and every process-derived string in it sits inside a ```DATA fence that the
+# preamble tells the agent to treat strictly as data. That matters — the
+# s1ngularity attack drove the victim's own AI CLIs, so an alert about a
+# malicious postinstall must not become an injection channel.
+#
+# The daemon never launches an agent (no session, no terminal, runs as root);
+# moatctl does, from the user's session.
+
+# Per-agent flags for a read-only or plan mode (LEARNING §2 step 4).
+#
+# ADVISORY ONLY on Omarchy 4: /usr/share/omarchy/bin/omarchy-agent accepts
+# exactly --inline, --pick and --prompt, rejects anything else, and builds each
+# agent's own flags itself (`claude --permission-mode auto`, ...) with no
+# environment variable to influence it. There is no pass-through, so
+# `moatctl analyze` prints the equivalent direct command instead of dropping
+# these silently.
+agent_args = { claude = ["--permission-mode", "plan"] }
+
+# Where bundle.md and the incident snapshots live: <bundle_dir>/<alert id>/.
+# 0750 root:moat, so the panel and the agent (running as the user) can read
+# them and only the daemon writes them. `moatd run --incidents-dir` overrides
+# it for dev mode.
+bundle_dir = "/var/lib/moat/incidents"
+
+[incidents]
+# LEARNING §4: capture before it is gone. On an alert at or above this severity
+# the daemon copies /proc/<pid>/{status,cmdline,environ,cwd,exe,fd}, the process
+# tree, the tree's sockets (parsed from /proc/net, never `ss`), the executed
+# binary and the alerted file — BEFORE anything is killed, because in enforce
+# mode the process is about to stop existing. Environment values that look like
+# credentials are masked.
+#
+# `critical` narrows it to the loudest alerts; `never` switches capture off.
+snapshot_min_severity = "high"
+
+# Snapshots are deleted when they are older than this many days...
+retain_days = 30
+
+# ...or when there are more than this many, oldest first.
+retain_max = 200
+
+[digest]
+# LEARNING §5: one notification a week — "moat: 0 incidents, 18 installs
+# watched, 3 baseline proposals to review" — and the only scheduled
+# notification moat ever sends. Its job is to say the thing is on and working.
+#
+# The daemon computes it and publishes it in state.json; delivery is the user
+# timer moat-digest.timer running `moatctl digest --notify`, because desktop
+# notifications belong to the user's session and not to a root service.
+#
+# `moatctl set digest off` flips the switch in state.json without touching this
+# file or systemd; this key is only the first-boot default.
+enabled = true
+
+# Local weekday and hour. Local, not UTC: "Monday 9am" is a promise about the
+# user's morning.
+weekday = "monday"
+hour = 9

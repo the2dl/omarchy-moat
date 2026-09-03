@@ -12,8 +12,14 @@ metadata:
       you run; a payload that lands in either and then executes is the last step before
       it has your session.
     moat.omarchy/expected: >-
-      Frequently. Playwright, Cypress, Puppeteer, bun, uv, mise and electron-builder all
-      keep executables under ~/.cache and run them during ordinary builds.
+      The version-manager and toolchain directories a developer runs binaries from all
+      day (~/.cargo/bin, ~/.local/bin, mise, pnpm, bun, go/bin, nvm, rustup, pyenv,
+      rbenv, asdf, uv, JetBrains, VS Code extensions, ~/.local/share/omarchy) are
+      excluded in-kernel by the first selector. What remains and still fires often:
+      project worktrees - node_modules/.bin, target/debug, .venv/bin - which cannot be
+      excluded here because they sit anywhere under $HOME; moatd suppresses those by
+      context. Playwright, Cypress, Puppeteer and electron-builder run executables from
+      ~/.cache on purpose and will fire.
     moat.omarchy/fp-hint: "exe"
 spec:
   options:
@@ -26,13 +32,42 @@ spec:
     - index: 0
       type: "linux_binprm"
     selectors:
+    # Selector 0 ends in NoPost. `linux_binprm` accepts Equal/NotEqual/Prefix/Postfix
+    # only - there is no NotPrefix for this argument type (notes section 2) - so the
+    # toolchain exclusion has to be a NoPost-first selector rather than a negated
+    # filter. Selectors are ORed and the first match wins (notes section 2 / 10).
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "{{HOME}}/.cargo/bin/"
+        - "{{HOME}}/.local/bin/"
+        - "{{HOME}}/.local/share/mise/"
+        - "{{HOME}}/.local/share/pnpm/"
+        - "{{HOME}}/.bun/bin/"
+        - "{{HOME}}/go/bin/"
+        - "{{HOME}}/.nvm/"
+        - "{{HOME}}/.rustup/"
+        - "{{HOME}}/.pyenv/"
+        - "{{HOME}}/.rbenv/"
+        - "{{HOME}}/.asdf/"
+        - "{{HOME}}/.local/share/uv/"
+        - "{{HOME}}/.local/share/JetBrains/"
+        - "{{HOME}}/.vscode/extensions/"
+        - "{{HOME}}/.local/share/omarchy/"
+      matchActions:
+      - action: NoPost
     - matchArgs:
       - index: 0
         operator: "Prefix"
         values:
         - "{{HOME}}/Downloads/"
         - "{{HOME}}/.cache/"
+        - "{{HOME}}/.config/"
         - "{{HOME}}/.local/share/Trash/"
+        # the generic rest of $HOME: project worktrees land here and moatd
+        # decides by context whether they are worth an alert.
+        - "{{HOME}}/"
       matchActions:
       - action: Post
         rateLimit: "300s"

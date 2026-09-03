@@ -1,0 +1,17 @@
+[Unit]
+Description=Moat weekly digest notification
+Documentation=file:///usr/share/doc/omarchy-moat/README.md
+# The daemon computes the summary and publishes it in state.json; this unit
+# only delivers it. It is a *user* unit because desktop notifications belong to
+# the user's session bus, which a root system service does not have — and
+# because moatctl needs no privilege at all (docs/LEARNING-AND-ANALYSIS.md §5).
+
+[Service]
+Type=oneshot
+# Sends through omarchy-notification-send when the digest is on and due;
+# prints and exits 0 otherwise, so a machine with the digest switched off never
+# turns this into a failed unit.
+ExecStart=/usr/bin/moatctl digest --notify
+# The socket is 0660 root:moat: without the group there is nothing to read, and
+# nagging weekly about it would be worse than silence.
+ExecCondition=/usr/bin/test -r /run/moat/control.sock

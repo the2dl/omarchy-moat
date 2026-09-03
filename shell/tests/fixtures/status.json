@@ -1,0 +1,58 @@
+{
+  "ok": true,
+  "version": "0.1.0",
+  "mode": "monitor",
+  "tetragon": "running",
+  "policies": 32,
+  "policies_failed": [],
+  "feeds": {
+    "updated": "2026-09-03T11:00:00Z",
+    "hashes": 123456,
+    "domains": 5432,
+    "urls": 210
+  },
+  "unacked": {
+    "critical": 3,
+    "high": 5,
+    "medium": 5,
+    "low": 1
+  },
+  "sandbox": false,
+  "socket_group": "moat",
+  "baseline": {
+    "learning": false,
+    "learning_ends": "2026-08-30T09:12:00Z",
+    "proposals": 2,
+    "learned": 7,
+    "demoted": ["moat-persist-hypr-config-write"]
+  },
+  "demoted_rules": ["moat-persist-hypr-config-write"],
+  "proposals": [
+    {
+      "id": "p-01",
+      "rule": "moat-exec-untrusted-home",
+      "exe": "/home/dan/.local/share/mise/installs/node/26.5.0/bin/node",
+      "parent": "/usr/bin/fish",
+      "dir": "/home/dan/Projects/omarchy-moat/node_modules/.bin",
+      "count": 41,
+      "days": 5,
+      "first_seen": "2026-08-29T09:20:11Z",
+      "last_seen": "2026-09-03T15:58:02Z",
+      "toml": "[[rule]]\nname = \"moat-exec-untrusted-home\"\nexe = \"/home/dan/.local/share/mise/installs/node/26.5.0/bin/node\"\nparent = \"/usr/bin/fish\"\nfile = \"/home/dan/Projects/omarchy-moat/node_modules/.bin/*\"",
+      "comment": "# proposed 2026-09-03: 41 alerts on 5 distinct days"
+    },
+    {
+      "id": "p-02",
+      "rule": "moat-persist-git-hook-write",
+      "exe": "/usr/bin/lefthook",
+      "parent": "/usr/bin/git",
+      "dir": "/home/dan/Projects/omarchy-moat/.git/hooks",
+      "count": 12,
+      "days": 4,
+      "first_seen": "2026-08-30T10:02:41Z",
+      "last_seen": "2026-09-02T18:11:09Z",
+      "toml": "[[rule]]\nname = \"moat-persist-git-hook-write\"\nexe = \"/usr/bin/lefthook\"\nfile = \"/home/dan/Projects/omarchy-moat/.git/hooks/*\"",
+      "comment": "# proposed 2026-09-03: 12 alerts on 4 distinct days"
+    }
+  ]
+}

@@ -1,0 +1,261 @@
+{
+  "dir": "/var/lib/moat/incidents",
+  "incidents": [
+    {
+      "id": "01M1ME4KXMXWCDBX4X95MYS51V",
+      "dir": "/var/lib/moat/incidents/01M1ME4KXMXWCDBX4X95MYS51V",
+      "rule": "moat-cred-cloud-credentials-read",
+      "severity": "critical",
+      "title": "Cloud or cluster credentials read by an unexpected program",
+      "captured": "2026-09-03T20:07:37.144Z",
+      "errors": [
+        "file/: /home/moattest/.aws/credentials: No such file or directory (os error 2)"
+      ],
+      "files": [
+        {
+          "name": "file/node",
+          "size": 47416,
+          "sha256": "9625c74169aa65857a76c5db03fa0dff8ba7a211e69fb72ef388d4f37abd355f"
+        },
+        {
+          "name": "net.txt",
+          "size": 219,
+          "sha256": "de7601eaf2dea922fb069cbff2b8e76dab7be1f6fe8cbd3122ad1f344c8466d5"
+        },
+        {
+          "name": "pkg.json",
+          "size": 136,
+          "sha256": "0b9830da5cfb0291526379b77593b15d9ea84d28186b7bf2646e50e3e4f9ff12"
+        },
+        {
+          "name": "process.json",
+          "size": 14168,
+          "sha256": "dcbbbb6a4293db3f586cbf823dcc86f8f9f2bd6bbfe01ab5a92c4c12317127c7"
+        },
+        {
+          "name": "tree.txt",
+          "size": 633,
+          "sha256": "9ad88da1a25712eb67e693b14cc091854c30c176d7ab4194aafe19c3ee18dd0c"
+        }
+      ],
+      "bundle": true
+    },
+    {
+      "id": "01M1ME4KXS4PAZ7462JGGP9EP5",
+      "dir": "/var/lib/moat/incidents/01M1ME4KXS4PAZ7462JGGP9EP5",
+      "rule": "moat-cred-ssh-private-key-read",
+      "severity": "high",
+      "title": "Private SSH key read by an unexpected program",
+      "captured": "2026-09-03T20:07:37.147Z",
+      "errors": [
+        "file/: /usr/bin/node: No such file or directory (os error 2)",
+        "file/: /home/moattest/.ssh/id_ed25519: No such file or directory (os error 2)"
+      ],
+      "files": [
+        {
+          "name": "net.txt",
+          "size": 219,
+          "sha256": "de7601eaf2dea922fb069cbff2b8e76dab7be1f6fe8cbd3122ad1f344c8466d5"
+        },
+        {
+          "name": "pkg.json",
+          "size": 136,
+          "sha256": "3c2ebd68c9333500b60bdb89bb2e53bbb9f399d83365e2b398f087ba5f4412a0"
+        },
+        {
+          "name": "process.json",
+          "size": 912,
+          "sha256": "2c6bd8547a08078be7e97b129fef5ffe0f9298570de5d05c1b30c69cc56171d4"
+        },
+        {
+          "name": "tree.txt",
+          "size": 631,
+          "sha256": "46292a01205e371a9447990b11852152229bce8283a0acf482c574fc25ca3bba"
+        }
+      ],
+      "bundle": false
+    },
+    {
+      "id": "01M1ME4KXVB39VX1KJ46JWDRNF",
+      "dir": "/var/lib/moat/incidents/01M1ME4KXVB39VX1KJ46JWDRNF",
+      "rule": "moat-pkg-subtree-netcat-exec",
+      "severity": "critical",
+      "title": "Package install ran netcat or socat",
+      "captured": "2026-09-03T20:07:37.150Z",
+      "errors": [],
+      "files": [
+        {
+          "name": "file/nc",
+          "size": 39512,
+          "sha256": "88e2c5b80863f70be851bf3dce4c535a0edc4473d16c96b580d79c7659d37a66"
+        },
+        {
+          "name": "net.txt",
+          "size": 219,
+          "sha256": "de7601eaf2dea922fb069cbff2b8e76dab7be1f6fe8cbd3122ad1f344c8466d5"
+        },
+        {
+          "name": "pkg.json",
+          "size": 119,
+          "sha256": "b278e2e42ab4474578b9a5809f6ec24c0a07ea5458cb2d4c6a6e9e1b1f6c768d"
+        },
+        {
+          "name": "process.json",
+          "size": 910,
+          "sha256": "0948951604c34d6c1909a433119f26b32046cfec7829e3968cfcf151e8ee0845"
+        },
+        {
+          "name": "tree.txt",
+          "size": 612,
+          "sha256": "194855a1e915b3bd530a4178d1538be4be3d7fe9e3eb88046aaa744b0e83485a"
+        }
+      ],
+      "bundle": false
+    },
+    {
+      "id": "01M1ME4KXY1AS18ZMJ981YKBVT",
+      "dir": "/var/lib/moat/incidents/01M1ME4KXY1AS18ZMJ981YKBVT",
+      "rule": "moat-pkg-subtree-downloader",
+      "severity": "high",
+      "title": "Package install ran a downloader or decoder",
+      "captured": "2026-09-03T20:07:37.155Z",
+      "errors": [],
+      "files": [
+        {
+          "name": "file/curl",
+          "size": 223624,
+          "sha256": "fde59bde5e1ffc1476eaa85c49fc9935e007b8c5410df6e7dc9b53fb3ce8ec04"
+        },
+        {
+          "name": "net.txt",
+          "size": 219,
+          "sha256": "de7601eaf2dea922fb069cbff2b8e76dab7be1f6fe8cbd3122ad1f344c8466d5"
+        },
+        {
+          "name": "pkg.json",
+          "size": 131,
+          "sha256": "dc7d7dc6e8019c280355f73f2b980487d6d8733f0374d914080ef69e88aa0d27"
+        },
+        {
+          "name": "process.json",
+          "size": 912,
+          "sha256": "3f8b72815baa99718fbdb54e2bdf2c6043409d7ff83a6e747e7cf10bdfdac550"
+        },
+        {
+          "name": "tree.txt",
+          "size": 626,
+          "sha256": "bcfcab32c8a6fd2b03ad5f28dbbbccd5788cdb1054363d25cf524ee64070086e"
+        }
+      ],
+      "bundle": false
+    },
+    {
+      "id": "01M1ME4KY3GYJQZGHG4M0EC10P",
+      "dir": "/var/lib/moat/incidents/01M1ME4KY3GYJQZGHG4M0EC10P",
+      "rule": "moat-net-suspicious-port-egress",
+      "severity": "high",
+      "title": "Connection to an unusual public port",
+      "captured": "2026-09-03T20:07:37.160Z",
+      "errors": [],
+      "files": [
+        {
+          "name": "file/curl",
+          "size": 223624,
+          "sha256": "fde59bde5e1ffc1476eaa85c49fc9935e007b8c5410df6e7dc9b53fb3ce8ec04"
+        },
+        {
+          "name": "net.txt",
+          "size": 219,
+          "sha256": "de7601eaf2dea922fb069cbff2b8e76dab7be1f6fe8cbd3122ad1f344c8466d5"
+        },
+        {
+          "name": "pkg.json",
+          "size": 131,
+          "sha256": "dc7d7dc6e8019c280355f73f2b980487d6d8733f0374d914080ef69e88aa0d27"
+        },
+        {
+          "name": "process.json",
+          "size": 912,
+          "sha256": "d3fa39a2d3eb33ef057e023f648757204e78a3c0e410663697f7e90aa7bf19a3"
+        },
+        {
+          "name": "tree.txt",
+          "size": 626,
+          "sha256": "bcfcab32c8a6fd2b03ad5f28dbbbccd5788cdb1054363d25cf524ee64070086e"
+        }
+      ],
+      "bundle": false
+    },
+    {
+      "id": "01M1ME4KY8EFS75VMBR9E3QSW8",
+      "dir": "/var/lib/moat/incidents/01M1ME4KY8EFS75VMBR9E3QSW8",
+      "rule": "moat-x-pkg-egress",
+      "severity": "high",
+      "title": "Package install connected to a host outside the registry allowlist",
+      "captured": "2026-09-03T20:07:37.165Z",
+      "errors": [],
+      "files": [
+        {
+          "name": "file/curl",
+          "size": 223624,
+          "sha256": "fde59bde5e1ffc1476eaa85c49fc9935e007b8c5410df6e7dc9b53fb3ce8ec04"
+        },
+        {
+          "name": "net.txt",
+          "size": 219,
+          "sha256": "de7601eaf2dea922fb069cbff2b8e76dab7be1f6fe8cbd3122ad1f344c8466d5"
+        },
+        {
+          "name": "pkg.json",
+          "size": 131,
+          "sha256": "dc7d7dc6e8019c280355f73f2b980487d6d8733f0374d914080ef69e88aa0d27"
+        },
+        {
+          "name": "process.json",
+          "size": 912,
+          "sha256": "e8407a1a304f2e9b4832b56be78ccca31e72354245b80345f11936ff625c6087"
+        },
+        {
+          "name": "tree.txt",
+          "size": 626,
+          "sha256": "bcfcab32c8a6fd2b03ad5f28dbbbccd5788cdb1054363d25cf524ee64070086e"
+        }
+      ],
+      "bundle": false
+    },
+    {
+      "id": "01M1ME4KYD6Q2VGYTQ78DSWJF3",
+      "dir": "/var/lib/moat/incidents/01M1ME4KYD6Q2VGYTQ78DSWJF3",
+      "rule": "moat-persist-shell-rc-write",
+      "severity": "high",
+      "title": "Shell startup file modified by a non-editor",
+      "captured": "2026-09-03T20:07:37.167Z",
+      "errors": [
+        "file/: /usr/bin/restic: No such file or directory (os error 2)",
+        "file/: /home/moattest/.bashrc: No such file or directory (os error 2)"
+      ],
+      "files": [
+        {
+          "name": "net.txt",
+          "size": 219,
+          "sha256": "de7601eaf2dea922fb069cbff2b8e76dab7be1f6fe8cbd3122ad1f344c8466d5"
+        },
+        {
+          "name": "process.json",
+          "size": 670,
+          "sha256": "cba1abff1d4f929328b4fcad06aed493f176a23bc4e5448d662b3154f831cfb4"
+        },
+        {
+          "name": "tree.txt",
+          "size": 287,
+          "sha256": "398573031ed5dbc5a6b8be571baa16f91dab4741dfa713de7066eff10ff802cc"
+        }
+      ],
+      "bundle": false
+    }
+  ],
+  "retain_days": 30,
+  "retain_max": 200,
+  "snapshot_min_severity": "high",
+  "ok": true
+}

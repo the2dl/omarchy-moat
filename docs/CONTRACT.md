@@ -233,11 +233,22 @@ use moatd to kill or move something the sensor did not already flag.
 
 `status` response:
 ```json
-{"ok":true,"version":"0.1.0","mode":"monitor","tetragon":"running","policies":17,
+{"ok":true,"version":"0.1.0","mode":"monitor","tetragon":"running","policies":32,
  "policies_failed":[],"feeds":{"updated":"...","hashes":123456,"domains":5432},
  "unacked":{"critical":0,"high":2,"medium":5,"low":11},"sandbox":false,
- "group_ok":true}
+ "socket_group":"moat"}
 ```
+
+Two corrections to that example, made by the integration review rather than
+guessed at: `policies` is 32, the number of templates in `policies/` after the
+`pkg` family was deleted and its rules moved into moatd (section 6.4); and the
+field is `socket_group`, the NAME of the group that owns the socket, not
+`group_ok`. "Is the caller in the group" is unanswerable from the daemon side —
+a client that was not in it could not have reached the socket to ask — so the
+plugin answers that one itself with `id -nG` and uses `socket_group` to print
+`sudo usermod -aG <actual group> $USER` instead of hardcoding `moat`. Baselining
+adds more fields to this response; they are listed in docs/BASELINE.md section 8
+and docs/LEARNING-AND-ANALYSIS.md section 9.
 
 `moatctl` is a thin CLI over this socket: `moatctl status|kill|quarantine|ack|ignore|unignore|allowlist|explain|set|list|feeds`.
 `moatctl explain <id>` prints the human-readable version: WHAT HAPPENED, WHY IT WAS
@@ -283,7 +294,15 @@ sudoers rule.
    - `moat-x-mass-read`: one process reads > N (default 40) distinct files
      under $HOME dotdirs within 10 s (TruffleHog pattern). Requires the policies
      agent to emit read events for those dirs; coordinate via the `cred` family.
-5. Enforcement: in `enforce` mode Tetragon kills; moatd records
+   Since the first live run the four package-manager rules (`moat-pkg-subtree-interpreter-spawn`,
+   `moat-pkg-subtree-downloader`, `moat-pkg-subtree-netcat-exec`, `moat-ai-cli-in-pkg-subtree`)
+   are userland rules built on the daemon's exec_id ancestry and argv (rules/pkgtree.rs),
+   not policies: Tetragon's follow-children parent matching misfired on unrelated
+   processes. `moat-x-sensor-mismatch` (low) is raised when a kernel event contradicts
+   its own policy's selectors (selectors.rs re-validation).
+5. Enforcement: in `enforce` mode Tetragon kills; the one userland exception is
+   `moat-pkg-subtree-netcat-exec`, where moatd itself SIGKILLs after verifying pid start
+   time and exe. moatd records
    `action_taken: killed` when the event carries the action. In monitor mode
    moatd never kills unless asked over the socket.
 6. Serve the control socket. Write `state.json` every 5 s.
@@ -385,3 +404,14 @@ Everything is version `0.1.0`. Plugin id `io.github.the2dl.moat`, package
 `omarchy-moat`, binaries prefixed `moat`. Placeholder name; a rename is a
 search-and-replace, so do not scatter the word into user-visible strings more
 than necessary. Use "Moat" in UI text.
+
+## 11. Baselining
+
+Alert volume is a product requirement: a quiet day produces zero
+notifications. docs/BASELINE.md specifies provenance classification, provenance
+scoring, the learning window with proposals, the noise guard, and the surfacing
+policy. Its section 8 extends the alert record; its section 7 adds config
+keys; `moatctl baseline list|accept|dismiss|relearn` and the socket commands
+`{"cmd":"baseline","action":"list|accept|dismiss|relearn",...}` are part of
+section 5. The plugin gets an Alerts tab (high/critical), a Timeline tab
+(everything else, grouped), and proposals in the Allowlist tab.

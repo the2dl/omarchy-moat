@@ -2,17 +2,80 @@
   "rules": [
     {
       "index": 1,
+      "file": "/etc/moat/allowlist.d/baseline.toml",
+      "source": "learned",
+      "removable": true,
+      "comment": "learned 2026-09-03: seen 4 times on 1 distinct day (2026-09-03 .. 2026-09-03), actor official (restic 0.18.1-1), context service, rarity common",
+      "name": "moat-persist-desktop-entry-write",
+      "exe": "/usr/bin/restic",
+      "path": "/home/moattest/.local/share/applications/*",
+      "parent": "/usr/lib/systemd/systemd",
+      "toml": "[[rule]]\nname = \"moat-persist-desktop-entry-write\"\nexe = \"/usr/bin/restic\"\nfile = \"/home/moattest/.local/share/applications/*\"\nparent = \"/usr/lib/systemd/systemd\"\n"
+    },
+    {
+      "index": 1,
+      "file": "/etc/moat/allowlist.d/omarchy-default.toml",
+      "source": "shipped",
+      "removable": false,
+      "comment": "`cargo test` executes a copied `sleep` named `nc` from a tempdir to prove the exec-from-tmpfs rule fires and that enforce mode kills it.",
+      "name": "moat-exec-untrusted-tmpfs",
+      "exe": "/tmp/.tmp*/nc",
+      "path": null,
+      "parent": "*/target/*/deps/moatd-*",
+      "toml": "[[rule]]\nname = \"moat-exec-untrusted-tmpfs\"\nexe = \"/tmp/.tmp*/nc\"\nparent = \"*/target/*/deps/moatd-*\"\n"
+    },
+    {
+      "index": 2,
+      "file": "/etc/moat/allowlist.d/omarchy-default.toml",
+      "source": "shipped",
+      "removable": false,
+      "comment": "The same suite executes its own helpers (`moat-*`) out of a tempdir.",
+      "name": "moat-exec-untrusted-tmpfs",
+      "exe": "/tmp/.tmp*/moat-*",
+      "path": null,
+      "parent": "*/target/*/deps/moatd-*",
+      "toml": "[[rule]]\nname = \"moat-exec-untrusted-tmpfs\"\nexe = \"/tmp/.tmp*/moat-*\"\nparent = \"*/target/*/deps/moatd-*\"\n"
+    },
+    {
+      "index": 3,
+      "file": "/etc/moat/allowlist.d/omarchy-default.toml",
+      "source": "shipped",
+      "removable": false,
+      "comment": "The netcat rule is the one those tests exist to exercise: a fake `nc` under a cargo test runner is the test, not an install script opening a shell.",
+      "name": "moat-pkg-subtree-netcat-exec",
+      "exe": "/tmp/.tmp*/nc",
+      "path": null,
+      "parent": "*/target/*/deps/moatd-*",
+      "toml": "[[rule]]\nname = \"moat-pkg-subtree-netcat-exec\"\nexe = \"/tmp/.tmp*/nc\"\nparent = \"*/target/*/deps/moatd-*\"\n"
+    },
+    {
+      "index": 4,
+      "file": "/etc/moat/allowlist.d/omarchy-default.toml",
+      "source": "shipped",
+      "removable": false,
+      "comment": "...and the same for the suite's own helpers.",
+      "name": "moat-pkg-subtree-netcat-exec",
+      "exe": "/tmp/.tmp*/moat-*",
+      "path": null,
+      "parent": "*/target/*/deps/moatd-*",
+      "toml": "[[rule]]\nname = \"moat-pkg-subtree-netcat-exec\"\nexe = \"/tmp/.tmp*/moat-*\"\nparent = \"*/target/*/deps/moatd-*\"\n"
+    },
+    {
+      "index": 1,
       "file": "/etc/moat/allowlist.d/user.toml",
-      "comment": "added 2026-09-03 from alert 01M1M5XHBZTEYJ03KHCF0R5P32: Private SSH key read by an unexpected program — wire fixture",
-      "name": "moat-cred-ssh-private-key-read",
+      "source": "user",
+      "removable": true,
+      "comment": "added 2026-09-03 from alert 01M1ME4KXMXWCDBX4X95MYS51V: Cloud or cluster credentials read by an unexpected program — wire fixture",
+      "name": "moat-cred-cloud-credentials-read",
       "exe": "/usr/bin/node",
       "path": null,
       "parent": null,
-      "toml": "[[rule]]\nname = \"moat-cred-ssh-private-key-read\"\nexe = \"/usr/bin/node\"\n"
+      "toml": "[[rule]]\nname = \"moat-cred-cloud-credentials-read\"\nexe = \"/usr/bin/node\"\n"
     }
   ],
   "dir": "/etc/moat/allowlist.d",
   "user_file": "/etc/moat/allowlist.d/user.toml",
+  "baseline_file": "/etc/moat/allowlist.d/baseline.toml",
   "errors": [],
   "ok": true
 }

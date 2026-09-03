@@ -1,0 +1,72 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-persist-desktop-entry-write
+  annotations:
+    moat.omarchy/severity: "medium"
+    moat.omarchy/title: "Desktop entry written in ~/.local/share/applications"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "quarantine,ignore"
+    moat.omarchy/why: >-
+      A .desktop file here shadows the system one of the same name, so rewriting the
+      Exec= line of a launcher you use every day (the browser, the terminal) runs a
+      payload each time you start it - without any autostart entry or unit file.
+    moat.omarchy/expected: >-
+      Often. Web-app installers, Flatpak, pacman and omarchy-refresh-applications write
+      here as a matter of course, which is why this is medium and not high; the omarchy
+      helpers are suppressed in-kernel by the first selector.
+    moat.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  - hook: "file_post_open"
+    message: "Desktop entry opened for writing"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int"
+    selectors:
+    - matchBinaries:
+      - operator: "Prefix"
+        values:
+        - "/usr/bin/omarchy-"
+        - "/usr/share/omarchy/"
+      matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "{{HOME}}/.local/share/applications/"
+      - index: 1
+        operator: "Mask"
+        values: ["2"]
+      matchActions:
+      - action: NoPost
+    - matchBinaries:
+      - operator: "NotPostfix"
+        values:
+        - "/nvim"
+        - "/vim"
+        - "/nano"
+        - "/emacs"
+        - "/code"
+        - "/zed"
+        - "/hx"
+        - "/kate"
+        - "/pacman"
+        - "/flatpak"
+        - "/omarchy-refresh-applications"
+      matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "{{HOME}}/.local/share/applications/"
+      - index: 1
+        operator: "Mask"
+        values: ["2"]
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

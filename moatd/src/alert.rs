@@ -101,15 +101,69 @@ pub struct Alert {
     pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<u64>,
+
+    // --- BASELINE §8 -------------------------------------------------------
+    /// Who acted: provenance, the owning package, and the script when an
+    /// interpreter took its class from one.
+    #[serde(default)]
+    pub actor: crate::provenance::Actor,
+    /// `interactive` | `pkg-install` | `service` | `unknown`.
+    #[serde(default)]
+    pub context: crate::context::Context,
+    /// The severity the rule itself decided, before provenance and context.
+    #[serde(default)]
+    pub severity_base: String,
+    /// "high → medium: actor is official (package hyprland)".
+    #[serde(default)]
+    pub severity_reason: String,
+    /// `alerts` | `timeline` (BASELINE §5). A demoted rule is forced to
+    /// `timeline` without being suppressed.
+    #[serde(default = "default_surface")]
+    pub surface: String,
+    /// `null`, or the allowlist entry that suppressed it: `"user.toml#1"`,
+    /// `"baseline.toml#3"`. Demoted rules are **not** suppressed.
+    #[serde(default)]
+    pub suppressed_by: Option<String>,
+    /// `first_seen` | `rare` | `common` (LEARNING §1).
+    #[serde(default)]
+    pub rarity: crate::rarity::Rarity,
+    /// The plain sentence behind `rarity`.
+    #[serde(default)]
+    pub rarity_text: String,
+    /// LEARNING §4 and §9: the snapshot taken before any kill. Absent until the
+    /// capture finishes, then appended as an `update` line — the alert must not
+    /// wait on a filesystem walk to be written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incident: Option<crate::incident::Incident>,
     /// Not serialised: only the live daemon uses it, to tie a later
     /// `process_exit` back to the alert that predicted the kill.
     #[serde(skip)]
     pub exec_id: String,
 }
 
+fn default_surface() -> String {
+    "alerts".to_string()
+}
+
 impl Alert {
     pub fn severity_rank(&self) -> u8 {
         severity_rank(&self.severity)
+    }
+
+    /// Suppressed alerts are recorded but never notified and never counted
+    /// (BASELINE §8). A demoted rule keeps `suppressed_by: null` and is filtered
+    /// out of the badge by its `surface` instead.
+    pub fn is_suppressed(&self) -> bool {
+        self.suppressed_by.is_some()
+    }
+
+    /// BASELINE §8 "Resolved shapes": timeline rows group on the script an
+    /// interpreter was running when there is one, otherwise on the binary.
+    pub fn group_key(&self) -> &str {
+        self.actor
+            .script
+            .as_deref()
+            .unwrap_or(self.process.exe.as_str())
     }
 }
 
@@ -153,6 +207,12 @@ pub fn fold(alert: &mut Alert, update: &Map<String, Value>) {
             ("count", Value::Number(n)) => alert.count = n.as_u64(),
             ("severity", Value::String(s)) => alert.severity = s.clone(),
             ("ts", Value::String(s)) => alert.ts = s.clone(),
+            ("surface", Value::String(s)) => alert.surface = s.clone(),
+            ("suppressed_by", Value::String(s)) => alert.suppressed_by = Some(s.clone()),
+            ("suppressed_by", Value::Null) => alert.suppressed_by = None,
+            ("incident", v) => {
+                alert.incident = serde_json::from_value(v.clone()).ok();
+            }
             _ => {}
         }
     }
@@ -230,6 +290,19 @@ pub mod tests_support {
             acked: false,
             mode: "monitor".into(),
             count: None,
+            actor: crate::provenance::Actor {
+                provenance: crate::provenance::Provenance::User,
+                package: None,
+                script: None,
+            },
+            context: crate::context::Context::PkgInstall,
+            severity_base: "high".into(),
+            severity_reason: "stays high: package install: never downgraded".into(),
+            surface: "alerts".into(),
+            suppressed_by: None,
+            rarity: crate::rarity::Rarity::FirstSeen,
+            rarity_text: "first time /usr/bin/node has read /home/dan/.ssh on this machine".into(),
+            incident: None,
             exec_id: "abc".into(),
         }
     }
@@ -252,6 +325,13 @@ mod tests {
         assert!(!line.contains("exec_id"), "internal field must not leak");
         assert!(!line.contains("\"count\""), "absent optionals are omitted");
         assert!(!line.contains("\"net\""));
+        // The baseline fields are part of the record, always.
+        for k in [
+            "\"actor\"", "\"context\"", "\"severity_base\"", "\"severity_reason\"",
+            "\"surface\"", "\"suppressed_by\"", "\"rarity\"", "\"rarity_text\"",
+        ] {
+            assert!(line.contains(k), "record has no {}", k);
+        }
         match parse_record(&line).unwrap() {
             Record::Full(b) => {
                 let mut back = *b;
@@ -280,6 +360,82 @@ mod tests {
         assert!(a.acked);
         assert_eq!(a.action_taken, "killed");
         assert_eq!(a.count, Some(3));
+    }
+
+    #[test]
+    fn suppression_and_surface_fold_like_every_other_field() {
+        let mut a = demo();
+        assert!(!a.is_suppressed());
+        let u = UpdateLine::new(&a.id)
+            .set("suppressed_by", Value::String("baseline.toml#3".into()))
+            .set("surface", Value::String("timeline".into()));
+        fold(&mut a, &u.update);
+        assert!(a.is_suppressed());
+        assert_eq!(a.suppressed_by.as_deref(), Some("baseline.toml#3"));
+        assert_eq!(a.surface, "timeline");
+        let clear = UpdateLine::new(&a.id).set("suppressed_by", Value::Null);
+        fold(&mut a, &clear.update);
+        assert!(!a.is_suppressed());
+    }
+
+    /// LEARNING §9: the snapshot reaches readers as an update line, so the
+    /// alert can be written the instant it is raised.
+    #[test]
+    fn an_incident_folds_in_from_an_update_line() {
+        let mut a = demo();
+        assert!(a.incident.is_none());
+        assert!(!serde_json::to_string(&a).unwrap().contains("incident"));
+        let u = UpdateLine::new(&a.id).set(
+            "incident",
+            serde_json::json!({
+                "dir": "/var/lib/moat/incidents/01J",
+                "files": [{"name": "process.json", "size": 4096, "sha256": "ab"}],
+            }),
+        );
+        let line = serde_json::to_string(&u).unwrap();
+        match parse_record(&line).unwrap() {
+            Record::Update(u) => fold(&mut a, &u.update),
+            _ => panic!("should parse as an update"),
+        }
+        let inc = a.incident.as_ref().unwrap();
+        assert_eq!(inc.dir, "/var/lib/moat/incidents/01J");
+        assert_eq!(inc.files[0].name, "process.json");
+        assert_eq!(inc.files[0].size, 4096);
+        // And it round-trips on the full record.
+        let line = serde_json::to_string(&a).unwrap();
+        match parse_record(&line).unwrap() {
+            Record::Full(b) => assert_eq!(b.incident, a.incident),
+            _ => panic!("should parse as a full alert"),
+        }
+    }
+
+    #[test]
+    fn the_timeline_groups_on_the_script_when_there_is_one() {
+        let mut a = demo();
+        assert_eq!(a.group_key(), "/usr/bin/node");
+        a.actor.script = Some("/home/dan/proj/setup.mjs".into());
+        assert_eq!(a.group_key(), "/home/dan/proj/setup.mjs");
+    }
+
+    /// An alert written by an older moatd has none of the §8 fields; it must
+    /// still load, because alerts.jsonl outlives upgrades.
+    #[test]
+    fn a_pre_baseline_record_still_parses() {
+        let mut v = serde_json::to_value(demo()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        for k in ["actor", "context", "severity_base", "severity_reason", "surface", "suppressed_by", "rarity", "rarity_text"] {
+            o.remove(k);
+        }
+        let line = serde_json::to_string(&v).unwrap();
+        match parse_record(&line).unwrap() {
+            Record::Full(a) => {
+                assert_eq!(a.surface, "alerts");
+                assert_eq!(a.context, crate::context::Context::Unknown);
+                assert_eq!(a.actor.provenance, crate::provenance::Provenance::Unknown);
+                assert!(!a.is_suppressed());
+            }
+            _ => panic!("should parse"),
+        }
     }
 
     #[test]

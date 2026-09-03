@@ -30,8 +30,11 @@
     "defaultSection": "right",
     "defaults": {
       "minNotifySeverity": "high",
+      "notifyCooldownMinutes": 10,
       "pollSeconds": 10,
-      "showCountBadge": true
+      "showCountBadge": true,
+      "showSuppressed": false,
+      "weeklyDigest": true
     },
     "schema": [
       {
@@ -46,6 +49,16 @@
         ],
         "defaultValue": "high",
         "description": "Alerts below this severity never raise a desktop notification. They still appear in the panel."
+      },
+      {
+        "key": "notifyCooldownMinutes",
+        "type": "integer",
+        "label": "Notification cooldown (minutes)",
+        "min": 1,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 10,
+        "description": "At most one notification per rule per this many minutes. Further alerts of that rule are counted and land as one \"N more from ...\" notification when the window ends; they are all in the panel either way. Critical alerts seen for the first time on this machine ignore the cooldown."
       },
       {
         "key": "pollSeconds",
@@ -63,6 +76,20 @@
         "label": "Show count badge",
         "defaultValue": true,
         "description": "Draw the number of unacknowledged high and critical alerts on the shield."
+      },
+      {
+        "key": "showSuppressed",
+        "type": "boolean",
+        "label": "Show suppressed alerts",
+        "defaultValue": false,
+        "description": "Include alerts a learned or user allowlist entry already covers in the panel timeline, greyed out. They never notify and never count toward the badge either way."
+      },
+      {
+        "key": "weeklyDigest",
+        "type": "boolean",
+        "label": "Weekly digest notification",
+        "defaultValue": true,
+        "description": "One notification a week summarising incidents, installs watched and baseline proposals waiting for review. The only scheduled notification moat sends; moatd sends it, this is the off switch."
       }
     ]
   }

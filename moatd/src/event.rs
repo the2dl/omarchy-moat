@@ -167,6 +167,20 @@ impl<'a> HookHit<'a> {
         self.ev.args.iter().find_map(arg_file_path)
     }
 
+    /// The `linux_binprm` argument only: the file being **executed**.
+    ///
+    /// Unlike [`file_path`](Self::file_path) this never returns the file an
+    /// open-hook touched, so it is safe to use as "what binary is this really",
+    /// which is how a `/proc/self/fd/<n>` exe gets its name back.
+    pub fn binprm_path(&self) -> Option<String> {
+        self.ev.args.iter().find_map(|a| {
+            a.get("linux_binprm_arg")
+                .and_then(|v| v.get("path"))
+                .and_then(|p| p.as_str())
+                .map(str::to_string)
+        })
+    }
+
     /// First `int_arg` — the access mask on `file_post_open` /
     /// `file_permission`, the mode on `path_chmod`, the id on module hooks.
     pub fn int_arg(&self) -> Option<i64> {

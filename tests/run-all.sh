@@ -66,13 +66,41 @@ summary_and_exit() {
   exit $status
 }
 
+# The plugin folder is the repository root (manifest.json lives there), so the
+# validator has to see the tree a fresh `omarchy plugin add` clone produces --
+# not this working copy. A local `makepkg` run leaves pkg/src/ and pkg/pkg/
+# behind: gitignored build scratch containing a symlink to the downloaded
+# Tetragon tarball, which the validator refuses outright ("symlinks are not
+# allowed inside a plugin folder"). Validating in place therefore failed on any
+# machine where the package had ever been built -- and the old
+# `... || { echo skipped; }` form swallowed that failure as "not installed",
+# which is how it went unnoticed. A missing validator skips; a present one that
+# rejects the plugin now fails the suite.
+validate_plugin() {
+  if ! command -v omarchy-plugin-validate >/dev/null 2>&1; then
+    echo "omarchy-plugin-validate not installed, skipped"
+    return 0
+  fi
+  local scratch rc=0
+  scratch=$(mktemp -d "${TMPDIR:-/tmp}/moat-plugin-validate.XXXXXX") || return 1
+  tar -c \
+    --exclude=./.git \
+    --exclude=./pkg/src \
+    --exclude=./pkg/pkg \
+    --exclude=./moatd/target \
+    --exclude='*.pkg.tar.zst' \
+    --exclude='*.tar.gz' \
+    -C "$root" . | tar -x -C "$scratch" || rc=1
+  ((rc == 0)) && { omarchy-plugin-validate "$scratch" || rc=$?; }
+  rm -rf -- "$scratch"
+  return $rc
+}
+
 # Static gates first: they cost seconds and catch most breakage.
 suite policies bash -c 'python3 policies/check.py'
 suite scanner  bash -c 'python3 -m unittest discover scanner/tests'
 suite shell    bash shell/tests/run-tests.sh
-suite manifest bash -c 'command -v omarchy-plugin-validate >/dev/null \
-  && omarchy-plugin-validate . \
-  || { echo "omarchy-plugin-validate not installed, skipped"; }'
+suite manifest validate_plugin
 
 # Then the ones that build or run things.
 suite sandbox  bash sandbox/tests/run.sh

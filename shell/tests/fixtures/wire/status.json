@@ -12,16 +12,77 @@
     "urls": 0
   },
   "unacked": {
-    "critical": 0,
-    "high": 3,
-    "low": 0,
-    "medium": 0
+    "critical": 2,
+    "high": 5,
+    "low": 16,
+    "medium": 2
   },
   "sandbox": false,
   "socket_group": "moat",
-  "uptime_secs": 2,
-  "events_seen": 15,
-  "alerts": 4,
-  "processes": 6,
-  "allowlist_rules": 0
+  "uptime_secs": 4,
+  "events_seen": 40,
+  "alerts": 25,
+  "alerts_suppressed": 0,
+  "processes": 13,
+  "allowlist_rules": 1,
+  "installed_at": "2026-09-03T20:07:36.000Z",
+  "baseline": {
+    "learning": false,
+    "learning_ends": "2026-09-03T20:07:38.000Z",
+    "proposals": 1,
+    "learned": 1,
+    "demoted": [
+      "moat-persist-omarchy-menu-extension-write"
+    ]
+  },
+  "proposals": [
+    {
+      "id": "01M1ME4NACVF1XYFBR0E3A64C3",
+      "rule": "moat-persist-omarchy-plugin-write",
+      "exe": "/usr/bin/restic",
+      "parent": "/usr/lib/systemd/systemd",
+      "dir": "/home/moattest/.config/omarchy/plugins/backup-restore",
+      "count": 4,
+      "days": 1,
+      "first_seen": "2026-09-03T20:07:38.572Z",
+      "last_seen": "2026-09-03T20:07:38.572Z",
+      "toml": "[[rule]]\nname = \"moat-persist-omarchy-plugin-write\"\nexe = \"/usr/bin/restic\"\nfile = \"/home/moattest/.config/omarchy/plugins/backup-restore/*\"\nparent = \"/usr/lib/systemd/systemd\"\n",
+      "key": "moat-persist-omarchy-plugin-write|/usr/bin/restic|/usr/lib/systemd/systemd|/home/moattest/.config/omarchy/plugins/backup-restore"
+    }
+  ],
+  "demoted_rules": [
+    "moat-persist-omarchy-menu-extension-write"
+  ],
+  "rarity_counters": 17,
+  "digest": true,
+  "digest_enabled": true,
+  "digest_summary": {
+    "enabled": true,
+    "due": "2026-09-07T13:00:00.000Z",
+    "due_unix": 1788786000,
+    "last_sent": null,
+    "text": "moat: 7 incidents, 1 install watched, 1 baseline proposal to review",
+    "urgency": "normal",
+    "weekday": "monday",
+    "hour": 9,
+    "incidents": 7,
+    "installs": 1,
+    "proposals": 1,
+    "last_sent_unix": 0
+  },
+  "incidents": 7,
+  "incidents_dir": "/var/lib/moat/incidents",
+  "incidents_captured": 7,
+  "receipts": 1,
+  "installs_watched": 0,
+  "provenance": {
+    "packages": 6,
+    "files": 8,
+    "trusted_repos": [
+      "core",
+      "extra",
+      "multilib",
+      "omarchy"
+    ]
+  }
 }

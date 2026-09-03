@@ -26,12 +26,21 @@ Item {
 
   property bool opened: false
   property string selectedId: ""
-  property string tab: "alerts"          // "alerts" | "allowlist"
+  // BASELINE 5 splits the alert list in two: Alerts is high + critical, the
+  // things asking for a decision; Timeline is medium, low, demoted and (when
+  // asked for) suppressed, grouped. Allowlist and Settings are the other two.
+  property string tab: "alerts"          // "alerts" | "timeline" | "allowlist" | "settings"
   property string notice: ""             // transient result line under the header
 
+  readonly property var tabNames: ["alerts", "timeline", "allowlist", "settings"]
+
   readonly property string pluginId: "io.github.the2dl.moat"
-  readonly property var alerts: service ? service.alerts : []
+  // The Alerts tab's list: high + critical, not demoted, not suppressed,
+  // unacked first (BASELINE 5).
+  readonly property var alertsList: service ? service.alertsSurface : []
   readonly property bool ready: !!service && service.available && service.groupOk
+  readonly property bool listTab: root.tab === "alerts" || root.tab === "timeline"
+  readonly property bool enforcing: !!service && service.status.mode === "enforce"
   readonly property var selected: {
     if (!service || !root.selectedId) return null
     return service.alertById(root.selectedId)
@@ -46,10 +55,16 @@ Item {
     var payload = {}
     try { payload = JSON.parse(String(payloadJson || "") || "{}") } catch (e) { payload = {} }
     if (payload && payload.alert) {
-      root.tab = "alerts"
       root.selectAlert(String(payload.alert))
+      // Land on the tab that actually holds it. The one alert that can arrive
+      // here from a toast while living on the timeline is moat-x-noisy-rule,
+      // which notifies at medium on purpose (BASELINE 4); opening the Alerts
+      // tab on it would show an empty list.
+      var target = service ? service.alertById(String(payload.alert)) : null
+      root.tab = target && target.surface === "timeline" ? "timeline" : "alerts"
     }
-    if (payload && payload.tab === "allowlist") root.tab = "allowlist"
+    if (payload && payload.tab && root.tabNames.indexOf(String(payload.tab)) !== -1)
+      root.tab = String(payload.tab)
     root.notice = ""
     root.opened = true
     if (service) service.refresh()
@@ -71,7 +86,7 @@ Item {
 
   onOpenedChanged: {
     if (!opened) return
-    if (!root.selectedId && root.alerts.length > 0) root.selectAlert(root.alerts[0].id)
+    if (!root.selectedId && root.alertsList.length > 0) root.selectAlert(root.alertsList[0].id)
   }
 
   Connections {
@@ -88,6 +103,16 @@ Item {
           : "Allowlist rule written to " + root.service.allowlistFile
       } else if (command === "unignore") {
         root.notice = "Allowlist rule removed."
+      } else if (command === "baseline-accept") {
+        root.notice = "Proposal accepted — written to /etc/moat/allowlist.d/baseline.toml."
+      } else if (command === "baseline-dismiss") {
+        root.notice = "Proposal dismissed. Its alerts keep coming."
+      } else if (command === "baseline-relearn") {
+        root.notice = "Learning window restarted."
+      } else if (command === "digest") {
+        // setWeeklyDigest already wrote the notice, and it says more than this
+        // would (whether the setting was persisted). Leave it alone.
+        return
       } else {
         root.notice = command.charAt(0).toUpperCase() + command.slice(1) + " done."
       }
@@ -111,6 +136,7 @@ Item {
   // Remove button one tab away.
   property string _pendingCommand: ""
   property string _pendingArg: ""
+  property string _pendingArg2: ""
 
   function requestKill(id) {
     root._confirm("kill", id, "Kill the process tree recorded in this alert?")
@@ -121,19 +147,37 @@ Item {
       "Move this file into quarantine (chmod 000, under /var/lib/moat/quarantine)? Anything still using it will break.")
   }
 
-  function requestUnignore(index) {
+  function requestUnignore(index, file) {
+    root._pendingArg2 = String(file || "")
     root._confirm("unignore", String(index),
-      "Remove allowlist rule #" + index + "? Its detection starts firing again.")
+      "Remove allowlist rule #" + index + (file ? " from " + file : "")
+      + "? Its detection starts firing again.")
+  }
+
+  // BASELINE 3: relearning re-opens the window in which recurring medium/low
+  // alerts are silently written to baseline.toml instead of shown. That is a
+  // week of deliberately reduced visibility, so it asks first.
+  function requestRelearn() {
+    root._confirm("baseline-relearn", "",
+      "Restart the baseline learning window? For the next learning period, recurring medium and low alerts from official binaries are written to baseline.toml instead of being shown.")
   }
 
   function requestAck(id) { if (service) service.ack(id) }
   function requestIgnore(id, scope) { if (service) service.ignore(id, scope) }
+  // Accept and dismiss are both reversible — an accepted entry is listed with a
+  // Remove button in the same tab, and a dismissed pattern proposes itself
+  // again if it keeps recurring — so neither goes through the confirm.
+  function requestAcceptProposal(id) { if (service) service.acceptProposal(id) }
+  function requestDismissProposal(id) { if (service) service.dismissProposal(id) }
 
   function _confirm(command, arg, message) {
     root._pendingCommand = command
     root._pendingArg = String(arg)
+    if (command !== "unignore") root._pendingArg2 = ""
     confirm.message = message
-    confirm.confirmText = command.charAt(0).toUpperCase() + command.slice(1)
+    confirm.confirmText = command === "baseline-relearn"
+      ? "Relearn"
+      : command.charAt(0).toUpperCase() + command.slice(1)
     confirm.selectedIndex = 0     // a destructive prompt defaults to Cancel
     confirm.opened = true
   }
@@ -141,12 +185,15 @@ Item {
   function _runPending() {
     var command = root._pendingCommand
     var arg = root._pendingArg
+    var arg2 = root._pendingArg2
     confirm.opened = false
     root._pendingCommand = ""
+    root._pendingArg2 = ""
     if (!service) return
     if (command === "kill") service.kill(arg)
     else if (command === "quarantine") service.quarantine(arg)
-    else if (command === "unignore") service.unignore(Number(arg))
+    else if (command === "unignore") service.unignore(Number(arg), arg2)
+    else if (command === "baseline-relearn") service.relearnBaseline()
   }
 
   // ------------------------------------------------------------- keyboard nav
@@ -156,18 +203,28 @@ Item {
   // shadow the component's own and kill every binding it provides). While the
   // confirm is up, the same signals drive the dialog instead of the list.
 
+  // The list j/k walks: the Alerts tab's own list, or on the Timeline the rows
+  // that are actually on screen (an expanded group's alerts). Moving the
+  // selection into a collapsed group would be a cursor nobody can see.
+  function navigableAlerts() {
+    if (root.tab === "alerts") return root.alertsList
+    if (root.tab === "timeline") return timelineView.flatAlerts
+    return []
+  }
+
   function moveSelection(delta) {
     if (confirm.opened) {
       confirm.selectedIndex = confirm.selectedIndex === 0 ? 1 : 0
       return
     }
-    if (root.tab !== "alerts" || root.alerts.length === 0) return
+    var list = root.navigableAlerts()
+    if (list.length === 0) return
     var index = 0
-    for (var i = 0; i < root.alerts.length; i++) {
-      if (root.alerts[i].id === root.selectedId) { index = i; break }
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].id === root.selectedId) { index = i; break }
     }
-    index = Math.max(0, Math.min(root.alerts.length - 1, index + delta))
-    root.selectAlert(root.alerts[index].id)
+    index = Math.max(0, Math.min(list.length - 1, index + delta))
+    root.selectAlert(list[index].id)
   }
 
   function activate() {
@@ -194,8 +251,21 @@ Item {
     switch (text) {
     case "a": if (root.selected) root.requestAck(root.selected.id); break
     case "r": if (service) service.refresh(); break
-    case "t": root.tab = root.tab === "alerts" ? "allowlist" : "alerts"; break
+    case "t": root.cycleTab(1); break
     }
+  }
+
+  // `t` cycles the four tabs in order rather than toggling two, so the key
+  // still reaches every surface now that there are four of them.
+  function cycleTab(delta) {
+    var index = root.tabNames.indexOf(root.tab)
+    if (index < 0) index = 0
+    root.selectTab(root.tabNames[(index + delta + root.tabNames.length) % root.tabNames.length])
+  }
+
+  function selectTab(name) {
+    root.tab = String(name)
+    if (root.tab === "allowlist" && service) service.loadAllowlist()
   }
 
   // Persisting min-notify-severity means writing the bar widget's shell.json
@@ -209,6 +279,44 @@ Item {
     root.notice = error
       ? "Notify threshold set to " + value + " for this session (not saved: " + error + ")"
       : "Notify threshold saved: " + value
+    noticeTimer.restart()
+  }
+
+  function setNotifyCooldown(minutes) {
+    if (!service) return
+    var value = Number(minutes)
+    service.notifyCooldownMinutes = value
+    var error = service.persistSetting("notifyCooldownMinutes", value)
+    root.notice = error
+      ? "Notification cooldown " + value + " min for this session (not saved: " + error + ")"
+      : "Notification cooldown saved: " + value + " min per rule"
+    noticeTimer.restart()
+  }
+
+  function setShowSuppressed(value) {
+    if (!service) return
+    service.showSuppressed = value === true
+    var error = service.persistSetting("showSuppressed", value === true)
+    var label = value === true ? "shown" : "hidden"
+    root.notice = error
+      ? "Suppressed alerts " + label + " for this session (not saved: " + error + ")"
+      : "Suppressed alerts " + label + "."
+    noticeTimer.restart()
+  }
+
+  // LEARNING 5. The digest is the daemon's to send; this switch is the user's
+  // to turn off. Two writes, because they answer different questions: the bar
+  // widget entry is what the panel reads back, and `moatctl set digest` is what
+  // actually stops the notification being scheduled.
+  function setWeeklyDigest(value) {
+    if (!service) return
+    var on = value === true
+    service.weeklyDigest = on
+    service.setDigest(on)
+    var error = service.persistSetting("weeklyDigest", on)
+    root.notice = error
+      ? "Weekly digest " + (on ? "on" : "off") + " for this session (not saved: " + error + ")"
+      : "Weekly digest " + (on ? "on" : "off") + "."
     noticeTimer.restart()
   }
 
@@ -384,24 +492,32 @@ Item {
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.spacing.sm
 
-              Button {
-                anchors.verticalCenter: parent.verticalCenter
-                text: "Alerts"
-                selected: root.tab === "alerts"
-                foreground: card.fg
-                fontSize: Style.font.bodySmall
-                onClicked: root.tab = "alerts"
-              }
+              Repeater {
+                model: [
+                  { tab: "alerts", label: "Alerts" },
+                  { tab: "timeline", label: "Timeline" },
+                  { tab: "allowlist", label: "Allowlist" },
+                  { tab: "settings", label: "Settings" }
+                ]
 
-              Button {
-                anchors.verticalCenter: parent.verticalCenter
-                text: "Allowlist"
-                selected: root.tab === "allowlist"
-                foreground: card.fg
-                fontSize: Style.font.bodySmall
-                onClicked: {
-                  root.tab = "allowlist"
-                  if (root.service) root.service.loadAllowlist()
+                delegate: Button {
+                  required property var modelData
+                  anchors.verticalCenter: parent.verticalCenter
+                  // The Alerts tab carries the badge count and the Allowlist
+                  // tab the number of proposals waiting: the two places where
+                  // something is asking the user for a decision.
+                  text: {
+                    if (modelData.tab === "alerts" && root.service && root.service.badgeCount > 0)
+                      return "Alerts " + root.service.badgeCount
+                    if (modelData.tab === "allowlist" && root.service
+                        && root.service.proposals.length > 0)
+                      return "Allowlist " + root.service.proposals.length
+                    return modelData.label
+                  }
+                  selected: root.tab === modelData.tab
+                  foreground: card.fg
+                  fontSize: Style.font.bodySmall
+                  onClicked: root.selectTab(modelData.tab)
                 }
               }
 
@@ -440,6 +556,15 @@ Item {
                     warn: s.policies_failed.length > 0 || s.policies === 0 },
                   { label: "feeds", value: root.service.feedsAge() || "never", warn: !s.feeds.updated },
                   { label: "sandbox", value: s.sandbox ? "on" : "off", warn: false },
+                  // BASELINE 3: where the machine is in its learning window,
+                  // and how many patterns are waiting to be reviewed. It is a
+                  // status cell rather than a banner because it is the normal
+                  // state of the system, not an incident.
+                  // learningSummary already reads as a phrase ("learning, 5
+                  // days left" / "baseline active · 3 proposals"), so this cell
+                  // carries no label of its own.
+                  { label: "", value: root.service.learningSummary,
+                    warn: s.baseline.proposals > 0 },
                   { label: "unacked", value: String(root.service.unacked.total),
                     warn: root.service.unacked.total > 0 }
                 ]
@@ -447,7 +572,7 @@ Item {
 
               delegate: Text {
                 required property var modelData
-                text: modelData.label + " " + modelData.value
+                text: modelData.label ? modelData.label + " " + modelData.value : modelData.value
                 color: modelData.warn ? Color.urgent : card.mutedFg
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
@@ -471,105 +596,26 @@ Item {
         }
 
         // ------------------------------------------------------------ footer
+        //
+        // The settings row CONTRACT 7 asks for moved into its own tab when
+        // baselining added a fifth and sixth control to it (show suppressed,
+        // relearn); a Flow of six controls under every tab was more chrome than
+        // list. What stays pinned here is the one thing that is true no matter
+        // which tab you are on: the sensor is armed to kill.
         Column {
           id: footerBlock
           anchors.bottom: parent.bottom
           anchors.left: parent.left
           anchors.right: parent.right
           spacing: Style.spacing.md
+          visible: root.enforcing
 
-          PanelSeparator { width: parent.width; foreground: card.fg }
-
-          Flow {
-            width: parent.width
-            spacing: Style.spacing.xl
-
-            Row {
-              spacing: Style.spacing.controlGap
-
-              Text {
-                anchors.verticalCenter: parent.verticalCenter
-                text: "Mode"
-                color: card.mutedFg
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                font.bold: true
-              }
-
-              Button {
-                text: "Monitor"
-                selected: !!root.service && root.service.status.mode === "monitor"
-                bordered: true
-                foreground: card.fg
-                fontSize: Style.font.bodySmall
-                onClicked: if (root.service) root.service.setMode("monitor")
-              }
-
-              Button {
-                text: "Enforce"
-                selected: !!root.service && root.service.status.mode === "enforce"
-                bordered: true
-                foreground: Color.urgent
-                accent: Color.urgent
-                fontSize: Style.font.bodySmall
-                onClicked: if (root.service) root.service.setMode("enforce")
-              }
-            }
-
-            Row {
-              spacing: Style.spacing.controlGap
-
-              Text {
-                anchors.verticalCenter: parent.verticalCenter
-                text: "Sandbox shims"
-                color: card.mutedFg
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                font.bold: true
-              }
-
-              ToggleSwitch {
-                anchors.verticalCenter: parent.verticalCenter
-                checked: !!root.service && root.service.status.sandbox
-                busy: !!root.service && root.service.busy
-                foreground: card.fg
-                trackHeight: Style.space(18)
-                onToggled: if (root.service) root.service.setSandbox(!root.service.status.sandbox)
-              }
-            }
-
-            Row {
-              spacing: Style.spacing.sm
-
-              Text {
-                anchors.verticalCenter: parent.verticalCenter
-                text: "Notify at"
-                color: card.mutedFg
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                font.bold: true
-              }
-
-              Repeater {
-                model: ["low", "medium", "high", "critical"]
-
-                delegate: Button {
-                  required property string modelData
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: modelData
-                  selected: !!root.service && root.service.minNotifySeverity === modelData
-                  foreground: card.fg
-                  fontSize: Style.font.caption
-                  onClicked: root.setMinNotifySeverity(modelData)
-                }
-              }
-            }
-          }
+          PanelSeparator { width: parent.width; foreground: card.fg; visible: root.enforcing }
 
           Text {
             width: parent.width
-            visible: !!root.service && root.service.status.mode === "enforce"
-            text: "Enforce mode lets Tetragon SIGKILL a matching process in the kernel, before this panel ever sees it. A false positive stops a real program mid-write. Stay in monitor until the allowlist is quiet."
+            visible: root.enforcing
+            text: "Enforce mode: Tetragon can SIGKILL a matching process in the kernel before this panel sees it. A false positive stops a real program mid-write."
             color: Color.urgent
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
@@ -605,26 +651,46 @@ Item {
             visible: root.ready && root.tab === "allowlist"
             service: root.service
             foreground: card.fg
-            onRemoveRequested: function(index) { root.requestUnignore(index) }
+            onRemoveRequested: function(index, file) { root.requestUnignore(index, file) }
+            onAcceptRequested: function(id) { root.requestAcceptProposal(id) }
+            onDismissRequested: function(id) { root.requestDismissProposal(id) }
           }
 
+          SettingsView {
+            anchors.fill: parent
+            visible: root.ready && root.tab === "settings"
+            service: root.service
+            foreground: card.fg
+            onMinNotifySeverityRequested: function(value) { root.setMinNotifySeverity(value) }
+            onNotifyCooldownRequested: function(minutes) { root.setNotifyCooldown(minutes) }
+            onShowSuppressedRequested: function(value) { root.setShowSuppressed(value) }
+            onWeeklyDigestRequested: function(value) { root.setWeeklyDigest(value) }
+            onRelearnRequested: root.requestRelearn()
+          }
+
+          // Alerts and Timeline are the same two-pane layout with a different
+          // left half: one detail pane serves both, because a demoted or
+          // downgraded alert deserves the same five blocks as a critical one.
           Row {
             anchors.fill: parent
-            visible: root.ready && root.tab === "alerts"
+            visible: root.ready && root.listTab
             spacing: Style.spacing.panelGap
 
             Item {
               id: listPane
-              width: Math.round(Math.min(Style.space(300), parent.width * 0.4))
+              width: Math.round(Math.min(Style.space(340), parent.width * 0.42))
               height: parent.height
 
               Text {
                 anchors.centerIn: parent
                 width: parent.width
-                visible: root.alerts.length === 0
-                text: root.service && root.service.logReadable
-                  ? "No alerts. Moat is watching."
-                  : "The alert log is not readable."
+                visible: root.tab === "alerts" && root.alertsList.length === 0
+                text: {
+                  if (root.service && !root.service.logReadable) return "The alert log is not readable."
+                  if (root.service && root.service.timelineRows.length > 0)
+                    return "Nothing needs a decision. Lower-severity activity and install receipts are in the Timeline."
+                  return "No alerts. Moat is watching."
+                }
                 color: card.mutedFg
                 font.family: Style.font.family
                 font.pixelSize: Style.font.bodySmall
@@ -635,14 +701,14 @@ Item {
               ListView {
                 id: alertList
                 anchors.fill: parent
-                visible: root.alerts.length > 0
+                visible: root.tab === "alerts" && root.alertsList.length > 0
                 clip: true
-                model: root.alerts
+                model: root.alertsList
                 spacing: Style.spacing.xxs
                 boundsBehavior: Flickable.StopAtBounds
                 currentIndex: {
-                  for (var i = 0; i < root.alerts.length; i++)
-                    if (root.alerts[i].id === root.selectedId) return i
+                  for (var i = 0; i < root.alertsList.length; i++)
+                    if (root.alertsList[i].id === root.selectedId) return i
                   return -1
                 }
                 onCurrentIndexChanged: if (currentIndex >= 0) positionViewAtIndex(currentIndex, ListView.Contain)
@@ -656,6 +722,16 @@ Item {
                   foreground: card.fg
                   onClicked: root.selectAlert(modelData.id)
                 }
+              }
+
+              TimelineView {
+                id: timelineView
+                anchors.fill: parent
+                visible: root.tab === "timeline"
+                service: root.service
+                foreground: card.fg
+                selectedId: root.selectedId
+                onAlertSelected: function(id) { root.selectAlert(id) }
               }
             }
 
@@ -747,6 +823,14 @@ Item {
                 onRequestQuarantine: function(id) { root.requestQuarantine(id) }
                 onRequestAck: function(id) { root.requestAck(id) }
                 onRequestIgnore: function(id, scope) { root.requestIgnore(id, scope) }
+                // LEARNING 2 and 4. All three go straight to the service: none
+                // of them changes anything on this machine, so none needs the
+                // confirm that Kill and Quarantine go through. Their results
+                // land next to the buttons rather than in the panel notice,
+                // because they are about one alert, not about the daemon.
+                onRequestAnalyze: function(id) { if (root.service) root.service.analyze(id) }
+                onRequestCopyBundle: function(id) { if (root.service) root.service.copyBundlePath(id) }
+                onRequestCopyPath: function(path) { if (root.service) root.service.copyText(path, "incident path") }
               }
             }
           }

@@ -38,7 +38,9 @@ ReadWritePaths=/var/lib/moat /var/log/moat /run/moat /etc/moat
 #   CAP_DAC_OVERRIDE     move a quarantined file out of a directory we do not own
 #   CAP_CHOWN            chown alerts.jsonl and the socket to root:moat
 #   CAP_FOWNER           chmod 000 a quarantined file we do not own
-#   CAP_SYS_PTRACE       read /proc/<pid>/exe of another uid to verify a kill target
+#   CAP_SYS_PTRACE       read /proc/<pid>/{exe,environ,fd} of another uid: to verify
+#                        a kill target, and to take the incident snapshot of the
+#                        process before it is killed (LEARNING §4)
 CapabilityBoundingSet=CAP_KILL CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SYS_PTRACE
 AmbientCapabilities=CAP_KILL CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SYS_PTRACE
 NoNewPrivileges=yes

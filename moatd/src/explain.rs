@@ -40,6 +40,25 @@ pub struct Finding {
     /// Set when the policy asked for a kill; only a `process_exit` with
     /// `signal: SIGKILL` turns this into `action_taken: killed`.
     pub kill_expected: bool,
+    /// Set by a userland rule that enforces in the daemon rather than in the
+    /// kernel (`moat-pkg-subtree-netcat-exec`). The engine kills the process
+    /// **only** in `enforce` mode, and only after re-verifying its start time.
+    pub request_kill: bool,
+
+    // --- baselining (BASELINE §1, §2, §2b; LEARNING §1) ---------------------
+    /// Who acted, once the interpreter rule has been applied.
+    pub actor: crate::provenance::Actor,
+    pub context: crate::context::Context,
+    /// The provenance/context adjustment. `None` means "not scored yet", in
+    /// which case the rule's own severity stands.
+    pub score: Option<crate::scoring::Score>,
+    pub rarity: Option<crate::rarity::RarityInfo>,
+    /// The allowlist entry that suppressed this, if any.
+    pub suppressed_by: Option<String>,
+    /// The noise guard put this rule on the timeline. Not a suppression.
+    pub demoted: bool,
+    /// Extra `if_expected` options a rule offers beyond the four scopes.
+    pub extra_options: Vec<crate::alert::ExplainOption>,
 }
 
 impl Finding {
@@ -60,7 +79,36 @@ impl Finding {
             what_override: None,
             mode: "monitor".into(),
             kill_expected: false,
+            request_kill: false,
+            actor: Default::default(),
+            context: Default::default(),
+            score: None,
+            rarity: None,
+            suppressed_by: None,
+            demoted: false,
+            extra_options: Vec::new(),
         }
+    }
+
+    /// The severity after scoring, or the rule's own when nothing scored it.
+    pub fn severity(&self) -> &str {
+        self.score
+            .as_ref()
+            .map(|s| s.severity.as_str())
+            .unwrap_or(self.meta.severity.as_str())
+    }
+
+    /// The directory the baseline tuple keys on: the file's, or `""`.
+    pub fn file_dir(&self) -> String {
+        self.file
+            .as_ref()
+            .map(|f| crate::rarity::dir_of(&f.path))
+            .unwrap_or_default()
+    }
+
+    /// The parent the baseline tuple keys on.
+    pub fn parent_exe(&self) -> String {
+        self.ancestry.first().map(|p| p.exe.clone()).unwrap_or_default()
     }
 
     /// Dedupe key: same rule + exe + file inside the window is one alert
@@ -98,11 +146,19 @@ pub fn build_alert(f: &Finding, id: &str, ts: &str, allowlist_file: &str, allowl
         next: next_steps(f),
     };
 
+    let score = f
+        .score
+        .clone()
+        .unwrap_or_else(|| crate::scoring::Score::unadjusted(&f.meta.severity));
+    let rarity = f.rarity.clone();
+    // A demoted rule is not suppressed; it just stops being an Alerts-tab item.
+    let surface = if f.demoted { "timeline".to_string() } else { score.surface.clone() };
+
     Alert {
         v: ALERT_V,
         id: id.to_string(),
         ts: ts.to_string(),
-        severity: f.meta.severity.clone(),
+        severity: score.severity.clone(),
         rule: f.rule.clone(),
         family: f.meta.family.clone(),
         title: f.meta.title.clone(),
@@ -126,6 +182,17 @@ pub fn build_alert(f: &Finding, id: &str, ts: &str, allowlist_file: &str, allowl
         acked: false,
         mode: f.mode.clone(),
         count: None,
+        actor: f.actor.clone(),
+        context: f.context,
+        severity_base: score.severity_base.clone(),
+        severity_reason: score.severity_reason.clone(),
+        surface,
+        suppressed_by: f.suppressed_by.clone(),
+        rarity: rarity.as_ref().map(|r| r.class).unwrap_or_default(),
+        rarity_text: rarity.map(|r| r.text).unwrap_or_default(),
+        // The snapshot arrives as an update line once the capture finishes
+        // (LEARNING §4): the alert must not wait on a /proc walk.
+        incident: None,
         exec_id: f.exec_id.clone(),
     }
 }
@@ -279,6 +346,12 @@ fn evidence(f: &Finding, allowlist_note: &str) -> Vec<String> {
         }
     ));
 
+    // A binary we had to reconstruct says so, right under the process line:
+    // "exe" is a claim, and this is the footnote to it.
+    if let Some(note) = &f.proc.exe_note {
+        ev.push(note.clone());
+    }
+
     if !f.ancestry_line.is_empty() {
         let cwd = if f.proc.cwd.is_empty() {
             String::new()
@@ -291,8 +364,43 @@ fn evidence(f: &Finding, allowlist_note: &str) -> Vec<String> {
     if let Some(ioc) = &f.ioc {
         ev.push(format!("ioc: {} matched {}", ioc.source, ioc.matched));
     }
+
+    // Baselining evidence: who acted, where from, how usual it is, and what
+    // that did to the severity (BASELINE §1/§2/§2b, LEARNING §1). Provenance is
+    // evidence, never a verdict, so it reads as a fact in this list.
+    ev.push(f.actor.evidence());
+    ev.push(format!("context: {}", f.context));
+    if let Some(r) = &f.rarity {
+        ev.push(format!("rarity: {} — {}", r.class, r.text));
+    }
+    if let Some(s) = &f.score {
+        if s.severity != s.severity_base || s.matrix_row.is_some() {
+            ev.push(format!(
+                "severity: {}{}",
+                s.severity_reason,
+                s.matrix_row
+                    .map(|k| format!(" [matrix row {}]", k))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    if f.demoted {
+        ev.push(format!(
+            "noise guard: {} is demoted, so this is a timeline entry rather than an alert; \
+             `moatctl baseline undemote {}` starts watching it again",
+            f.rule, f.rule
+        ));
+    }
+
     ev.extend(f.extra_evidence.iter().cloned());
-    ev.push(allowlist_note.to_string());
+    match &f.suppressed_by {
+        Some(by) => ev.push(format!(
+            "suppressed by allowlist entry {}: recorded for the timeline, not notified and not \
+             counted",
+            by
+        )),
+        None => ev.push(allowlist_note.to_string()),
+    }
     ev
 }
 
@@ -360,6 +468,9 @@ fn if_expected(f: &Finding, id: &str, allowlist_file: &str) -> IfExpected {
     // Recommended scope first; the plugin renders them in order.
     let hint = f.meta.fp_hint.clone();
     options.sort_by_key(|o| (o.scope != hint) as u8);
+    // Rule-specific options (the noise guard's "these are expected" / "keep
+    // watching") go last, after the four scopes.
+    options.extend(f.extra_options.iter().cloned());
 
     IfExpected {
         hint,
@@ -551,6 +662,7 @@ mod tests {
             parent_exec_id: Some("e0".into()),
             exited_at: None,
             exit_signal: None,
+            exe_note: None,
         }
     }
 
@@ -582,6 +694,7 @@ mod tests {
             parent_exec_id: Some("e-1".into()),
             exited_at: None,
             exit_signal: None,
+            exe_note: None,
         }, ProcInfo {
             exec_id: "e-1".into(),
             pid: 41201,
@@ -593,6 +706,7 @@ mod tests {
             parent_exec_id: None,
             exited_at: None,
             exit_signal: None,
+            exe_note: None,
         }];
         f.ancestry_line = "npm -> sh -> node".into();
         f
@@ -728,21 +842,37 @@ mod tests {
     }
 
     /// CONTRACT §3 lists nine families; `what_sentence` must have a template
-    /// for every family the shipped policies actually use, or the alert falls
-    /// back to "node matched the rule moat-…", which explains nothing.
+    /// for every one of them plus every family the shipped policies and the
+    /// userland rules actually use, or the alert falls back to "node matched
+    /// the rule moat-…", which explains nothing.
+    ///
+    /// The nine are asserted from the contract rather than counted from
+    /// `policies/`, because a family can move from a kernel policy to a
+    /// userland rule (`pkg` and `ai` did exactly that) without the alert text
+    /// for it becoming any less necessary.
     #[test]
     fn every_shipped_family_has_a_what_template() {
+        let mut families: Vec<String> = [
+            "cred", "pkg", "persist", "shell", "rootkit", "priv", "ai", "net", "exec",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for r in crate::rules::all() {
+            families.push(r.meta().family);
+        }
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .map(|p| p.join("policies"));
-        let Some(dir) = dir.filter(|d| d.is_dir()) else {
-            return;
-        };
-        let set = crate::policy::PolicySet::load(&dir);
-        let mut families: Vec<String> =
-            set.policies.values().map(|m| m.family.clone()).collect();
+        if let Some(dir) = dir.filter(|d| d.is_dir()) {
+            let set = crate::policy::PolicySet::load(&dir);
+            assert!(!set.is_empty(), "no policies loaded from {}", dir.display());
+            families.extend(set.policies.values().map(|m| m.family.clone()));
+        }
         families.sort();
         families.dedup();
+        // "x" is the userland namespace: those rules all set `what_override`.
+        families.retain(|f| f != "x");
         assert!(families.len() >= 9, "expected all nine families, got {:?}", families);
         for family in families {
             let mut f = finding();

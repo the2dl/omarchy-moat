@@ -1,8 +1,8 @@
 {
-  "id": "01M1M5XHBZTEYJ03KHCF0R5P32",
+  "id": "01M1ME4KXMXWCDBX4X95MYS51V",
   "scope": "exe",
   "file": "/etc/moat/allowlist.d/user.toml",
-  "block": "# added 2026-09-03 from alert 01M1M5XHBZTEYJ03KHCF0R5P32: Private SSH key read by an unexpected program — wire fixture\n[[rule]]\nname = \"moat-cred-ssh-private-key-read\"\nexe = \"/usr/bin/node\"\n",
+  "block": "# Written by `moatctl ignore`. Hand edits are kept; see\n# /etc/moat/allowlist.d/default.toml for the field reference.\n\n# added 2026-09-03 from alert 01M1ME4KXMXWCDBX4X95MYS51V: Cloud or cluster credentials read by an unexpected program — wire fixture\n[[rule]]\nname = \"moat-cred-cloud-credentials-read\"\nexe = \"/usr/bin/node\"\n",
   "acked": true,
   "ok": true
 }

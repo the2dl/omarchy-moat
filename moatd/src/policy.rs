@@ -9,6 +9,8 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::selectors::{Mismatch, SelectorSet};
+
 const NS: &str = "moat.omarchy/";
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -63,6 +65,9 @@ pub fn family_of(name: &str) -> String {
 #[derive(Debug, Default, Clone)]
 pub struct PolicySet {
     pub policies: BTreeMap<String, PolicyMeta>,
+    /// The selectors each policy actually loaded with, for re-validating what
+    /// the kernel reports (see `selectors.rs`). Keyed by policy name.
+    pub selectors: BTreeMap<String, SelectorSet>,
     /// Files in the directory that did not parse, by file name.
     pub failed: Vec<String>,
 }
@@ -89,7 +94,8 @@ impl PolicySet {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
             match std::fs::read_to_string(&p).map_err(|e| e.to_string()).and_then(parse) {
-                Ok(meta) => {
+                Ok((meta, selectors)) => {
+                    set.selectors.insert(meta.name.clone(), selectors);
                     set.policies.insert(meta.name.clone(), meta);
                 }
                 Err(e) => {
@@ -111,6 +117,23 @@ impl PolicySet {
             .unwrap_or_else(|| PolicyMeta::fallback(name))
     }
 
+    /// Re-validate a reported event against the policy's own selectors.
+    ///
+    /// A policy we never loaded (or one with no selectors we model) passes:
+    /// this can only ever *reject* a value the policy provably excludes.
+    pub fn validate(
+        &self,
+        name: &str,
+        hook: &str,
+        path: Option<&str>,
+        binary: &str,
+    ) -> Result<(), Box<Mismatch>> {
+        match self.selectors.get(name) {
+            Some(s) => s.validate(name, hook, path, binary),
+            None => Ok(()),
+        }
+    }
+
     pub fn names(&self) -> Vec<String> {
         self.policies.keys().cloned().collect()
     }
@@ -124,7 +147,7 @@ impl PolicySet {
     }
 }
 
-fn parse(text: String) -> Result<PolicyMeta, String> {
+fn parse(text: String) -> Result<(PolicyMeta, SelectorSet), String> {
     let doc: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| e.to_string())?;
     let name = doc
         .get("metadata")
@@ -182,7 +205,7 @@ fn parse(text: String) -> Result<PolicyMeta, String> {
     if !meta.actions.iter().any(|a| a == "ignore") {
         meta.actions.push("ignore".into());
     }
-    Ok(meta)
+    Ok((meta, SelectorSet::parse(&doc)))
 }
 
 fn split_list(s: &str) -> Vec<String> {
@@ -262,5 +285,22 @@ spec:
         let set = PolicySet::load(&dir);
         assert!(set.len() >= 3, "testdata policies should load");
         assert!(set.failed.is_empty());
+    }
+
+    #[test]
+    fn selectors_load_alongside_the_annotations() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/policies");
+        let set = PolicySet::load(&dir);
+        let ssh = "moat-cred-ssh-private-key-read";
+        assert!(set.selectors.contains_key(ssh), "every loaded policy keeps its selectors");
+        // The rendered testdata policy names /home/dan's keys.
+        assert!(set
+            .validate(ssh, "file_post_open", Some("/home/dan/.ssh/id_rsa"), "/usr/bin/node")
+            .is_ok());
+        assert!(set
+            .validate(ssh, "file_post_open", Some("/sys/devices/system/cpu/online"), "/usr/bin/node")
+            .is_err());
+        // A policy we never loaded cannot be contradicted.
+        assert!(set.validate("moat-nope", "x", Some("/anything"), "/bin/sh").is_ok());
     }
 }

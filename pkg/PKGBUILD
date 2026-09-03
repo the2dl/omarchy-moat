@@ -87,6 +87,12 @@ backup=(
 	etc/moat/moat.toml
 	etc/moat/feeds.toml
 	etc/moat/allowlist.d/default.toml
+	# The shipped baseline (LEARNING section 8). It belongs to the package and
+	# `moatctl allowlist` reports every entry in it as source=shipped,
+	# removable=false -- but it is still under /etc and still a file a site
+	# admin may narrow, so an edit must survive an upgrade as a .pacnew
+	# rather than being silently reverted.
+	etc/moat/allowlist.d/omarchy-default.toml
 	etc/moat/sandbox.conf
 	etc/moat/scanner-allow.conf
 )
@@ -198,10 +204,21 @@ package() {
 		"${pkgdir}/usr/lib/systemd/system/moat-feeds.service"
 	install -Dm644 "${tree}/moatd/systemd/moat-feeds.timer" \
 		"${pkgdir}/usr/lib/systemd/system/moat-feeds.timer"
+	# The weekly digest (LEARNING section 5) is a *user* timer: desktop
+	# notifications belong to the session bus, and `moatctl digest --notify`
+	# needs no privilege. It is not enabled by the package; the .install
+	# file tells the user the one command that enables it.
+	install -Dm644 "${tree}/moatd/systemd/user/moat-digest.service" \
+		"${pkgdir}/usr/lib/systemd/user/moat-digest.service"
+	install -Dm644 "${tree}/moatd/systemd/user/moat-digest.timer" \
+		"${pkgdir}/usr/lib/systemd/user/moat-digest.timer"
 	install -Dm644 "${tree}/moatd/systemd/sysusers.d/moat.conf" \
 		"${pkgdir}/usr/lib/sysusers.d/moat.conf"
 	# /run/moat/policies (the rendered policies) comes from here, not
-	# from the package: it lives on tmpfs.
+	# from the package: it lives on tmpfs. So does
+	# /var/lib/moat/incidents (LEARNING section 4: the snapshots and the
+	# bundle.md the AI analysis reads), 0750 root:moat so the panel and the
+	# user's agent can read what the daemon wrote.
 	install -Dm644 "${tree}/moatd/systemd/tmpfiles.d/moat.conf" \
 		"${pkgdir}/usr/lib/tmpfiles.d/moat.conf"
 
@@ -234,6 +251,12 @@ package() {
 	install -Dm600 "${tree}/moatd/etc/feeds.toml"    "${pkgdir}/etc/moat/feeds.toml"
 	install -Dm644 "${tree}/moatd/etc/allowlist.d/default.toml" \
 		"${pkgdir}/etc/moat/allowlist.d/default.toml"
+	# The shipped baseline (LEARNING section 8): reviewed once by a human,
+	# every entry carrying a comment saying which actor, which rule and why
+	# it is benign. baseline.toml, the *learned* file next to it, is runtime
+	# state written by the daemon and is deliberately NOT shipped.
+	install -Dm644 "${tree}/moatd/etc/allowlist.d/omarchy-default.toml" \
+		"${pkgdir}/etc/moat/allowlist.d/omarchy-default.toml"
 	install -Dm644 "${tree}/sandbox/sandbox.conf"        "${pkgdir}/etc/moat/sandbox.conf"
 	install -Dm644 "${srcdir}/scanner-allow.conf"        "${pkgdir}/etc/moat/scanner-allow.conf"
 
@@ -255,4 +278,11 @@ package() {
 	install -Dm644 "${tree}/docs/CONTRACT.md"    "${pkgdir}/usr/share/doc/${pkgname}/CONTRACT.md"
 	install -Dm644 "${tree}/docs/TETRAGON-NOTES.md" \
 		"${pkgdir}/usr/share/doc/${pkgname}/TETRAGON-NOTES.md"
+	# /etc/moat/moat.toml's own comments cite these two by section number
+	# ([baseline], [learning], [analysis], [incidents], [digest]), so a user
+	# reading the config needs them on disk.
+	install -Dm644 "${tree}/docs/BASELINE.md" \
+		"${pkgdir}/usr/share/doc/${pkgname}/BASELINE.md"
+	install -Dm644 "${tree}/docs/LEARNING-AND-ANALYSIS.md" \
+		"${pkgdir}/usr/share/doc/${pkgname}/LEARNING-AND-ANALYSIS.md"
 }

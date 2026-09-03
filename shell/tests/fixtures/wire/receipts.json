@@ -1,0 +1,32 @@
+{
+  "receipts": [
+    {
+      "id": "01M1ME4KYDM4BAFNBTN24DSX08",
+      "root_exe": "/usr/bin/node",
+      "root_args": "/usr/lib/node_modules/npm/bin/npm-cli.js install",
+      "cwd": "/home/moattest/proj",
+      "started": "2026-09-03T20:07:00.737Z",
+      "duration_s": 37,
+      "exit": 0,
+      "postinstall_scripts": [
+        "evil"
+      ],
+      "writes_outside_project": [],
+      "network": [
+        "185.220.101.55"
+      ],
+      "credential_reads": [
+        "/home/moattest/.aws/credentials",
+        "/home/moattest/.ssh/id_ed25519"
+      ],
+      "persistence_writes": [],
+      "execs_from_tree": 0,
+      "execs_from_tmp": 0
+    }
+  ],
+  "rendered": [
+    "node /usr/lib/node_modules/npm/bin/npm-cli.js in /home/moattest/proj (37 s, exit 0)\n  postinstall scripts: 1 (evil)\n  wrote outside the project: none\n  network: 185.220.101.55\n  credential reads: /home/moattest/.aws/credentials, /home/moattest/.ssh/id_ed25519 · persistence writes: none\n  binaries executed from the tree: 0 · from /tmp: 0"
+  ],
+  "open": 0,
+  "ok": true
+}

@@ -27,8 +27,19 @@ Item {
   // entry gets no settings of its own. BarWidget.qml pushes them here, and the
   // defaults below are what the service uses when the widget is not on the bar.
   property string minNotifySeverity: "high"
+  // BASELINE 5: at most one toast per rule per this many minutes; the rest of
+  // the burst is counted and lands as one "N more from ..." toast when the
+  // window ends. 10 minutes is the manifest default.
+  property int notifyCooldownMinutes: 10
   property int pollSeconds: 10
   property bool showCountBadge: true
+  // BASELINE 8: suppressed alerts are logged so the timeline CAN show them, and
+  // hidden by default so it normally does not. This is the switch.
+  property bool showSuppressed: false
+  // LEARNING 5: the weekly digest is the only scheduled notification moat ever
+  // sends, and the DAEMON sends it. This flag is the user's off switch and
+  // nothing else — flipping it runs `moatctl set digest on|off`.
+  property bool weeklyDigest: true
 
   readonly property string pluginId: "io.github.the2dl.moat"
 
@@ -42,6 +53,11 @@ Item {
 
   // ------------------------------------------------------------------- state
   property var alerts: []
+  // LEARNING 3: install receipts share alerts.jsonl with the alerts. They are
+  // kept apart from `alerts` from the moment the file is parsed, which is what
+  // makes "receipts never notify and never count" true by construction rather
+  // than by a filter someone has to remember.
+  property var receipts: []
   property var unacked: ({ critical: 0, high: 0, medium: 0, low: 0, total: 0 })
   property var status: Model.normalizeStatus(null)
 
@@ -70,6 +86,46 @@ Item {
   readonly property int badgeCount: Model.badgeCount(root.unacked)
   readonly property string statusSummary: Model.statusSummary(root.status, root.unacked, root.nowMs)
 
+  // ---------------------------------------------------------------- baseline
+  //
+  // BASELINE 4's demoted rule ids and BASELINE 3's proposals both ride on the
+  // status poll, so the surfacing rules re-evaluate the moment the daemon
+  // demotes a rule — no re-read of alerts.jsonl, because `surface` and
+  // `visible` are computed from the folded alerts rather than stored in them.
+  readonly property var demotedRules: root.status.demoted_rules
+  readonly property var proposals: root.status.proposals
+  readonly property var baselineState: root.status.baseline
+  readonly property string learningSummary: Model.learningSummary(root.status, root.nowMs)
+
+  // The two panel surfaces (BASELINE 5). The Alerts tab is high + critical,
+  // unacked first; the Timeline is everything else, grouped by (rule, actor
+  // exe) so a flood reads as one row with a count.
+  readonly property var alertsSurface: Model.surfaceAlerts(root.alerts, "alerts", root.baselineOptions())
+  readonly property var timelineGroups: Model.timelineGroups(root.alerts, root.baselineOptions())
+  // What the Timeline tab renders: those groups interleaved with the receipts,
+  // newest first, each row tagged with its kind.
+  readonly property var timelineRows: Model.timelineRows(root.alerts, root.receipts, root.baselineOptions())
+
+  // The single place the surfacing inputs are assembled. Written as a function
+  // rather than a property so every caller re-reads it; it is cheap and the
+  // bindings above already depend on demotedRules/showSuppressed through it.
+  function baselineOptions() {
+    return { demotedRules: root.demotedRules, showSuppressed: root.showSuppressed }
+  }
+
+  // The same inputs plus the two the notification decision needs. Kept apart
+  // from baselineOptions() so the surfacing calls cannot come to depend on a
+  // notification setting.
+  function notifyOptions(initialLoad) {
+    return {
+      demotedRules: root.demotedRules,
+      showSuppressed: root.showSuppressed,
+      minNotifySeverity: root.minNotifySeverity,
+      notifyCooldownMinutes: root.notifyCooldownMinutes,
+      initialLoad: initialLoad === true
+    }
+  }
+
   // One clock for every relative timestamp in the UI, ticked once a minute so
   // "3m ago" ages without every row owning a Timer.
   property double nowMs: Date.now()
@@ -82,8 +138,9 @@ Item {
   property var _store: Model.createStore()
 
   function _ingest(text) {
-    var result = Model.ingestText(root._store, text)
+    var result = Model.ingestText(root._store, text, root.baselineOptions())
     root.alerts = result.alerts
+    root.receipts = result.receipts
     root.unacked = result.unacked
     root.logReadable = true
     if (result.reloaded) {
@@ -99,6 +156,18 @@ Item {
     }
     root.alertsUpdated()
   }
+
+  // A rule the daemon just demoted stops counting toward the shield, and
+  // "show suppressed" changes what the timeline holds. Neither re-reads the
+  // log, so the counts have to be recomputed from the alerts already folded.
+  function _recount() {
+    if (!root.logReadable) return
+    root.unacked = Model.unackedCounts(root.alerts, root.baselineOptions())
+    root.alertsUpdated()
+  }
+
+  onDemotedRulesChanged: root._recount()
+  onShowSuppressedChanged: root._recount()
 
   FileView {
     id: alertsFile
@@ -117,6 +186,7 @@ Item {
     onLoadFailed: function(error) {
       root.logReadable = false
       root.alerts = []
+      root.receipts = []
       root.unacked = ({ critical: 0, high: 0, medium: 0, low: 0, total: 0 })
       root.lastError = "cannot read " + root.alertsPath
       // A failed open is the strongest signal we get that the group or the
@@ -145,7 +215,17 @@ Item {
   // the toast. See shell/README.md for why Kill/Quarantine/Ignore are not three
   // separate toast buttons.
   function _maybeNotify(alert, initialLoad) {
-    if (!Model.shouldNotify(alert, root.minNotifySeverity, initialLoad)) return
+    // shouldNotify (BASELINE 5's table) is inside notifyDecision, together with
+    // the per-rule cooldown: one call, one answer, one place the policy lives.
+    var decision = Model.notifyDecision(root._store, alert, Date.now(),
+                                        root.notifyOptions(initialLoad))
+    if (!decision.toast) {
+      if (decision.reason === "cooldown" && decision.collapsed === 1) {
+        // Say it once per window, not once per collapsed alert.
+        console.log("moat: " + alert.rule + " is inside its notification cooldown, collapsing")
+      }
+      return
+    }
 
     var urgency = Model.notifyUrgency(alert.severity)
     var argv = ["omarchy-notification-send",
@@ -167,6 +247,39 @@ Item {
               JSON.stringify({ alert: alert.id }))
 
     Util.execArgv(argv)
+  }
+
+  // The other half of the cooldown: when a rule's window ends with alerts
+  // collapsed into it, one toast says how many and points at the panel. Driven
+  // by a clock rather than by the next alert, because the tail of a burst is
+  // exactly when no next alert arrives.
+  function _flushCollapsed() {
+    var summaries = Model.flushCollapsed(root._store, Date.now())
+    for (var i = 0; i < summaries.length; i++) root._notifyCollapsed(summaries[i])
+  }
+
+  function _notifyCollapsed(summary) {
+    var argv = ["omarchy-notification-send",
+                "--app-name", "Moat",
+                "-u", "normal",
+                "-g", Model.notifyGlyphFor("medium")]
+    argv.push(root._notifyText(Model.collapsedSummaryText(summary)))
+    argv.push(root._notifyText(
+      summary.rule + " kept firing inside its " + root.notifyCooldownMinutes
+      + "-minute notification cooldown. Click to open the timeline."))
+    // The collapsed alerts are a group on the Timeline, not one alert on the
+    // Alerts tab, so the click opens the tab rather than selecting an id.
+    argv.push("--exec", "omarchy-shell", "shell", "summon", root.pluginId,
+              JSON.stringify({ tab: "timeline" }))
+    Util.execArgv(argv)
+  }
+
+  Timer {
+    // Cooldown windows end on their own, with or without another alert.
+    interval: 30000
+    running: true
+    repeat: true
+    onTriggered: root._flushCollapsed()
   }
 
   // omarchy-notification-send takes the headline as a positional after its
@@ -321,12 +434,27 @@ Item {
     case "quarantine": return [root.ctlPath, "quarantine", String(arg), "--json"]
     case "ack": return [root.ctlPath, "ack", String(arg), "--json"]
     case "ignore": return [root.ctlPath, "ignore", String(arg), "--scope", Model.normalizeIgnoreScope(arg2), "--json"]
-    // CONTRACT 5: unignore takes the index of the [[rule]] block in
-    // user.toml, which is why the panel never renumbers what allowlist returns.
-    case "unignore": return [root.ctlPath, "unignore", String(arg), "--json"]
+    // CONTRACT 5 + BASELINE 8: unignore takes the index of the [[rule]] block
+    // WITHIN ONE allowlist.d fragment, which is why the panel never renumbers
+    // what allowlist returns -- and why the fragment has to travel with the
+    // index. Every file restarts at 1, so "index 1" alone would remove the
+    // first rule of user.toml no matter which row was clicked.
+    case "unignore": return arg2
+      ? [root.ctlPath, "unignore", String(arg), "--file", String(arg2), "--json"]
+      : [root.ctlPath, "unignore", String(arg), "--json"]
     case "mode": return [root.ctlPath, "set", "mode", Model.normalizeMode(arg), "--json"]
     case "sandbox": return [root.ctlPath, "set", "sandbox", arg === true || arg === "on" ? "on" : "off", "--json"]
+    // LEARNING 5: the daemon owns the schedule and sends the digest; this is
+    // only the on/off switch, so it is a `set` like mode and sandbox.
+    case "digest": return [root.ctlPath, "set", "digest", arg === true || arg === "on" ? "on" : "off", "--json"]
     case "feeds": return [root.ctlPath, "feeds", "refresh", "--json"]
+    // CONTRACT 11 / BASELINE 3: `moatctl baseline list|accept|dismiss|relearn`
+    // over {"cmd":"baseline","action":...}. Accept and dismiss name a proposal
+    // id, the same way every other action names an alert id — the plugin never
+    // sends the tuple itself, so it cannot widen what the daemon proposed.
+    case "baseline-accept": return [root.ctlPath, "baseline", "accept", String(arg), "--json"]
+    case "baseline-dismiss": return [root.ctlPath, "baseline", "dismiss", String(arg), "--json"]
+    case "baseline-relearn": return [root.ctlPath, "baseline", "relearn", "--json"]
     }
     return null
   }
@@ -401,8 +529,10 @@ Item {
         // Not JSON. exitCode already decided ok; stderr already carries why.
       }
       if (!ok) root.lastError = message || ("moatctl " + actionProc.pendingCommand + " failed")
-      // Both halves of the allowlist tab move when a rule is added or removed.
-      if (ok && (actionProc.pendingCommand === "ignore" || actionProc.pendingCommand === "unignore"))
+      // Both halves of the allowlist tab move when a rule is added or removed,
+      // and accepting a proposal writes one to baseline.toml.
+      if (ok && (actionProc.pendingCommand === "ignore" || actionProc.pendingCommand === "unignore"
+                 || actionProc.pendingCommand.indexOf("baseline-") === 0))
         root.loadAllowlist()
       root.actionFinished(actionProc.pendingCommand, ok, message)
       root.actionSerial++
@@ -426,10 +556,39 @@ Item {
     root.lastIgnoreBlock = ""
     return root._enqueue("ignore", id, scope)
   }
-  function unignore(index) { return root._enqueue("unignore", Number(index)) }
+  // `file` is the bare fragment name (`user.toml`, `baseline.toml`), which is
+  // what `moatctl unignore --file` expects; omitting it means user.toml.
+  function unignore(index, file) { return root._enqueue("unignore", Number(index), file || "") }
   function setMode(mode) { return root._enqueue("mode", mode) }
   function setSandbox(on) { return root._enqueue("sandbox", on === true || on === "on") }
+  function setDigest(on) { return root._enqueue("digest", on === true || on === "on") }
   function refreshFeeds() { return root._enqueue("feeds") }
+
+  // Baseline proposals (BASELINE 3). Accepting writes the proposed block to
+  // baseline.toml, so both halves of the Allowlist tab move afterwards — the
+  // action queue's completion handler already reloads the allowlist for
+  // ignore/unignore, and these are added to that set.
+  function acceptProposal(id) {
+    if (!String(id || "")) {
+      root.lastError = "this proposal carries no id, so it cannot be accepted"
+      root.actionFinished("baseline-accept", false, root.lastError)
+      return false
+    }
+    return root._enqueue("baseline-accept", id)
+  }
+
+  function dismissProposal(id) {
+    if (!String(id || "")) {
+      root.lastError = "this proposal carries no id, so it cannot be dismissed"
+      root.actionFinished("baseline-dismiss", false, root.lastError)
+      return false
+    }
+    return root._enqueue("baseline-dismiss", id)
+  }
+
+  // Restarts the learning window (BASELINE 3). Destructive enough to deserve a
+  // confirm, which the panel owns.
+  function relearnBaseline() { return root._enqueue("baseline-relearn") }
 
   function refresh() {
     alertsFile.reload()
@@ -511,6 +670,156 @@ Item {
     }
   }
 
+  // ------------------------------------------------------------- AI analysis
+  //
+  // LEARNING 2. One button: hand this alert to whatever agent the user already
+  // chose. The plugin's part of that is deliberately small — it asks
+  // `omarchy default agent` what to call the button, and it runs
+  // `moatctl analyze <id>`. moatctl bundles the alert into
+  // /var/lib/moat/incidents/<id>/bundle.md and launches
+  // `omarchy-agent --prompt <preamble + path>` itself.
+  //
+  // The plugin never builds the prompt and never reads the bundle. That is the
+  // point: the bundle fences every process-derived field in ```DATA``` blocks
+  // because an alert about a malicious postinstall must not become a
+  // prompt-injection channel into the agent that analyzes it. A prompt
+  // assembled here out of alert fields would be exactly that channel.
+
+  // The agent name from `omarchy default agent`, read once at service start.
+  // "" means no default is set, and the panel shows the hint instead of a
+  // button rather than launching something the user never chose.
+  property string defaultAgent: ""
+  readonly property string agentButtonLabel: Model.analyzeLabel(root.defaultAgent)
+  readonly property string agentHint: Model.ANALYZE_HINT
+
+  // Transient result state for the two analysis buttons. Cleared on a timer so
+  // "opened in claude" does not sit under an alert forever.
+  property string analyzeState: ""        // "" | "running" | "opened" | "failed"
+  property string analyzeMessage: ""
+  property string analyzeId: ""
+  property string copyState: ""           // "" | "running" | "copied" | "failed"
+  property string copyMessage: ""
+
+  Process {
+    id: agentProc
+    // Through bash so a machine without `omarchy` on PATH is a quiet empty
+    // answer (no default agent) rather than a failed-to-start process.
+    command: ["bash", "-c", "omarchy default agent 2>/dev/null || true"]
+    stdout: StdioCollector { id: agentStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.defaultAgent = Model.normalizeAgentName(agentStdout.text)
+    }
+  }
+
+  function _setAnalyze(state, message) {
+    root.analyzeState = String(state)
+    root.analyzeMessage = String(message || "")
+    if (state === "opened" || state === "failed") analyzeResetTimer.restart()
+  }
+
+  function _setCopy(state, message) {
+    root.copyState = String(state)
+    root.copyMessage = String(message || "")
+    if (state === "copied" || state === "failed") copyResetTimer.restart()
+  }
+
+  Timer {
+    id: analyzeResetTimer
+    interval: 12000
+    onTriggered: { root.analyzeState = ""; root.analyzeMessage = "" }
+  }
+
+  Timer {
+    id: copyResetTimer
+    interval: 12000
+    onTriggered: { root.copyState = ""; root.copyMessage = "" }
+  }
+
+  // Runs outside the action queue on purpose: the queue's completion handler
+  // refreshes everything and reports through actionFinished, and analyze is not
+  // a state change to the daemon — it is a launch, and its result is a line
+  // next to the button rather than a panel-wide notice.
+  function analyze(id) {
+    var key = String(id || "")
+    if (!key) return false
+    if (!root.available) { root._setAnalyze("failed", "moatctl is not installed"); return false }
+    if (!root.defaultAgent) { root._setAnalyze("failed", Model.ANALYZE_HINT); return false }
+    if (analyzeProc.running) return false
+    root.analyzeId = key
+    root._setAnalyze("running", "")
+    analyzeProc.command = [root.ctlPath, "analyze", key]
+    analyzeProc.running = true
+    return true
+  }
+
+  Process {
+    id: analyzeProc
+    stderr: StdioCollector { id: analyzeStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      var stderr = String(analyzeStderr.text || "").trim()
+      if (exitCode === 0) root._setAnalyze("opened", "opened in " + root.defaultAgent)
+      else root._setAnalyze("failed", stderr || ("moatctl analyze exited " + exitCode))
+    }
+  }
+
+  // The smaller sibling: get the bundle written and put its path on the
+  // clipboard, for the user who would rather paste it into an agent they are
+  // already talking to. Two steps because the path comes back as JSON.
+  function copyBundlePath(id) {
+    var key = String(id || "")
+    if (!key) return false
+    if (!root.available) { root._setCopy("failed", "moatctl is not installed"); return false }
+    if (bundleProc.running || copyProc.running) return false
+    root._setCopy("running", "")
+    bundleProc.command = [root.ctlPath, "bundle", key, "--json"]
+    bundleProc.running = true
+    return true
+  }
+
+  Process {
+    id: bundleProc
+    stdout: StdioCollector { id: bundleStdout; waitForEnd: true }
+    stderr: StdioCollector { id: bundleStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      var stdout = String(bundleStdout.text || "").trim()
+      var stderr = String(bundleStderr.text || "").trim()
+      if (exitCode !== 0 && !stdout) {
+        root._setCopy("failed", stderr || ("moatctl bundle exited " + exitCode))
+        return
+      }
+      var parsed = Model.parseBundleResponse(stdout)
+      if (!parsed.ok) { root._setCopy("failed", parsed.error || stderr); return }
+      root.copyText(parsed.path, "bundle path")
+    }
+  }
+
+  // Clipboard. The text is passed as a bash POSITIONAL PARAMETER, never
+  // interpolated into the script, so a path out of a daemon response cannot
+  // become a command — the same rule Util.execArgv exists to enforce for the
+  // notification vector.
+  function copyText(text, label) {
+    var value = String(text || "")
+    if (!value) { root._setCopy("failed", "nothing to copy"); return false }
+    if (copyProc.running) return false
+    root._setCopy("running", "")
+    copyProc.copiedLabel = String(label || "path")
+    copyProc.copiedValue = value
+    copyProc.command = ["bash", "-c", "printf %s \"$1\" | wl-copy", "moat-copy", value]
+    copyProc.running = true
+    return true
+  }
+
+  Process {
+    id: copyProc
+    property string copiedLabel: "path"
+    property string copiedValue: ""
+    stderr: StdioCollector { id: copyStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode === 0) root._setCopy("copied", copyProc.copiedLabel + " copied: " + copyProc.copiedValue)
+      else root._setCopy("failed", String(copyStderr.text || "").trim() || "wl-copy is not available")
+    }
+  }
+
   // Persist a bar-widget setting through the registry, which is where the
   // shell keeps per-widget values (shell.json's layout entry). Returns "" on
   // success or the registry's error string; the panel surfaces it rather than
@@ -535,11 +844,27 @@ Item {
   function setupSteps() { return Model.setupSteps(!root.available, !root.groupOk, root.status.socket_group) }
   function feedsAge() { return Model.relativeTime(root.status.feeds.updated, root.nowMs) }
   function hasExplain(alert) { return Model.hasExplain(alert) }
+  function actorLine(alert) { return Model.actorLine(alert) }
+  function severityChangeLine(alert) { return Model.severityChangeLine(alert) }
+  function suppressedLine(alert) { return Model.suppressedLine(alert) }
+  function proposalDetail(proposal) { return Model.proposalDetail(proposal) }
+  function allowlistSections() { return Model.allowlistSections(root.allowlistRules) }
   function ignoreOptions(alert) { return Model.ignoreOptions(alert) }
+  function otherOptions(alert) { return Model.otherOptions(alert) }
   function ignoreScopeLabel(scope) { return Model.ignoreScopeLabel(scope) }
   function ignoreScopeCaution(scope) { return Model.ignoreScopeCaution(scope) }
+  function rarityPill(rarity) { return Model.rarityPill(rarity) }
+  function rarityLine(alert) { return Model.rarityLine(alert) }
+  function formatBytes(bytes) { return Model.formatBytes(bytes) }
+  function receiptSummary(receipt) { return Model.receiptSummary(receipt) }
+  function receiptBlock(receipt) { return Model.receiptBlock(receipt) }
 
   onAvailableChanged: if (root.available) root.loadAllowlist()
 
-  Component.onCompleted: root.probe()
+  Component.onCompleted: {
+    root.probe()
+    // Once, at service start: the button label is the user's own default agent
+    // and it does not change under us mid-session.
+    agentProc.running = true
+  }
 }

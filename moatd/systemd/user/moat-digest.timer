@@ -1,0 +1,18 @@
+[Unit]
+Description=Moat weekly digest notification
+Documentation=file:///usr/share/doc/omarchy-moat/README.md
+
+[Timer]
+# Weekly, matching the shipped [digest] weekday/hour of moat.toml. The daemon
+# is the authority on whether it is actually due: `moatctl digest --notify`
+# sends nothing before `digest_summary.due`, so changing the config to another
+# day works without touching this file — the timer just checks more often than
+# it sends.
+OnCalendar=Mon *-*-* 09:00:00
+# A laptop that was asleep on Monday morning still gets it when it wakes.
+Persistent=true
+RandomizedDelaySec=15min
+Unit=moat-digest.service
+
+[Install]
+WantedBy=timers.target

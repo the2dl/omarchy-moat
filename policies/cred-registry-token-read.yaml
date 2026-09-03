@@ -49,6 +49,27 @@ spec:
         - "/cargo"
         - "/docker"
         - "/podman"
+        # devops tools that log in to a container registry by design
+        # (coordinator review): they read ~/.docker/config.json themselves.
+        - "/kubectl"
+        - "/helm"
+        - "/k9s"
+        - "/minikube"
+        - "/kind"
+        - "/skaffold"
+        - "/terraform"
+        - "/tofu"
+        - "/pulumi"
+        - "/ansible"
+        - "/ansible-playbook"
+        - "/gcloud"
+        - "/az"
+        - "/sam"
+        - "/flyctl"
+        - "/wrangler"
+        - "/vercel"
+        - "/netlify"
+        - "/doctl"
       matchArgs:
       - index: 0
         operator: "Equal"

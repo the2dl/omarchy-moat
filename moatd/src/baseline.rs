@@ -1,0 +1,1035 @@
+//! The learning window, proposals, and the noise guard (BASELINE §3 and §4).
+//!
+//! Everything here is **visible and reversible**. A learned entry is a line in
+//! `/etc/moat/allowlist.d/baseline.toml` with a comment saying how it was
+//! earned; a proposal is a record in `state.json` carrying the exact TOML that
+//! accepting it would write; a demotion is a named rule in `demoted_rules[]`
+//! plus one alert explaining itself. Nothing is ever silently dropped.
+//!
+//! ## The window
+//!
+//! `installed_at` is stamped on the first run. For `learning_days` (7) after
+//! that, a (rule, actor exe, parent exe, file dir) tuple that produces
+//! **medium or low** alerts from an **official** actor on `learn_min_days` (3)
+//! distinct days, and whose rarity is `common`, is written straight to
+//! `baseline.toml`. High and critical are never learned; foreign and user actors
+//! are never learned. After the window the same condition produces a
+//! **proposal** instead, which the user accepts or dismisses.
+//!
+//! ## The noise guard
+//!
+//! More than `noisy_rule_per_day` (20) alerts from one rule in a rolling 24 h
+//! demotes the rule: it still lands in `alerts.jsonl`, it just stops being an
+//! Alerts-tab item (`surface: timeline`). One `moat-x-noisy-rule` alert names
+//! the top five tuples and offers both "these are expected" (baseline entries
+//! for exactly those tuples) and "keep watching" (undo). The demotion clears
+//! itself once 24 h pass under the threshold.
+
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::allowlist::{render_block, RuleSpec};
+
+pub const BASELINE_V: u32 = 1;
+pub const DAY: u64 = 86_400;
+
+/// Rules moat raises about *itself*. Learning them would silence the machinery
+/// that reports the machinery.
+pub const NEVER_LEARN: &[&str] = &[
+    "moat-x-noisy-rule",
+    "moat-x-baseline-revoked",
+    "moat-x-sensor-mismatch",
+    "moat-x-new-exec-ioc",
+];
+
+/// One (rule, actor exe, parent exe, file dir) tuple and what we know about it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TupleStat {
+    pub rule: String,
+    pub exe: String,
+    #[serde(default)]
+    pub parent: String,
+    #[serde(default)]
+    pub dir: String,
+    pub count: u64,
+    /// Distinct `YYYY-MM-DD` days this tuple was seen on, newest last.
+    #[serde(default)]
+    pub days: Vec<String>,
+    pub first_seen: String,
+    pub last_seen: String,
+    /// The severity the last alert scored to.
+    pub severity: String,
+    /// The highest severity this tuple ever produced; learning looks at this,
+    /// so one critical is enough to keep a tuple out of the baseline forever.
+    #[serde(default)]
+    pub max_rank: u8,
+    pub provenance: String,
+    pub context: String,
+    #[serde(default)]
+    pub package: Option<String>,
+    pub rarity: String,
+    /// Ever suppressed by an allowlist entry.
+    #[serde(default)]
+    pub suppressed: bool,
+    /// Ever raised while its rule was demoted.
+    #[serde(default)]
+    pub demoted: bool,
+    #[serde(default)]
+    pub learned: bool,
+    #[serde(default)]
+    pub proposed: bool,
+    #[serde(default)]
+    pub dismissed: bool,
+}
+
+impl TupleStat {
+    pub fn key(&self) -> String {
+        tuple_key(&self.rule, &self.exe, &self.parent, &self.dir)
+    }
+
+    /// The allowlist rule this tuple would become.
+    pub fn spec(&self) -> RuleSpec {
+        RuleSpec {
+            name: self.rule.clone(),
+            exe: (!self.exe.is_empty()).then(|| self.exe.clone()),
+            file: (!self.dir.is_empty()).then(|| format!("{}/*", self.dir.trim_end_matches('/'))),
+            parent: (!self.parent.is_empty()).then(|| self.parent.clone()),
+        }
+    }
+
+    pub fn toml(&self) -> String {
+        render_block(&self.spec())
+    }
+
+    /// The comment written above a learned or accepted entry.
+    pub fn comment(&self, how: &str) -> String {
+        format!(
+            "{} {}: seen {} time{} on {} distinct day{} ({} .. {}), actor {}{}, context {}, rarity {}",
+            how,
+            today(),
+            self.count,
+            if self.count == 1 { "" } else { "s" },
+            self.days.len(),
+            if self.days.len() == 1 { "" } else { "s" },
+            date_part(&self.first_seen),
+            date_part(&self.last_seen),
+            self.provenance,
+            self.package.as_ref().map(|p| format!(" ({})", p)).unwrap_or_default(),
+            self.context,
+            self.rarity
+        )
+    }
+}
+
+pub fn tuple_key(rule: &str, exe: &str, parent: &str, dir: &str) -> String {
+    format!("{}|{}|{}|{}", rule, exe, parent, dir)
+}
+
+/// A recurring pattern waiting for the user's yes or no (BASELINE §3).
+/// The field names are fixed by BASELINE §8 "Resolved shapes".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Proposal {
+    pub id: String,
+    pub rule: String,
+    pub exe: String,
+    pub parent: String,
+    pub dir: String,
+    pub count: u64,
+    pub days: usize,
+    pub first_seen: String,
+    pub last_seen: String,
+    /// Exactly what accepting would append to `baseline.toml`.
+    pub toml: String,
+    /// Internal: which tuple it came from.
+    #[serde(default)]
+    pub key: String,
+}
+
+/// A rule the noise guard put on the timeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Demotion {
+    pub rule: String,
+    /// unix seconds
+    pub since: u64,
+    /// The 24 h count that tripped it.
+    pub count: u64,
+    /// unix seconds of the last alert from this rule.
+    pub last_seen: u64,
+}
+
+/// Everything the baseline persists, in `<state_dir>/baseline.json`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct BaselineState {
+    #[serde(default)]
+    pub v: u32,
+    pub installed_at: u64,
+    /// unix seconds at which the learning window closes.
+    pub learning_until: u64,
+    #[serde(default)]
+    pub tuples: HashMap<String, TupleStat>,
+    #[serde(default)]
+    pub proposals: Vec<Proposal>,
+    #[serde(default)]
+    pub demoted: BTreeMap<String, Demotion>,
+    /// rule -> hour bucket (unix hours) -> alerts in that hour.
+    #[serde(default)]
+    pub windows: HashMap<String, BTreeMap<u64, u64>>,
+    /// Learned entries, by tuple key, so provenance can be re-checked.
+    #[serde(default)]
+    pub learned: BTreeMap<String, LearnedEntry>,
+}
+
+/// A line moat wrote into `baseline.toml` by itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearnedEntry {
+    pub key: String,
+    pub rule: String,
+    pub exe: String,
+    pub written: String,
+    /// Set once provenance stopped being official and the entry was disabled.
+    #[serde(default)]
+    pub revoked: Option<String>,
+}
+
+/// What `observe` decided to do about one alert.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Learned {
+    /// Nothing changed.
+    None,
+    /// Written to `baseline.toml` during the learning window.
+    Entry { key: String, toml: String, comment: String },
+    /// Recorded as a proposal for the user to accept.
+    Proposed { id: String },
+}
+
+/// One alert's worth of facts, as the baseline sees it.
+#[derive(Debug, Clone)]
+pub struct Observation<'a> {
+    pub rule: &'a str,
+    pub exe: &'a str,
+    pub parent: &'a str,
+    /// Directory of the file the alert names, `""` when it names none.
+    pub dir: &'a str,
+    pub severity: &'a str,
+    pub provenance: &'a str,
+    pub package: Option<String>,
+    pub context: &'a str,
+    pub rarity: &'a str,
+    pub suppressed: bool,
+    pub demoted: bool,
+    pub ts: String,
+    pub now: u64,
+}
+
+pub struct Baseline {
+    pub state: BaselineState,
+    path: PathBuf,
+    group: String,
+    pub learning_days: u64,
+    pub learn_min_days: usize,
+    pub noisy_rule_per_day: u64,
+    dirty: bool,
+    last_save: u64,
+    pub save_every: u64,
+}
+
+impl Baseline {
+    /// Load, stamping `installed_at` on the first run. `installed_at_hint`
+    /// comes from `state.json`, which is where BASELINE §3 says it lives; the
+    /// tuple store is kept beside it so state.json stays readable.
+    pub fn load(
+        state_dir: &Path,
+        group: &str,
+        learning_days: u64,
+        learn_min_days: usize,
+        noisy_rule_per_day: u64,
+        installed_at_hint: Option<u64>,
+        now: u64,
+    ) -> Baseline {
+        let path = state_dir.join("baseline.json");
+        let mut state: BaselineState = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let mut dirty = false;
+        if state.installed_at == 0 {
+            state.installed_at = installed_at_hint.unwrap_or(now);
+            state.learning_until = state.installed_at + learning_days * DAY;
+            state.v = BASELINE_V;
+            dirty = true;
+            log::info!(
+                "baseline: first run, learning until {}",
+                crate::util::rfc3339_of(state.learning_until)
+            );
+        }
+        if state.learning_until == 0 {
+            state.learning_until = state.installed_at + learning_days * DAY;
+            dirty = true;
+        }
+        Baseline {
+            state,
+            path,
+            group: group.to_string(),
+            learning_days,
+            learn_min_days,
+            noisy_rule_per_day,
+            dirty,
+            last_save: 0,
+            save_every: 60,
+        }
+    }
+
+    // ------------------------------------------------------------ the window
+
+    pub fn learning(&self, now: u64) -> bool {
+        now < self.state.learning_until
+    }
+
+    pub fn learning_ends(&self) -> String {
+        crate::util::rfc3339_of(self.state.learning_until)
+    }
+
+    /// `moatctl baseline relearn [--days N]`: restart the window, for after a
+    /// big change (new job, new toolchain).
+    pub fn relearn(&mut self, days: Option<u64>, now: u64) -> u64 {
+        let days = days.unwrap_or(self.learning_days);
+        self.state.learning_until = now + days * DAY;
+        // Learning again means the day counters start over; the counts stay, so
+        // the export keeps its history.
+        for t in self.state.tuples.values_mut() {
+            t.proposed = false;
+            t.dismissed = false;
+        }
+        self.state.proposals.clear();
+        self.dirty = true;
+        self.state.learning_until
+    }
+
+    // ------------------------------------------------------------- observing
+
+    /// Record one alert against its tuple and decide whether it earns a
+    /// baseline entry (during the window) or a proposal (after it).
+    pub fn observe(&mut self, o: &Observation) -> Learned {
+        let key = tuple_key(o.rule, o.exe, o.parent, o.dir);
+        let day = date_part(&o.ts);
+        let rank = crate::alert::severity_rank(o.severity);
+        let e = self.state.tuples.entry(key.clone()).or_insert_with(|| TupleStat {
+            rule: o.rule.to_string(),
+            exe: o.exe.to_string(),
+            parent: o.parent.to_string(),
+            dir: o.dir.to_string(),
+            first_seen: o.ts.clone(),
+            ..Default::default()
+        });
+        e.count += 1;
+        e.last_seen = o.ts.clone();
+        e.severity = o.severity.to_string();
+        e.max_rank = e.max_rank.max(rank);
+        e.provenance = o.provenance.to_string();
+        e.package = o.package.clone();
+        e.context = o.context.to_string();
+        e.rarity = o.rarity.to_string();
+        e.suppressed |= o.suppressed;
+        e.demoted |= o.demoted;
+        if !e.days.iter().any(|d| d == &day) {
+            e.days.push(day);
+            // 64 days of history is more than any decision here needs.
+            if e.days.len() > 64 {
+                e.days.remove(0);
+            }
+        }
+        self.dirty = true;
+
+        let stat = e.clone();
+        if !self.eligible(&stat) {
+            return Learned::None;
+        }
+        if self.learning(o.now) {
+            let entry = self.state.tuples.get_mut(&key).expect("just inserted");
+            entry.learned = true;
+            self.state.learned.insert(
+                key.clone(),
+                LearnedEntry {
+                    key: key.clone(),
+                    rule: stat.rule.clone(),
+                    exe: stat.exe.clone(),
+                    written: o.ts.clone(),
+                    revoked: None,
+                },
+            );
+            Learned::Entry {
+                key,
+                toml: stat.toml(),
+                comment: stat.comment("learned"),
+            }
+        } else {
+            let entry = self.state.tuples.get_mut(&key).expect("just inserted");
+            entry.proposed = true;
+            let id = ulid::Ulid::new().to_string();
+            self.state.proposals.push(Proposal {
+                id: id.clone(),
+                rule: stat.rule.clone(),
+                exe: stat.exe.clone(),
+                parent: stat.parent.clone(),
+                dir: stat.dir.clone(),
+                count: stat.count,
+                days: stat.days.len(),
+                first_seen: stat.first_seen.clone(),
+                last_seen: stat.last_seen.clone(),
+                toml: stat.toml(),
+                key,
+            });
+            Learned::Proposed { id }
+        }
+    }
+
+    /// BASELINE §3 + LEARNING §1: medium or low, official actor, enough
+    /// distinct days, and `common` rarity.
+    fn eligible(&self, t: &TupleStat) -> bool {
+        if t.learned || t.proposed || t.dismissed {
+            return false;
+        }
+        if NEVER_LEARN.contains(&t.rule.as_str()) {
+            return false;
+        }
+        // High and critical are never learned — and one high in this tuple's
+        // history is enough, not just the latest one.
+        if t.max_rank > crate::alert::severity_rank("medium") {
+            return false;
+        }
+        if t.provenance != "official" {
+            return false;
+        }
+        if t.days.len() < self.learn_min_days {
+            return false;
+        }
+        // A tuple cannot be proposed until it has been ordinary for a while.
+        t.rarity == "common"
+    }
+
+    // --------------------------------------------------------- the proposals
+
+    pub fn proposals(&self) -> &[Proposal] {
+        &self.state.proposals
+    }
+
+    pub fn proposal(&self, id: &str) -> Option<&Proposal> {
+        self.state.proposals.iter().find(|p| p.id == id)
+    }
+
+    /// Take a proposal out of the list. Returns it plus the comment to write.
+    pub fn accept(&mut self, id: &str, who: &str) -> Result<(Proposal, String), String> {
+        let idx = self
+            .state
+            .proposals
+            .iter()
+            .position(|p| p.id == id)
+            .ok_or_else(|| format!("no proposal {}", id))?;
+        let p = self.state.proposals.remove(idx);
+        let comment = match self.state.tuples.get(&p.key) {
+            Some(t) => format!("{} — accepted by {}", t.comment("learned"), who),
+            None => format!("accepted by {} on {}: {} from {}", who, today(), p.rule, p.exe),
+        };
+        if let Some(t) = self.state.tuples.get_mut(&p.key) {
+            t.learned = true;
+            t.proposed = false;
+        }
+        self.state.learned.insert(
+            p.key.clone(),
+            LearnedEntry {
+                key: p.key.clone(),
+                rule: p.rule.clone(),
+                exe: p.exe.clone(),
+                written: crate::util::now_rfc3339(),
+                revoked: None,
+            },
+        );
+        self.dirty = true;
+        Ok((p, comment))
+    }
+
+    pub fn dismiss(&mut self, id: &str) -> Result<Proposal, String> {
+        let idx = self
+            .state
+            .proposals
+            .iter()
+            .position(|p| p.id == id)
+            .ok_or_else(|| format!("no proposal {}", id))?;
+        let p = self.state.proposals.remove(idx);
+        if let Some(t) = self.state.tuples.get_mut(&p.key) {
+            t.proposed = false;
+            // Dismissed means "do not ask me again", not "ask me tomorrow".
+            t.dismissed = true;
+        }
+        self.dirty = true;
+        Ok(p)
+    }
+
+    /// Propose baseline entries for a named set of tuples: the `if_expected`
+    /// option on a `moat-x-noisy-rule` alert.
+    pub fn propose_keys(&mut self, keys: &[String]) -> Vec<Proposal> {
+        let mut out = Vec::new();
+        for key in keys {
+            let Some(t) = self.state.tuples.get_mut(key) else {
+                continue;
+            };
+            if t.learned || t.proposed {
+                continue;
+            }
+            t.proposed = true;
+            t.dismissed = false;
+            let t = t.clone();
+            let p = Proposal {
+                id: ulid::Ulid::new().to_string(),
+                rule: t.rule.clone(),
+                exe: t.exe.clone(),
+                parent: t.parent.clone(),
+                dir: t.dir.clone(),
+                count: t.count,
+                days: t.days.len(),
+                first_seen: t.first_seen.clone(),
+                last_seen: t.last_seen.clone(),
+                toml: t.toml(),
+                key: key.clone(),
+            };
+            self.state.proposals.push(p.clone());
+            out.push(p);
+        }
+        self.dirty = true;
+        out
+    }
+
+    // -------------------------------------------------------- the noise guard
+
+    /// Count one alert against its rule's rolling 24 h window. Returns the
+    /// demotion when this alert is the one that crossed the threshold.
+    pub fn note_alert(&mut self, rule: &str, now: u64) -> Option<Demotion> {
+        let hour = now / 3_600;
+        let w = self.state.windows.entry(rule.to_string()).or_default();
+        *w.entry(hour).or_insert(0) += 1;
+        let cutoff = hour.saturating_sub(23);
+        w.retain(|h, _| *h >= cutoff);
+        let count: u64 = w.values().sum();
+        self.dirty = true;
+        if let Some(d) = self.state.demoted.get_mut(rule) {
+            d.last_seen = now;
+            d.count = count;
+            return None;
+        }
+        if count > self.noisy_rule_per_day {
+            let d = Demotion {
+                rule: rule.to_string(),
+                since: now,
+                count,
+                last_seen: now,
+            };
+            self.state.demoted.insert(rule.to_string(), d.clone());
+            log::warn!(
+                "noise guard: {} raised {} alerts in 24 h; demoting it to the timeline",
+                rule,
+                count
+            );
+            return Some(d);
+        }
+        None
+    }
+
+    pub fn is_demoted(&self, rule: &str) -> bool {
+        self.state.demoted.contains_key(rule)
+    }
+
+    pub fn demoted_rules(&self) -> Vec<String> {
+        self.state.demoted.keys().cloned().collect()
+    }
+
+    /// "keep watching": clear a demotion on request.
+    pub fn undemote(&mut self, rule: &str) -> bool {
+        let hit = self.state.demoted.remove(rule).is_some();
+        if hit {
+            // Start the window over, or the next alert re-demotes instantly.
+            self.state.windows.remove(rule);
+            self.dirty = true;
+        }
+        hit
+    }
+
+    /// Demotions clear themselves once 24 h pass under the threshold.
+    /// Returns the rules that came back.
+    pub fn clear_stale_demotions(&mut self, now: u64) -> Vec<String> {
+        let hour = now / 3_600;
+        let cutoff = hour.saturating_sub(23);
+        let mut cleared = Vec::new();
+        let rules: Vec<String> = self.state.demoted.keys().cloned().collect();
+        for rule in rules {
+            let count: u64 = self
+                .state
+                .windows
+                .get(&rule)
+                .map(|w| w.iter().filter(|(h, _)| **h >= cutoff).map(|(_, c)| *c).sum())
+                .unwrap_or(0);
+            let since = self.state.demoted.get(&rule).map(|d| d.since).unwrap_or(0);
+            if count <= self.noisy_rule_per_day && now.saturating_sub(since) >= DAY {
+                self.state.demoted.remove(&rule);
+                self.dirty = true;
+                cleared.push(rule);
+            }
+        }
+        cleared
+    }
+
+    /// The five (actor, file) tuples a demoted rule fires on most.
+    pub fn top_tuples(&self, rule: &str, n: usize) -> Vec<TupleStat> {
+        let mut v: Vec<TupleStat> = self
+            .state
+            .tuples
+            .values()
+            .filter(|t| t.rule == rule)
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| b.count.cmp(&a.count).then(a.exe.cmp(&b.exe)));
+        v.truncate(n);
+        v
+    }
+
+    // ------------------------------------------------------------- revocation
+
+    /// Learned entries whose actor is no longer official, with the reason.
+    /// The caller has the provenance classifier; this only knows the keys.
+    pub fn learned_entries(&self) -> Vec<LearnedEntry> {
+        self.state
+            .learned
+            .values()
+            .filter(|e| e.revoked.is_none())
+            .cloned()
+            .collect()
+    }
+
+    pub fn mark_revoked(&mut self, key: &str, reason: &str) {
+        if let Some(e) = self.state.learned.get_mut(key) {
+            e.revoked = Some(reason.to_string());
+        }
+        if let Some(t) = self.state.tuples.get_mut(key) {
+            t.learned = false;
+        }
+        self.dirty = true;
+    }
+
+    // ----------------------------------------------------------------- export
+
+    /// LEARNING §8 step 1: every tuple with its counts, days, window and
+    /// severity, suppressed and demoted ones included and marked.
+    pub fn export(&self, since: Option<&str>) -> Vec<serde_json::Value> {
+        let mut rows: Vec<&TupleStat> = self
+            .state
+            .tuples
+            .values()
+            .filter(|t| match since {
+                Some(s) => t.last_seen.as_str() >= s,
+                None => true,
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then(a.rule.cmp(&b.rule))
+                .then(a.exe.cmp(&b.exe))
+        });
+        rows.iter()
+            .map(|t| {
+                serde_json::json!({
+                    "rule": t.rule,
+                    "exe": t.exe,
+                    "provenance": t.provenance,
+                    "package": t.package,
+                    "parent": t.parent,
+                    "dir": t.dir,
+                    "context": t.context,
+                    "severity": t.severity,
+                    "count": t.count,
+                    "days": t.days.len(),
+                    "first_seen": t.first_seen,
+                    "last_seen": t.last_seen,
+                    "rarity": t.rarity,
+                    "suppressed": t.suppressed,
+                    "demoted": t.demoted || self.is_demoted(&t.rule),
+                    "learned": t.learned,
+                    "eligible": t.provenance == "official",
+                    "toml": t.toml(),
+                })
+            })
+            .collect()
+    }
+
+    // ---------------------------------------------------------- persistence
+
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    pub fn save_if_due(&mut self, now: u64, force: bool) {
+        if !self.dirty {
+            return;
+        }
+        if !force && now.saturating_sub(self.last_save) < self.save_every {
+            return;
+        }
+        self.state.v = BASELINE_V;
+        let body = match serde_json::to_string(&self.state) {
+            Ok(b) => format!("{}\n", b),
+            Err(e) => {
+                log::warn!("baseline.json: {}", e);
+                return;
+            }
+        };
+        match crate::util::atomic_write(&self.path, body.as_bytes(), 0o640) {
+            Ok(_) => {
+                let _ = crate::util::secure_path(&self.path, &self.group, 0o640);
+                self.dirty = false;
+                self.last_save = now;
+            }
+            Err(e) => log::warn!("baseline.json: {}", e),
+        }
+    }
+
+    /// The `baseline` block of `status` (BASELINE §8 "Resolved shapes").
+    pub fn status(&self, now: u64) -> serde_json::Value {
+        serde_json::json!({
+            "learning": self.learning(now),
+            "learning_ends": self.learning_ends(),
+            "proposals": self.state.proposals.len(),
+            "learned": self.state.learned.values().filter(|e| e.revoked.is_none()).count(),
+            "demoted": self.demoted_rules(),
+        })
+    }
+}
+
+fn today() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
+}
+
+/// `2026-09-03T16:21:07.123Z` -> `2026-09-03`.
+pub fn date_part(ts: &str) -> String {
+    ts.split('T').next().unwrap_or(ts).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn baseline(dir: &Path, now: u64) -> Baseline {
+        Baseline::load(dir, "moat", 7, 3, 20, None, now)
+    }
+
+    const NOW: u64 = 1_800_000_000;
+
+    fn obs<'a>(day: u64, sev: &'a str, prov: &'a str, rarity: &'a str) -> Observation<'a> {
+        let now = NOW + day * DAY;
+        Observation {
+            rule: "moat-cred-ssh-private-key-read",
+            exe: "/usr/bin/restic",
+            parent: "/usr/bin/systemd",
+            dir: "/home/dan/.ssh",
+            severity: sev,
+            provenance: prov,
+            package: Some("restic 0.18-1".into()),
+            context: "service",
+            rarity,
+            suppressed: false,
+            demoted: false,
+            ts: crate::util::rfc3339_of(now),
+            now,
+        }
+    }
+
+    // -------------------------------------------------------------- learning
+
+    #[test]
+    fn three_distinct_days_of_an_official_medium_is_learned_during_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        assert!(b.learning(NOW));
+        assert_eq!(b.observe(&obs(0, "medium", "official", "common")), Learned::None);
+        assert_eq!(b.observe(&obs(1, "medium", "official", "common")), Learned::None);
+        let got = b.observe(&obs(2, "low", "official", "common"));
+        match got {
+            Learned::Entry { toml, comment, .. } => {
+                assert!(toml.contains("name = \"moat-cred-ssh-private-key-read\""));
+                assert!(toml.contains("exe = \"/usr/bin/restic\""));
+                assert!(toml.contains("file = \"/home/dan/.ssh/*\""));
+                assert!(toml.contains("parent = \"/usr/bin/systemd\""));
+                assert!(comment.starts_with("learned "), "{}", comment);
+                assert!(comment.contains("3 distinct days"), "{}", comment);
+                assert!(comment.contains("actor official (restic 0.18-1)"), "{}", comment);
+            }
+            other => panic!("expected an entry, got {:?}", other),
+        }
+        // And it only happens once.
+        assert_eq!(b.observe(&obs(3, "medium", "official", "common")), Learned::None);
+    }
+
+    #[test]
+    fn nothing_high_foreign_or_rare_is_ever_learned() {
+        let dir = tempfile::tempdir().unwrap();
+        for (sev, prov, rarity, why) in [
+            ("high", "official", "common", "high is never learned"),
+            ("medium", "foreign", "common", "foreign actors are never learned"),
+            ("medium", "user", "common", "user actors are never learned"),
+            ("medium", "official", "rare", "a tuple must be ordinary first"),
+        ] {
+            let sub = dir.path().join(why.replace(' ', "-"));
+            std::fs::create_dir_all(&sub).unwrap();
+            let mut b = baseline(&sub, NOW);
+            for d in 0..5 {
+                assert_eq!(b.observe(&obs(d, sev, prov, rarity)), Learned::None, "{}", why);
+            }
+        }
+    }
+
+    #[test]
+    fn one_high_in_the_history_disqualifies_the_tuple_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        b.observe(&obs(0, "high", "official", "common"));
+        for d in 1..6 {
+            assert_eq!(b.observe(&obs(d, "medium", "official", "common")), Learned::None);
+        }
+    }
+
+    #[test]
+    fn after_the_window_the_same_pattern_becomes_a_proposal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        // Close the window.
+        b.state.learning_until = NOW;
+        for d in 0..2 {
+            assert_eq!(b.observe(&obs(d, "medium", "official", "common")), Learned::None);
+        }
+        let Learned::Proposed { id } = b.observe(&obs(2, "medium", "official", "common")) else {
+            panic!("expected a proposal");
+        };
+        let p = b.proposal(&id).unwrap().clone();
+        assert_eq!(p.rule, "moat-cred-ssh-private-key-read");
+        assert_eq!(p.days, 3);
+        assert_eq!(p.count, 3);
+        assert!(p.toml.contains("[[rule]]"));
+        assert!(!p.first_seen.is_empty() && !p.last_seen.is_empty());
+
+        // Accept it: it leaves the list and carries a comment naming who.
+        let (accepted, comment) = b.accept(&id, "dan").unwrap();
+        assert_eq!(accepted.id, id);
+        assert!(comment.contains("accepted by dan"), "{}", comment);
+        assert!(b.proposals().is_empty());
+        assert!(b.accept(&id, "dan").is_err());
+    }
+
+    #[test]
+    fn a_dismissed_proposal_is_not_offered_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        b.state.learning_until = NOW;
+        for d in 0..3 {
+            b.observe(&obs(d, "medium", "official", "common"));
+        }
+        let id = b.proposals()[0].id.clone();
+        b.dismiss(&id).unwrap();
+        assert!(b.proposals().is_empty());
+        for d in 3..8 {
+            assert_eq!(b.observe(&obs(d, "medium", "official", "common")), Learned::None);
+        }
+    }
+
+    #[test]
+    fn relearn_reopens_the_window_and_clears_the_pending_questions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        b.state.learning_until = NOW;
+        for d in 0..3 {
+            b.observe(&obs(d, "medium", "official", "common"));
+        }
+        assert_eq!(b.proposals().len(), 1);
+        let until = b.relearn(Some(14), NOW);
+        assert_eq!(until, NOW + 14 * DAY);
+        assert!(b.learning(NOW));
+        assert!(b.proposals().is_empty());
+        // The tuple is askable again, and now it lands in baseline.toml.
+        assert!(matches!(b.observe(&obs(4, "medium", "official", "common")), Learned::Entry { .. }));
+    }
+
+    // ----------------------------------------------------------- noise guard
+
+    #[test]
+    fn a_rule_over_the_threshold_is_demoted_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        let rule = "moat-persist-hypr-config-write";
+        for i in 0..20 {
+            assert!(b.note_alert(rule, NOW + i).is_none(), "20 is not over 20");
+        }
+        assert!(!b.is_demoted(rule));
+        let d = b.note_alert(rule, NOW + 21).expect("the 21st crosses it");
+        assert_eq!(d.rule, rule);
+        assert_eq!(d.count, 21);
+        assert!(b.is_demoted(rule));
+        assert_eq!(b.demoted_rules(), vec![rule]);
+        // No second alert about the same demotion.
+        assert!(b.note_alert(rule, NOW + 22).is_none());
+    }
+
+    #[test]
+    fn a_demotion_clears_itself_after_a_quiet_day_and_on_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        let rule = "moat-x-pkg-egress";
+        for i in 0..25 {
+            b.note_alert(rule, NOW + i);
+        }
+        assert!(b.is_demoted(rule));
+        // Still noisy: nothing clears.
+        assert!(b.clear_stale_demotions(NOW + 100).is_empty());
+        // A day later with the window aged out.
+        assert_eq!(b.clear_stale_demotions(NOW + DAY + 3_600), vec![rule]);
+        assert!(!b.is_demoted(rule));
+
+        // "keep watching" clears it immediately and resets the window.
+        for i in 0..25 {
+            b.note_alert(rule, NOW + 2 * DAY + i);
+        }
+        assert!(b.is_demoted(rule));
+        assert!(b.undemote(rule));
+        assert!(!b.is_demoted(rule));
+        assert!(!b.undemote(rule), "already cleared");
+        assert!(b.note_alert(rule, NOW + 2 * DAY + 100).is_none(), "the window restarted");
+    }
+
+    #[test]
+    fn the_top_tuples_of_a_noisy_rule_can_be_proposed_wholesale() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        for i in 0..8u64 {
+            let exe = format!("/usr/bin/tool{}", i % 3);
+            let ts = crate::util::rfc3339_of(NOW + i);
+            b.observe(&Observation {
+                rule: "moat-persist-hypr-config-write",
+                exe: &exe,
+                parent: "/usr/bin/Hyprland",
+                dir: "/home/dan/.config/hypr",
+                severity: "low",
+                provenance: "official",
+                package: None,
+                context: "service",
+                rarity: "common",
+                suppressed: false,
+                demoted: true,
+                ts,
+                now: NOW + i,
+            });
+        }
+        let top = b.top_tuples("moat-persist-hypr-config-write", 5);
+        assert_eq!(top.len(), 3);
+        assert!(top[0].count >= top[1].count);
+
+        let keys: Vec<String> = top.iter().map(|t| t.key()).collect();
+        let made = b.propose_keys(&keys);
+        assert_eq!(made.len(), 3);
+        assert!(made.iter().all(|p| p.toml.contains("moat-persist-hypr-config-write")));
+        // Idempotent: proposing the same tuples again adds nothing.
+        assert!(b.propose_keys(&keys).is_empty());
+    }
+
+    // ---------------------------------------------------------------- export
+
+    #[test]
+    fn the_export_carries_every_field_the_reviewer_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        let mut o = obs(0, "medium", "official", "common");
+        o.suppressed = true;
+        b.observe(&o);
+        b.observe(&obs(1, "medium", "foreign", "rare"));
+        let rows = b.export(None);
+        assert_eq!(rows.len(), 1, "the same tuple both times");
+        let r = &rows[0];
+        for k in [
+            "rule", "exe", "provenance", "parent", "dir", "context", "severity", "count",
+            "days", "first_seen", "last_seen", "rarity", "suppressed", "demoted", "toml",
+        ] {
+            assert!(r.get(k).is_some(), "export row has no {}", k);
+        }
+        assert_eq!(r["count"], 2);
+        assert_eq!(r["suppressed"], true, "suppressed tuples are included and marked");
+        assert_eq!(r["eligible"], false, "the last sighting was foreign");
+
+        // `--since` filters on last_seen.
+        assert!(b.export(Some("2099-01-01")).is_empty());
+        assert_eq!(b.export(Some("1970-01-01")).len(), 1);
+    }
+
+    // ----------------------------------------------------------- persistence
+
+    #[test]
+    fn installed_at_is_stamped_once_and_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut b = baseline(dir.path(), NOW);
+            assert_eq!(b.state.installed_at, NOW);
+            assert_eq!(b.state.learning_until, NOW + 7 * DAY);
+            b.observe(&obs(0, "medium", "official", "common"));
+            b.save_if_due(NOW, true);
+        }
+        let b2 = baseline(dir.path(), NOW + 100 * DAY);
+        assert_eq!(b2.state.installed_at, NOW, "not re-stamped");
+        assert!(!b2.learning(NOW + 100 * DAY));
+        assert_eq!(b2.state.tuples.len(), 1);
+    }
+
+    #[test]
+    fn a_corrupt_state_file_starts_over_rather_than_crashing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("baseline.json"), b"{{{").unwrap();
+        let b = baseline(dir.path(), NOW);
+        assert_eq!(b.state.installed_at, NOW);
+    }
+
+    #[test]
+    fn moats_own_meta_rules_are_never_learned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        for rule in NEVER_LEARN {
+            for d in 0..5 {
+                let now = NOW + d * DAY;
+                let r = b.observe(&Observation {
+                    rule,
+                    exe: "/usr/bin/moatd",
+                    parent: "",
+                    dir: "",
+                    severity: "low",
+                    provenance: "official",
+                    package: None,
+                    context: "service",
+                    rarity: "common",
+                    suppressed: false,
+                    demoted: false,
+                    ts: crate::util::rfc3339_of(now),
+                    now,
+                });
+                assert_eq!(r, Learned::None, "{}", rule);
+            }
+        }
+    }
+
+    #[test]
+    fn a_revoked_entry_stops_counting_as_learned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        for d in 0..3 {
+            b.observe(&obs(d, "medium", "official", "common"));
+        }
+        assert_eq!(b.learned_entries().len(), 1);
+        let key = b.learned_entries()[0].key.clone();
+        b.mark_revoked(&key, "the owning package is no longer official");
+        assert!(b.learned_entries().is_empty());
+        assert_eq!(b.status(NOW)["learned"], 0);
+    }
+}

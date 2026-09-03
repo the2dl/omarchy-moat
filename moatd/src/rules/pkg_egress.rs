@@ -18,7 +18,8 @@ use crate::explain::Finding;
 use crate::alert::NetRef;
 use crate::policy::PolicyMeta;
 use crate::rules::netmatch::{contains_any, is_private, parse_all, Cidr};
-use crate::rules::{meta, pkg_ancestor, RuleCtx, UserRule};
+use crate::rules::pkgtree;
+use crate::rules::{meta, RuleCtx, UserRule};
 
 pub const ID: &str = "moat-x-pkg-egress";
 
@@ -79,9 +80,12 @@ impl UserRule for PkgEgress {
         let Ok(ip) = ip_s.parse::<IpAddr>() else {
             return Vec::new();
         };
-        let Some(pkg) = pkg_ancestor(ctx.table, exec_id) else {
+        // The subtree test is `pkgtree`'s, the same one the pkg-subtree rules
+        // and the egress escalation use: one definition of "inside an install".
+        let Some((pkg, why)) = pkgtree::pkg_root_with_reason(ctx.table, exec_id) else {
             return Vec::new();
         };
+        let (pkg, why) = (pkg.clone(), why);
         if ctx.cfg.net.allow_private && is_private(&ip) {
             return Vec::new();
         }
@@ -113,10 +117,7 @@ impl UserRule for PkgEgress {
             port
         ));
         f.extra_evidence = vec![
-            format!(
-                "package manager in ancestry: {} pid {} args {}",
-                pkg.exe, pkg.pid, pkg.args
-            ),
+            pkgtree::root_evidence(&pkg, &why),
             format!(
                 "{} is neither private nor inside any of the {} configured registry CIDR(s)",
                 ip_s,

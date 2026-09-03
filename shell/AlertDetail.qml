@@ -25,15 +25,44 @@ Item {
   signal requestQuarantine(string id)
   signal requestAck(string id)
   signal requestIgnore(string id, string scope)
+  // LEARNING 2 and 4. The panel owns the service call, the same way it does for
+  // every other action here.
+  signal requestAnalyze(string id)
+  signal requestCopyBundle(string id)
+  signal requestCopyPath(string path)
 
   readonly property var explain: alert && alert.explain ? alert.explain : null
+  // LEARNING 1: how unusual this exact tuple is on this machine. null when the
+  // daemon said nothing, in which case neither the pill nor the line renders.
+  readonly property var rarity: alert && service ? service.rarityPill(alert.rarity) : null
+  readonly property string rarityText: alert && service ? service.rarityLine(alert) : ""
+  // LEARNING 4: what was captured into /var/lib/moat/incidents/<id>/ before
+  // anything was killed. null on every alert below the snapshot threshold.
+  readonly property var incident: alert && alert.incident ? alert.incident : null
   readonly property var ignoreOptions: alert && service ? service.ignoreOptions(alert) : []
+  // BASELINE 4's noise-guard alert offers two options that are not allowlist
+  // scopes ("these are expected", "keep watching"). They carry their own
+  // command; the panel prints it rather than growing a button for a verb the
+  // service does not speak.
+  readonly property var otherOptions: alert && service ? service.otherOptions(alert) : []
   readonly property var rotateItems: alert && service ? service.rotateItems(alert) : []
   readonly property bool canKill: alert && alert.actions.indexOf("kill") !== -1
   readonly property bool canQuarantine: alert && alert.actions.indexOf("quarantine") !== -1
 
   readonly property color mutedForeground: Qt.darker(foreground, 1.5)
   readonly property color codeBackground: Util.alpha(foreground, 0.06)
+
+  // The rarity pill's weight. "first seen" is the one that should catch an eye:
+  // it is the tuple nobody on this machine has ever produced before. "common"
+  // is deliberately the quietest thing on the pane — it is reassurance, and
+  // reassurance that shouts is noise.
+  function rarityColor(kind) {
+    switch (String(kind || "")) {
+    case "strong": return Color.urgent
+    case "warn": return "#d9a13b"
+    default: return Util.alpha(root.foreground, 0.35)
+    }
+  }
 
   function toggleScope(scope) {
     var next = ({})
@@ -170,6 +199,90 @@ Item {
           wrapMode: Text.WordWrap
         }
 
+        // LEARNING 1: rarity. "first time /usr/bin/node has read ~/.aws on this
+        // machine" is the single most useful sentence on the pane for deciding
+        // whether something is worth caring about, so it sits directly under
+        // WHAT HAPPENED with a pill that says which of the three classes it is.
+        //
+        // It is evidence, never a verdict. A `common` alert is still an alert:
+        // rarity does not move a severity here any more than it does in the
+        // daemon, and the pill is styled so it cannot read as an all-clear.
+        Row {
+          width: parent.width
+          spacing: Style.spacing.md
+          visible: root.rarityText !== "" || !!root.rarity
+
+          Rectangle {
+            id: rarityPill
+            anchors.verticalCenter: parent.verticalCenter
+            visible: !!root.rarity
+            width: visible ? rarityPillText.implicitWidth + Style.space(8) : 0
+            height: Math.round(Style.font.caption * 1.55)
+            radius: Style.cornerRadius > 0 ? height / 2 : 0
+            color: root.rarityColor(root.rarity ? root.rarity.kind : "")
+
+            Text {
+              id: rarityPillText
+              anchors.centerIn: parent
+              text: root.rarity ? root.rarity.label : ""
+              color: Color.background
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+          }
+
+          Text {
+            anchors.verticalCenter: parent.verticalCenter
+            width: parent.width - rarityPill.width - parent.spacing
+            text: root.rarityText
+            color: root.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+        }
+
+        // BASELINE 1 and 2b: who acted, and what they were doing at the time.
+        // "context: interactive · actor: official (package hyprland 0.53-1)".
+        // Provenance is evidence, not a verdict, so it reads as a fact line
+        // rather than as a reassurance.
+        Text {
+          width: parent.width
+          visible: text !== ""
+          text: root.alert && root.service ? root.service.actorLine(root.alert) : ""
+          color: root.mutedForeground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+
+        // BASELINE 2: when provenance or context moved the severity, say so and
+        // say why. A user who reads "high → medium: interactive session" learns
+        // what moat would have done to the same event from an install script.
+        Text {
+          width: parent.width
+          visible: text !== ""
+          text: root.alert && root.service ? root.service.severityChangeLine(root.alert) : ""
+          color: root.mutedForeground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+
+        // BASELINE 6: every suppression is visible and removable. An alert that
+        // only appears because "show suppressed" is on says what hid it.
+        Text {
+          width: parent.width
+          visible: text !== ""
+          text: root.alert && root.service ? root.service.suppressedLine(root.alert) : ""
+          color: root.mutedForeground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+          font.italic: true
+          wrapMode: Text.WrapAnywhere
+        }
+
         Repeater {
           model: {
             if (!root.alert) return []
@@ -272,11 +385,108 @@ Item {
         }
       }
 
+      // --------------------------------------------- INCIDENT SNAPSHOT
+      //
+      // LEARNING 4. On a high or critical alert the daemon copies the process
+      // state, the tree, the sockets and the acting binary into
+      // /var/lib/moat/incidents/<id>/ immediately, before any kill — because
+      // quarantine moves the original and a dead process has no /proc.
+      //
+      // The panel lists what was captured and hands over the path. It never
+      // opens the files: they are a byte-for-byte copy of exactly the untrusted
+      // material the alert is about.
+      Column {
+        width: parent.width
+        spacing: Style.spacing.sm
+        visible: !!root.incident
+
+        PanelSectionHeader { text: "INCIDENT SNAPSHOT"; foreground: root.foreground }
+
+        Row {
+          width: parent.width
+          spacing: Style.spacing.md
+
+          Text {
+            id: incidentDir
+            anchors.verticalCenter: parent.verticalCenter
+            width: parent.width - copyIncident.width - parent.spacing
+            text: root.incident ? root.incident.dir : ""
+            color: root.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WrapAnywhere
+          }
+
+          Button {
+            id: copyIncident
+            anchors.verticalCenter: parent.verticalCenter
+            text: "Copy path"
+            foreground: root.mutedForeground
+            fontSize: Style.font.caption
+            onClicked: root.requestCopyPath(root.incident ? root.incident.dir : "")
+          }
+        }
+
+        Rectangle {
+          width: parent.width
+          visible: !!root.incident && root.incident.files.length > 0
+          height: visible ? incidentFiles.implicitHeight + Style.spacing.xl : 0
+          color: root.codeBackground
+          radius: Style.cornerRadius
+
+          Column {
+            id: incidentFiles
+            x: Style.spacing.rowPaddingX
+            y: Style.spacing.md
+            width: parent.width - Style.spacing.rowPaddingX * 2
+            spacing: Style.spacing.xxs
+
+            Repeater {
+              model: root.incident ? root.incident.files : []
+
+              delegate: Row {
+                required property var modelData
+                width: incidentFiles.width
+                spacing: Style.spacing.md
+
+                Text {
+                  width: parent.width - Style.space(70) - parent.spacing
+                  text: modelData.name
+                  color: root.foreground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                  wrapMode: Text.WrapAnywhere
+                }
+
+                Text {
+                  width: Style.space(70)
+                  horizontalAlignment: Text.AlignRight
+                  text: root.service ? root.service.formatBytes(modelData.size) : ""
+                  color: root.mutedForeground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                }
+              }
+            }
+          }
+        }
+
+        Text {
+          width: parent.width
+          text: "Captured before any kill or quarantine, and kept for 30 days. The copies are the untrusted files themselves — read them in a viewer, not by executing them."
+          color: root.mutedForeground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+      }
+
       // ------------------------------------------- 4. IF THIS IS EXPECTED
       Column {
         width: parent.width
         spacing: Style.spacing.sm
         visible: (root.explain && root.explain.expected !== "") || root.ignoreOptions.length > 0
+          || root.otherOptions.length > 0
 
         PanelSectionHeader { text: "IF THIS IS EXPECTED"; foreground: root.foreground }
 
@@ -369,6 +579,47 @@ Item {
           }
         }
 
+        Repeater {
+          model: root.otherOptions
+
+          delegate: Column {
+            required property var modelData
+            width: parent.width
+            spacing: Style.spacing.xxs
+
+            Text {
+              width: parent.width
+              text: modelData.label
+              color: root.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+              wrapMode: Text.WordWrap
+            }
+
+            Text {
+              width: parent.width
+              text: "$ " + modelData.cmd
+              color: root.mutedForeground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WrapAnywhere
+              textFormat: Text.PlainText
+            }
+
+            Text {
+              width: parent.width
+              visible: text !== ""
+              text: modelData.line
+              color: root.mutedForeground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WrapAnywhere
+              textFormat: Text.PlainText
+            }
+          }
+        }
+
         Text {
           width: parent.width
           visible: root.ignoreOptions.length > 0
@@ -431,6 +682,97 @@ Item {
               wrapMode: Text.WordWrap
             }
           }
+        }
+      }
+
+      // -------------------------------------------------------- 6. ANALYSIS
+      //
+      // LEARNING 2. Sixth block, deliberately after the five CONTRACT 7 pins in
+      // order: the user reads what happened and what to do about it before
+      // being offered a second opinion, and the five headed blocks stay in the
+      // order the contract fixes them in.
+      Column {
+        width: parent.width
+        spacing: Style.spacing.sm
+        visible: !!root.alert
+
+        PanelSectionHeader { text: "ANALYSIS"; foreground: root.foreground }
+
+        Row {
+          width: parent.width
+          spacing: Style.spacing.controlGap
+          visible: !!root.service && root.service.agentButtonLabel !== ""
+
+          Button {
+            text: root.service ? root.service.agentButtonLabel : ""
+            bordered: true
+            enabled: !!root.service && root.service.analyzeState !== "running"
+            opacity: enabled ? 1 : 0.5
+            foreground: root.foreground
+            accent: root.accent
+            fontSize: Style.font.bodySmall
+            onClicked: root.requestAnalyze(root.alert ? root.alert.id : "")
+          }
+
+          Button {
+            anchors.verticalCenter: parent.verticalCenter
+            text: "Copy bundle path"
+            foreground: root.mutedForeground
+            fontSize: Style.font.caption
+            enabled: !!root.service && root.service.copyState !== "running"
+            opacity: enabled ? 1 : 0.5
+            onClicked: root.requestCopyBundle(root.alert ? root.alert.id : "")
+          }
+        }
+
+        // No default agent: say the exact command that sets one rather than
+        // showing a button that cannot do anything.
+        Text {
+          width: parent.width
+          visible: !!root.service && root.service.agentButtonLabel === ""
+          text: root.service ? root.service.agentHint : ""
+          color: root.mutedForeground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+
+        // Transient: "opened in claude" after a launch, the daemon's own error
+        // when moatctl exited non-zero. Cleared by the service on a timer.
+        Text {
+          width: parent.width
+          visible: text !== ""
+          text: {
+            if (!root.service) return ""
+            if (root.service.analyzeState === "running") return "bundling…"
+            return root.service.analyzeMessage
+          }
+          color: root.service && root.service.analyzeState === "failed"
+            ? Color.urgent : root.mutedForeground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WrapAnywhere
+        }
+
+        Text {
+          width: parent.width
+          visible: text !== ""
+          text: root.service ? root.service.copyMessage : ""
+          color: root.service && root.service.copyState === "failed"
+            ? Color.urgent : root.mutedForeground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WrapAnywhere
+        }
+
+        Text {
+          width: parent.width
+          visible: !!root.service && root.service.agentButtonLabel !== ""
+          text: "moatctl writes the evidence bundle and launches the agent on it. Everything the bundle quotes from a process is fenced as untrusted data, and the agent is asked to propose moatctl commands rather than run kill, quarantine or ignore itself."
+          color: root.mutedForeground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
         }
       }
 

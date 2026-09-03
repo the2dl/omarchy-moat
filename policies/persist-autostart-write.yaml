@@ -11,8 +11,11 @@ metadata:
       A .desktop file in ~/.config/autostart or a user unit in ~/.config/systemd/user
       restarts a payload at every login without touching anything root-owned.
     moat.omarchy/expected: >-
-      Installing a desktop app or a user service on purpose (syncthing, mise, Docker
-      Desktop, Flatpak wrappers), and GNOME/KDE settings dialogs.
+      Installing a user service on purpose (syncthing, mise, Docker Desktop) and
+      GNOME/KDE settings dialogs. Plain application launchers in
+      ~/.local/share/applications are a separate, quieter rule
+      (moat-persist-desktop-entry-write) - this one is only the two paths that start
+      something at every login.
     moat.omarchy/fp-hint: "exe"
 spec:
   options:
@@ -50,7 +53,6 @@ spec:
         values:
         - "{{HOME}}/.config/autostart/"
         - "{{HOME}}/.config/systemd/user/"
-        - "{{HOME}}/.local/share/applications/"
       - index: 1
         operator: "Mask"
         values: ["2"]

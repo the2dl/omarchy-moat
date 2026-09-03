@@ -34,6 +34,14 @@ pub fn normalize_ts(s: &str) -> String {
     }
 }
 
+/// Unix seconds as the contract's millisecond RFC3339 form. The inverse of
+/// reading a `ts` back out of an alert.
+pub fn rfc3339_of(secs: u64) -> String {
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+        .map(|d| d.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+        .unwrap_or_else(now_rfc3339)
+}
+
 pub fn unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -130,6 +138,69 @@ pub fn hex(bytes: &[u8]) -> String {
 
 pub fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+/// A binary executed with `fexecve` (or from a memfd / an already-open fd) is
+/// reported by Tetragon as `/proc/self/fd/<n>`: the kernel has no name for it
+/// beyond the descriptor. Seen in the wild on the first live run.
+pub const PROC_SELF_FD: &str = "/proc/self/fd/";
+
+pub fn is_proc_self_fd(exe: &str) -> bool {
+    exe.starts_with(PROC_SELF_FD)
+}
+
+/// Recover the real path of a `/proc/self/fd/<n>` binary.
+///
+/// Order of preference:
+///
+/// 1. the path the hook itself carried (the `linux_binprm` argument of
+///    `bprm_check_security` is the file being executed, and it is resolved);
+/// 2. the parent's argument 0, when it is an absolute path — the usual shape is
+///    a launcher that was handed the program it then `fexecve`s.
+///
+/// Returns `(exe, note)`. When nothing can be recovered the reported path is
+/// kept and the note says so, because an alert naming `/proc/self/fd/9` with no
+/// explanation is worse than useless.
+pub fn resolve_exec_binary(
+    reported: &str,
+    binprm: Option<&str>,
+    parent_args: Option<&str>,
+) -> (String, Option<String>) {
+    if !is_proc_self_fd(reported) {
+        return (reported.to_string(), None);
+    }
+    if let Some(p) = binprm.filter(|p| p.starts_with('/') && !is_proc_self_fd(p)) {
+        return (
+            p.to_string(),
+            Some(format!(
+                "binary reported as {} (executed from a file descriptor); resolved to {} from the \
+                 hook's exec'd-file argument",
+                reported, p
+            )),
+        );
+    }
+    if let Some(a0) = parent_args
+        .and_then(|a| a.split_whitespace().next())
+        .filter(|a| a.starts_with('/') && !is_proc_self_fd(a))
+    {
+        return (
+            a0.to_string(),
+            Some(format!(
+                "binary reported as {} (executed from a file descriptor); resolved to {} from the \
+                 parent's argument 0",
+                reported, a0
+            )),
+        );
+    }
+    (
+        reported.to_string(),
+        Some(format!(
+            "binary reported as {} (executed from a file descriptor): the kernel had no path for \
+             it and neither the hook nor the parent's arguments named one, so the exe below is \
+             the descriptor, not a file you can inspect",
+            reported
+        )),
+    )
 }
 
 /// True when `path` sits under one of the directories a quarantine or a
@@ -287,10 +358,43 @@ mod tests {
     }
 
     #[test]
+    fn proc_self_fd_binaries_are_resolved_and_noted() {
+        // Nothing to do for a normal path.
+        let (exe, note) = resolve_exec_binary("/usr/bin/node", None, None);
+        assert_eq!(exe, "/usr/bin/node");
+        assert!(note.is_none());
+
+        // The hook's own exec'd-file argument wins.
+        let (exe, note) = resolve_exec_binary(
+            "/proc/self/fd/9",
+            Some("/home/dan/proj/node_modules/.bin/evil"),
+            Some("/usr/bin/other"),
+        );
+        assert_eq!(exe, "/home/dan/proj/node_modules/.bin/evil");
+        assert!(note.unwrap().contains("/proc/self/fd/9"));
+
+        // Otherwise the parent's argument 0.
+        let (exe, note) = resolve_exec_binary("/proc/self/fd/9", None, Some("/tmp/.x9k --quiet"));
+        assert_eq!(exe, "/tmp/.x9k");
+        assert!(note.unwrap().contains("parent's argument 0"));
+
+        // Nothing usable: keep the descriptor, say so.
+        let (exe, note) = resolve_exec_binary("/proc/self/fd/9", None, Some("-c ls"));
+        assert_eq!(exe, "/proc/self/fd/9");
+        assert!(note.unwrap().contains("no path for it"));
+    }
+
+    #[test]
     fn timestamps_normalize_to_millis() {
         assert_eq!(
             normalize_ts("2026-09-03T16:21:07.123456789Z"),
             "2026-09-03T16:21:07.123Z"
         );
+    }
+
+    #[test]
+    fn unix_seconds_render_as_the_contracts_timestamp() {
+        assert_eq!(rfc3339_of(1_800_000_000), "2027-01-15T08:00:00.000Z");
+        assert_eq!(rfc3339_to_nanos(&rfc3339_of(1_700_000_000)).unwrap(), 1_700_000_000i128 * 1_000_000_000);
     }
 }

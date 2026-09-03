@@ -41,7 +41,21 @@ What the build does:
 | `prepare()` | copy the working tree into `$srcdir`, drop any developer `target/`, `cargo fetch --locked` |
 | `build()` | `cargo build --release --locked` in the copied `moatd/` (`Cargo.lock` is committed, so `--locked` is meaningful) |
 | `check()` | `cargo test --release --locked` · `python3 policies/check.py policies` · `python3 -m unittest discover tests` in `scanner/` · `bash sandbox/tests/run.sh` |
-| `package()` | install exactly the layout in `docs/CONTRACT.md` §2 |
+| `package()` | install the layout in `docs/CONTRACT.md` §2, plus the four things baselining added after it was written (below) |
+
+`docs/CONTRACT.md` §2 predates docs/BASELINE.md and
+docs/LEARNING-AND-ANALYSIS.md, so four installed paths are not in it:
+
+| path | why | from |
+|---|---|---|
+| `/etc/moat/allowlist.d/omarchy-default.toml` | the shipped baseline: reviewed once by a human, every entry commented with which actor, which rule and why it is benign. A `backup=()` file, so a site edit survives an upgrade as a `.pacnew` | LEARNING §8 |
+| `/usr/lib/systemd/user/moat-digest.{service,timer}` | the weekly digest, delivered from the user's session because notifications are not a root service's to send. Installed, never enabled | LEARNING §5 |
+| `/var/lib/moat/incidents` (via `tmpfiles.d/moat.conf`) | incident snapshots and `bundle.md`, 0750 root:moat | LEARNING §4 |
+| `/usr/share/doc/omarchy-moat/{BASELINE,LEARNING-AND-ANALYSIS}.md` | `/etc/moat/moat.toml`'s own comments cite these by section number | — |
+
+`allowlist.d/baseline.toml` — the file the learning window writes — is
+deliberately **not** shipped: it is runtime state the daemon owns, and a
+packaged copy would be reverted on every upgrade.
 
 `check()` runs in full — the sandbox suite uses **real** bubblewrap, and that
 works because makepkg itself is unprivileged (only `package()` is `fakeroot`ed).
@@ -70,7 +84,10 @@ sudo pacman -U omarchy-moat-0.1.0-1-x86_64.pkg.tar.zst
 pacman's own alpm hooks run `systemd-sysusers` (creating the `moat` group)
 and `systemd-tmpfiles --create` (creating `/var/lib/moat`,
 `/var/log/moat`, `/run/moat`, `/run/moat/policies` and the
-quarantine dir), then reload the systemd manager. The `.install` file does not
+quarantine dir and `/var/lib/moat/incidents`, which is where the incident
+snapshots and the `bundle.md` the AI analysis reads live — 0750 root:moat, so
+the panel and the user's agent can read what the daemon wrote), then reload the
+systemd manager. The `.install` file does not
 duplicate any of that, and it never enables or starts a unit.
 
 ## Enable
@@ -80,8 +97,18 @@ sudo systemctl enable --now tetragon moatd moat-feeds.timer
 sudo usermod -aG moat $USER
 # log out and back in — a new group only reaches a fresh session
 omarchy plugin add https://github.com/the2dl/omarchy-moat --enable
+systemctl --user enable --now moat-digest.timer
 moatctl status
 ```
+
+`moat-digest.timer` is the weekly digest (LEARNING §5): one normal-urgency
+notification a week — *"moat: 0 incidents, 18 installs watched, 3 baseline
+proposals to review"* — and the only scheduled notification Moat ever sends.
+It is a **user** unit, not a system one, and it is the one line above that must
+NOT be run with sudo: desktop notifications belong to the session bus, which a
+root service does not have, and `moatctl digest --notify` needs no privilege
+beyond `moat` group membership. The daemon decides whether it is due, so
+`moatctl set digest off` silences it without touching systemd.
 
 Moat starts in **monitor** mode: it alerts, it never kills.
 `moatctl set mode enforce` switches it. The bubblewrap shims are off until
@@ -93,6 +120,7 @@ effect in a new login shell.
 
 ```bash
 sudo systemctl disable --now tetragon moatd moat-feeds.timer
+systemctl --user disable --now moat-digest.timer
 sudo pacman -Rns omarchy-moat
 ```
 
@@ -136,6 +164,14 @@ until you restart the sensor:
 ```bash
 sudo systemctl restart tetragon moatd
 ```
+
+In that order, and as one command. `moatd.service` is `Requires=`+`After=`
+`tetragon.service`, so restarting `moatd` first leaves it reading a log the old
+sensor is still writing under the old policy set, and restarting `tetragon`
+alone leaves `moatd` holding the previous policies' annotations — alerts would
+carry the old titles, severities and `why` text for policies that no longer
+exist. The user digest timer needs nothing: it only runs `moatctl digest
+--notify` against whatever daemon is up.
 
 `post_upgrade` prints this and stops there — restarting the sensor for you would
 tear down every loaded BPF program mid-`pacman`, which is exactly the moment you

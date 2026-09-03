@@ -87,12 +87,22 @@ struct RunArgs {
     policies_dir: Option<PathBuf>,
     #[arg(long)]
     allowlist_dir: Option<PathBuf>,
+    /// Incident snapshots and bundles (LEARNING §2, §4). Defaults to
+    /// `[analysis] bundle_dir`; dev mode points it at a scratch directory.
+    #[arg(long)]
+    incidents_dir: Option<PathBuf>,
     #[arg(long)]
     sandbox_flag: Option<PathBuf>,
     #[arg(long)]
     tetra: Option<PathBuf>,
     #[arg(long)]
     passwd: Option<PathBuf>,
+    /// Local pacman database, for provenance (BASELINE §1).
+    #[arg(long)]
+    pacman_local: Option<PathBuf>,
+    /// `pacman` binary, called once per pacman transaction for `-Sl`.
+    #[arg(long)]
+    pacman: Option<PathBuf>,
     /// Group that owns the socket and the alert log.
     #[arg(long)]
     group: Option<String>,
@@ -219,6 +229,9 @@ fn cmd_run(mut cfg: Config, cfg_path: PathBuf, a: RunArgs) -> std::process::Exit
     if let Some(p) = a.allowlist_dir {
         cfg.paths.allowlist_dir = p;
     }
+    if let Some(p) = a.incidents_dir {
+        cfg.analysis.bundle_dir = p;
+    }
     if let Some(p) = a.sandbox_flag {
         cfg.paths.sandbox_flag = p;
     }
@@ -227,6 +240,12 @@ fn cmd_run(mut cfg: Config, cfg_path: PathBuf, a: RunArgs) -> std::process::Exit
     }
     if let Some(p) = a.passwd {
         cfg.paths.passwd = p;
+    }
+    if let Some(p) = a.pacman_local {
+        cfg.paths.pacman_local = p;
+    }
+    if let Some(p) = a.pacman {
+        cfg.paths.pacman = p;
     }
     if let Some(g) = a.group {
         cfg.group = g;

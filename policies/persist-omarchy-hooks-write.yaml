@@ -1,19 +1,19 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: moat-persist-desktop-config-write
+  name: moat-persist-omarchy-hooks-write
   annotations:
-    moat.omarchy/severity: "medium"
-    moat.omarchy/title: "Hyprland or Omarchy configuration modified by a non-editor"
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "Omarchy event hook script written by a non-editor"
     moat.omarchy/enforce: "none"
-    moat.omarchy/actions: "quarantine,ignore"
+    moat.omarchy/actions: "kill,quarantine,ignore"
     moat.omarchy/why: >-
-      Hyprland exec-once lines and Omarchy autostart config run at session start with
-      your full desktop session; editing them is persistence that hides in plain sight
-      among files you edit yourself.
+      Scripts in ~/.config/omarchy/hooks are executed by Omarchy on system events -
+      theme change, login, resume, package update. Dropping a file here is arbitrary
+      code execution on a schedule you do not control, with no unit file to notice.
     moat.omarchy/expected: >-
-      Your editor, the omarchy-* helper scripts (allowlisted here), omarchy-shell saving
-      its own settings, and theme switches.
+      Your editor writing a hook on purpose, and the omarchy-* helper scripts
+      (suppressed in-kernel by the first selector) installing or migrating one.
     moat.omarchy/fp-hint: "exe"
 spec:
   options:
@@ -21,7 +21,7 @@ spec:
     value: "monitor"
   lsmhooks:
   - hook: "file_post_open"
-    message: "Hyprland or Omarchy configuration opened for writing"
+    message: "Omarchy event hook script opened for writing"
     args:
     - index: 0
       type: "file"
@@ -37,8 +37,7 @@ spec:
       - index: 0
         operator: "Prefix"
         values:
-        - "{{HOME}}/.config/hypr/"
-        - "{{HOME}}/.config/omarchy/"
+        - "{{HOME}}/.config/omarchy/hooks/"
       - index: 1
         operator: "Mask"
         values: ["2"]
@@ -63,8 +62,7 @@ spec:
       - index: 0
         operator: "Prefix"
         values:
-        - "{{HOME}}/.config/hypr/"
-        - "{{HOME}}/.config/omarchy/"
+        - "{{HOME}}/.config/omarchy/hooks/"
       - index: 1
         operator: "Mask"
         values: ["2"]

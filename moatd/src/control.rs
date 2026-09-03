@@ -102,6 +102,13 @@ pub fn dispatch(d: &mut Daemon, req: &Value) -> Value {
         "allowlist" => cmd_allowlist(d),
         "set" => cmd_set(d, req),
         "feeds" => cmd_feeds(d, req),
+        "baseline" => cmd_baseline(d, req),
+        "receipts" => cmd_receipts(d, req),
+        "incidents" => cmd_incidents(d, req),
+        "bundle" => cmd_bundle(d, &id()),
+        "analyze" => cmd_analyze(d, &id()),
+        "rarity" => cmd_rarity(d, &id()),
+        "digest" => cmd_digest(d, req),
         "" => err("missing `cmd`"),
         other => err(format!("unknown command {:?}", other)),
     }
@@ -118,6 +125,93 @@ fn cmd_list(d: &Daemon, req: &Value) -> Value {
         alerts = alerts.split_off(alerts.len() - limit);
     }
     ok(json!({ "alerts": alerts }))
+}
+
+/// LEARNING §3/§7: `{"cmd":"receipts","last":20}`. Informational only — a
+/// receipt has no actions, no ack and no badge.
+fn cmd_receipts(d: &Daemon, req: &Value) -> Value {
+    let last = req.get("last").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+    let receipts = d.receipt_list(last.max(1));
+    ok(json!({
+        "receipts": receipts,
+        "rendered": receipts.iter().map(|r| r.render()).collect::<Vec<_>>(),
+        "open": d.receipts.len(),
+    }))
+}
+
+/// LEARNING §7: `{"cmd":"incidents","last":20}` — what is on disk.
+fn cmd_incidents(d: &Daemon, req: &Value) -> Value {
+    let last = req.get("last").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+    let dir = d.incidents_dir();
+    ok(json!({
+        "dir": dir.display().to_string(),
+        "incidents": crate::incident::list(&dir, last.max(1)),
+        "retain_days": d.cfg.incidents.retain_days,
+        "retain_max": d.cfg.incidents.retain_max,
+        "snapshot_min_severity": d.cfg.incidents.snapshot_min_severity,
+    }))
+}
+
+/// LEARNING §2 step 1 and §9: write `bundle.md`, return its path.
+fn cmd_bundle(d: &Daemon, id: &str) -> Value {
+    match d.write_bundle(id) {
+        Ok(p) => ok(json!({"id": id, "path": p.display().to_string()})),
+        Err(e) => err(e),
+    }
+}
+
+/// LEARNING §7: bundle **plus** everything `moatctl` needs to do the launch.
+/// The daemon deliberately does not launch anything: it has no session, and an
+/// interactive agent started by a root service would be both broken and wrong.
+fn cmd_analyze(d: &Daemon, id: &str) -> Value {
+    let path = match d.write_bundle(id) {
+        Ok(p) => p.display().to_string(),
+        Err(e) => return err(e),
+    };
+    ok(json!({
+        "id": id,
+        "path": path,
+        "preamble": crate::analysis::preamble(&path),
+        "agent_args": d.cfg.analysis.agent_args,
+        "launcher": crate::analysis::agent_launcher(),
+        "note": "the daemon only writes the bundle; moatctl launches the agent in the user session",
+    }))
+}
+
+/// LEARNING §7: the rarity sentences for one alert.
+fn cmd_rarity(d: &Daemon, id: &str) -> Value {
+    let Some(a) = d.find_alert(id) else {
+        return err(format!("no alert {}", id));
+    };
+    ok(json!({
+        "id": id,
+        "rarity": a.rarity.as_str(),
+        "rarity_text": a.rarity_text,
+        "counters": d.rarity.len(),
+        "sentences": a
+            .explain
+            .evidence
+            .iter()
+            .filter(|e| e.starts_with("rarity"))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// LEARNING §5: `{"cmd":"digest"}` reads it, `{"cmd":"digest","action":"sent"}`
+/// records a delivery so a catch-up run does not send twice.
+fn cmd_digest(d: &mut Daemon, req: &Value) -> Value {
+    let now = util::unix_secs();
+    match req.get("action").and_then(|v| v.as_str()).unwrap_or("show") {
+        "show" => ok(d.digest(now).to_json()),
+        "sent" => {
+            d.digest_sent(now);
+            ok(d.digest(now).to_json())
+        }
+        other => err(format!(
+            "unknown digest action {:?}; use show or sent",
+            other
+        )),
+    }
 }
 
 fn cmd_ack(d: &mut Daemon, id: &str) -> Value {
@@ -170,7 +264,10 @@ fn cmd_kill(d: &mut Daemon, id: &str) -> Value {
 
 /// Refuse to signal a recycled pid. The alert records the process start time;
 /// `/proc/<pid>/stat` gives us the live one.
-fn verify_pid(pid: u32, start_ts: &str, exe: &str) -> Result<(), String> {
+///
+/// Public because the engine reuses it for enforce-mode kills: there is one
+/// answer to "is this pid still the process we mean", not two.
+pub fn verify_pid(pid: u32, start_ts: &str, exe: &str) -> Result<(), String> {
     let Some(live) = util::proc_start_nanos(pid) else {
         return Err(format!("pid {} is gone", pid));
     };
@@ -307,18 +404,40 @@ fn cmd_ignore(d: &mut Daemon, req: &Value, id: &str) -> Value {
     }))
 }
 
+/// `{"cmd":"unignore","rule":N}` still means user.toml, for compatibility.
+/// `{"cmd":"unignore","file":"baseline.toml","index":N}` removes a learned
+/// entry the same way (BASELINE §8 "Resolved shapes"). Shipped files are
+/// refused: they belong to the package, not to the user.
 fn cmd_unignore(d: &mut Daemon, req: &Value) -> Value {
     let n = req
-        .get("rule")
+        .get("index")
+        .or_else(|| req.get("rule"))
         .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
     let Some(n) = n else {
-        return err("`rule` must be the index shown by `allowlist`");
+        return err("`index` (with `file`) or `rule` must be the index shown by `allowlist`");
     };
-    let path = d.cfg.paths.user_allowlist();
+    let path = match req.get("file").and_then(|v| v.as_str()) {
+        None | Some("") => d.cfg.paths.user_allowlist(),
+        Some(f) => {
+            let name = Path::new(f)
+                .file_name()
+                .map(|x| x.to_os_string())
+                .unwrap_or_default();
+            let p = d.cfg.paths.allowlist_dir.join(&name);
+            if !crate::allowlist::is_removable(&p) {
+                return err(format!(
+                    "{} is shipped by the package; it is not removable from here. Override it \
+                     with an entry in user.toml instead.",
+                    name.to_string_lossy()
+                ));
+            }
+            p
+        }
+    };
     match remove_rule(&path, n as usize) {
         Ok(removed) => {
             d.reload_allowlist();
-            ok(json!({"removed": removed, "file": path.display().to_string()}))
+            ok(json!({"removed": removed, "file": path.display().to_string(), "index": n}))
         }
         Err(e) => err(e),
     }
@@ -331,10 +450,13 @@ fn cmd_allowlist(d: &Daemon) -> Value {
         .rules
         .iter()
         .map(|r| {
+            let removable = crate::allowlist::is_removable(&r.source);
             json!({
-                // Only user.toml entries can be removed with `unignore`.
-                "index": if r.source == user { Some(r.index) } else { None },
+                // Position within its own file: `unignore {file, index}`.
+                "index": r.index,
                 "file": r.source.display().to_string(),
+                "source": crate::allowlist::source_label(&r.source),
+                "removable": removable,
                 "comment": r.comment,
                 "name": r.spec.name,
                 "exe": r.spec.exe,
@@ -348,8 +470,126 @@ fn cmd_allowlist(d: &Daemon) -> Value {
         "rules": rules,
         "dir": d.cfg.paths.allowlist_dir.display().to_string(),
         "user_file": user.display().to_string(),
+        "baseline_file": d.cfg.paths.baseline_allowlist().display().to_string(),
         "errors": d.allowlist.failed,
     }))
+}
+
+/// `{"cmd":"baseline","action":"list|accept|dismiss|relearn|export|propose|undemote"}`
+/// (CONTRACT §11, BASELINE §3 and §4).
+fn cmd_baseline(d: &mut Daemon, req: &Value) -> Value {
+    let action = req.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+    let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let now = util::unix_secs();
+    match action {
+        "list" => ok(json!({
+            "learning": d.baseline.learning(now),
+            "learning_ends": d.baseline.learning_ends(),
+            "proposals": d.baseline.proposals(),
+            "learned": d.baseline.learned_entries(),
+            "demoted_rules": d.baseline.demoted_rules(),
+            "baseline_file": d.cfg.paths.baseline_allowlist().display().to_string(),
+        })),
+        "accept" => baseline_accept(d, id),
+        "dismiss" => match d.baseline.dismiss(id) {
+            Ok(p) => {
+                d.baseline.save_if_due(now, true);
+                ok(json!({"dismissed": p}))
+            }
+            Err(e) => err(e),
+        },
+        "relearn" => {
+            let days = req.get("days").and_then(|v| v.as_u64());
+            let until = d.baseline.relearn(days, now);
+            d.baseline.save_if_due(now, true);
+            log::info!("baseline: learning restarted until {}", util::rfc3339_of(until));
+            ok(json!({
+                "learning": true,
+                "learning_ends": util::rfc3339_of(until),
+                "days": days.unwrap_or(d.baseline.learning_days),
+            }))
+        }
+        "export" => {
+            let since = req.get("since").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+            let rows = d.baseline.export(since);
+            ok(json!({
+                "since": since,
+                "generated": util::now_rfc3339(),
+                "machine": std::fs::read_to_string("/etc/hostname")
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default(),
+                "trusted_repos": d.cfg.baseline.trusted_repos,
+                "count": rows.len(),
+                "tuples": rows,
+            }))
+        }
+        "propose" => {
+            let rule = req.get("rule").and_then(|v| v.as_str()).unwrap_or("");
+            if rule.is_empty() {
+                return err("`rule` is required for baseline propose");
+            }
+            let keys: Vec<String> = d
+                .baseline
+                .top_tuples(rule, req.get("top").and_then(|v| v.as_u64()).unwrap_or(5) as usize)
+                .iter()
+                .map(|t| t.key())
+                .collect();
+            let made = d.baseline.propose_keys(&keys);
+            d.baseline.save_if_due(now, true);
+            ok(json!({"rule": rule, "proposals": made}))
+        }
+        "undemote" => {
+            let rule = req.get("rule").and_then(|v| v.as_str()).unwrap_or("");
+            if rule.is_empty() {
+                return err("`rule` is required for baseline undemote");
+            }
+            if !d.baseline.undemote(rule) {
+                return err(format!("{} is not demoted", rule));
+            }
+            d.baseline.save_if_due(now, true);
+            log::info!("noise guard: {} is being watched again", rule);
+            ok(json!({"rule": rule, "demoted_rules": d.baseline.demoted_rules()}))
+        }
+        other => err(format!(
+            "unknown baseline action {:?}; use list, accept, dismiss, relearn, export, propose \
+             or undemote",
+            other
+        )),
+    }
+}
+
+fn baseline_accept(d: &mut Daemon, id: &str) -> Value {
+    let (p, comment) = match d.baseline.accept(id, &acting_user()) {
+        Ok(x) => x,
+        Err(e) => return err(e),
+    };
+    let path = d.cfg.paths.baseline_allowlist();
+    let spec = crate::allowlist::RuleSpec {
+        name: p.rule.clone(),
+        exe: (!p.exe.is_empty()).then(|| p.exe.clone()),
+        file: (!p.dir.is_empty()).then(|| format!("{}/*", p.dir.trim_end_matches('/'))),
+        parent: (!p.parent.is_empty()).then(|| p.parent.clone()),
+    };
+    let block = match crate::allowlist::append_rule(&path, &comment, &spec) {
+        Ok(b) => b,
+        Err(e) => return err(format!("{}: {}", path.display(), e)),
+    };
+    d.reload_allowlist();
+    d.baseline.save_if_due(util::unix_secs(), true);
+    log::info!("baseline: accepted proposal {} for {}", id, p.rule);
+    ok(json!({
+        "accepted": p,
+        "file": path.display().to_string(),
+        "block": block.trim_start_matches('\n'),
+    }))
+}
+
+/// Best effort: who the daemon can say accepted a proposal. The socket is
+/// group-readable, so this is the machine's account, not an identity claim.
+fn acting_user() -> String {
+    std::env::var("SUDO_USER")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "the console".into())
 }
 
 fn cmd_set(d: &mut Daemon, req: &Value) -> Value {
@@ -358,9 +598,31 @@ fn cmd_set(d: &mut Daemon, req: &Value) -> Value {
     match key {
         "mode" => set_mode(d, value),
         "sandbox" => set_sandbox(d, value),
+        "digest" => set_digest(d, value),
         "" => err("missing `key`"),
-        other => err(format!("unknown key {:?}; use mode or sandbox", other)),
+        other => err(format!(
+            "unknown key {:?}; use mode, sandbox or digest",
+            other
+        )),
     }
+}
+
+/// LEARNING §9: `moatctl set digest on|off` -> `state.json.digest_enabled`,
+/// and `status.digest`. The user timer keeps firing either way; with the digest
+/// off, `moatctl digest --notify` simply sends nothing, so switching it off
+/// needs neither root nor `systemctl`.
+fn set_digest(d: &mut Daemon, value: &str) -> Value {
+    let on = match value {
+        "on" | "true" | "1" => true,
+        "off" | "false" | "0" => false,
+        other => return err(format!("digest must be on or off, got {:?}", other)),
+    };
+    d.set_digest(on);
+    let mut v = d.digest(util::unix_secs()).to_json();
+    if let Some(o) = v.as_object_mut() {
+        o.insert("digest".into(), Value::Bool(on));
+    }
+    ok(v)
 }
 
 /// `tetra tp set-mode` takes effect immediately on the pinned `policy_conf` map
@@ -532,10 +794,15 @@ mod tests {
         cfg.paths.allowlist_dir = dir.join("allowlist.d");
         cfg.paths.tetragon_log = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/sample.log");
         cfg.paths.sandbox_flag = dir.join("sandbox.enabled");
+        // Snapshots and bundles must never touch the real /var/lib/moat.
+        cfg.analysis.bundle_dir = dir.join("incidents");
         cfg.paths.tetra = dir.join("no-such-tetra");
+        cfg.paths.pacman_local = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/pacman-local");
+        cfg.paths.pacman = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/fake-pacman");
         std::fs::create_dir_all(&cfg.paths.allowlist_dir).unwrap();
         let mut d = Daemon::new(cfg, &dir.join("moat.toml")).unwrap();
         d.homes = vec!["/home/dan".into()];
+        d.provenance.set_homes(&d.homes);
         let text = std::fs::read_to_string(&d.cfg.paths.tetragon_log).unwrap();
         for line in text.lines() {
             d.handle_line(line);
@@ -753,6 +1020,315 @@ mod tests {
             std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777,
             0o660
         );
+    }
+
+    // ---------------------------------------------- baselining (CONTRACT §11)
+
+    /// Put one accepted-shaped proposal in the daemon's baseline.
+    fn seed_proposal(d: &mut Daemon) -> String {
+        d.baseline.state.learning_until = 1; // the window is closed
+        let now = util::unix_secs();
+        for day in 0..3u64 {
+            d.baseline.observe(&crate::baseline::Observation {
+                rule: "moat-persist-hypr-config-write",
+                exe: "/usr/bin/restic",
+                parent: "/usr/bin/Hyprland",
+                dir: "/home/dan/.config/hypr",
+                severity: "low",
+                provenance: "official",
+                package: Some("restic 0.18.1-1".into()),
+                context: "service",
+                rarity: "common",
+                suppressed: false,
+                demoted: false,
+                ts: format!("2026-09-0{}T10:00:00.000Z", day + 1),
+                now,
+            });
+        }
+        d.baseline.proposals()[0].id.clone()
+    }
+
+    #[test]
+    fn baseline_list_reports_the_window_the_proposals_and_the_demotions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let id = seed_proposal(&mut d);
+        let r = dispatch(&mut d, &json!({"cmd":"baseline","action":"list"}));
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["learning"], false);
+        assert_eq!(r["proposals"].as_array().unwrap().len(), 1);
+        let p = &r["proposals"][0];
+        assert_eq!(p["id"], id);
+        for k in ["id", "rule", "exe", "parent", "dir", "count", "days", "first_seen", "last_seen", "toml"] {
+            assert!(p.get(k).is_some(), "proposal has no {}", k);
+        }
+        assert!(r["demoted_rules"].as_array().unwrap().is_empty());
+        assert!(r["baseline_file"].as_str().unwrap().ends_with("baseline.toml"));
+
+        // An unknown action is a clear error, not a silent default.
+        assert_eq!(dispatch(&mut d, &json!({"cmd":"baseline","action":"wat"}))["ok"], false);
+    }
+
+    #[test]
+    fn accepting_a_proposal_writes_the_exact_toml_it_advertised() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let id = seed_proposal(&mut d);
+        let advertised = d.baseline.proposal(&id).unwrap().toml.clone();
+
+        let r = dispatch(&mut d, &json!({"cmd":"baseline","action":"accept","id":id}));
+        assert_eq!(r["ok"], true, "{:?}", r);
+        let block = r["block"].as_str().unwrap();
+        assert!(block.contains(&advertised), "the block must match the promise");
+        assert!(block.contains("accepted by"), "{}", block);
+        assert!(r["file"].as_str().unwrap().ends_with("baseline.toml"));
+        // It is live, it is out of the proposal list, and it cannot be accepted twice.
+        assert_eq!(d.allowlist.len(), 1);
+        assert!(d.baseline.proposals().is_empty());
+        assert_eq!(dispatch(&mut d, &json!({"cmd":"baseline","action":"accept","id":id}))["ok"], false);
+
+        // And it shows up as a `learned` entry in the allowlist listing.
+        let al = dispatch(&mut d, &json!({"cmd":"allowlist"}));
+        assert_eq!(al["rules"][0]["source"], "learned");
+        assert_eq!(al["rules"][0]["removable"], true);
+        assert_eq!(al["rules"][0]["index"], 1);
+    }
+
+    #[test]
+    fn dismissing_a_proposal_drops_it_without_writing_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let id = seed_proposal(&mut d);
+        let r = dispatch(&mut d, &json!({"cmd":"baseline","action":"dismiss","id":id}));
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["dismissed"]["id"], id);
+        assert!(d.baseline.proposals().is_empty());
+        assert!(!d.cfg.paths.baseline_allowlist().exists());
+        assert_eq!(dispatch(&mut d, &json!({"cmd":"baseline","action":"dismiss","id":id}))["ok"], false);
+    }
+
+    #[test]
+    fn relearn_reopens_the_window_for_the_days_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        d.baseline.state.learning_until = 1;
+        let r = dispatch(&mut d, &json!({"cmd":"baseline","action":"relearn","days":14}));
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["learning"], true);
+        assert_eq!(r["days"], 14);
+        assert!(d.baseline.learning(util::unix_secs()));
+        assert_eq!(dispatch(&mut d, &json!({"cmd":"status"}))["baseline"]["learning"], true);
+    }
+
+    #[test]
+    fn export_dumps_every_tuple_with_the_reviewers_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        seed_proposal(&mut d);
+        let r = dispatch(&mut d, &json!({"cmd":"baseline","action":"export"}));
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["count"], r["tuples"].as_array().unwrap().len());
+        assert!(r["count"].as_u64().unwrap() >= 1);
+        let t = &r["tuples"][0];
+        for k in ["rule", "exe", "provenance", "parent", "dir", "context", "severity", "count", "days", "first_seen", "last_seen", "suppressed", "demoted", "toml"] {
+            assert!(t.get(k).is_some(), "export tuple has no {}", k);
+        }
+        assert!(r["trusted_repos"].as_array().unwrap().contains(&json!("core")));
+        // `--since` in the future filters everything out.
+        let r = dispatch(&mut d, &json!({"cmd":"baseline","action":"export","since":"2099-01-01"}));
+        assert_eq!(r["count"], 0);
+    }
+
+    #[test]
+    fn undemote_and_propose_are_the_two_answers_to_a_noisy_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        seed_proposal(&mut d);
+        d.baseline.dismiss(&d.baseline.proposals()[0].id.clone()).unwrap();
+
+        // "these are expected": propose the rule's top tuples.
+        let r = dispatch(&mut d, &json!({"cmd":"baseline","action":"propose","rule":"moat-persist-hypr-config-write"}));
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["proposals"].as_array().unwrap().len(), 1);
+        assert_eq!(dispatch(&mut d, &json!({"cmd":"baseline","action":"propose"}))["ok"], false);
+
+        // "keep watching": clear a demotion.
+        let now = util::unix_secs();
+        for i in 0..25 {
+            d.baseline.note_alert("moat-x-pkg-egress", now + i);
+        }
+        assert_eq!(dispatch(&mut d, &json!({"cmd":"status"}))["demoted_rules"][0], "moat-x-pkg-egress");
+        let r = dispatch(&mut d, &json!({"cmd":"baseline","action":"undemote","rule":"moat-x-pkg-egress"}));
+        assert_eq!(r["ok"], true);
+        assert!(r["demoted_rules"].as_array().unwrap().is_empty());
+        assert_eq!(dispatch(&mut d, &json!({"cmd":"baseline","action":"undemote","rule":"moat-x-pkg-egress"}))["ok"], false);
+    }
+
+    #[test]
+    fn unignore_takes_a_file_and_an_index_and_refuses_shipped_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let spec = crate::allowlist::RuleSpec {
+            name: "moat-persist-hypr-config-write".into(),
+            exe: Some("/usr/bin/hyprctl".into()),
+            ..Default::default()
+        };
+        crate::allowlist::append_rule(&d.cfg.paths.baseline_allowlist(), "learned", &spec).unwrap();
+        crate::allowlist::append_rule(
+            &d.cfg.paths.allowlist_dir.join("default.toml"),
+            "shipped",
+            &crate::allowlist::RuleSpec { name: "moat-net-*".into(), ..Default::default() },
+        )
+        .unwrap();
+        d.reload_allowlist();
+        assert_eq!(d.allowlist.len(), 2);
+
+        let list = dispatch(&mut d, &json!({"cmd":"allowlist"}));
+        let by_source: Vec<&str> = list["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["source"].as_str().unwrap())
+            .collect();
+        assert!(by_source.contains(&"learned") && by_source.contains(&"shipped"));
+
+        // A shipped file is refused with an explanation.
+        let r = dispatch(&mut d, &json!({"cmd":"unignore","file":"default.toml","index":1}));
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap().contains("shipped by the package"));
+
+        // A learned entry comes out the same way a user one does.
+        let r = dispatch(&mut d, &json!({"cmd":"unignore","file":"baseline.toml","index":1}));
+        assert_eq!(r["ok"], true, "{:?}", r);
+        assert!(r["removed"].as_str().unwrap().contains("hyprctl"));
+        assert_eq!(d.allowlist.len(), 1);
+        // Path traversal in `file` cannot escape allowlist.d.
+        assert_eq!(
+            dispatch(&mut d, &json!({"cmd":"unignore","file":"../../etc/passwd","index":1}))["ok"],
+            false
+        );
+    }
+
+    // ------------------------------- receipts, incidents, bundle, digest (§7)
+
+    /// LEARNING §7: `receipts` is informational and never looks like an alert.
+    #[test]
+    fn receipts_are_listed_and_rendered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let now = util::unix_secs();
+        d.handle_line(&format!(
+            r#"{{"process_exec":{{"process":{{"exec_id":"c-npm","pid":51201,"uid":1000,"cwd":"/home/dan/proj","binary":"/usr/bin/npm","arguments":"install","start_time":"{}"}}}}}}"#,
+            util::rfc3339_of(now)
+        ));
+        d.handle_line(r#"{"process_exit":{"process":{"exec_id":"c-npm","pid":51201,"binary":"/usr/bin/npm","arguments":"install"},"status":0}}"#);
+
+        let r = dispatch(&mut d, &json!({"cmd":"receipts","last":10}));
+        assert_eq!(r["ok"], true);
+        let list = r["receipts"].as_array().unwrap();
+        assert_eq!(list.len(), 1);
+        for k in [
+            "id", "root_exe", "root_args", "cwd", "started", "duration_s", "exit",
+            "postinstall_scripts", "writes_outside_project", "network", "credential_reads",
+            "persistence_writes", "execs_from_tree", "execs_from_tmp",
+        ] {
+            assert!(list[0].get(k).is_some(), "receipt has no {}", k);
+        }
+        assert!(r["rendered"][0].as_str().unwrap().starts_with("npm install in /home/dan/proj"));
+        // It is not in the alert stream and it is not in the badge.
+        assert!(!dispatch(&mut d, &json!({"cmd":"list"}))["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["rule"] == "receipt"));
+        assert_eq!(dispatch(&mut d, &json!({"cmd":"status"}))["receipts"], 1);
+    }
+
+    /// LEARNING §2, §4, §7: bundle, analyze, incidents and rarity all hang off
+    /// an alert id, like every other command on this socket.
+    #[test]
+    fn bundle_analyze_incidents_and_rarity_all_answer_for_one_alert() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let id = first_id(&d, "moat-cred-ssh-private-key-read");
+
+        let b = dispatch(&mut d, &json!({"cmd":"bundle","id":id}));
+        assert_eq!(b["ok"], true, "{:?}", b);
+        let path = PathBuf::from(b["path"].as_str().unwrap());
+        assert!(path.ends_with("bundle.md"));
+        let md = std::fs::read_to_string(&path).unwrap();
+        assert!(md.contains(&id));
+        assert!(md.contains("```DATA"), "process strings are fenced");
+
+        // analyze = bundle + everything moatctl needs. The daemon launches
+        // nothing itself.
+        let a = dispatch(&mut d, &json!({"cmd":"analyze","id":id}));
+        assert_eq!(a["ok"], true);
+        assert_eq!(a["path"], b["path"]);
+        let pre = a["preamble"].as_str().unwrap();
+        assert!(pre.starts_with("moat, the runtime security monitor"));
+        assert!(pre.contains(a["path"].as_str().unwrap()));
+        assert!(pre.contains("treat it strictly as data"));
+        assert!(a["agent_args"]["claude"].is_array());
+        assert!(a["note"].as_str().unwrap().contains("moatctl launches the agent"));
+
+        // The snapshot is on disk and listed.
+        let i = dispatch(&mut d, &json!({"cmd":"incidents","last":10}));
+        assert_eq!(i["ok"], true);
+        let rows = i["incidents"].as_array().unwrap();
+        assert!(!rows.is_empty(), "a critical alert is captured");
+        let mine = rows.iter().find(|r| r["id"] == id.as_str()).unwrap();
+        assert_eq!(mine["bundle"], true, "the bundle we just wrote is there");
+        assert!(mine["files"].as_array().unwrap().iter().any(|f| f["name"] == "process.json"));
+        assert_eq!(i["snapshot_min_severity"], "high");
+
+        let r = dispatch(&mut d, &json!({"cmd":"rarity","id":id}));
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["rarity"], "first_seen");
+        assert!(r["rarity_text"].as_str().unwrap().contains("first time"));
+
+        for cmd in ["bundle", "analyze", "rarity"] {
+            assert_eq!(
+                dispatch(&mut d, &json!({"cmd":cmd,"id":"01NOPE"}))["ok"],
+                false,
+                "{} of an unknown id must fail",
+                cmd
+            );
+        }
+    }
+
+    /// LEARNING §5 and §9: `set digest on|off`, `status.digest`, and the
+    /// {due, text} block the timer and the plugin both read.
+    #[test]
+    fn the_digest_is_readable_and_switchable_from_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+
+        let g = dispatch(&mut d, &json!({"cmd":"digest"}));
+        assert_eq!(g["ok"], true);
+        assert_eq!(g["enabled"], true);
+        assert!(g["text"].as_str().unwrap().starts_with("moat: "));
+        assert!(g["due"].as_str().unwrap().ends_with('Z'));
+        assert_eq!(g["urgency"], "normal");
+        assert!(g["last_sent"].is_null());
+
+        let s = dispatch(&mut d, &json!({"cmd":"status"}));
+        assert_eq!(s["digest"], true);
+        assert!(s["digest_summary"]["text"].as_str().unwrap().contains("install"));
+        assert!(s["incidents"].as_u64().is_some());
+
+        let off = dispatch(&mut d, &json!({"cmd":"set","key":"digest","value":"off"}));
+        assert_eq!(off["ok"], true);
+        assert_eq!(off["digest"], false);
+        assert_eq!(dispatch(&mut d, &json!({"cmd":"status"}))["digest"], false);
+        assert_eq!(dispatch(&mut d, &json!({"cmd":"digest"}))["enabled"], false);
+        assert_eq!(dispatch(&mut d, &json!({"cmd":"set","key":"digest","value":"on"}))["digest"], true);
+        assert_eq!(dispatch(&mut d, &json!({"cmd":"set","key":"digest","value":"maybe"}))["ok"], false);
+
+        // A delivery is recorded, so a catch-up run does not send twice.
+        let sent = dispatch(&mut d, &json!({"cmd":"digest","action":"sent"}));
+        assert!(sent["last_sent"].is_string());
+        assert_eq!(dispatch(&mut d, &json!({"cmd":"digest","action":"wat"}))["ok"], false);
     }
 
     #[test]

@@ -1,0 +1,11 @@
+%NAME%
+coreutils
+
+%VERSION%
+9.11-2
+
+%ARCH%
+x86_64
+
+%VALIDATION%
+sha256

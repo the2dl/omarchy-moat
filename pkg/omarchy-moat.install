@@ -17,6 +17,15 @@ post_install() {
     2. sudo usermod -aG moat $USER
     3. Log out and back in (the new group only applies to a fresh session).
     4. omarchy plugin add https://github.com/the2dl/omarchy-moat --enable
+    5. systemctl --user enable --now moat-digest.timer
+
+  Step 5 is the weekly digest: one normal-urgency notification a week
+  ("moat: 0 incidents, 18 installs watched, 3 baseline proposals to review")
+  and the only scheduled notification Moat ever sends. It is a *user* timer,
+  not a system one, because desktop notifications belong to your session --
+  run it as yourself, without sudo. Turn the content off with
+  `moatctl set digest off` (the timer then delivers nothing), or drop the
+  timer entirely with `systemctl --user disable --now moat-digest.timer`.
 
   Then check it:
 
@@ -42,8 +51,18 @@ post_upgrade() {
 
     sudo systemctl restart tetragon moatd
 
-  (Restarting tetragon re-runs `moatd render-policies`, which rewrites
-  /run/moat/policies and /etc/tetragon/tetragon.conf.d/export-allowlist.)
+  In that order, and as one command: moatd.service is Requires=+After=
+  tetragon.service, so restarting moatd first would leave it reading a log
+  that the old Tetragon is still writing with the old policy set, and
+  restarting tetragon alone leaves moatd holding the previous policies'
+  annotations -- alerts would carry the old titles, severities and `why`
+  text for policies that no longer exist. Restarting tetragon re-runs
+  `moatd render-policies`, which rewrites /run/moat/policies and
+  /etc/tetragon/tetragon.conf.d/export-allowlist; moatd picks the rendered
+  set up on its own start (or on `systemctl reload moatd`, which is SIGHUP).
+
+  If you enabled the weekly digest, the user timer needs nothing: it only
+  runs `moatctl digest --notify`, which talks to whatever moatd is running.
 
   Check for .pacnew files under /etc/moat and /etc/tetragon if you have
   edited the shipped configuration.
@@ -58,9 +77,10 @@ pre_remove() {
   failed units around:
 
     sudo systemctl disable --now tetragon moatd moat-feeds.timer
+    systemctl --user disable --now moat-digest.timer
 
-  /var/lib/moat (alerts, quarantine, feeds) and /var/log/moat are not
-  removed by pacman; delete them by hand if you want them gone.
+  /var/lib/moat (alerts, quarantine, feeds, incidents) and /var/log/moat
+  are not removed by pacman; delete them by hand if you want them gone.
 
 EOF
 }

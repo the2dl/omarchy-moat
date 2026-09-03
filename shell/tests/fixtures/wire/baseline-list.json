@@ -1,0 +1,33 @@
+{
+  "learning": false,
+  "learning_ends": "2026-09-03T20:07:38.000Z",
+  "proposals": [
+    {
+      "id": "01M1ME4NACVF1XYFBR0E3A64C3",
+      "rule": "moat-persist-omarchy-plugin-write",
+      "exe": "/usr/bin/restic",
+      "parent": "/usr/lib/systemd/systemd",
+      "dir": "/home/moattest/.config/omarchy/plugins/backup-restore",
+      "count": 4,
+      "days": 1,
+      "first_seen": "2026-09-03T20:07:38.572Z",
+      "last_seen": "2026-09-03T20:07:38.572Z",
+      "toml": "[[rule]]\nname = \"moat-persist-omarchy-plugin-write\"\nexe = \"/usr/bin/restic\"\nfile = \"/home/moattest/.config/omarchy/plugins/backup-restore/*\"\nparent = \"/usr/lib/systemd/systemd\"\n",
+      "key": "moat-persist-omarchy-plugin-write|/usr/bin/restic|/usr/lib/systemd/systemd|/home/moattest/.config/omarchy/plugins/backup-restore"
+    }
+  ],
+  "learned": [
+    {
+      "key": "moat-persist-desktop-entry-write|/usr/bin/restic|/usr/lib/systemd/systemd|/home/moattest/.local/share/applications",
+      "rule": "moat-persist-desktop-entry-write",
+      "exe": "/usr/bin/restic",
+      "written": "2026-09-03T20:07:37.168Z",
+      "revoked": null
+    }
+  ],
+  "demoted_rules": [
+    "moat-persist-omarchy-menu-extension-write"
+  ],
+  "baseline_file": "/etc/moat/allowlist.d/baseline.toml",
+  "ok": true
+}

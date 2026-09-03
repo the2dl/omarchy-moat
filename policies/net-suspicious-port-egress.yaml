@@ -1,0 +1,81 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-net-suspicious-port-egress
+  annotations:
+    moat.omarchy/severity: "medium"
+    moat.omarchy/title: "Connection to an unusual public port"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,ignore"
+    moat.omarchy/why: >-
+      Legitimate services live on 443 and 80. A connection out to 4444, 31337 or a
+      low unassigned port on a public address is a C2 or exfiltration channel, and it
+      happens before any file the payload drops is ever executed. moatd raises this to
+      high when the connecting process is inside a package-manager subtree, which is
+      the ancestry the kernel cannot see (notes Gaps 1).
+    moat.omarchy/expected: >-
+      Often, on a workstation: git over SSH (port 22), IRC, XMPP and game clients, a
+      private registry or corporate proxy on a custom port, VPN and tunnel clients, and
+      dev servers reaching a public API. RFC1918, loopback, link-local and IPv6 ULA
+      destinations never fire - they are excluded in-kernel.
+    moat.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  # No matchParentBinaries here any more. The package-manager-subtree variant of this
+  # rule matched quickshell, Xwayland and make with no package manager anywhere in
+  # their ancestry, and npm/pnpm/yarn are node scripts, so the kernel only ever records
+  # the interpreter. The subtree question is answered in moatd from exec_id ancestry.
+  - call: "tcp_connect"
+    syscall: false
+    message: "Connection to an unusual public port"
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Family"
+        values: ["AF_INET", "AF_INET6"]
+      - index: 0
+        operator: "NotDAddr"
+        values:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+        - "127.0.0.0/8"
+        - "169.254.0.0/16"
+        - "::1/128"
+        - "fc00::/7"
+        - "fe80::/10"
+      - index: 0
+        operator: "DPort"
+        values: ["1:79", "81:442", "444:1023"]
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"
+    - matchArgs:
+      - index: 0
+        operator: "Family"
+        values: ["AF_INET", "AF_INET6"]
+      - index: 0
+        operator: "NotDAddr"
+        values:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+        - "127.0.0.0/8"
+        - "169.254.0.0/16"
+        - "::1/128"
+        - "fc00::/7"
+        - "fe80::/10"
+      - index: 0
+        operator: "DPort"
+        values: ["1337", "4444", "5555", "31337"]
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

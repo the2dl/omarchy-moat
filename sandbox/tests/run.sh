@@ -468,8 +468,23 @@ else
 fi
 
 # ...and skips the scan with a warning when the scanner is not installed.
+#
+# "Not installed" has to be true of the whole PATH, and on a machine where the
+# omarchy-moat package IS installed /usr/bin/moat-scan-pkgbuild would be found
+# and the case would silently test nothing (it did: the assertion below caught
+# the real scanner reporting "clean: no findings"). So the system bin directory
+# is replaced, for this one invocation, by a symlink farm of itself with the
+# scanner removed — everything the shim and moat-sandbox need is still there.
+# It lives under $PROJ, i.e. under $PWD, because that is the one directory the
+# sandbox binds through: anything in $TMPROOT is hidden by the /tmp tmpfs and
+# the real makepkg's own `#!/usr/bin/env bash` would not resolve.
+NOSCAN_BIN=$PROJ/noscan-bin
+rm -rf -- "$NOSCAN_BIN"
+mkdir -p "$NOSCAN_BIN"
+cp -as /usr/bin/. "$NOSCAN_BIN"/ 2>/dev/null || true
+rm -f "$NOSCAN_BIN/moat-scan-pkgbuild"
 rm -f "$PROJ/moat-scan-pkgbuild"
-out=$(cd "$PROJ" && env PATH="$SHIMS:$PROJ:$SANDBOX_DIR:/usr/bin:/bin" HOME="$FAKE_HOME" \
+out=$(cd "$PROJ" && env PATH="$SHIMS:$PROJ:$SANDBOX_DIR:$NOSCAN_BIN" HOME="$FAKE_HOME" \
 	XDG_CONFIG_HOME="$FAKE_HOME/.config" \
 	"$SHIMS/makepkg" -f </dev/null 2>&1)
 if [[ $out == *"skipping the PKGBUILD scan"* && $out == *"REAL makepkg argv:-f"* ]]; then
@@ -492,7 +507,7 @@ else
 	no "MOAT_SANDBOX=0 skips the PKGBUILD scan as well as the sandbox" "rc=$rc out=$out"
 fi
 
-rm -f "$PROJ/PKGBUILD" "$PROJ/makepkg" "$PROJ/cargo" "$PROJ/npm" "$PROJ/moat-scan-pkgbuild"
+rm -rf "$PROJ/PKGBUILD" "$PROJ/makepkg" "$PROJ/cargo" "$PROJ/npm" "$PROJ/moat-scan-pkgbuild" "$NOSCAN_BIN"
 
 # ------------------------------------------------- (g) MOAT_SANDBOX=0 ----
 

@@ -270,6 +270,72 @@ pub fn append_rule(path: &Path, comment: &str, spec: &RuleSpec) -> std::io::Resu
     Ok(block)
 }
 
+/// Where an allowlist entry came from, for the panel's Allowlist tab
+/// (BASELINE §8 "Resolved shapes").
+///
+/// * `user` — `user.toml`, written by `moatctl ignore`
+/// * `learned` — `baseline.toml`, written by the learning window or by accepting
+///   a proposal
+/// * `shipped` — anything else (`default.toml`, `omarchy-default.toml`), which
+///   belongs to the package and is not removable from the UI
+pub fn source_label(file: &Path) -> &'static str {
+    match file.file_name().and_then(|n| n.to_str()) {
+        Some("user.toml") => "user",
+        Some("baseline.toml") => "learned",
+        _ => "shipped",
+    }
+}
+
+pub fn is_removable(file: &Path) -> bool {
+    matches!(source_label(file), "user" | "learned")
+}
+
+/// Comment out the `index`-th `[[rule]]` block in place, keeping it visible with
+/// a reason above it. Used when a learned entry's actor stops being official:
+/// deleting it would hide the fact that moat ever trusted it (LEARNING §1).
+///
+/// Returns the disabled text.
+pub fn disable_rule(path: &Path, index: usize, reason: &str) -> Result<String, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let (preamble, blocks) = split_blocks(&text);
+    if index == 0 || index > blocks.len() {
+        return Err(format!(
+            "no rule {} in {} ({} rules)",
+            index,
+            path.display(),
+            blocks.len()
+        ));
+    }
+    let mut out = preamble;
+    let mut disabled = String::new();
+    for (i, b) in blocks.iter().enumerate() {
+        if i + 1 == index {
+            disabled.push_str(&format!("# DISABLED {}: {}\n", crate::util::now_rfc3339(), reason));
+            for line in b.text.lines() {
+                if line.trim().is_empty() {
+                    disabled.push('\n');
+                } else if line.trim_start().starts_with('#') {
+                    disabled.push_str(line);
+                    disabled.push('\n');
+                } else {
+                    disabled.push_str(&format!("# {}\n", line));
+                }
+            }
+            out.push_str(&disabled);
+        } else {
+            out.push_str(&b.text);
+        }
+    }
+    crate::util::atomic_write(path, out.as_bytes(), 0o644).map_err(|e| e.to_string())?;
+    Ok(disabled)
+}
+
+/// Index of the first `[[rule]]` block in `path` matching `spec`, 1-based.
+pub fn find_index(path: &Path, spec: &RuleSpec) -> Option<usize> {
+    let rules = Allowlist::load_file(path).ok()?;
+    rules.iter().position(|r| &r.spec == spec).map(|i| i + 1)
+}
+
 /// Remove the `index`-th (1-based) `[[rule]]` block from `path`.
 /// Returns the removed text.
 pub fn remove_rule(path: &Path, index: usize) -> Result<String, String> {
@@ -477,12 +543,125 @@ exe = "/usr/bin/gnome-keyring-daemon"
     }
 
     #[test]
+    fn a_learned_entry_is_disabled_in_place_with_its_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("baseline.toml");
+        append_rule(
+            &p,
+            "learned 2026-09-03: seen 9 times on 3 distinct days",
+            &RuleSpec {
+                name: "moat-persist-hypr-config-write".into(),
+                exe: Some("/usr/bin/hyprctl".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        append_rule(&p, "second", &RuleSpec { name: "moat-net-*".into(), ..Default::default() }).unwrap();
+        assert_eq!(Allowlist::load_file(&p).unwrap().len(), 2);
+
+        let text = disable_rule(&p, 1, "the owning package is no longer official").unwrap();
+        assert!(text.contains("# DISABLED"));
+        assert!(text.contains("no longer official"));
+        // The entry stops matching, the other one is untouched, and the record
+        // of what moat once trusted is still readable in the file.
+        let left = Allowlist::load_file(&p).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].spec.name, "moat-net-*");
+        let on_disk = std::fs::read_to_string(&p).unwrap();
+        assert!(on_disk.contains("# exe = \"/usr/bin/hyprctl\""), "{}", on_disk);
+        assert!(disable_rule(&p, 9, "x").is_err());
+    }
+
+    #[test]
+    fn entries_are_labelled_by_the_file_they_came_from() {
+        assert_eq!(source_label(Path::new("/etc/moat/allowlist.d/user.toml")), "user");
+        assert_eq!(source_label(Path::new("/etc/moat/allowlist.d/baseline.toml")), "learned");
+        assert_eq!(source_label(Path::new("/etc/moat/allowlist.d/omarchy-default.toml")), "shipped");
+        assert!(is_removable(Path::new("/x/user.toml")));
+        assert!(is_removable(Path::new("/x/baseline.toml")));
+        assert!(!is_removable(Path::new("/x/default.toml")));
+    }
+
+    #[test]
+    fn find_index_locates_a_block_by_its_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("baseline.toml");
+        let a = RuleSpec { name: "r-a".into(), exe: Some("/x".into()), ..Default::default() };
+        let b = RuleSpec { name: "r-b".into(), ..Default::default() };
+        append_rule(&p, "a", &a).unwrap();
+        append_rule(&p, "b", &b).unwrap();
+        assert_eq!(find_index(&p, &a), Some(1));
+        assert_eq!(find_index(&p, &b), Some(2));
+        assert_eq!(find_index(&p, &RuleSpec { name: "nope".into(), ..Default::default() }), None);
+    }
+
+    #[test]
     fn shipped_defaults_parse() {
-        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("etc/allowlist.d/default.toml");
-        let rules = Allowlist::load_file(&p).expect("default.toml must parse");
-        assert!(!rules.is_empty());
-        for r in &rules {
-            assert!(!r.comment.is_empty(), "every default rule explains itself");
+        for name in ["default.toml", "omarchy-default.toml"] {
+            let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("etc/allowlist.d")
+                .join(name);
+            let rules = Allowlist::load_file(&p).unwrap_or_else(|e| panic!("{}: {}", name, e));
+            assert!(!rules.is_empty(), "{} has no rules", name);
+            for r in &rules {
+                assert!(!r.comment.is_empty(), "{}: every rule explains itself", name);
+                assert_eq!(source_label(&r.source), "shipped");
+                assert!(!is_removable(&r.source), "{} must not be removable", name);
+            }
+        }
+    }
+
+    /// BASELINE §5: moat's own build and tests are not incidents — and the
+    /// entry that says so must be as narrow as the paragraph promises.
+    #[test]
+    fn the_shipped_baseline_covers_moats_own_test_suite_and_nothing_wider() {
+        let p =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("etc/allowlist.d/omarchy-default.toml");
+        let al = Allowlist {
+            rules: Allowlist::load_file(&p).unwrap(),
+            ..Default::default()
+        };
+        assert_eq!(al.len(), 4, "two rules x two exe globs, nothing else");
+
+        let parent = "/home/dan/Projects/omarchy-moat/moatd/target/debug/deps/moatd-16a3beb0";
+        // The two rules the paragraph names, for both globs.
+        for rule in ["moat-exec-untrusted-tmpfs", "moat-pkg-subtree-netcat-exec"] {
+            for exe in ["/tmp/.tmpAbC123/nc", "/tmp/.tmpAbC123/moat-helper"] {
+                assert!(
+                    al.find(&Candidate {
+                        rule,
+                        exe,
+                        file: None,
+                        parents: vec![parent.to_string()],
+                    })
+                    .is_some(),
+                    "{} {} is the test suite",
+                    rule,
+                    exe
+                );
+            }
+        }
+        // Nothing wider: a real dropper, the same binary from a shell, another
+        // rule, or a plain /tmp path all still alert.
+        for (rule, exe, parents) in [
+            ("moat-exec-untrusted-tmpfs", "/tmp/.tmpAbC123/nc", vec!["/usr/bin/bash"]),
+            ("moat-exec-untrusted-tmpfs", "/tmp/nc", vec![parent]),
+            ("moat-exec-untrusted-tmpfs", "/tmp/.tmpAbC123/evil", vec![parent]),
+            ("moat-cred-ssh-private-key-read", "/tmp/.tmpAbC123/nc", vec![parent]),
+            ("moat-exec-untrusted-tmpfs", "/home/dan/.cache/nc", vec![parent]),
+        ] {
+            assert!(
+                al.find(&Candidate {
+                    rule,
+                    exe,
+                    file: None,
+                    parents: parents.iter().map(|s| s.to_string()).collect(),
+                })
+                .is_none(),
+                "{} {} must still alert",
+                rule,
+                exe
+            );
         }
     }
 }
