@@ -637,7 +637,20 @@ hardcoded `/usr/bin/moatctl`, `/var/lib/moat/alerts.jsonl`,
    (seam check g), so this is latent rather than live. Honouring a reported
    `surface: "timeline"` would close it.
 
-8. **`shell/tests/fixtures/wire/list.json` is 120 KB.** Real daemon output with
+8. **Cross-process `/proc/<pid>/environ` reads are not covered.** The technique
+   is real credential theft — the environment holds `GITHUB_TOKEN`,
+   `AWS_SECRET_ACCESS_KEY` and database URLs with the password inline — but a
+   rule for it flags *process enumeration*, which is ordinary on a developer
+   desktop: `pgrep`, `herdr` and `quickshell` all do it, and silencing them
+   would mean allowlisting the desktop shell, which is where a hijacked plugin
+   runs. Measured at 126 high alerts in four idle minutes. The rule, the
+   working self-read filter (`moatd/src/rules/self_proc_read.rs`) and the full
+   evidence are parked in `policies/incubating/`; what it needs is target
+   awareness — alerting on whose environment is read, not merely that one was.
+   Not a regression: the previous shape alerted on everything and was
+   permanently demoted, which is not coverage either.
+
+9. **`shell/tests/fixtures/wire/list.json` is 120 KB.** Real daemon output with
    a full `explain` block per alert is bulky, and 25 alerts is already the
    trimmed scenario. If it becomes a problem, capture `list --limit` with a
    filter rather than hand-editing the fixture — it is only worth anything while

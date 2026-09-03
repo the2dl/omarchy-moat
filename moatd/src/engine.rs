@@ -395,6 +395,19 @@ impl Daemon {
         let path = hook.file_path();
         let hook_name = hook.hook_name();
 
+        // Never alert on our own reads. Taking an incident snapshot means
+        // reading /proc/<pid>/{environ,status,cmdline,fd} for the alerting
+        // process and every live ancestor (incident.rs), and any file rule that
+        // covers those paths turns that into a fresh alert — which takes another
+        // snapshot, which reads more. A /proc/<pid>/environ rule under test on
+        // 2026-09-03 produced 126 high alerts in four idle minutes this way.
+        // The daemon watching its own evidence-gathering is a loop, not a
+        // detection, so it is cut here rather than in each policy's
+        // matchBinaries, where the next rule would forget it.
+        if proc.pid == std::process::id() {
+            return None;
+        }
+
         // The environ rule matches `Postfix /environ` in the kernel, because a
         // selector cannot compare the path's pid against the opener's. The exact
         // cut is here: reading your own environment is not credential theft, and
@@ -1798,6 +1811,34 @@ mod tests {
         d.cfg.paths.tetragon_log = dir.path().join("no-such.log");
         assert_eq!(d.tetragon_state(), "stopped");
         assert!(d.sensor_unhealthy());
+    }
+
+    /// The daemon must not alert on its own reads. An incident snapshot reads
+    /// /proc/<pid>/{environ,status,cmdline,fd} for the alerting process and
+    /// every ancestor, so any file rule covering those paths turns one alert
+    /// into an unbounded chain of them.
+    #[test]
+    fn moatd_never_alerts_on_its_own_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        let me = std::process::id();
+
+        let line = |pid: u32| {
+            format!(
+                r#"{{"process_kprobe":{{"process":{{"exec_id":"e-{pid}","pid":{pid},"uid":0,"binary":"/usr/bin/moatd","arguments":"run","cwd":"/","start_time":"2026-09-03T16:21:00.000000000Z"}},"function_name":"security_file_post_open","policy_name":"moat-cred-ssh-private-key-read","args":[{{"file_arg":{{"path":"/home/dan/.ssh/id_ed25519"}}}},{{"int_arg":4}}]}},"time":"2026-09-03T16:21:00.100Z"}}"#
+            )
+        };
+
+        // Somebody else doing it is exactly what the rule is for.
+        let other = if me == 4242 { 4243 } else { 4242 };
+        let n = d.store.load().len();
+        d.handle_line(&line(other));
+        assert!(d.store.load().len() > n, "another process still alerts");
+
+        // Us doing it is the loop, and must produce nothing at all.
+        let n = d.store.load().len();
+        d.handle_line(&line(me));
+        assert_eq!(d.store.load().len(), n, "moatd must not alert on itself");
     }
 
     fn replay(d: &mut Daemon) {
