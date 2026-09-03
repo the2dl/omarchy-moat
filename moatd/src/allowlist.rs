@@ -623,44 +623,81 @@ exe = "/usr/bin/gnome-keyring-daemon"
         };
         assert_eq!(
             al.len(),
-            5,
+            6,
             "two test-suite rules x two exe globs, plus the omarchy-shell plugin \
-             exec entry — nothing else"
+             exec entry and the agent-usage credential read — nothing else"
         );
 
         // omarchy-shell running its own plugins' helper scripts. Scoped to that
         // actor and that tree: everything else executing from there still fires,
         // and quickshell executing from anywhere else still fires.
         let plugin = "/home/dan/.config/omarchy/plugins/io.github.x.thing/scripts/config";
-        assert!(
-            al.find(&Candidate {
-                rule: "moat-exec-untrusted-home",
-                exe: "/usr/bin/quickshell",
-                file: Some(plugin),
-                parents: vec!["/usr/bin/quickshell".to_string()],
-            })
-            .is_some(),
-            "the shell running its own plugin helper"
-        );
-        for (exe, file) in [
-            // Someone else executing out of the plugins tree is the actual threat.
-            ("/usr/bin/bash", plugin),
-            ("/home/dan/.cache/dropper", plugin),
-            // The shell executing something outside the plugins tree.
-            ("/usr/bin/quickshell", "/home/dan/.cache/evil"),
-            ("/usr/bin/quickshell", "/tmp/evil"),
-            // Adjacent path that only looks like the plugins tree.
-            ("/usr/bin/quickshell", "/home/dan/.config/omarchy-plugins-evil/x"),
-        ] {
+        let under_shell = vec![
+            "/usr/bin/python3.14".to_string(),
+            "/usr/bin/quickshell".to_string(),
+            "/usr/bin/Hyprland".to_string(),
+        ];
+        // Scoped by ancestry, because the helper is as often run through an
+        // interpreter as by the shell directly: both must be covered.
+        for exe in ["/usr/bin/quickshell", "/usr/bin/python3.14", "/usr/bin/bash"] {
             assert!(
                 al.find(&Candidate {
                     rule: "moat-exec-untrusted-home",
                     exe,
+                    file: Some(plugin),
+                    parents: under_shell.clone(),
+                })
+                .is_some(),
+                "{} running a plugin helper under the shell",
+                exe
+            );
+        }
+        // Nothing wider. Not descended from the shell, or not the plugins tree.
+        let no_shell = vec!["/usr/bin/bash".to_string(), "/usr/bin/sshd".to_string()];
+        for (file, parents) in [
+            (plugin, no_shell.clone()),
+            ("/home/dan/.cache/evil", under_shell.clone()),
+            ("/tmp/evil", under_shell.clone()),
+            ("/home/dan/.config/omarchy-plugins-evil/x", under_shell.clone()),
+        ] {
+            assert!(
+                al.find(&Candidate {
+                    rule: "moat-exec-untrusted-home",
+                    exe: "/usr/bin/python3.14",
                     file: Some(file),
-                    parents: vec!["/usr/bin/quickshell".to_string()],
+                    parents,
                 })
                 .is_none(),
-                "must still alert: {} executing {}",
+                "must still alert: executing {}",
+                file
+            );
+        }
+
+        // The bar's agent-usage widget reading the Claude credentials file.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-cred-ai-credentials-read",
+                exe: "/usr/share/omarchy/bin/omarchy-agent-usage-claude",
+                file: Some("/home/dan/.claude/.credentials.json"),
+                parents: under_shell.clone(),
+            })
+            .is_some()
+        );
+        // Any other reader of that file, and that reader against any other file.
+        for (exe, file) in [
+            ("/usr/bin/curl", "/home/dan/.claude/.credentials.json"),
+            ("/usr/share/omarchy/bin/omarchy-agent-usage-other", "/home/dan/.claude/.credentials.json"),
+            ("/usr/share/omarchy/bin/omarchy-agent-usage-claude", "/home/dan/.aws/credentials"),
+        ] {
+            assert!(
+                al.find(&Candidate {
+                    rule: "moat-cred-ai-credentials-read",
+                    exe,
+                    file: Some(file),
+                    parents: under_shell.clone(),
+                })
+                .is_none(),
+                "must still alert: {} reading {}",
                 exe,
                 file
             );

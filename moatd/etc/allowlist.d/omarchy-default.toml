@@ -62,11 +62,30 @@ parent = "*/target/*/deps/moatd-*"
 # spawns those helpers as part of drawing the bar — `scripts/config` alone fires
 # every ~30s, which on 2026-09-03 was 8 high alerts a minute on an idle desktop.
 #
-# Scoped to quickshell as the actor and the plugins tree as the target, so this
-# does not weaken the rule generally: anything else executing out of the plugins
-# directory still fires, and a plugin *appearing or changing* is a different
-# question entirely, still covered by moat-persist-omarchy-plugin-write.
+# Scoped by ancestry, not by actor: a plugin helper is often run through an
+# interpreter, so the process doing the exec is python3.14 or bash as often as it
+# is quickshell itself — scoping on exe caught only a third of them. `parent`
+# matches any ancestor, so this says "somewhere under the shell", which is the
+# thing that is actually trustworthy here.
+#
+# It does not weaken the rule generally: the same script executed from a shell
+# you opened, or from anything not descended from omarchy-shell, still fires. And
+# a plugin *appearing or changing* is a different question entirely, still
+# covered by moat-persist-omarchy-plugin-write.
 [[rule]]
 name = "moat-exec-untrusted-home"
-exe = "/usr/bin/quickshell"
+parent = "/usr/bin/quickshell"
 file = "/home/*/.config/omarchy/plugins/*"
+
+# The bar's agent-usage widget reads the Claude credentials file to report your
+# usage. omarchy-agent-usage-claude is an Omarchy binary under /usr/share, run by
+# omarchy-agent-usage-update from the shell, and reading that file is the whole
+# job — but it is also literally what credential theft looks like, which is why
+# the rule fires and why this entry names the one binary rather than the family.
+#
+# Anything else reading ~/.claude/.credentials.json still fires, including the
+# same file read by a different Omarchy helper.
+[[rule]]
+name = "moat-cred-ai-credentials-read"
+exe = "/usr/share/omarchy/bin/omarchy-agent-usage-claude"
+file = "/home/*/.claude/.credentials.json"
