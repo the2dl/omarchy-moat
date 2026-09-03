@@ -623,9 +623,10 @@ exe = "/usr/bin/gnome-keyring-daemon"
         };
         assert_eq!(
             al.len(),
-            6,
-            "two test-suite rules x two exe globs, plus the omarchy-shell plugin \
-             exec entry and the agent-usage credential read — nothing else"
+            7,
+            "two test-suite rules x two exe globs, the omarchy-shell plugin exec \
+             entry, the agent-usage credential read, and the sandbox suite's \
+             fake toolchain — nothing else"
         );
 
         // omarchy-shell running its own plugins' helper scripts. Scoped to that

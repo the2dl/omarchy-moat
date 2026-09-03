@@ -1841,6 +1841,34 @@ mod tests {
         assert_eq!(d.store.load().len(), n, "moatd must not alert on itself");
     }
 
+    /// A finding at high severity captures an incident snapshot, and that
+    /// snapshot sha256s the file the event named. So a fixture that names a
+    /// real path makes the test suite *open that file* — and every fixture
+    /// here is a credential path by construction. Naming the developer's own
+    /// ~/.ssh/id_rsa meant `cargo test` read their private key on every run,
+    /// and raised three real moat-cred-ssh-private-key-read alerts while doing
+    /// it. Fixture paths must not exist.
+    #[test]
+    fn no_test_fixture_names_a_path_that_exists_on_this_machine() {
+        let src = include_str!("engine.rs");
+        let mut bad = Vec::new();
+        for cap in src.split('"').filter(|s| s.starts_with("/home/") || s.starts_with("/root/")) {
+            let path = cap.split_whitespace().next().unwrap_or(cap);
+            // Directories are fine and expected: tests name $HOME and a cwd.
+            // A regular *file* is the hazard, because that is what gets opened.
+            if std::path::Path::new(path).is_file() {
+                bad.push(path.to_string());
+            }
+        }
+        bad.sort();
+        bad.dedup();
+        assert!(
+            bad.is_empty(),
+            "fixtures name real paths on this machine, so the suite reads them: {:?}",
+            bad
+        );
+    }
+
     fn replay(d: &mut Daemon) {
         let text = std::fs::read_to_string(&d.cfg.paths.tetragon_log).unwrap();
         for line in text.lines() {
@@ -2843,7 +2871,7 @@ mod tests {
             t0
         ));
         // A credential read inside the install, and a persistence write.
-        d.handle_line(r#"{"process_kprobe":{"process":{"exec_id":"r-node","pid":41233,"uid":1000,"binary":"/usr/bin/node","cwd":"/home/dan/proj","parent_exec_id":"r-npm2"},"function_name":"security_file_permission","policy_name":"moat-cred-ssh-private-key-read","args":[{"file_arg":{"path":"/home/dan/.ssh/id_rsa"}},{"int_arg":4}]},"time":"2026-09-03T16:21:07.000Z"}"#);
+        d.handle_line(r#"{"process_kprobe":{"process":{"exec_id":"r-node","pid":41233,"uid":1000,"binary":"/usr/bin/node","cwd":"/home/dan/proj","parent_exec_id":"r-npm2"},"function_name":"security_file_permission","policy_name":"moat-cred-ssh-private-key-read","args":[{"file_arg":{"path":"/home/dan/.ssh/id_rsa_moat_fixture"}},{"int_arg":4}]},"time":"2026-09-03T16:21:07.000Z"}"#);
 
         assert_eq!(d.store.receipts().len(), 0, "nothing until the root exits");
         // The nested npm exiting is not the end of the install.
@@ -2859,7 +2887,7 @@ mod tests {
         assert_eq!(r.cwd, "/home/dan/proj");
         assert_eq!(r.exit, 0);
         assert_eq!(r.postinstall_scripts, vec!["evil"], "the node_modules package");
-        assert_eq!(r.credential_reads, vec!["/home/dan/.ssh/id_rsa"]);
+        assert_eq!(r.credential_reads, vec!["/home/dan/.ssh/id_rsa_moat_fixture"]);
         assert_eq!(r.execs_from_tmp, 1);
         assert!(!r.id.is_empty());
         // A receipt is not an alert: it never reaches the badge.

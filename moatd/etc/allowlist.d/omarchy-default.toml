@@ -89,3 +89,14 @@ file = "/home/*/.config/omarchy/plugins/*"
 name = "moat-cred-ai-credentials-read"
 exe = "/usr/share/omarchy/bin/omarchy-agent-usage-claude"
 file = "/home/*/.claude/.credentials.json"
+
+# The sandbox suite builds a fake toolchain under /tmp/moat-sandbox-test.*/bin
+# and runs the real shims against it, so the shim execs a binary from a tmpfs —
+# which is the rule, exercised on purpose. Scoped by ancestry rather than by
+# actor for the same reason as the plugin entry above: the exec is done by bash
+# or env as often as by the shim itself. A binary under that prefix executed
+# outside a shim, or any other tmpfs path, still fires.
+[[rule]]
+name = "moat-exec-untrusted-tmpfs"
+file = "/tmp/moat-sandbox-test.*/*"
+parent = "*/sandbox/shims/*"
