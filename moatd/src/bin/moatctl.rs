@@ -162,8 +162,14 @@ enum BaselineCmd {
         #[arg(long, default_value_t = 5)]
         top: u64,
     },
-    /// Clear a demotion: go back to watching this rule.
-    Undemote { rule: String },
+    /// Clear a demotion: go back to watching this rule, or all of them.
+    Undemote {
+        rule: Option<String>,
+        /// Clear every demotion. Use after a retune: the demotions on the board
+        /// were caused by the noise you just fixed.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -342,9 +348,12 @@ fn baseline_request(a: &BaselineCmd) -> Value {
         BaselineCmd::Propose { rule, top } => {
             json!({"cmd": "baseline", "action": "propose", "rule": rule, "top": top})
         }
-        BaselineCmd::Undemote { rule } => {
-            json!({"cmd": "baseline", "action": "undemote", "rule": rule})
-        }
+        BaselineCmd::Undemote { rule, all } => json!({
+            "cmd": "baseline",
+            "action": "undemote",
+            "rule": rule.clone().unwrap_or_default(),
+            "all": all,
+        }),
     }
 }
 
@@ -871,7 +880,21 @@ fn print_baseline(a: &BaselineCmd, r: &Value) {
             }
             println!("Review them with `moatctl baseline list`.");
         }
-        BaselineCmd::Undemote { rule } => println!("{} is being watched again", rule),
+        BaselineCmd::Undemote { rule, all } => {
+            if *all {
+                match r["cleared"].as_array() {
+                    Some(c) if c.is_empty() => println!("nothing was demoted"),
+                    Some(c) => {
+                        for x in c {
+                            println!("{} is being watched again", x.as_str().unwrap_or("?"));
+                        }
+                    }
+                    None => println!("nothing was demoted"),
+                }
+            } else {
+                println!("{} is being watched again", rule.clone().unwrap_or_default());
+            }
+        }
     }
 }
 
@@ -1005,7 +1028,7 @@ mod tests {
             (BaselineCmd::Relearn { days: Some(14) }, "relearn"),
             (BaselineCmd::Export { since: Some("2026-09-01".into()) }, "export"),
             (BaselineCmd::Propose { rule: "moat-x-pkg-egress".into(), top: 5 }, "propose"),
-            (BaselineCmd::Undemote { rule: "moat-x-pkg-egress".into() }, "undemote"),
+            (BaselineCmd::Undemote { rule: Some("moat-x-pkg-egress".into()), all: false }, "undemote"),
         ];
         for (cmd, action) in &cases {
             let r = baseline_request(cmd);

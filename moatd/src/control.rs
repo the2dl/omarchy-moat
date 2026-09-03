@@ -570,8 +570,32 @@ fn cmd_baseline(d: &mut Daemon, req: &Value) -> Value {
         }
         "undemote" => {
             let rule = req.get("rule").and_then(|v| v.as_str()).unwrap_or("");
+            // Clearing every demotion at once. After a retune the demotions on
+            // the board were caused by rules that no longer exist or no longer
+            // misfire, and they are silencing whatever shares the board with
+            // them — moat-cred-ssh-private-key-read was demoted on 2026-09-03 by
+            // a flood from unrelated rules. They do expire on their own 24 h
+            // later, but a day of a silenced key-theft rule is a day too long,
+            // and clearing them one name at a time invites the text-parsing that
+            // gets a rule name wrong.
+            if req["all"] == Value::Bool(true) {
+                let cleared: Vec<String> = d
+                    .baseline
+                    .demoted_rules()
+                    .into_iter()
+                    .filter(|r| d.baseline.undemote(r))
+                    .collect();
+                for r in &cleared {
+                    log::info!("noise guard: {} is being watched again", r);
+                }
+                d.baseline.save_if_due(now, true);
+                return ok(json!({
+                    "cleared": cleared,
+                    "demoted_rules": d.baseline.demoted_rules()
+                }));
+            }
             if rule.is_empty() {
-                return err("`rule` is required for baseline undemote");
+                return err("`rule` is required for baseline undemote (or pass --all)");
             }
             if !d.baseline.undemote(rule) {
                 return err(format!("{} is not demoted", rule));
@@ -1054,6 +1078,42 @@ mod tests {
         let id = first_id(&d, "moat-cred-ssh-private-key-read");
         assert_eq!(dispatch(&mut d, &json!({"cmd":"ack","id":id}))["ok"], true);
         assert!(d.find_alert(&id).unwrap().acked);
+    }
+
+    /// Demotions outlive the noise that caused them by up to 24 h, and they
+    /// silence whatever shares the board: a flood from unrelated rules demoted
+    /// moat-cred-ssh-private-key-read on 2026-09-03.
+    #[test]
+    fn undemote_all_clears_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let now = crate::util::unix_secs();
+        for rule in ["moat-cred-ssh-private-key-read", "moat-exec-untrusted-home"] {
+            for _ in 0..(d.baseline.noisy_rule_per_day + 2) {
+                d.baseline.note_alert(rule, now);
+            }
+            assert!(d.baseline.is_demoted(rule), "{} should be demoted", rule);
+        }
+
+        let r = dispatch(&mut d, &json!({"cmd":"baseline","action":"undemote","all":true}));
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["cleared"].as_array().unwrap().len(), 2);
+        assert!(d.baseline.demoted_rules().is_empty(), "board is clear");
+
+        // Idempotent, and still an honest answer when there is nothing to do.
+        let r = dispatch(&mut d, &json!({"cmd":"baseline","action":"undemote","all":true}));
+        assert_eq!(r["ok"], true);
+        assert!(r["cleared"].as_array().unwrap().is_empty());
+
+        // Without --all a name is still required, and still has to be demoted.
+        assert_eq!(
+            dispatch(&mut d, &json!({"cmd":"baseline","action":"undemote"}))["ok"],
+            false
+        );
+        assert_eq!(
+            dispatch(&mut d, &json!({"cmd":"baseline","action":"undemote","rule":"moat-nope"}))["ok"],
+            false
+        );
     }
 
     /// A retune leaves a backlog about rules that no longer exist. Acking it
