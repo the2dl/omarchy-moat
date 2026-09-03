@@ -2358,6 +2358,17 @@ mod tests {
             // BASELINE §5: only high and critical reach the Alerts tab.
             if a.surface == "alerts" {
                 assert!(a.severity_rank() >= 2, "{} is {} on the Alerts tab", a.rule, a.severity);
+                // ...and nothing already answered for reaches it at all. The
+                // recorded surface is the only thing a reader working from
+                // alerts.jsonl alone has (an offline audit, the setup screen),
+                // so it has to agree with what the UI shows rather than relying
+                // on every consumer to recompute it.
+                assert!(
+                    a.suppressed_by.is_none(),
+                    "{} is suppressed by {:?} but recorded on the Alerts tab",
+                    a.rule,
+                    a.suppressed_by
+                );
             }
             let ev = a.explain.evidence.join("\n");
             assert!(ev.contains("actor: "), "{} has no actor evidence", a.rule);

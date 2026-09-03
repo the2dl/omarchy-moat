@@ -152,7 +152,19 @@ pub fn build_alert(f: &Finding, id: &str, ts: &str, allowlist_file: &str, allowl
         .unwrap_or_else(|| crate::scoring::Score::unadjusted(&f.meta.severity));
     let rarity = f.rarity.clone();
     // A demoted rule is not suppressed; it just stops being an Alerts-tab item.
-    let surface = if f.demoted { "timeline".to_string() } else { score.surface.clone() };
+    // A suppressed alert belongs on the timeline exactly as a demoted one does.
+    // The plugin already recomputes it that way, so only the *recorded* surface
+    // was wrong — but that is the field anything reading alerts.jsonl on its own
+    // has to trust (an offline audit, the setup screen, a measurement of how
+    // noisy an idle machine is). INTEGRATION.md section 6.7 predicted this as
+    // latent; on 2026-09-03 it was live: 38 allowlisted omarchy-shell plugin
+    // execs were recorded surface "alerts" while the UI correctly showed them on
+    // the timeline and never notified.
+    let surface = if f.demoted || f.suppressed_by.is_some() {
+        "timeline".to_string()
+    } else {
+        score.surface.clone()
+    };
 
     Alert {
         v: ALERT_V,

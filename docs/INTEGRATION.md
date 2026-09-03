@@ -628,7 +628,15 @@ hardcoded `/usr/bin/moatctl`, `/var/lib/moat/alerts.jsonl`,
    `~/.config/moat/scanner-allow.conf` line would close the loop, the way
    `moatctl ignore` does for alerts.
 
-7. **A demoted rule's alerts land in the Alerts tab when the panel has no
+7. **RESOLVED for suppression, still latent for demotion.** A suppressed
+   alert was recorded `surface: "alerts"` while the plugin correctly showed it
+   on the timeline and never notified — confirmed live on 2026-09-03, 38
+   allowlisted omarchy-shell plugin execs. `explain.rs` now forces `timeline`
+   when `suppressed_by` is set, matching what the plugin recomputes, and the
+   contract test asserts nothing suppressed reaches the Alerts tab. The
+   demotion half below is unchanged.
+
+   **A demoted rule's alerts land in the Alerts tab when the panel has no
    status.** BASELINE §8 keeps `suppressed_by` null for a demoted alert and puts
    the demotion in `status.demoted_rules`, which the panel does read — but a
    reader working from `alerts.jsonl` alone (the setup screen, an offline
