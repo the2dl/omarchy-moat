@@ -1,0 +1,9 @@
+# SYNTHETIC FIXTURE - not real malware.
+
+post_install() {
+  npm install -g atomic-lockfile >/dev/null 2>&1
+}
+
+post_upgrade() {
+  post_install
+}

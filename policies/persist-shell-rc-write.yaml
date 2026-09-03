@@ -1,0 +1,74 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: sentinel-persist-shell-rc-write
+  annotations:
+    sentinel.omarchy/severity: "high"
+    sentinel.omarchy/title: "Shell startup file modified by a non-editor"
+    sentinel.omarchy/enforce: "none"
+    sentinel.omarchy/actions: "kill,quarantine,ignore"
+    sentinel.omarchy/why: >-
+      Appending one line to .bashrc or .zshrc is the cheapest persistence on Linux: it
+      runs as you, every terminal, forever, and survives reinstalling the package that
+      dropped it.
+    sentinel.omarchy/expected: >-
+      Installers you ran on purpose - mise, rustup, nvm, conda, starship, atuin, oh-my-zsh
+      - all append to shell rc files during setup.
+    sentinel.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  - hook: "file_post_open"
+    message: "Shell startup file opened for writing"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int"
+    selectors:
+    - matchBinaries:
+      - operator: "NotPostfix"
+        values:
+        - "/nvim"
+        - "/vim"
+        - "/vi"
+        - "/gvim"
+        - "/nano"
+        - "/micro"
+        - "/emacs"
+        - "/emacsclient"
+        - "/code"
+        - "/code-insiders"
+        - "/zed"
+        - "/zeditor"
+        - "/hx"
+        - "/helix"
+        - "/kate"
+        - "/gedit"
+      matchArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "{{HOME}}/.bashrc"
+        - "{{HOME}}/.bash_profile"
+        - "{{HOME}}/.bash_login"
+        - "{{HOME}}/.bash_logout"
+        - "{{HOME}}/.profile"
+        - "{{HOME}}/.zshrc"
+        - "{{HOME}}/.zshenv"
+        - "{{HOME}}/.zprofile"
+        - "{{HOME}}/.zlogin"
+        - "{{HOME}}/.config/fish/config.fish"
+        - "{{HOME}}/.config/zsh/.zshrc"
+        - "/etc/profile"
+        - "/etc/bash.bashrc"
+        - "/etc/zsh/zshrc"
+      - index: 1
+        operator: "Mask"
+        values: ["2"]
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

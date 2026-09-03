@@ -1,0 +1,50 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: sentinel-priv-ptrace-attach
+  annotations:
+    sentinel.omarchy/severity: "high"
+    sentinel.omarchy/title: "Process attached to another process with ptrace"
+    sentinel.omarchy/enforce: "none"
+    sentinel.omarchy/actions: "kill,ignore"
+    sentinel.omarchy/why: >-
+      Attaching to a running process reads its memory and injects code into it: this is
+      how tokens are lifted out of a running browser, an ssh-agent or a password manager
+      without ever touching a file on disk.
+    sentinel.omarchy/expected: >-
+      gdb, lldb, strace, ltrace, perf, rr and delve while you debug, and
+      systemd-coredump when something crashes.
+    sentinel.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  - hook: "ptrace_access_check"
+    message: "ptrace attach requested by an unexpected binary"
+    args:
+    - index: 1
+      type: "uint32"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/gdb"
+        - "/usr/bin/gdbserver"
+        - "/usr/bin/lldb"
+        - "/usr/bin/lldb-server"
+        - "/usr/bin/strace"
+        - "/usr/bin/ltrace"
+        - "/usr/bin/perf"
+        - "/usr/bin/rr"
+        - "/usr/bin/valgrind"
+        - "/usr/bin/dlv"
+        - "/usr/lib/systemd/systemd-coredump"
+      matchArgs:
+      - index: 1
+        operator: "Mask"
+        values: ["2"]
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

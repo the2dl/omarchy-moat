@@ -1,0 +1,55 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: sentinel-rootkit-bpf-prog-load
+  annotations:
+    sentinel.omarchy/severity: "high"
+    sentinel.omarchy/title: "eBPF program loaded by an unexpected binary"
+    sentinel.omarchy/enforce: "none"
+    sentinel.omarchy/actions: "kill,ignore"
+    sentinel.omarchy/why: >-
+      Modern Linux rootkits are eBPF programs: they hide processes and files and tamper
+      with the very telemetry that would show them. On a desktop the only things that
+      load BPF are systemd, container runtimes and this sensor.
+    sentinel.omarchy/expected: >-
+      Docker, containerd, podman and Cilium load BPF on every container start; systemd
+      loads it for cgroup and socket filters. bpftrace, bcc tools and perf if you use
+      them.
+    sentinel.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  - hook: "bpf"
+    message: "BPF_PROG_LOAD from an unexpected binary"
+    args:
+    - index: 0
+      type: "int"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/tetragon"
+        - "/usr/lib/tetragon/bpftool"
+        - "/usr/bin/bpftool"
+        - "/usr/lib/systemd/systemd"
+        - "/usr/lib/systemd/systemd-networkd"
+        - "/usr/lib/systemd/systemd-resolved"
+        - "/usr/lib/systemd/systemd-udevd"
+        - "/usr/bin/dockerd"
+        - "/usr/bin/containerd"
+        - "/usr/bin/runc"
+        - "/usr/bin/crun"
+        - "/usr/bin/podman"
+        - "/usr/bin/cilium-agent"
+        - "/usr/bin/ip"
+        - "/usr/bin/tc"
+      matchArgs:
+      - index: 0
+        operator: "Equal"
+        values: ["5"]
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

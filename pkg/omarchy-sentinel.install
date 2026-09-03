@@ -1,0 +1,66 @@
+# omarchy-sentinel: post-install guidance only.
+#
+# This file never enables, starts or restarts a unit. Arch's own alpm hooks
+# already handle the parts that can be automated:
+#   /usr/share/libalpm/hooks/20-systemd-sysusers.hook -> systemd-sysusers
+#   /usr/share/libalpm/hooks/21-systemd-tmpfiles.hook -> systemd-tmpfiles --create
+#   /usr/share/libalpm/hooks/30-systemd-daemon-reload-system.hook
+# so the `sentinel` group, /var/lib/sentinel, /var/log/sentinel and /run/sentinel
+# exist by the time pacman returns. Running them here would only duplicate work.
+
+post_install() {
+	cat <<'EOF'
+
+  Sentinel is installed but not running. Next steps:
+
+    1. sudo systemctl enable --now tetragon sentineld sentinel-feeds.timer
+    2. sudo usermod -aG sentinel $USER
+    3. Log out and back in (the new group only applies to a fresh session).
+    4. omarchy plugin add https://github.com/the2dl/omarchy-sentinel --enable
+
+  Then check it:
+
+    sentinelctl status
+
+  Sentinel starts in monitor mode: it alerts, it never kills. Switch with
+  `sentinelctl set mode enforce`. The bubblewrap shims are off until
+  `sentinelctl set sandbox on`, which needs a new login shell to take effect.
+
+  Config lives in /etc/sentinel; docs in /usr/share/doc/omarchy-sentinel.
+
+EOF
+}
+
+post_upgrade() {
+	cat <<'EOF'
+
+  Sentinel was upgraded. Nothing was restarted for you.
+
+  Tetragon reads its tracing policies once, at startup, and has no hot-reload,
+  so new or changed policies are not live until you restart it. sentineld
+  likewise loads its config and policy annotations at start:
+
+    sudo systemctl restart tetragon sentineld
+
+  (Restarting tetragon re-runs `sentineld render-policies`, which rewrites
+  /run/sentinel/policies and /etc/tetragon/tetragon.conf.d/export-allowlist.)
+
+  Check for .pacnew files under /etc/sentinel and /etc/tetragon if you have
+  edited the shipped configuration.
+
+EOF
+}
+
+pre_remove() {
+	cat <<'EOF'
+
+  Disable the services before removing the package, or systemd will keep
+  failed units around:
+
+    sudo systemctl disable --now tetragon sentineld sentinel-feeds.timer
+
+  /var/lib/sentinel (alerts, quarantine, feeds) and /var/log/sentinel are not
+  removed by pacman; delete them by hand if you want them gone.
+
+EOF
+}

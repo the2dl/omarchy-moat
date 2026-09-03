@@ -1,0 +1,56 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: sentinel-pkg-subtree-netcat-exec
+  annotations:
+    sentinel.omarchy/severity: "critical"
+    sentinel.omarchy/title: "Package install ran netcat or socat"
+    sentinel.omarchy/enforce: "kill"
+    sentinel.omarchy/actions: "kill,quarantine,ignore"
+    sentinel.omarchy/why: >-
+      No legitimate build step needs netcat, socat or telnet. Inside a package install
+      tree these binaries mean one thing: a reverse shell or an exfiltration channel.
+    sentinel.omarchy/expected: >-
+      Effectively never. A hand-written Makefile that waits for a local port with nc is
+      the only benign case seen in practice.
+    sentinel.omarchy/fp-hint: "parent"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  - hook: "bprm_check_security"
+    message: "Netcat or socat executed inside a package manager process tree"
+    args:
+    - index: 0
+      type: "linux_binprm"
+    selectors:
+    - matchParentBinaries:
+      - operator: "In"
+        followChildren: true
+        values:
+        - "/usr/bin/npm"
+        - "/usr/bin/npx"
+        - "/usr/bin/pnpm"
+        - "/usr/bin/yarn"
+        - "/usr/bin/bun"
+        - "/usr/bin/node"
+        - "/usr/local/bin/node"
+        - "/usr/bin/pip"
+        - "/usr/bin/pip3"
+        - "/usr/bin/uv"
+        - "/usr/bin/cargo"
+        - "/usr/bin/makepkg"
+      matchArgs:
+      - index: 0
+        operator: "Postfix"
+        values:
+        - "/nc"
+        - "/ncat"
+        - "/netcat"
+        - "/nc.openbsd"
+        - "/nc.traditional"
+        - "/socat"
+        - "/telnet"
+      matchActions:
+      - action: Sigkill

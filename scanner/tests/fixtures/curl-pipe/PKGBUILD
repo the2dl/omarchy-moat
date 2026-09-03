@@ -1,0 +1,24 @@
+# SYNTHETIC FIXTURE. The build fetches and runs whatever the vendor's server
+# is serving at build time - two spellings of the same anti-pattern.
+
+pkgname=vendor-sdk
+pkgver=5.0.1
+pkgrel=1
+pkgdesc="Vendor SDK installer wrapper"
+arch=('x86_64')
+url="https://github.com/example-org/vendor-sdk"
+license=('custom')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff')
+
+prepare() {
+  curl -fsSL https://install.example.tld/setup.sh | sh
+}
+
+build() {
+  bash <(wget -qO- https://install.example.tld/stage-two.sh)
+}
+
+package() {
+  install -Dm755 "$srcdir/vendor-sdk" "$pkgdir/usr/bin/vendor-sdk"
+}

@@ -1,0 +1,52 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: sentinel-net-tmpfs-binary-egress
+  annotations:
+    sentinel.omarchy/severity: "critical"
+    sentinel.omarchy/title: "Binary running from /tmp or /dev/shm connected to the internet"
+    sentinel.omarchy/enforce: "kill"
+    sentinel.omarchy/actions: "kill,quarantine,ignore"
+    sentinel.omarchy/why: >-
+      A program that lives in a world-writable directory and then talks to a public
+      address is a dropped implant checking in. Legitimate software is installed, not
+      dropped in /tmp.
+    sentinel.omarchy/expected: >-
+      Rare. A downloaded installer you unpacked into /tmp and ran on purpose, or a build
+      tool executing a temporary binary that fetches something.
+    sentinel.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  - call: "tcp_connect"
+    syscall: false
+    message: "Temporary-directory binary connected to a non-private address"
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchBinaries:
+      - operator: "Prefix"
+        values:
+        - "/tmp/"
+        - "/var/tmp/"
+        - "/dev/shm/"
+      matchArgs:
+      - index: 0
+        operator: "Family"
+        values: ["AF_INET", "AF_INET6"]
+      - index: 0
+        operator: "NotDAddr"
+        values:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+        - "127.0.0.0/8"
+        - "169.254.0.0/16"
+        - "::1/128"
+        - "fc00::/7"
+        - "fe80::/10"
+      matchActions:
+      - action: Sigkill

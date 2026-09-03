@@ -1,0 +1,47 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: sentinel-priv-setuid-chmod
+  annotations:
+    sentinel.omarchy/severity: "high"
+    sentinel.omarchy/title: "Setuid or setgid bit set on a file"
+    sentinel.omarchy/enforce: "none"
+    sentinel.omarchy/actions: "kill,quarantine,ignore"
+    sentinel.omarchy/why: >-
+      A setuid-root copy of bash or of any small helper is the standard way to keep root
+      after a single privileged moment; it is one chmod away and nothing else on a
+      desktop sets these bits outside package installs.
+    sentinel.omarchy/expected: >-
+      pacman installing a package that ships a setuid binary (sudo, ping, mount), and
+      makepkg or install -m 4755 inside a build.
+    sentinel.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  - hook: "path_chmod"
+    message: "Setuid or setgid bit set on a file"
+    args:
+    - index: 0
+      type: "path"
+    - index: 1
+      type: "uint16"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/pacman"
+        - "/usr/bin/bsdtar"
+        - "/usr/bin/tar"
+        - "/usr/bin/install"
+        - "/usr/bin/fakeroot"
+        - "/usr/bin/rsync"
+      matchArgs:
+      - index: 1
+        operator: "Mask"
+        values: ["2048", "1024"]
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

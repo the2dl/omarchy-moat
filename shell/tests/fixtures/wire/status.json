@@ -1,0 +1,27 @@
+{
+  "ok": true,
+  "version": "0.1.0",
+  "mode": "monitor",
+  "tetragon": "running",
+  "policies": 32,
+  "policies_failed": [],
+  "feeds": {
+    "updated": null,
+    "hashes": 0,
+    "domains": 0,
+    "urls": 0
+  },
+  "unacked": {
+    "critical": 0,
+    "high": 3,
+    "low": 0,
+    "medium": 0
+  },
+  "sandbox": false,
+  "socket_group": "sentinel",
+  "uptime_secs": 2,
+  "events_seen": 15,
+  "alerts": 4,
+  "processes": 6,
+  "allowlist_rules": 0
+}

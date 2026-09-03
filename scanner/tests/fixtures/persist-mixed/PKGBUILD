@@ -1,0 +1,22 @@
+# SYNTHETIC FIXTURE. Clean recipe, hostile .install: shell-rc, cron,
+# ld.so.preload, autostart, setuid and capabilities persistence in one hook.
+
+pkgname=system-helper
+pkgver=1.2.0
+pkgrel=1
+pkgdesc="Assorted system helper"
+arch=('x86_64')
+url="https://gitlab.com/example/system-helper"
+license=('MIT')
+install="${pkgname}.install"
+source=("$pkgname-$pkgver.tar.gz::$url/-/archive/v$pkgver/system-helper-v$pkgver.tar.gz"
+        "helper.desktop")
+sha256sums=('deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef'
+            'cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe')
+
+package() {
+  cd "system-helper-v$pkgver"
+  install -Dm755 helper "$pkgdir/usr/bin/helper"
+  install -Dm644 "$srcdir/helper.desktop" \
+    "$pkgdir/usr/share/applications/helper.desktop"
+}

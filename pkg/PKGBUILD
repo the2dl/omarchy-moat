@@ -1,0 +1,260 @@
+# Maintainer: the omarchy-sentinel authors
+#
+# IMPORTANT: run makepkg from inside this directory (pkg/).
+#
+#     cd pkg && makepkg -f
+#
+# makepkg has no source type for "a sibling directory of the PKGBUILD"
+# (`../sentineld` is not a valid source= entry), so the components we build
+# ourselves are copied out of the repository working tree in prepare() using
+# $startdir/.. -- the standard pattern for a PKGBUILD that lives inside the
+# repository it packages. That makes $startdir load-bearing: makepkg must be
+# invoked with pkg/ as the working directory, and prepare() fails loudly if
+# the repository root is not where it expects.
+
+pkgname=omarchy-sentinel
+pkgver=0.1.0
+pkgrel=1
+_tetragonver=1.7.1
+pkgdesc='eBPF supply-chain sensor for Omarchy: Tetragon policies, an alert daemon, a bubblewrap sandbox and a PKGBUILD scanner'
+arch=('x86_64')
+url='https://github.com/the2dl/omarchy-sentinel'
+# Apache-2.0: the bundled, unmodified Tetragon v1.7.1 (its eBPF objects are
+# GPL-2.0, see /usr/share/licenses/omarchy-sentinel/LICENSE.tetragon-bpf).
+# MIT: everything in this repository.
+license=('Apache-2.0' 'MIT')
+depends=(
+	'bash'          # sentinel-sandbox, the shims and shim-common.sh
+	'bubblewrap'    # sentinel-sandbox is a bwrap wrapper; hard dependency
+	'python'        # sentinel-scan-pkgbuild, stdlib only, python3
+)
+makedepends=('cargo')
+optdepends=(
+	'gum: interactive confirm prompt when the makepkg shim finds a high severity issue'
+	'fish: the shim PATH snippet is also installed for fish'
+)
+# !debug + !lto: a Rust release build; cargo owns codegen, and the release
+#   profile already sets strip = true, so there is nothing for makepkg to do.
+# !strip: makepkg's tidy-install strips every ELF it finds, which rewrites the
+#   94 upstream CO-RE BPF objects under /usr/lib/tetragon/bpf (26 sections down
+#   to 17) and the two Go binaries. Tetragon is meant to ship byte-identical to
+#   upstream, and a stripped BPF object is a CO-RE relocation waiting to fail.
+options=('!debug' '!lto' '!strip')
+install="${pkgname}.install"
+
+# The Tetragon tarball checksum is the one published next to the release as
+# tetragon-v1.7.1-amd64.tar.gz.sha256sum. Never SKIP: this is the one artifact
+# in the package we do not build ourselves.
+source=(
+	"https://github.com/cilium/tetragon/releases/download/v${_tetragonver}/tetragon-v${_tetragonver}-amd64.tar.gz"
+	"tetragon-${_tetragonver}-LICENSE::https://raw.githubusercontent.com/cilium/tetragon/v${_tetragonver}/LICENSE"
+	"tetragon-${_tetragonver}-LICENSE.bpf::https://raw.githubusercontent.com/cilium/tetragon/v${_tetragonver}/bpf/LICENSE.GPL-2.0"
+	'LICENSE.MIT'
+	'scanner-allow.conf'
+)
+sha256sums=(
+	'2f36a7bbb2b3d77a011383a01c8f804fe7761d934a76ff2fdf99ebad6f3e89ae'
+	'f096c31ac0fb2e66df5b7ec20049741ae15accd50c8cd4d100b4db6c9353f6aa'
+	'0d5bf346df9e635a29dcdddf832dc5b002ca6cdc1c5c9c6c567d2a61bb0c5c15'
+	'f71f5f48fd154c8e02cac6e35b27a2aa1cc20761b55095c1ffdf6ec70dc2b113'
+	'98db41efad2bb18a9db0c593b8aa70fda7435cfb0b8b895307f172106be0a4fa'
+)
+
+# One flag per file, Tetragon's own convention (CONTRACT section 2). All of
+# them are backup= entries: they are the knobs a user turns.
+_confd=(
+	bpf-lib
+	cgroup-rate
+	enable-process-environment-variables
+	event-queue-size
+	export-allowlist
+	export-file-compress
+	export-file-max-backups
+	export-file-max-size-mb
+	export-filename
+	filter-environment-variables
+	gops-address
+	health-server-address
+	log-format
+	log-level
+	metrics-server
+	parents-map-enabled
+	process-cache-size
+	server-address
+	tracing-policy-dir
+)
+
+backup=(
+	"${_confd[@]/#/etc/tetragon/tetragon.conf.d/}"
+	etc/sentinel/sentinel.toml
+	etc/sentinel/feeds.toml
+	etc/sentinel/allowlist.d/default.toml
+	etc/sentinel/sandbox.conf
+	etc/sentinel/scanner-allow.conf
+)
+
+# The repository working tree, copied into $srcdir by prepare().
+_tree="${pkgname}-tree"
+
+prepare() {
+	local repo="${startdir}/.."
+
+	if [[ ! -f ${repo}/docs/CONTRACT.md || ! -f ${repo}/sentineld/Cargo.toml ]]; then
+		error 'run makepkg from the pkg/ directory of the omarchy-sentinel checkout'
+		return 1
+	fi
+
+	rm -rf "${srcdir:?}/${_tree}"
+	install -d "${srcdir}/${_tree}"
+	cp -a \
+		"${repo}/sentineld" \
+		"${repo}/policies" \
+		"${repo}/sandbox" \
+		"${repo}/scanner" \
+		"${repo}/docs" \
+		"${repo}/README.md" \
+		"${srcdir}/${_tree}/"
+
+	# A developer's ./target would otherwise be reused (and its stale
+	# artifacts shipped) inside the build.
+	rm -rf "${srcdir}/${_tree}/sentineld/target"
+
+	# Vendor the crates now so build() can stay on --locked and the exact
+	# Cargo.lock in the repository is what gets compiled.
+	cd "${srcdir}/${_tree}/sentineld"
+	export RUSTUP_TOOLCHAIN=stable
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+	cd "${srcdir}/${_tree}/sentineld"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	cargo build --release --locked
+}
+
+check() {
+	cd "${srcdir}/${_tree}/sentineld"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	cargo test --release --locked
+
+	# Structural validation of the policy templates against the Tetragon
+	# v1.7.1 grammar: a policy that would be rejected at daemon start is
+	# caught here instead.
+	cd "${srcdir}/${_tree}"
+	python3 policies/check.py policies
+
+	cd "${srcdir}/${_tree}/scanner"
+	python3 -m unittest discover tests
+
+	# Real bubblewrap, unprivileged, entirely inside a mktemp directory.
+	# This works under makepkg because makepkg itself runs unprivileged;
+	# only package() is fakeroot'd, and this is not package().
+	cd "${srcdir}/${_tree}"
+	bash sandbox/tests/run.sh
+}
+
+package() {
+	local tetragon="${srcdir}/tetragon-v${_tetragonver}-amd64"
+	local tree="${srcdir}/${_tree}"
+
+	# --- upstream Tetragon, unmodified ---------------------------------
+	# The tarball stages under /usr/local; Arch packages own /usr.
+	install -Dm755 "${tetragon}/usr/local/bin/tetragon" "${pkgdir}/usr/bin/tetragon"
+	install -Dm755 "${tetragon}/usr/local/bin/tetra"    "${pkgdir}/usr/bin/tetra"
+
+	install -d "${pkgdir}/usr/lib/tetragon/bpf"
+	install -m644 "${tetragon}/usr/local/lib/tetragon/bpf/"*.o "${pkgdir}/usr/lib/tetragon/bpf/"
+
+	install -Dm755 "${tetragon}/usr/local/lib/tetragon/bpftool" "${pkgdir}/usr/lib/tetragon/bpftool"
+	install -Dm755 "${tetragon}/usr/local/lib/tetragon/gops"    "${pkgdir}/usr/lib/tetragon/gops"
+
+	# --- Tetragon configuration (ours, not upstream's) -----------------
+	install -d "${pkgdir}/etc/tetragon/tetragon.conf.d"
+	local f
+	for f in "${_confd[@]}"; do
+		if [[ ${f} == export-allowlist ]]; then
+			# Regenerated byte for byte by `sentineld render-policies`
+			# on every tetragon.service start (Tetragon has no policy
+			# hot-reload and policy_names has no glob). Shipped so the
+			# export is already filtered on a first, pre-render start.
+			install -m644 "${tree}/policies/export-allowlist.example" \
+				"${pkgdir}/etc/tetragon/tetragon.conf.d/export-allowlist"
+		else
+			install -m644 "${tree}/policies/tetragon.conf.d/${f}" \
+				"${pkgdir}/etc/tetragon/tetragon.conf.d/${f}"
+		fi
+	done
+
+	# --- policy templates ({{HOME}} placeholders) ----------------------
+	install -d "${pkgdir}/usr/lib/sentinel/policies"
+	install -m644 "${tree}/policies/"*.yaml "${pkgdir}/usr/lib/sentinel/policies/"
+
+	# --- systemd ------------------------------------------------------
+	install -Dm644 "${tree}/policies/tetragon.service" \
+		"${pkgdir}/usr/lib/systemd/system/tetragon.service"
+	install -Dm644 "${tree}/sentineld/systemd/sentineld.service" \
+		"${pkgdir}/usr/lib/systemd/system/sentineld.service"
+	install -Dm644 "${tree}/sentineld/systemd/sentinel-feeds.service" \
+		"${pkgdir}/usr/lib/systemd/system/sentinel-feeds.service"
+	install -Dm644 "${tree}/sentineld/systemd/sentinel-feeds.timer" \
+		"${pkgdir}/usr/lib/systemd/system/sentinel-feeds.timer"
+	install -Dm644 "${tree}/sentineld/systemd/sysusers.d/sentinel.conf" \
+		"${pkgdir}/usr/lib/sysusers.d/sentinel.conf"
+	# /run/sentinel/policies (the rendered policies) comes from here, not
+	# from the package: it lives on tmpfs.
+	install -Dm644 "${tree}/sentineld/systemd/tmpfiles.d/sentinel.conf" \
+		"${pkgdir}/usr/lib/tmpfiles.d/sentinel.conf"
+
+	# --- our binaries -------------------------------------------------
+	install -Dm755 "${tree}/sentineld/target/release/sentineld"      "${pkgdir}/usr/bin/sentineld"
+	install -Dm755 "${tree}/sentineld/target/release/sentinelctl"    "${pkgdir}/usr/bin/sentinelctl"
+	install -Dm755 "${tree}/sentineld/target/release/sentinel-feeds" "${pkgdir}/usr/bin/sentinel-feeds"
+	install -Dm755 "${tree}/sandbox/sentinel-sandbox"          "${pkgdir}/usr/bin/sentinel-sandbox"
+	install -Dm755 "${tree}/scanner/sentinel-scan-pkgbuild"    "${pkgdir}/usr/bin/sentinel-scan-pkgbuild"
+
+	# --- sandbox shims ------------------------------------------------
+	install -d "${pkgdir}/usr/lib/sentinel/shims"
+	# Sourced, never executed.
+	install -m644 "${tree}/sandbox/shims/shim-common.sh" "${pkgdir}/usr/lib/sentinel/shims/shim-common.sh"
+	local shim
+	for shim in npm npx pnpm yarn bun pip pip3 uv cargo makepkg; do
+		install -m755 "${tree}/sandbox/shims/${shim}" "${pkgdir}/usr/lib/sentinel/shims/${shim}"
+	done
+
+	# Both snippets are no-ops unless /etc/sentinel/sandbox.enabled exists,
+	# which `sentinelctl set sandbox on` creates.
+	install -Dm644 "${tree}/sandbox/profile.d/sentinel-shims.sh" \
+		"${pkgdir}/etc/profile.d/sentinel-shims.sh"
+	install -Dm644 "${tree}/sandbox/fish/conf.d/sentinel-shims.fish" \
+		"${pkgdir}/usr/share/fish/vendor_conf.d/sentinel-shims.fish"
+
+	# --- configuration ------------------------------------------------
+	install -Dm644 "${tree}/sentineld/etc/sentinel.toml" "${pkgdir}/etc/sentinel/sentinel.toml"
+	# feeds.toml holds the abuse.ch Auth-Key; only root reads it.
+	install -Dm600 "${tree}/sentineld/etc/feeds.toml"    "${pkgdir}/etc/sentinel/feeds.toml"
+	install -Dm644 "${tree}/sentineld/etc/allowlist.d/default.toml" \
+		"${pkgdir}/etc/sentinel/allowlist.d/default.toml"
+	install -Dm644 "${tree}/sandbox/sandbox.conf"        "${pkgdir}/etc/sentinel/sandbox.conf"
+	install -Dm644 "${srcdir}/scanner-allow.conf"        "${pkgdir}/etc/sentinel/scanner-allow.conf"
+
+	# --- licenses -----------------------------------------------------
+	install -Dm644 "${srcdir}/LICENSE.MIT" \
+		"${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+	install -Dm644 "${srcdir}/tetragon-${_tetragonver}-LICENSE" \
+		"${pkgdir}/usr/share/licenses/${pkgname}/LICENSE.tetragon"
+	install -Dm644 "${srcdir}/tetragon-${_tetragonver}-LICENSE.bpf" \
+		"${pkgdir}/usr/share/licenses/${pkgname}/LICENSE.tetragon-bpf"
+
+	# --- documentation ------------------------------------------------
+	# sentineld.service points its Documentation= at README.md here.
+	install -Dm644 "${tree}/README.md"           "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+	install -Dm644 "${tree}/sentineld/README.md" "${pkgdir}/usr/share/doc/${pkgname}/sentineld.md"
+	install -Dm644 "${tree}/policies/README.md"  "${pkgdir}/usr/share/doc/${pkgname}/policies.md"
+	install -Dm644 "${tree}/sandbox/README.md"   "${pkgdir}/usr/share/doc/${pkgname}/sandbox.md"
+	install -Dm644 "${tree}/scanner/README.md"   "${pkgdir}/usr/share/doc/${pkgname}/scanner.md"
+	install -Dm644 "${tree}/docs/CONTRACT.md"    "${pkgdir}/usr/share/doc/${pkgname}/CONTRACT.md"
+	install -Dm644 "${tree}/docs/TETRAGON-NOTES.md" \
+		"${pkgdir}/usr/share/doc/${pkgname}/TETRAGON-NOTES.md"
+}

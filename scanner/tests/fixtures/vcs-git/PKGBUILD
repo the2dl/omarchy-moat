@@ -1,0 +1,33 @@
+# SYNTHETIC FIXTURE. A legitimate -git package: SKIP is correct for a VCS
+# source, so src.skip-checksum must NOT fire here.
+
+pkgname=hyprshade-git
+_pkgname=hyprshade
+pkgver=r212.4f0a1c9
+pkgrel=1
+pkgdesc="Hyprland shader configuration tool (git)"
+arch=('any')
+url="https://github.com/loqusion/hyprshade"
+license=('MIT')
+depends=('python' 'hyprland')
+makedepends=('git' 'python-build' 'python-installer')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+source=("$_pkgname::git+https://github.com/loqusion/hyprshade.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$_pkgname"
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd "$_pkgname"
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "$_pkgname"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

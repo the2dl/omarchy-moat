@@ -1,0 +1,60 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: sentinel-persist-autostart-write
+  annotations:
+    sentinel.omarchy/severity: "high"
+    sentinel.omarchy/title: "Desktop autostart or user systemd unit written"
+    sentinel.omarchy/enforce: "none"
+    sentinel.omarchy/actions: "kill,quarantine,ignore"
+    sentinel.omarchy/why: >-
+      A .desktop file in ~/.config/autostart or a user unit in ~/.config/systemd/user
+      restarts a payload at every login without touching anything root-owned.
+    sentinel.omarchy/expected: >-
+      Installing a desktop app or a user service on purpose (syncthing, mise, Docker
+      Desktop, Flatpak wrappers), and GNOME/KDE settings dialogs.
+    sentinel.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  - hook: "file_post_open"
+    message: "Autostart entry or user systemd unit opened for writing"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int"
+    selectors:
+    - matchBinaries:
+      - operator: "NotPostfix"
+        values:
+        - "/nvim"
+        - "/vim"
+        - "/nano"
+        - "/emacs"
+        - "/code"
+        - "/zed"
+        - "/hx"
+        - "/kate"
+        - "/systemctl"
+        - "/systemd"
+        - "/systemd-run"
+        - "/pacman"
+        - "/flatpak"
+        - "/gnome-tweaks"
+      matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "{{HOME}}/.config/autostart/"
+        - "{{HOME}}/.config/systemd/user/"
+        - "{{HOME}}/.local/share/applications/"
+      - index: 1
+        operator: "Mask"
+        values: ["2"]
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

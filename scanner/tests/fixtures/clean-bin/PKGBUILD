@@ -1,0 +1,35 @@
+# Maintainer: A Nonymous <nobody@example.org>
+# Synthetic fixture for omarchy-sentinel: an ordinary, well-behaved -bin package.
+# Modelled on the shape of a typical AUR `-bin` recipe. Must produce no findings.
+
+pkgname=lazygit-bin
+_pkgname=lazygit
+pkgver=0.44.1
+pkgrel=1
+pkgdesc="Simple terminal UI for git commands (prebuilt binary)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/jesseduffield/lazygit"
+license=('MIT')
+provides=("$_pkgname=$pkgver")
+conflicts=("$_pkgname")
+options=('!debug')
+source_x86_64=("$pkgname-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/lazygit_${pkgver}_Linux_x86_64.tar.gz")
+source_aarch64=("$pkgname-$pkgver-aarch64.tar.gz::$url/releases/download/v$pkgver/lazygit_${pkgver}_Linux_arm64.tar.gz")
+source=("LICENSE::$url/raw/v$pkgver/LICENSE")
+sha256sums=('7f6c1d0a3c2b5f4e8d9a0b1c2d3e4f5061728394a5b6c7d8e9f0a1b2c3d4e5f6')
+sha256sums_x86_64=('1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809')
+sha256sums_aarch64=('90fedcba87654321fedcba9876543210fedcba9876543210fedcba9876543210')
+
+package() {
+  install -Dm755 "$srcdir/$_pkgname" "$pkgdir/usr/bin/$_pkgname"
+  install -Dm644 "$srcdir/LICENSE" \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  # completions shipped in the tarball
+  for shell in bash zsh fish; do
+    if [[ -f "$srcdir/completions/$_pkgname.$shell" ]]; then
+      install -Dm644 "$srcdir/completions/$_pkgname.$shell" \
+        "$pkgdir/usr/share/$shell/site-functions/_$_pkgname"
+    fi
+  done
+}

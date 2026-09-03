@@ -1,0 +1,59 @@
+#!/bin/bash
+# Run the Sentinel plugin's checks headless.
+#
+#   shell/tests/run-tests.sh
+#
+# Two gates:
+#
+#   1. A QML syntax pass over every file in shell/ (qmlformat parses and
+#      re-prints; a non-zero exit is a parse error).
+#   2. The SentinelModel.js unit suite under qmltestrunner.
+#
+# Two environment quirks are load-bearing for the suite:
+#
+#   QT_QPA_PLATFORM=offscreen     no window is ever mapped.
+#   QML_XHR_ALLOW_FILE_READ=1     the suite reads fixtures/alerts.jsonl over
+#                                 XMLHttpRequest, which Qt blocks for file://
+#                                 URLs by default.
+#
+# There is deliberately no view-instantiation suite. The view components import
+# qs.Commons, which imports Quickshell — and the Quickshell QML plugin is
+# *linked into the quickshell executable* (its qmldir says
+# `linktarget quickshell-coreplugin` and `prefer :/qt/qml/Quickshell/`), so it
+# cannot be loaded by a bare qmltestrunner at all. Instantiating the views
+# therefore needs a running quickshell, i.e. the real shell; see
+# shell/README.md for how to load the plugin against a live session.
+set -euo pipefail
+
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+plugin_shell=$(cd -- "$here/.." && pwd)
+runner=${QMLTESTRUNNER:-/usr/lib/qt6/bin/qmltestrunner}
+formatter=${QMLFORMAT:-/usr/lib/qt6/bin/qmlformat}
+
+status=0
+
+echo "--- qml syntax"
+for file in "$plugin_shell"/*.qml; do
+  if "$formatter" "$file" >/dev/null; then
+    echo "ok   ${file##*/}"
+  else
+    echo "FAIL ${file##*/}"
+    status=1
+  fi
+done
+
+[[ -x $runner ]] || { echo "qmltestrunner not found at $runner" >&2; exit 1; }
+
+echo "--- tst_model"
+QT_QPA_PLATFORM=offscreen QML_XHR_ALLOW_FILE_READ=1 \
+  "$runner" -input "$here/tst_model.qml" || status=1
+
+# tst_wire runs the model over output captured from a live sentineld (see the
+# header of tst_wire.qml). tst_model checks the model's rules; this checks that
+# the daemon's actual field names, nesting and vocabulary are the ones the
+# panel reads.
+echo "--- tst_wire"
+QT_QPA_PLATFORM=offscreen QML_XHR_ALLOW_FILE_READ=1 \
+  "$runner" -input "$here/tst_wire.qml" || status=1
+
+exit $status

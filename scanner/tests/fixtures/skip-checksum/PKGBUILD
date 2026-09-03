@@ -1,0 +1,30 @@
+# SYNTHETIC FIXTURE. Otherwise ordinary package that skips integrity checking
+# on a remote release tarball, so the upstream file can change silently.
+
+pkgname=tinyterm
+pkgver=3.1.0
+pkgrel=1
+pkgdesc="Minimal terminal emulator"
+arch=('x86_64')
+url="https://github.com/example-org/tinyterm"
+license=('MIT')
+depends=('vte3')
+makedepends=('meson' 'ninja')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+        "tinyterm-default-config.patch")
+sha256sums=('SKIP'
+            'f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f00')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  patch -Np1 -i "$srcdir/tinyterm-default-config.patch"
+}
+
+build() {
+  arch-meson "$pkgname-$pkgver" build
+  meson compile -C build
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+}

@@ -1,0 +1,64 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: sentinel-cred-ssh-private-key-read
+  annotations:
+    sentinel.omarchy/severity: "high"
+    sentinel.omarchy/title: "Private SSH key read by an unexpected program"
+    sentinel.omarchy/rotate: "ssh-key"
+    sentinel.omarchy/enforce: "kill"
+    sentinel.omarchy/actions: "kill,quarantine,ignore"
+    sentinel.omarchy/why: >-
+      Private keys are the first thing npm and PyPI stealers read; only ssh, git and a
+      few backup tools ever need them, and a key that leaves the machine gives an
+      attacker every host and forge you can reach.
+    sentinel.omarchy/expected: >-
+      Backup tools (restic, borg), IDE git integrations, ansible/terraform runs, and
+      custom scripts that call an ssh library instead of the ssh binary.
+    sentinel.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  - hook: "file_post_open"
+    message: "Private SSH key opened for reading"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int"
+    selectors:
+    - matchBinaries:
+      - operator: "NotPostfix"
+        values:
+        - "/ssh"
+        - "/sshd"
+        - "/ssh-add"
+        - "/ssh-agent"
+        - "/ssh-keygen"
+        - "/ssh-keyscan"
+        - "/ssh-pkcs11-helper"
+        - "/scp"
+        - "/sftp"
+        - "/rsync"
+        - "/git"
+        - "/git-remote-http"
+        - "/gpg-agent"
+        - "/keychain"
+      matchArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "{{HOME}}/.ssh/id_rsa"
+        - "{{HOME}}/.ssh/id_dsa"
+        - "{{HOME}}/.ssh/id_ecdsa"
+        - "{{HOME}}/.ssh/id_ecdsa_sk"
+        - "{{HOME}}/.ssh/id_ed25519"
+        - "{{HOME}}/.ssh/id_ed25519_sk"
+        - "{{HOME}}/.ssh/identity"
+      - index: 1
+        operator: "Mask"
+        values: ["4"]
+      matchActions:
+      - action: Sigkill

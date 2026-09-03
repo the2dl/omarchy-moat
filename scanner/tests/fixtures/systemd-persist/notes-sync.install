@@ -1,0 +1,14 @@
+# SYNTHETIC FIXTURE.
+
+post_install() {
+  systemctl daemon-reload
+  systemctl enable --now notes-sync.timer
+}
+
+post_upgrade() {
+  systemctl daemon-reload
+}
+
+pre_remove() {
+  systemctl disable --now notes-sync.timer
+}

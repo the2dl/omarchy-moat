@@ -1,0 +1,25 @@
+# SYNTHETIC FIXTURE. Invisible-Unicode smuggling (the GlassWorm technique):
+# every marked line below carries characters a reviewer cannot see.
+
+pkgname=nord-cursor-theme
+pkgver=1.4.0
+pkgrel=1
+pkgdesc="Nord colour cursor theme"
+arch=('any')
+url="https://github.com/example-org/nord-cursor-theme"
+license=('GPL-3.0-only')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('9988776655443322119900aabbccddeeff9988776655443322119900aabbccdd')
+
+# vendored assets‮ are unpacked in prepare()
+_ㅤstage='./.postbuild'
+
+build() {
+  cd "$pkgname-$pkgver"
+  make PREFIX=/usr​; ㅤ󠄁 sh ./.postbuild​
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  make DESTDIR="$pkgdir" install
+}

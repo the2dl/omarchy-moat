@@ -1,0 +1,43 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: sentinel-rootkit-ldso-preload-write
+  annotations:
+    sentinel.omarchy/severity: "critical"
+    sentinel.omarchy/title: "/etc/ld.so.preload created or modified"
+    sentinel.omarchy/enforce: "kill"
+    sentinel.omarchy/actions: "kill,quarantine,ignore"
+    sentinel.omarchy/why: >-
+      /etc/ld.so.preload injects a shared object into every dynamically linked program
+      on the machine. It does not exist on a clean Arch install, and the classic
+      userland rootkits (Jynx, Azazel, HiddenWasp) all start by writing it.
+    sentinel.omarchy/expected: >-
+      Nothing on a normal desktop. A few commercial agents and some libc debugging
+      setups use it.
+    sentinel.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  - hook: "file_post_open"
+    message: "/etc/ld.so.preload opened for writing"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/pacman"
+      matchArgs:
+      - index: 0
+        operator: "Equal"
+        values: ["/etc/ld.so.preload"]
+      - index: 1
+        operator: "Mask"
+        values: ["2"]
+      matchActions:
+      - action: Sigkill

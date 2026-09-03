@@ -1,0 +1,68 @@
+[Unit]
+Description=Sentinel alert daemon (Tetragon event enrichment and control socket)
+Documentation=file:///usr/share/doc/omarchy-sentinel/README.md
+# Tetragon is the sensor; without it there is no export file to tail. Requires=
+# (not Wants=) because a running sentineld with no sensor is a lie: the shield
+# in the bar would be green while nothing is watched.
+Requires=tetragon.service
+After=tetragon.service
+PartOf=tetragon.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sentineld run
+# SIGHUP re-reads sentinel.toml, the rendered policies' annotations and
+# allowlist.d without dropping the process table.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+# /run/sentinel, 0750 root:sentinel — the control socket lives here and the
+# group needs +x on the directory to reach it.
+RuntimeDirectory=sentinel
+RuntimeDirectoryMode=0750
+# yes: /run/sentinel also holds the policies rendered for tetragon.service; a
+# sentineld restart must not delete them. tmpfiles.d creates the dir at boot.
+RuntimeDirectoryPreserve=yes
+
+# Only these four trees are writable; everything else, /usr included, is
+# read-only to this unit.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sentinel /var/log/sentinel /run/sentinel /etc/sentinel
+
+# Capabilities, and why each one is here:
+#   CAP_KILL             `sentinelctl kill` signals a process of any uid
+#   CAP_DAC_READ_SEARCH  read $HOME dotfiles to sha256 an executed binary
+#   CAP_DAC_OVERRIDE     move a quarantined file out of a directory we do not own
+#   CAP_CHOWN            chown alerts.jsonl and the socket to root:sentinel
+#   CAP_FOWNER           chmod 000 a quarantined file we do not own
+#   CAP_SYS_PTRACE       read /proc/<pid>/exe of another uid to verify a kill target
+CapabilityBoundingSet=CAP_KILL CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SYS_PTRACE
+AmbientCapabilities=CAP_KILL CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SYS_PTRACE
+NoNewPrivileges=yes
+
+ProtectHome=read-only
+PrivateTmp=no
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=default
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @signal
+SystemCallErrorNumber=EPERM
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

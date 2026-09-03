@@ -1,0 +1,67 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: sentinel-persist-git-hook-write
+  annotations:
+    sentinel.omarchy/severity: "high"
+    sentinel.omarchy/title: "Git hook or .envrc written"
+    sentinel.omarchy/enforce: "none"
+    sentinel.omarchy/actions: "kill,quarantine,ignore"
+    sentinel.omarchy/why: >-
+      A git hook runs on your next commit and an .envrc runs the moment you cd into the
+      directory; both are executable code that lives inside a repository you trust and
+      that no lockfile covers.
+    sentinel.omarchy/expected: >-
+      husky, lefthook, pre-commit and direnv setups, and your editor. These write hooks
+      as part of a normal npm install.
+    sentinel.omarchy/fp-hint: "exe+file"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  - hook: "file_post_open"
+    message: "Git hook or direnv file opened for writing"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int"
+    selectors:
+    - matchBinaries:
+      - operator: "NotPostfix"
+        values:
+        - "/nvim"
+        - "/vim"
+        - "/nano"
+        - "/emacs"
+        - "/code"
+        - "/zed"
+        - "/hx"
+        - "/direnv"
+      matchArgs:
+      - index: 0
+        operator: "Postfix"
+        values:
+        - "/hooks/pre-commit"
+        - "/hooks/prepare-commit-msg"
+        - "/hooks/commit-msg"
+        - "/hooks/post-commit"
+        - "/hooks/pre-rebase"
+        - "/hooks/post-checkout"
+        - "/hooks/post-merge"
+        - "/hooks/pre-push"
+        - "/hooks/pre-receive"
+        - "/hooks/post-receive"
+        - "/hooks/post-update"
+        - "/hooks/pre-auto-gc"
+        - "/hooks/post-rewrite"
+        - "/hooks/sendemail-validate"
+        - "/.envrc"
+      - index: 1
+        operator: "Mask"
+        values: ["2"]
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

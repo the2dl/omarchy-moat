@@ -1,0 +1,63 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: sentinel-shell-reverse-shell-connect
+  annotations:
+    sentinel.omarchy/severity: "critical"
+    sentinel.omarchy/title: "Shell or netcat opened an outbound connection to the internet"
+    sentinel.omarchy/enforce: "kill"
+    sentinel.omarchy/actions: "kill,quarantine,ignore"
+    sentinel.omarchy/why: >-
+      A shell process that opens a TCP socket is almost always a reverse shell: bash -i
+      over /dev/tcp, nc -e, or socat exec. Shells do not talk to the network on their
+      own, so the connection itself is the detection - the flags never have to be seen.
+    sentinel.omarchy/expected: >-
+      Hand-written scripts that use bash /dev/tcp as a port check, and nc or socat used
+      deliberately against a public host. Connections to RFC1918 and loopback addresses
+      are excluded in-kernel and never fire.
+    sentinel.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  - call: "tcp_connect"
+    syscall: false
+    message: "Shell or netcat connected to a non-private address"
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchBinaries:
+      - operator: "Postfix"
+        values:
+        - "/bash"
+        - "/sh"
+        - "/dash"
+        - "/zsh"
+        - "/fish"
+        - "/busybox"
+        - "/nc"
+        - "/ncat"
+        - "/netcat"
+        - "/nc.openbsd"
+        - "/nc.traditional"
+        - "/socat"
+        - "/telnet"
+      matchArgs:
+      - index: 0
+        operator: "Family"
+        values: ["AF_INET", "AF_INET6"]
+      - index: 0
+        operator: "NotDAddr"
+        values:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+        - "127.0.0.0/8"
+        - "169.254.0.0/16"
+        - "::1/128"
+        - "fc00::/7"
+        - "fe80::/10"
+      matchActions:
+      - action: Sigkill

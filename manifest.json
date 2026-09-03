@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.the2dl.sentinel",
+  "name": "Sentinel",
+  "version": "0.1.0",
+  "author": "the2dl",
+  "license": "MIT",
+  "description": "Runtime security monitor for Omarchy: surfaces Tetragon-backed credential, package-manager, persistence and egress alerts in the bar, with kill / quarantine / ack / ignore actions and secret-rotation guidance.",
+  "kinds": [
+    "service",
+    "bar-widget",
+    "panel"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "shell/Service.qml",
+    "barWidget": "shell/BarWidget.qml",
+    "panel": "shell/Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Sentinel",
+    "description": "Shield glyph showing unacknowledged runtime security alerts. Click to open the alert panel.",
+    "category": "System",
+    "aliases": [
+      "sentinel",
+      "security",
+      "tetragon"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "minNotifySeverity": "high",
+      "pollSeconds": 10,
+      "showCountBadge": true
+    },
+    "schema": [
+      {
+        "key": "minNotifySeverity",
+        "type": "enum",
+        "label": "Minimum notify severity",
+        "options": [
+          "low",
+          "medium",
+          "high",
+          "critical"
+        ],
+        "defaultValue": "high",
+        "description": "Alerts below this severity never raise a desktop notification. They still appear in the panel."
+      },
+      {
+        "key": "pollSeconds",
+        "type": "integer",
+        "label": "Status poll interval (seconds)",
+        "min": 5,
+        "max": 60,
+        "step": 5,
+        "defaultValue": 10,
+        "description": "How often sentinelctl status is polled for mode, tetragon state, policies and feed age."
+      },
+      {
+        "key": "showCountBadge",
+        "type": "boolean",
+        "label": "Show count badge",
+        "defaultValue": true,
+        "description": "Draw the number of unacknowledged high and critical alerts on the shield."
+      }
+    ]
+  }
+}

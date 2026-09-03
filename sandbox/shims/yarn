@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# omarchy-sentinel shim: runs the real yarn under sentinel-sandbox.
+# Installed as /usr/lib/sentinel/shims/yarn; active only while
+# /etc/sentinel/sandbox.enabled exists (see /etc/profile.d/sentinel-shims.sh).
+set -euo pipefail
+SHIM_SELF=${BASH_SOURCE[0]}
+_shim_dir=${SHIM_SELF%/*}
+[[ $_shim_dir == "$SHIM_SELF" ]] && _shim_dir=/usr/lib/sentinel/shims
+# shellcheck source-path=SCRIPTDIR source=shim-common.sh
+. "$_shim_dir/shim-common.sh"
+shim_exec yarn "$@"

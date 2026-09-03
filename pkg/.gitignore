@@ -1,0 +1,10 @@
+# makepkg working directories and downloaded sources.
+# The repository .gitignore already covers *.pkg.tar.zst, pkg/src/, pkg/pkg/
+# and pkg/*.tar.gz; these are the remaining fetched sources.
+/src/
+/pkg/
+/tetragon-*-LICENSE
+/tetragon-*-LICENSE.bpf
+/*.tar.gz
+/*.pkg.tar.zst
+/*.log

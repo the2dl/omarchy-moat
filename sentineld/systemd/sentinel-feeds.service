@@ -1,0 +1,36 @@
+[Unit]
+Description=Fetch abuse.ch threat indicators for Sentinel
+Documentation=https://bazaar.abuse.ch/api/ https://threatfox.abuse.ch/api/ https://urlhaus-api.abuse.ch/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/sentinel-feeds
+# Never fails hard: with no abuse.ch auth_key it logs one line and exits 0,
+# leaving the previous feed files in place.
+SuccessExitStatus=0
+
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sentinel/feeds
+# feeds.toml holds the Auth-Key; read-only is enough.
+ReadOnlyPaths=/etc/sentinel
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0027
+TimeoutStartSec=5min

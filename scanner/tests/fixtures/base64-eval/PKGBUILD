@@ -1,0 +1,24 @@
+# SYNTHETIC FIXTURE - not real malware. Obfuscated payload: a base64 blob is
+# decoded into a shell, and a second stage is run through eval on a variable.
+
+pkgname=fastfetch-theme-pack
+pkgver=1.0.3
+pkgrel=1
+pkgdesc="Extra fastfetch themes"
+arch=('any')
+url="https://github.com/fastfetch-cli/fastfetch"
+license=('MIT')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/$pkgver.tar.gz")
+sha256sums=('aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899')
+
+_stage='ZWNobyAiaGVsbG8gZnJvbSBzdGFnZSBvbmUi'
+_stage2='cHJpbnRmICJzdGFnZSB0d29cbiI='
+
+prepare() {
+  echo "$_stage" | base64 -d | bash
+}
+
+build() {
+  _cmd="$(printf '%s' "$_stage2" | base64 --decode)"
+  eval "$_cmd"
+}

@@ -1,0 +1,61 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: sentinel-ai-cli-in-pkg-subtree
+  annotations:
+    sentinel.omarchy/severity: "high"
+    sentinel.omarchy/title: "AI coding CLI launched from inside a package install"
+    sentinel.omarchy/enforce: "none"
+    sentinel.omarchy/actions: "kill,ignore"
+    sentinel.omarchy/why: >-
+      An agent CLI started by an install script, rather than by you in a terminal, is a
+      payload borrowing your credentials and your permission-skipping flags to do its
+      work with a tool you already trust.
+    sentinel.omarchy/expected: >-
+      Monorepo tooling that shells out to an agent as part of a build or a
+      lint-fix step, and npx claude run by hand from inside another node process.
+    sentinel.omarchy/fp-hint: "parent"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  - hook: "bprm_check_security"
+    message: "AI coding CLI executed inside a package manager process tree"
+    args:
+    - index: 0
+      type: "linux_binprm"
+    selectors:
+    - matchParentBinaries:
+      - operator: "In"
+        followChildren: true
+        values:
+        - "/usr/bin/npm"
+        - "/usr/bin/npx"
+        - "/usr/bin/pnpm"
+        - "/usr/bin/yarn"
+        - "/usr/bin/bun"
+        - "/usr/bin/node"
+        - "/usr/local/bin/node"
+        - "/usr/bin/pip"
+        - "/usr/bin/pip3"
+        - "/usr/bin/uv"
+        - "/usr/bin/cargo"
+        - "/usr/bin/makepkg"
+      matchArgs:
+      - index: 0
+        operator: "Postfix"
+        values:
+        - "/claude"
+        - "/codex"
+        - "/gemini"
+        - "/opencode"
+        - "/amp"
+        - "/q"
+        - "/qterm"
+        - "/aider"
+        - "/cursor-agent"
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

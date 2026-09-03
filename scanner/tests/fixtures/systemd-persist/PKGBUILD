@@ -1,0 +1,23 @@
+# SYNTHETIC FIXTURE. The recipe itself is fine; the .install hook enables a
+# unit behind the user's back.
+
+pkgname=notes-sync
+pkgver=0.9.2
+pkgrel=1
+pkgdesc="Background note synchroniser"
+arch=('any')
+url="https://codeberg.org/example/notes-sync"
+license=('GPL-3.0-or-later')
+depends=('python')
+install="${pkgname}.install"
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')
+
+package() {
+  cd "$pkgname"
+  install -Dm755 notes-sync.py "$pkgdir/usr/bin/notes-sync"
+  install -Dm644 notes-sync.service \
+    "$pkgdir/usr/lib/systemd/system/notes-sync.service"
+  install -Dm644 notes-sync.timer \
+    "$pkgdir/usr/lib/systemd/system/notes-sync.timer"
+}

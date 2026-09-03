@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# omarchy-sentinel shim for makepkg.
+#
+#   1. scan the PKGBUILD with sentinel-scan-pkgbuild (exit 0 clean, 1 medium,
+#      2 high). High findings prompt when interactive, refuse when not.
+#   2. run the real makepkg under sentinel-sandbox.
+#
+# Installed as /usr/lib/sentinel/shims/makepkg; active only while
+# /etc/sentinel/sandbox.enabled exists (see /etc/profile.d/sentinel-shims.sh).
+#
+# LIMITATIONS - read sandbox/README.md before filing a bug:
+#   * The sandbox has no root and sets PR_SET_NO_NEW_PRIVS, so setuid binaries
+#     do not elevate: `makepkg -s` / `-i` (pacman via sudo) will fail. Install
+#     dependencies first and use --nodeps / -d, or run makepkg unsandboxed with
+#     SENTINEL_SANDBOX=0.
+#   * $PWD is writable, which covers the makepkg defaults (srcdir, pkgdir,
+#     SRCDEST/PKGDEST/SRCPKGDEST/LOGDEST all default to the build directory).
+#     If makepkg.conf points any of them elsewhere the shim adds an --allow for
+#     that path; BUILDDIR under /tmp lands in the sandbox tmpfs and the
+#     resulting package would be lost, so that case is refused with a hint.
+set -euo pipefail
+SHIM_SELF=${BASH_SOURCE[0]}
+_shim_dir=${SHIM_SELF%/*}
+[[ $_shim_dir == "$SHIM_SELF" ]] && _shim_dir=/usr/lib/sentinel/shims
+# shellcheck source-path=SCRIPTDIR source=shim-common.sh
+. "$_shim_dir/shim-common.sh"
+
+# --------------------------------------------------------------- PKGBUILD ---
+
+run_scan() {
+	# CONTRACT section 8: SENTINEL_SANDBOX=0 bypasses the shim, and both the
+	# refusal message below and sentinel-scan-pkgbuild's own "build anyway"
+	# hint tell the user exactly that. Scanning anyway made both of them lie:
+	# the escape hatch has to actually open.
+	#
+	# SENTINEL_SANDBOX_ACTIVE=1 deliberately does NOT skip the scan. A nested
+	# makepkg is usually in a different directory with a different PKGBUILD
+	# that the outer invocation never saw.
+	[[ ${SENTINEL_SANDBOX:-1} == 0 ]] && return 0
+	[[ -f ./PKGBUILD ]] || return 0
+	if ! command -v sentinel-scan-pkgbuild >/dev/null 2>&1; then
+		shim_warn "sentinel-scan-pkgbuild not found, skipping the PKGBUILD scan"
+		return 0
+	fi
+
+	local rc=0
+	sentinel-scan-pkgbuild . || rc=$?
+
+	case $rc in
+	0) return 0 ;;
+	1)
+		shim_warn "PKGBUILD scan: medium findings above. Continuing."
+		return 0
+		;;
+	2) ;;
+	*)
+		shim_warn "sentinel-scan-pkgbuild failed (exit $rc), continuing without a scan"
+		return 0
+		;;
+	esac
+
+	# High findings.
+	if ! shim_is_tty; then
+		printf '[sentinel] PKGBUILD scan found HIGH severity findings and this is not an interactive terminal. Refusing to build.\n' >&2
+		printf '[sentinel] Review the findings, then re-run from a terminal or set SENTINEL_SANDBOX=0 to bypass everything.\n' >&2
+		exit 1
+	fi
+	if command -v gum >/dev/null 2>&1; then
+		if gum confirm "Continue building anyway?"; then
+			shim_warn "continuing at your request despite HIGH findings"
+			return 0
+		fi
+	else
+		local reply=""
+		read -r -p "[sentinel] HIGH findings. Continue building anyway? [y/N] " reply || reply=""
+		if [[ $reply == [yY]* ]]; then
+			shim_warn "continuing at your request despite HIGH findings"
+			return 0
+		fi
+	fi
+	printf '[sentinel] aborted.\n' >&2
+	exit 1
+}
+
+# ------------------------------------------------------- makepkg.conf paths ---
+
+# Read a single assignment out of the makepkg config files without sourcing
+# them (sourcing would execute config code outside the sandbox).
+makepkg_conf_value() {
+	local key=$1 file val="" line
+	for file in /etc/makepkg.conf \
+		/etc/makepkg.conf.d/*.conf \
+		"${XDG_CONFIG_HOME:-$HOME/.config}/pacman/makepkg.conf" \
+		"$HOME/.makepkg.conf"; do
+		[[ -r $file ]] || continue
+		while IFS= read -r line; do
+			line=${line#"${line%%[![:space:]]*}"}
+			[[ $line == "$key="* ]] || continue
+			val=${line#"$key="}
+			val=${val%%#*}
+			val=${val%"${val##*[![:space:]]}"}
+			val=${val#\"}
+			val=${val%\"}
+			val=${val#\'}
+			val=${val%\'}
+		done <"$file"
+	done
+	[[ -z $val ]] && return 0
+	# The config file is not sourced, so ~ and $HOME arrive literally.
+	# shellcheck disable=SC2088,SC2016 # matching the literal text, not expanding it
+	case $val in
+	'~/'*) val=$HOME/${val#'~/'} ;;
+	'$HOME/'*) val=$HOME/${val#'$HOME/'} ;;
+	esac
+	# Anything still containing an unexpanded variable is unusable here.
+	[[ $val == *'$'* ]] && return 0
+	printf '%s' "$val"
+}
+
+add_allow_for() {
+	local key=$1 val
+	val=$(makepkg_conf_value "$key")
+	[[ -n $val ]] || return 0
+	[[ $val == /* ]] || return 0
+	[[ $val == "$PWD" || $val == "$PWD"/* ]] && return 0
+	if [[ $val == /tmp || $val == /tmp/* ]]; then
+		printf '[sentinel] makepkg.conf sets %s=%s, which is inside the sandbox tmpfs;\n' "$key" "$val" >&2
+		printf '[sentinel] the build output would be discarded. Point it outside /tmp or run with SENTINEL_SANDBOX=0.\n' >&2
+		exit 1
+	fi
+	mkdir -p -- "$val" 2>/dev/null || true
+	SHIM_SANDBOX_ARGS+=(--allow "$val")
+}
+
+# ------------------------------------------------------------------- main ---
+
+run_scan
+
+if [[ ${SENTINEL_SANDBOX:-1} != 0 && ${SENTINEL_SANDBOX_ACTIVE:-0} != 1 ]]; then
+	for key in SRCDEST PKGDEST SRCPKGDEST LOGDEST BUILDDIR; do
+		add_allow_for "$key"
+	done
+fi
+
+shim_exec makepkg "$@"

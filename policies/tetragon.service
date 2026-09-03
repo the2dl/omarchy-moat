@@ -1,0 +1,69 @@
+# omarchy-sentinel: hardened unit for the upstream Tetragon v1.7.1 daemon.
+# Derived from the unit shipped in tetragon-v1.7.1-amd64.tar.gz
+# (usr/lib/systemd/system/tetragon.service, Apache-2.0, Authors of Tetragon).
+# Changes: FHS paths from CONTRACT.md section 2, policy rendering as
+# ExecStartPre, and sandboxing that does not take away what eBPF needs.
+
+[Unit]
+Description=Tetragon eBPF sensor for omarchy-sentinel
+Documentation=https://tetragon.io/
+DefaultDependencies=no
+After=local-fs.target
+Before=shutdown.target
+Conflicts=shutdown.target
+# Restart on failure, but stop trying after 10 attempts in 2 minutes.
+# systemctl reset-failed tetragon clears the counter.
+StartLimitBurst=10
+StartLimitIntervalSec=2min
+
+[Service]
+Type=simple
+Environment="PATH=/usr/lib/tetragon:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+User=root
+Group=root
+
+# Render policies/*.yaml ({{HOME}} -> one value per human user home) into
+# /run/sentinel/policies and regenerate the export-allowlist conf.d file.
+# Tetragon reads --tracing-policy-dir once at startup and has no hot reload,
+# so this must run before every start.
+ExecStartPre=/usr/bin/sentineld render-policies
+ExecStart=/usr/bin/tetragon
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=mixed
+OOMScoreAdjust=-500
+
+# /run/tetragon holds the gRPC socket (server-address in tetragon.conf.d).
+# /run/sentinel and /var/log/sentinel come from the package's tmpfiles.d.
+RuntimeDirectory=tetragon
+RuntimeDirectoryMode=0750
+
+# BPF maps are accounted against locked memory on some configurations.
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+
+# --- sandboxing -------------------------------------------------------------
+# Everything below was chosen so that BPF program loading, bpffs pinning,
+# /proc scanning and kallsyms lookups keep working. Do not add
+# ProtectKernelTunables=yes (it remounts /sys read-only and breaks pinning)
+# or PrivateMounts/PrivateUsers (they break process and path visibility).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run/sentinel /var/log/sentinel /var/lib/sentinel /sys/fs/bpf /etc/tetragon/tetragon.conf.d
+PrivateTmp=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectControlGroups=no
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_SYS_RESOURCE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_NET_ADMIN CAP_SYSLOG CAP_IPC_LOCK CAP_CHOWN CAP_FOWNER CAP_KILL
+
+[Install]
+WantedBy=multi-user.target

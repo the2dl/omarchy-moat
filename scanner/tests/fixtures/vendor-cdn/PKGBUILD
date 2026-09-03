@@ -1,0 +1,25 @@
+# SYNTHETIC FIXTURE, modelled on the real slack-desktop AUR recipe: a vendor
+# whose downloads live on a sibling CDN domain. Worth a note, not a block, so
+# it must stay LOW and exit 0.
+
+pkgname=vendorchat-desktop
+pkgver=4.51.191
+pkgrel=1
+pkgdesc="VendorChat Desktop for Linux"
+arch=('x86_64')
+url="https://vendorchat.com/downloads"
+license=('custom')
+depends=('gtk3' 'libsecret' 'nss')
+options=('!debug')
+source=("https://downloads.vendorchat-edge.com/desktop-releases/linux/x64/${pkgver}/${pkgname}-${pkgver}-amd64.deb"
+        "${pkgname}.patch")
+noextract=("${pkgname}-${pkgver}-amd64.deb")
+b2sums=('d06a3a0880f776ccf702481bd0009da0ec60d250811ded0c7cc654678b0bcfe97c2d8e75f9e2d54938ff1b4d04d741a7afb4f19714e885de06ed6dbb116d8dcf'
+        '103447636acd7ac2789d7d89008483a2077d862a51a64427a66c51e64dc9eac588de187f13df2778ccb7b24110a36c259b33c0074ff69c9bab3f89283a1efaf1')
+
+package() {
+    bsdtar -O -xf "${pkgname}-${pkgver}"*.deb data.tar.xz | bsdtar -C "${pkgdir}" -xJf -
+    patch -d "${pkgdir}" -p1 <"${pkgname}".patch
+    find "${pkgdir}" -type d -exec chmod 755 {} +
+    rm -rf "${pkgdir}/usr/share/doc"
+}

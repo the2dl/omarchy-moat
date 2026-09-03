@@ -1,0 +1,2 @@
+{"event_set":["PROCESS_EXEC","PROCESS_EXIT"]}
+{"policy_names":["sentinel-cred-cloud-credential-read","sentinel-cred-ssh-private-key-read","sentinel-net-reverse-shell","sentinel-priv-ptrace-attach","sentinel-priv-setuid-chmod"]}

@@ -1,0 +1,39 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: sentinel-exec-untrusted-tmpfs
+  annotations:
+    sentinel.omarchy/severity: "high"
+    sentinel.omarchy/title: "Binary executed from /tmp, /var/tmp or /dev/shm"
+    sentinel.omarchy/enforce: "none"
+    sentinel.omarchy/actions: "kill,quarantine,ignore"
+    sentinel.omarchy/why: >-
+      World-writable directories are where a dropper lands its second stage; /dev/shm in
+      particular is memory-backed and leaves nothing on disk to find afterwards.
+    sentinel.omarchy/expected: >-
+      Build systems. autoconf configure tests, cargo and go temporary test binaries,
+      makepkg builds run from /tmp, AppImage extraction, and installer scripts you piped
+      to a shell yourself.
+    sentinel.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  - hook: "bprm_check_security"
+    message: "Executable started from a world-writable temporary directory"
+    args:
+    - index: 0
+      type: "linux_binprm"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/tmp/"
+        - "/var/tmp/"
+        - "/dev/shm/"
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

@@ -1,0 +1,51 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: sentinel-rootkit-bpffs-write
+  annotations:
+    sentinel.omarchy/severity: "medium"
+    sentinel.omarchy/title: "Write into the BPF filesystem by an unexpected binary"
+    sentinel.omarchy/enforce: "none"
+    sentinel.omarchy/actions: "kill,ignore"
+    sentinel.omarchy/why: >-
+      Pinning under /sys/fs/bpf is how a BPF implant survives the death of the process
+      that loaded it, and how it tampers with pinned maps that other tools trust.
+    sentinel.omarchy/expected: >-
+      Container runtimes and Cilium pin maps here; this sensor pins its own. Note that
+      pinning through bpf(BPF_OBJ_PIN) does not open a file and is covered by the
+      bpf-prog-load rule instead.
+    sentinel.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  - hook: "file_post_open"
+    message: "File under /sys/fs/bpf opened for writing"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/tetragon"
+        - "/usr/lib/tetragon/bpftool"
+        - "/usr/bin/bpftool"
+        - "/usr/lib/systemd/systemd"
+        - "/usr/bin/dockerd"
+        - "/usr/bin/containerd"
+        - "/usr/bin/cilium-agent"
+      matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values: ["/sys/fs/bpf/"]
+      - index: 1
+        operator: "Mask"
+        values: ["2"]
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

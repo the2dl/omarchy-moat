@@ -1,0 +1,137 @@
+{
+  "mode": "enforce",
+  "applied": 0,
+  "policies": 32,
+  "failed": [
+    {
+      "policy": "sentinel-ai-cli-in-pkg-subtree",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-cred-ai-credentials-read",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-cred-browser-secrets-read",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-cred-cloud-credentials-read",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-cred-etc-shadow-read",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-cred-gnupg-keyring-read",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-cred-registry-token-read",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-cred-ssh-private-key-read",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-cred-vcs-token-read",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-exec-untrusted-home",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-exec-untrusted-tmpfs",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-net-pkg-subtree-egress",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-net-tmpfs-binary-egress",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-persist-agent-config-write",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-persist-authorized-keys-write",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-persist-autostart-write",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-persist-desktop-config-write",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-persist-git-hook-write",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-persist-shell-rc-write",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-persist-system-unit-write",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-pkg-subtree-downloader",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-pkg-subtree-interpreter-spawn",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-pkg-subtree-netcat-exec",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-priv-proc-mem-access",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-priv-ptrace-attach",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-priv-setcap-xattr",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-priv-setuid-chmod",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-rootkit-bpf-prog-load",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-rootkit-bpffs-write",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-rootkit-kernel-module-load",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-rootkit-ldso-preload-write",
+      "error": "No such file or directory (os error 2)"
+    },
+    {
+      "policy": "sentinel-shell-reverse-shell-connect",
+      "error": "No such file or directory (os error 2)"
+    }
+  ],
+  "tetra": "/var/lib/sentinel/no-such-tetra",
+  "ok": true
+}

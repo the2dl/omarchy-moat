@@ -1,0 +1,46 @@
+[package]
+name = "sentineld"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Userspace brain for omarchy-sentinel: tails Tetragon's JSON export, builds explainable alerts, serves a control socket."
+license = "MIT"
+
+[lib]
+name = "sentineld"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sentineld"
+path = "src/bin/sentineld.rs"
+
+[[bin]]
+name = "sentinelctl"
+path = "src/bin/sentinelctl.rs"
+
+[[bin]]
+name = "sentinel-feeds"
+path = "src/bin/sentinel_feeds.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+ulid = "1"
+sha2 = "0.10"
+globset = "0.4"
+ureq = { version = "3", features = ["json"] }
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+libc = "0.2"
+serde_json = "1"
+tempfile = "3"
+
+[profile.release]
+strip = true

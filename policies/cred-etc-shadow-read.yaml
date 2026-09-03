@@ -1,0 +1,75 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: sentinel-cred-etc-shadow-read
+  annotations:
+    sentinel.omarchy/severity: "critical"
+    sentinel.omarchy/title: "/etc/shadow read by a program that is not an authentication tool"
+    sentinel.omarchy/rotate: "local-password"
+    sentinel.omarchy/enforce: "kill"
+    sentinel.omarchy/actions: "kill,ignore"
+    sentinel.omarchy/why: >-
+      Only PAM helpers and the shadow-utils suite have any reason to read the local
+      password hashes; anything else reading them is either already root and dumping
+      them for offline cracking, or a misconfigured file mode you want to know about.
+    sentinel.omarchy/expected: >-
+      Almost never. A screen locker, display manager or PAM module not in the allowlist,
+      or a backup of /etc run as root.
+    sentinel.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  - hook: "file_post_open"
+    message: "Local password hash database opened for reading"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/passwd"
+        - "/usr/bin/su"
+        - "/usr/bin/sudo"
+        - "/usr/bin/unix_chkpwd"
+        - "/usr/bin/login"
+        - "/usr/bin/sshd"
+        - "/usr/bin/chage"
+        - "/usr/bin/gpasswd"
+        - "/usr/bin/newgrp"
+        - "/usr/bin/chpasswd"
+        - "/usr/bin/useradd"
+        - "/usr/bin/userdel"
+        - "/usr/bin/usermod"
+        - "/usr/bin/groupadd"
+        - "/usr/bin/groupdel"
+        - "/usr/bin/groupmod"
+        - "/usr/bin/vipw"
+        - "/usr/bin/pwck"
+        - "/usr/bin/grpck"
+        - "/usr/bin/systemd-sysusers"
+        - "/usr/lib/systemd/systemd"
+        - "/usr/lib/systemd/systemd-homed"
+        - "/usr/lib/polkit-1/polkit-agent-helper-1"
+        - "/usr/bin/hyprlock"
+        - "/usr/bin/swaylock"
+        - "/usr/bin/gdm"
+        - "/usr/bin/sddm"
+        - "/usr/bin/greetd"
+        - "/usr/bin/pacman"
+      matchArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "/etc/shadow"
+        - "/etc/shadow-"
+        - "/etc/gshadow"
+      - index: 1
+        operator: "Mask"
+        values: ["4"]
+      matchActions:
+      - action: Sigkill

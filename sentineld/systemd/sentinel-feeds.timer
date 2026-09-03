@@ -1,0 +1,15 @@
+[Unit]
+Description=Hourly refresh of Sentinel threat feeds
+Documentation=man:sentinel-feeds(1)
+
+[Timer]
+OnCalendar=hourly
+# abuse.ch asks that clients not all arrive on the hour.
+RandomizedDelaySec=10min
+# Catch up after the machine was asleep or off.
+Persistent=true
+AccuracySec=1min
+Unit=sentinel-feeds.service
+
+[Install]
+WantedBy=timers.target

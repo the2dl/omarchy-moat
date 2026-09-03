@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# omarchy-sentinel shim: runs cargo under sentinel-sandbox, but only for the
+# subcommands that fetch code from the network or execute code from the
+# dependency tree (build scripts, proc macros, test/bench harnesses).
+#
+# Sandboxed:  build install add fetch update run test check
+#             (plus the aliases b, r, t, c and bench/clippy/doc, which all
+#              compile the dependency graph and therefore run build.rs)
+# Passed through: everything else (fmt, tree, metadata, --version, search,
+#             login, new, init, clean, ...). Those either touch no third-party
+#             code or need interactive/credential access that the sandbox
+#             deliberately removes (cargo login writes ~/.cargo/credentials).
+#
+# Rationale: `cargo build` on an untrusted crate is arbitrary code execution
+# via build.rs, which is exactly what the sandbox is for. `cargo fmt` is not,
+# and sandboxing it only costs startup time and breaks editor integrations.
+#
+# Installed as /usr/lib/sentinel/shims/cargo; active only while
+# /etc/sentinel/sandbox.enabled exists (see /etc/profile.d/sentinel-shims.sh).
+set -euo pipefail
+SHIM_SELF=${BASH_SOURCE[0]}
+_shim_dir=${SHIM_SELF%/*}
+[[ $_shim_dir == "$SHIM_SELF" ]] && _shim_dir=/usr/lib/sentinel/shims
+# shellcheck source-path=SCRIPTDIR source=shim-common.sh
+. "$_shim_dir/shim-common.sh"
+
+# Subcommands that fetch, or that compile/run third-party code.
+cargo_needs_sandbox() {
+	case $1 in
+	build | b | install | add | fetch | update | run | r | test | t | check | c) return 0 ;;
+	bench | clippy | doc | rustc | miri | publish | package) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# Find the first bare word (the subcommand). Options before it are things like
+# +toolchain, -v, --color=always, --config KEY=VAL.
+subcmd=""
+skip_next=0
+for arg in "$@"; do
+	if ((skip_next)); then
+		skip_next=0
+		continue
+	fi
+	case $arg in
+	--config | -Z | --explain) skip_next=1 ;;
+	+*) ;;
+	-*) ;;
+	*)
+		subcmd=$arg
+		break
+		;;
+	esac
+done
+
+if [[ -n $subcmd ]] && cargo_needs_sandbox "$subcmd"; then
+	shim_exec cargo "$@"
+fi
+
+# Pass through unsandboxed.
+shim_resolve cargo
+PATH=$SHIM_PATH_REDUCED exec -- "$SHIM_REAL" "$@"

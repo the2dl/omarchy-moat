@@ -1,0 +1,18 @@
+{
+  "rules": [
+    {
+      "index": 1,
+      "file": "/etc/sentinel/allowlist.d/user.toml",
+      "comment": "added 2026-09-03 from alert 01M1M5XHBZTEYJ03KHCF0R5P32: Private SSH key read by an unexpected program — wire fixture",
+      "name": "sentinel-cred-ssh-private-key-read",
+      "exe": "/usr/bin/node",
+      "path": null,
+      "parent": null,
+      "toml": "[[rule]]\nname = \"sentinel-cred-ssh-private-key-read\"\nexe = \"/usr/bin/node\"\n"
+    }
+  ],
+  "dir": "/etc/sentinel/allowlist.d",
+  "user_file": "/etc/sentinel/allowlist.d/user.toml",
+  "errors": [],
+  "ok": true
+}
