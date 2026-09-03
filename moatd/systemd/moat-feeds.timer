@@ -1,0 +1,15 @@
+[Unit]
+Description=Hourly refresh of Moat threat feeds
+Documentation=man:moat-feeds(1)
+
+[Timer]
+OnCalendar=hourly
+# abuse.ch asks that clients not all arrive on the hour.
+RandomizedDelaySec=10min
+# Catch up after the machine was asleep or off.
+Persistent=true
+AccuracySec=1min
+Unit=moat-feeds.service
+
+[Install]
+WantedBy=timers.target

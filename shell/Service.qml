@@ -2,16 +2,16 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
-import "SentinelModel.js" as Model
+import "MoatModel.js" as Model
 
-// Sentinel service: the single owner of alert state for the whole plugin.
+// Moat service: the single owner of alert state for the whole plugin.
 //
 // The shell instantiates exactly one of these (kind "service", keepLoaded), and
 // hands the same instance to the bar widget (bar.shell.serviceFor(id)) and to
 // the panel (injected as `service`). Nothing else reads alerts.jsonl or runs
-// sentinelctl, so there is one fold, one poll, and one notification decision.
+// moatctl, so there is one fold, one poll, and one notification decision.
 //
-// Everything testable lives in SentinelModel.js; this file is the I/O shell
+// Everything testable lives in MoatModel.js; this file is the I/O shell
 // around it: a FileView tail, a status poll, a command queue, and notifications.
 Item {
   id: root
@@ -30,25 +30,25 @@ Item {
   property int pollSeconds: 10
   property bool showCountBadge: true
 
-  readonly property string pluginId: "io.github.the2dl.sentinel"
+  readonly property string pluginId: "io.github.the2dl.moat"
 
   // -------------------------------------------------------------- filesystem
   //
   // Settable rather than readonly so a probe or a test harness can point the
-  // service at a fixture instead of the real /var/lib/sentinel. Nothing in the
+  // service at a fixture instead of the real /var/lib/moat. Nothing in the
   // shell ever writes them.
-  property string alertsPath: "/var/lib/sentinel/alerts.jsonl"
-  property string ctlPath: "/usr/bin/sentinelctl"
+  property string alertsPath: "/var/lib/moat/alerts.jsonl"
+  property string ctlPath: "/usr/bin/moatctl"
 
   // ------------------------------------------------------------------- state
   property var alerts: []
   property var unacked: ({ critical: 0, high: 0, medium: 0, low: 0, total: 0 })
   property var status: Model.normalizeStatus(null)
 
-  // `available` is the package: no /usr/bin/sentinelctl means nothing else can
-  // be true. `groupOk` is membership of the `sentinel` group, without which
-  // both the control socket (0660 root:sentinel) and alerts.jsonl (0640
-  // root:sentinel) are unreadable. Both drive the panel's setup screen.
+  // `available` is the package: no /usr/bin/moatctl means nothing else can
+  // be true. `groupOk` is membership of the `moat` group, without which
+  // both the control socket (0660 root:moat) and alerts.jsonl (0640
+  // root:moat) are unreadable. Both drive the panel's setup screen.
   property bool available: false
   property bool groupOk: false
   property bool daemonOk: false
@@ -87,11 +87,11 @@ Item {
     root.unacked = result.unacked
     root.logReadable = true
     if (result.reloaded) {
-      // sentineld renamed alerts.jsonl to alerts.1.jsonl at 20 MB and opened a
+      // moatd renamed alerts.jsonl to alerts.1.jsonl at 20 MB and opened a
       // fresh file, or the file was truncated. ingestText already re-folded
       // from the new content and kept the seen-set, so rotated-out ids cannot
       // come back as "new" and re-notify.
-      console.log("sentinel: alerts.jsonl rotated or truncated, re-folded")
+      console.log("moat: alerts.jsonl rotated or truncated, re-folded")
     }
     for (var i = 0; i < result.newIds.length; i++) {
       var alert = root.alertById(result.newIds[i])
@@ -111,7 +111,7 @@ Item {
 
     // text() is only guaranteed fresh in onLoaded, so onFileChanged asks for a
     // re-read rather than parsing here. Append-heavy files fire this often;
-    // the fold is O(file) but the file is capped at 20 MB by sentineld.
+    // the fold is O(file) but the file is capped at 20 MB by moatd.
     onFileChanged: reload()
     onLoaded: root._ingest(text())
     onLoadFailed: function(error) {
@@ -149,7 +149,7 @@ Item {
 
     var urgency = Model.notifyUrgency(alert.severity)
     var argv = ["omarchy-notification-send",
-                "--app-name", "Sentinel",
+                "--app-name", "Moat",
                 "-u", urgency,
                 "-g", Model.notifyGlyphFor(alert.severity)]
 
@@ -176,7 +176,7 @@ Item {
   // neutralize and expensive to debug.
   function _notifyText(value) {
     var text = String(value || "").replace(/^[-\s]+/, "")
-    return text === "" ? "Sentinel alert" : text
+    return text === "" ? "Moat alert" : text
   }
 
   function _notifyBody(alert) {
@@ -186,7 +186,7 @@ Item {
     if (offered.length > 0) {
       // Name the actions in the body: the toast has one click, and this says
       // where the buttons are.
-      parts.push("Click to open Sentinel (" +
+      parts.push("Click to open Moat (" +
                  offered.map(function(a) { return a.charAt(0).toUpperCase() + a.slice(1) }).join(" / ") + ").")
     }
     return parts.join("\n")
@@ -195,7 +195,7 @@ Item {
   // --------------------------------------------------------- capability probe
   //
   // One bash call answers both halves of the setup screen: is the package
-  // installed, and is this session in the sentinel group. `id -nG` reflects the
+  // installed, and is this session in the moat group. `id -nG` reflects the
   // session's credentials, which is exactly the question — a usermod without a
   // re-login must still read as "not yet".
   function probe() {
@@ -208,8 +208,8 @@ Item {
   Process {
     id: probeProc
     command: ["bash", "-c",
-      "if [ -x /usr/bin/sentinelctl ]; then a=true; else a=false; fi; " +
-      "if id -nG 2>/dev/null | tr ' ' '\\n' | grep -qx sentinel; then g=true; else g=false; fi; " +
+      "if [ -x /usr/bin/moatctl ]; then a=true; else a=false; fi; " +
+      "if id -nG 2>/dev/null | tr ' ' '\\n' | grep -qx moat; then g=true; else g=false; fi; " +
       "printf '{\"available\":%s,\"group\":%s}\\n' \"$a\" \"$g\""]
     stdout: StdioCollector { id: probeStdout; waitForEnd: true; onStreamFinished: root._probeOutput = text }
     onExited: function(exitCode) {
@@ -230,9 +230,9 @@ Item {
   // ------------------------------------------------------------- status poll
   //
   // CONTRACT 5 defines a newline-delimited JSON control socket, and
-  // Quickshell.Io.Socket can speak to a unix path — but sentinelctl is the
+  // Quickshell.Io.Socket can speak to a unix path — but moatctl is the
   // documented client for it and is one request/response per connection
-  // anyway, so shelling out to `sentinelctl status --json` costs one fork and
+  // anyway, so shelling out to `moatctl status --json` costs one fork and
   // removes an entire reconnect/framing state machine from the shell. See
   // shell/README.md.
   function pollStatus() {
@@ -257,7 +257,7 @@ Item {
         // mark it not-ok so the UI stops claiming a mode it cannot verify.
         root.status = Model.normalizeStatus(null)
         root.daemonOk = false
-        root.lastError = stderr || ("sentinelctl status exited " + exitCode)
+        root.lastError = stderr || ("moatctl status exited " + exitCode)
         return
       }
 
@@ -265,7 +265,7 @@ Item {
       root.status = next
       root.daemonOk = next.ok
       if (next.ok) root.lastError = ""
-      else root.lastError = next.error || stderr || "sentineld is not reachable"
+      else root.lastError = next.error || stderr || "moatd is not reachable"
 
       // group_ok from the daemon is authoritative about socket access; it can
       // only ever take groupOk away, never grant it.
@@ -309,7 +309,7 @@ Item {
   // what makes the control socket safe to expose to the user's group, and the
   // plugin does not get to widen it.
   //
-  // sentinelctl's argv is the sentineld agent's surface; it is spelled out once
+  // moatctl's argv is the moatd agent's surface; it is spelled out once
   // here so a change there is a change in one place.
   function _argvFor(command, arg, arg2) {
     switch (command) {
@@ -331,7 +331,7 @@ Item {
 
   function _enqueue(command, arg, arg2) {
     if (!root.available) {
-      root.lastError = "sentinelctl is not installed"
+      root.lastError = "moatctl is not installed"
       root.actionFinished(command, false, root.lastError)
       return false
     }
@@ -370,19 +370,19 @@ Item {
       root._actionError = ""
 
       var ok = exitCode === 0
-      var message = ok ? "" : (stderr || "sentinelctl exited " + exitCode)
+      var message = ok ? "" : (stderr || "moatctl exited " + exitCode)
       try {
         var value = JSON.parse(stdout || "{}")
         if (value.ok === false) { ok = false; message = String(value.error || message) }
         // `set mode` answers ok:true even when `tetra tp set-mode` failed on
-        // every policy: sentineld deliberately persists the mode so a restart
+        // every policy: moatd deliberately persists the mode so a restart
         // reapplies it. But nothing in the kernel changed, and a panel that
         // says "enforce" over a sensor still in monitor is the one lie this UI
         // must not tell. Treat "0 of N applied" as a failure and name it.
         if (ok && actionProc.pendingCommand === "mode" && Number(value.policies || 0) > 0
             && Number(value.applied || 0) === 0) {
           ok = false
-          message = "sentineld recorded mode " + String(value.mode || "?") +
+          message = "moatd recorded mode " + String(value.mode || "?") +
                     " but could not apply it to any of " + Number(value.policies) +
                     " policies (" + String(value.tetra || "tetra") +
                     " failed). Tetragon is still in the previous mode."
@@ -396,14 +396,14 @@ Item {
       } catch (e) {
         // Not JSON. exitCode already decided ok; stderr already carries why.
       }
-      if (!ok) root.lastError = message || ("sentinelctl " + actionProc.pendingCommand + " failed")
+      if (!ok) root.lastError = message || ("moatctl " + actionProc.pendingCommand + " failed")
       // Both halves of the allowlist tab move when a rule is added or removed.
       if (ok && (actionProc.pendingCommand === "ignore" || actionProc.pendingCommand === "unignore"))
         root.loadAllowlist()
       root.actionFinished(actionProc.pendingCommand, ok, message)
       root.actionSerial++
       root.busy = false
-      // sentineld appends the resulting update line, so the FileView watch will
+      // moatd appends the resulting update line, so the FileView watch will
       // fire on its own — but ask anyway so a same-millisecond write is not
       // missed, and re-poll status because mode/sandbox/feeds live there.
       root.refresh()
@@ -439,7 +439,7 @@ Item {
   // Reads, so they get their own processes rather than the action queue: the
   // queue's completion handler refreshes everything, which would loop.
   property var allowlistRules: []
-  property string allowlistFile: "/etc/sentinel/allowlist.d/user.toml"
+  property string allowlistFile: "/etc/moat/allowlist.d/user.toml"
   property string allowlistError: ""
   property bool allowlistLoading: false
   property string lastIgnoreBlock: ""
@@ -462,7 +462,7 @@ Item {
       var stdout = String(allowlistStdout.text || root._allowlistOutput || "").trim()
       var stderr = String(allowlistStderr.text || root._allowlistError || "").trim()
       if (exitCode !== 0 && !stdout) {
-        root.allowlistError = stderr || ("sentinelctl allowlist exited " + exitCode)
+        root.allowlistError = stderr || ("moatctl allowlist exited " + exitCode)
         return
       }
       var parsed = Model.parseAllowlist(stdout)
@@ -475,7 +475,7 @@ Item {
   // --------------------------------------------------------------- explain
   //
   // The alert on disk normally carries its own explain block, so this is the
-  // repair path: an alert written by an older sentineld, or one whose line was
+  // repair path: an alert written by an older moatd, or one whose line was
   // truncated, can be re-fetched by id (CONTRACT 5's `explain` command) without
   // touching anything else the sensor recorded.
   property string _explainId: ""

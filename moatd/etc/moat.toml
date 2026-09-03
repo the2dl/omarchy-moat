@@ -1,0 +1,124 @@
+# /etc/moat/moat.toml — moatd configuration (root:root 0644).
+#
+# Everything here has a built-in default; this file only needs the values you
+# want to change. Unknown keys are an error, so a typo is loud rather than
+# silently ignored. Reloaded on SIGHUP (`systemctl reload moatd`).
+
+# Group that owns the control socket and alerts.jsonl. Members can read alerts
+# and act on them: sudo usermod -aG moat $USER, then log out and back in.
+group = "moat"
+
+# Starting policy mode. `moatctl set mode enforce` overrides this and
+# persists the choice in state.json, so this is only the first-boot default.
+#   monitor — Tetragon reports, never kills. moatd kills only when asked.
+#   enforce — policies carrying matchActions Sigkill/Override act in the kernel.
+mode = "monitor"
+
+[paths]
+# Tetragon's JSON export (its `export-filename`). moatd tails this and
+# handles rename-rotation and truncation.
+tetragon_log = "/var/log/moat/tetragon.log"
+
+# Rendered policies. Tetragon's `tracing-policy-dir` must point here.
+policies_dir = "/run/moat/policies"
+
+# Policy templates containing {{HOME}}, shipped by the package.
+templates_dir = "/usr/lib/moat/policies"
+
+# Generated Tetragon conf.d fragment listing the exact policy names to export.
+# Tetragon's policy_names filter is exact-match only, so this is regenerated on
+# every `moatd render-policies`.
+export_allowlist = "/etc/tetragon/tetragon.conf.d/export-allowlist"
+
+# alerts.jsonl, state.json, quarantine/ and feeds/ live under here.
+state_dir = "/var/lib/moat"
+
+runtime_dir = "/run/moat"
+socket = "/run/moat/control.sock"
+
+# Every *.toml in this directory is merged, in file-name order.
+allowlist_dir = "/etc/moat/allowlist.d"
+
+# Presence of this file makes /etc/profile.d/moat-shims.sh put the sandbox
+# shims on PATH. Toggled by `moatctl set sandbox on|off`.
+sandbox_flag = "/etc/moat/sandbox.enabled"
+
+# Existence of this socket is the "is Tetragon up?" check in `status`.
+tetragon_socket = "/run/tetragon/tetragon.sock"
+
+# Used only for `tetra tp set-mode <policy> monitor|enforce`.
+tetra = "/usr/bin/tetra"
+
+# Spawned by `moatctl feeds refresh`.
+feeds_bin = "/usr/bin/moat-feeds"
+
+# Where human users (uid >= 1000, home under /home or /var/home, real shell)
+# are discovered for {{HOME}} expansion.
+passwd = "/etc/passwd"
+
+[rules]
+# Userland rules (`moat-x-*`) — the detections a TracingPolicy cannot
+# express. Each can be turned off independently.
+
+# An AI CLI (claude, codex, gemini, opencode, q, amp) with no terminal anywhere
+# in its ancestry, or started with a permission-skipping flag from inside a
+# package install.
+ai_cli_headless = true
+
+# A package-manager subtree connecting to an address that is neither private nor
+# in net.registry_cidrs below.
+pkg_egress = true
+
+# sha256 of a newly executed file under $HOME, /tmp, /var/tmp or /dev/shm
+# matching the abuse.ch hash feed.
+new_exec_ioc = true
+
+# One process reading many distinct files under $HOME dotdirs in seconds.
+mass_read = true
+
+[thresholds]
+# Same rule + exe + file inside this many seconds folds into one alert with a
+# `count` update instead of a new alert.
+dedupe_secs = 60
+
+# mass-read: more than this many distinct files inside the window fires.
+mass_read_files = 40
+mass_read_window_secs = 10
+
+# How long an exited process stays in the table. Kprobe events can be written
+# after the exit line, and kill confirmation arrives on the exit event.
+process_prune_secs = 60
+
+# Ancestry chain cap recorded on each alert.
+ancestry_max = 8
+
+# alerts.jsonl is renamed to alerts.1.jsonl at this size (20 MiB).
+alerts_max_bytes = 20971520
+
+# state.json write interval, and feed-file mtime poll interval.
+state_interval_secs = 5
+feeds_poll_secs = 60
+
+[net]
+# Destinations a package install may reach without an alert. There is no DNS in
+# the kernel and no hostname in the export (TETRAGON-NOTES gap 4), so this is
+# addresses only — coarse by necessity, which is why the rule is `medium`.
+# Add your company mirror or private registry here.
+registry_cidrs = [
+  "151.101.0.0/16",   # Fastly: registry.npmjs.org, crates.io
+  "199.232.0.0/16",   # Fastly
+  "140.82.112.0/20",  # GitHub
+  "143.55.64.0/20",   # GitHub
+  "192.30.252.0/22",  # GitHub
+  "185.199.108.0/22", # GitHub Pages / raw
+  "104.16.0.0/12",    # Cloudflare: pypi.org and much else
+  "172.64.0.0/13",    # Cloudflare
+]
+
+# RFC1918, loopback, link-local and CGNAT are allowed implicitly. Set false to
+# alert on LAN traffic from installs too (noisy on a machine with a local proxy
+# or a devcontainer registry).
+allow_private = true
+
+# Severity for a pkg-egress hit: critical | high | medium | low.
+egress_severity = "medium"

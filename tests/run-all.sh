@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Every omarchy-sentinel suite, in dependency order, from the repo root.
+# Every omarchy-moat suite, in dependency order, from the repo root.
 #
 #   tests/run-all.sh            run everything, stop reporting at the end
 #   tests/run-all.sh -x         stop at the first failing suite
@@ -76,6 +76,6 @@ suite manifest bash -c 'command -v omarchy-plugin-validate >/dev/null \
 
 # Then the ones that build or run things.
 suite sandbox  bash sandbox/tests/run.sh
-suite sentineld bash -c 'cd sentineld && cargo test --release'
+suite moatd bash -c 'cd moatd && cargo test --release'
 
 summary_and_exit

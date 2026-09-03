@@ -1,20 +1,20 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-persist-desktop-config-write
+  name: moat-persist-desktop-config-write
   annotations:
-    sentinel.omarchy/severity: "medium"
-    sentinel.omarchy/title: "Hyprland or Omarchy configuration modified by a non-editor"
-    sentinel.omarchy/enforce: "none"
-    sentinel.omarchy/actions: "quarantine,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "medium"
+    moat.omarchy/title: "Hyprland or Omarchy configuration modified by a non-editor"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "quarantine,ignore"
+    moat.omarchy/why: >-
       Hyprland exec-once lines and Omarchy autostart config run at session start with
       your full desktop session; editing them is persistence that hides in plain sight
       among files you edit yourself.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       Your editor, the omarchy-* helper scripts (allowlisted here), omarchy-shell saving
       its own settings, and theme switches.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

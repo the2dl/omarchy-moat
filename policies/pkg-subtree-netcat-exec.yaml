@@ -1,19 +1,19 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-pkg-subtree-netcat-exec
+  name: moat-pkg-subtree-netcat-exec
   annotations:
-    sentinel.omarchy/severity: "critical"
-    sentinel.omarchy/title: "Package install ran netcat or socat"
-    sentinel.omarchy/enforce: "kill"
-    sentinel.omarchy/actions: "kill,quarantine,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "critical"
+    moat.omarchy/title: "Package install ran netcat or socat"
+    moat.omarchy/enforce: "kill"
+    moat.omarchy/actions: "kill,quarantine,ignore"
+    moat.omarchy/why: >-
       No legitimate build step needs netcat, socat or telnet. Inside a package install
       tree these binaries mean one thing: a reverse shell or an exfiltration channel.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       Effectively never. A hand-written Makefile that waits for a local port with nc is
       the only benign case seen in practice.
-    sentinel.omarchy/fp-hint: "parent"
+    moat.omarchy/fp-hint: "parent"
 spec:
   options:
   - name: "policy-mode"

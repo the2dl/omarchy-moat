@@ -1,11 +1,11 @@
-# Sentinel — omarchy-shell plugin
+# Moat — omarchy-shell plugin
 
-The user-facing half of `omarchy-sentinel`. It reads the alert log sentineld
+The user-facing half of `omarchy-moat`. It reads the alert log moatd
 writes, shows a shield in the bar, and gives every alert a panel that explains
 what happened and offers the four things you can do about it.
 
 The plugin never touches processes or files itself. Every action is a
-`sentinelctl` call that names an **alert id** — the daemon looks up what it
+`moatctl` call that names an **alert id** — the daemon looks up what it
 already recorded for that id and acts on that. A plugin bug therefore cannot
 kill or quarantine something the sensor did not flag.
 
@@ -14,15 +14,15 @@ kill or quarantine something the sensor did not flag.
 | File | What it is |
 |------|------------|
 | `../manifest.json` | Plugin manifest: kinds `service`, `bar-widget`, `panel`, `keepLoaded: true`, and the `barWidget.defaults` + `schema` for the three settings. |
-| `SentinelModel.js` | All the logic, as pure functions: JSONL parsing, update folding, rotation detection, severity ordering, unacked counts, the notification decision, `explain` normalization, ignore-scope ordering, allowlist parsing, rotate guidance, relative time. `.pragma library`, no QML types — which is what makes it unit-testable. |
-| `Service.qml` | Kind `service`. The single owner of state: tails `alerts.jsonl`, polls `sentinelctl status --json`, queues actions, sends notifications, exposes `alerts` / `unacked` / `status` / `available` / `groupOk` and the action functions. |
+| `MoatModel.js` | All the logic, as pure functions: JSONL parsing, update folding, rotation detection, severity ordering, unacked counts, the notification decision, `explain` normalization, ignore-scope ordering, allowlist parsing, rotate guidance, relative time. `.pragma library`, no QML types — which is what makes it unit-testable. |
+| `Service.qml` | Kind `service`. The single owner of state: tails `alerts.jsonl`, polls `moatctl status --json`, queues actions, sends notifications, exposes `alerts` / `unacked` / `status` / `available` / `groupOk` and the action functions. |
 | `BarWidget.qml` | Kind `bar-widget`. A `WidgetButton` drawing the shield glyph plus a count badge. |
 | `Panel.qml` | Kind `panel`. The window, tabs, keyboard handling, confirmations, status strip and settings row. |
 | `AlertRow.qml` | One row of the alert list: severity pill, title, exe basename, relative time, ack state. |
 | `AlertDetail.qml` | The five headed blocks: WHAT HAPPENED, WHY IT WAS FLAGGED, EVIDENCE, IF THIS IS EXPECTED, WHAT TO DO. |
 | `SetupView.qml` | Shown instead of the alert list when the package or the group is missing, with the exact commands. |
 | `AllowlistView.qml` | The Allowlist tab: user.toml rules with their comment and a Remove button. |
-| `tests/tst_model.qml` | 39 unit tests over `SentinelModel.js`. |
+| `tests/tst_model.qml` | 39 unit tests over `MoatModel.js`. |
 | `tests/fixtures/alerts.jsonl` | 13 realistic alerts across every family, plus 5 update lines including a dedupe `count` update. |
 | `tests/run-tests.sh` | Syntax pass over every `.qml` plus the unit suite, headless. |
 
@@ -33,14 +33,14 @@ point into `shell/`), so the whole repo is the plugin directory.
 
 ```bash
 # From a git remote — clones into ~/.config/omarchy/plugins/<id>/, disabled.
-omarchy plugin add https://github.com/the2dl/omarchy-sentinel.git
-omarchy plugin enable io.github.the2dl.sentinel
+omarchy plugin add https://github.com/the2dl/omarchy-moat.git
+omarchy plugin enable io.github.the2dl.moat
 
 # From a local checkout — copy it, do not symlink: omarchy-plugin-validate
 # refuses a plugin folder containing any symlink, and the shell agrees.
-cp -r /path/to/omarchy-sentinel ~/.config/omarchy/plugins/io.github.the2dl.sentinel
+cp -r /path/to/omarchy-moat ~/.config/omarchy/plugins/io.github.the2dl.moat
 omarchy-shell shell rescanPlugins
-omarchy plugin enable io.github.the2dl.sentinel
+omarchy plugin enable io.github.the2dl.moat
 ```
 
 Saving a file anywhere under `~/.config/omarchy/plugins/` hot-reloads the plugin
@@ -50,12 +50,12 @@ code. If a change does not take, `omarchy-shell shell rescanPlugins`, then
 Validate before installing:
 
 ```bash
-omarchy-plugin-validate /path/to/omarchy-sentinel
+omarchy-plugin-validate /path/to/omarchy-moat
 ```
 
 The bar widget lands in the right section. Move it with
-`omarchy bar move io.github.the2dl.sentinel --before omarchy.clock`, and change
-its settings with `omarchy bar set io.github.the2dl.sentinel minNotifySeverity critical`
+`omarchy bar move io.github.the2dl.moat --before omarchy.clock`, and change
+its settings with `omarchy bar set io.github.the2dl.moat minNotifySeverity critical`
 (or from the panel's settings row, which writes the same entry).
 
 ## Running the tests
@@ -82,9 +82,9 @@ those files with a `qmlformat` parse pass instead.
 
 ## The notification mechanism, and why
 
-**Mechanism:** `omarchy-notification-send --app-name Sentinel -u <urgency>
+**Mechanism:** `omarchy-notification-send --app-name Moat -u <urgency>
 -g <glyph> <title> <body> --exec omarchy-shell shell summon
-io.github.the2dl.sentinel '{"alert":"<id>"}'`, run through
+io.github.the2dl.moat '{"alert":"<id>"}'`, run through
 `Commons.Util.execArgv` (which executes the vector as bash *positional
 parameters*, never a shell string, so an alert id or a file path can never
 become a command).
@@ -94,7 +94,7 @@ become a command).
 `omarchy-notification-send` calls `org.freedesktop.Notifications.Notify`
 directly over `busctl` rather than shelling out to `notify-send`. That matters
 here specifically: `notify-send`'s argv parsing is the surface that would
-reinterpret a relayed headline like `--hint=…` as an option, and Sentinel's
+reinterpret a relayed headline like `--hint=…` as an option, and Moat's
 headlines and bodies contain attacker-influenced text (process paths, args,
 domains). Going through `busctl` makes the summary and body typed D-Bus strings
 that cannot become hints.
@@ -103,7 +103,7 @@ The click action rides as the `omarchy-exec-argv` hint, which `--exec` is the
 only way to set. `NotificationLogic.parseExecArgv` +
 `Service.invokePopupDefault` in `/usr/share/omarchy/shell/plugins/notifications/`
 are what make that clickable, and because the hint is persisted with the toast,
-a Sentinel alert stays clickable across a shell restart — a libnotify action
+a Moat alert stays clickable across a shell restart — a libnotify action
 would not, since its sender is gone.
 
 **Deviation from CONTRACT 7, deliberate:** the contract asks for toast actions
@@ -122,7 +122,7 @@ than one extra click.
 Urgency follows the contract: critical → `critical` (and `-t 0`, so it does not
 expire on its own), high and medium → `normal`, low → `low`. `minNotifySeverity`
 (default `high`) filters below that. Alerts that already existed when the shell
-started **never** notify: `SentinelModel.ingestText` marks the first ingest as
+started **never** notify: `MoatModel.ingestText` marks the first ingest as
 the priming load and returns no new ids for it, and `shouldNotify` refuses on
 `initialLoad` independently, so a login does not replay the backlog as toasts.
 
@@ -163,8 +163,8 @@ Things worth knowing before changing this plugin.
 - **The control socket was not used directly.** `Quickshell.Io.Socket` does
   exist in 0.3.1 and can connect to a unix path, but CONTRACT 5 is one
   request/response *per connection*, so a socket client would reconnect for every
-  call anyway — and `sentinelctl` is the contract's own documented client for it.
-  `Process` running `sentinelctl <verb> --json` costs one fork and removes a
+  call anyway — and `moatctl` is the contract's own documented client for it.
+  `Process` running `moatctl <verb> --json` costs one fork and removes a
   reconnect/framing state machine from inside the shell. `Service.qml`'s
   `_argvFor()` is the single place the CLI's argv is spelled out.
 

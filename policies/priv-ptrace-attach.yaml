@@ -1,20 +1,20 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-priv-ptrace-attach
+  name: moat-priv-ptrace-attach
   annotations:
-    sentinel.omarchy/severity: "high"
-    sentinel.omarchy/title: "Process attached to another process with ptrace"
-    sentinel.omarchy/enforce: "none"
-    sentinel.omarchy/actions: "kill,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "Process attached to another process with ptrace"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,ignore"
+    moat.omarchy/why: >-
       Attaching to a running process reads its memory and injects code into it: this is
       how tokens are lifted out of a running browser, an ssh-agent or a password manager
       without ever touching a file on disk.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       gdb, lldb, strace, ltrace, perf, rr and delve while you debug, and
       systemd-coredump when something crashes.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

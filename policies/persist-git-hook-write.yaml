@@ -1,20 +1,20 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-persist-git-hook-write
+  name: moat-persist-git-hook-write
   annotations:
-    sentinel.omarchy/severity: "high"
-    sentinel.omarchy/title: "Git hook or .envrc written"
-    sentinel.omarchy/enforce: "none"
-    sentinel.omarchy/actions: "kill,quarantine,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "Git hook or .envrc written"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,quarantine,ignore"
+    moat.omarchy/why: >-
       A git hook runs on your next commit and an .envrc runs the moment you cd into the
       directory; both are executable code that lives inside a repository you trust and
       that no lockfile covers.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       husky, lefthook, pre-commit and direnv setups, and your editor. These write hooks
       as part of a normal npm install.
-    sentinel.omarchy/fp-hint: "exe+file"
+    moat.omarchy/fp-hint: "exe+file"
 spec:
   options:
   - name: "policy-mode"

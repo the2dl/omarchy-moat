@@ -1,21 +1,21 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-net-pkg-subtree-egress
+  name: moat-net-pkg-subtree-egress
   annotations:
-    sentinel.omarchy/severity: "high"
-    sentinel.omarchy/title: "Package install connected to an unusual port on the internet"
-    sentinel.omarchy/enforce: "none"
-    sentinel.omarchy/actions: "kill,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "Package install connected to an unusual port on the internet"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,ignore"
+    moat.omarchy/why: >-
       Registries live on 443. An install script that opens 22, 4444 or 31337 to a public
       address is exfiltrating or calling home, and the connection happens before any
       file it drops is ever executed.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       Git over SSH inside a build (port 22), private registries or proxies on a custom
       port, and dev servers reaching a public API. RFC1918, loopback and link-local
       destinations are excluded in-kernel.
-    sentinel.omarchy/fp-hint: "parent"
+    moat.omarchy/fp-hint: "parent"
 spec:
   options:
   - name: "policy-mode"

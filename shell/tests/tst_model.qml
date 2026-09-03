@@ -1,8 +1,8 @@
 import QtQuick
 import QtTest
-import "../SentinelModel.js" as Model
+import "../MoatModel.js" as Model
 
-// Unit tests for SentinelModel.js. No shell, no daemon, no /var/lib/sentinel:
+// Unit tests for MoatModel.js. No shell, no daemon, no /var/lib/moat:
 // the model is pure functions over plain values precisely so the folding,
 // severity and notification rules can be checked here.
 //
@@ -10,7 +10,7 @@ import "../SentinelModel.js" as Model
 //     -input shell/tests/tst_model.qml
 TestCase {
   id: suite
-  name: "SentinelModel"
+  name: "MoatModel"
 
   // ------------------------------------------------------------ fixture load
 
@@ -118,7 +118,7 @@ TestCase {
     compare(sshKey.acked, false)
     // An update may not rewrite what the sensor saw.
     compare(sshKey.severity, "high")
-    compare(sshKey.rule, "sentinel-cred-ssh-private-key-read")
+    compare(sshKey.rule, "moat-cred-ssh-private-key-read")
   }
 
   function test_update_before_base_is_parked_then_applied() {
@@ -208,7 +208,7 @@ TestCase {
 
     var appended = suite.fixtureText + JSON.stringify({
       v: 1, id: "01J8ZK6B4Q3M7N9P2R5S8T1V4Z", ts: "2026-09-03T17:00:00.000Z",
-      severity: "critical", rule: "sentinel-shell-reverse-shell", family: "shell",
+      severity: "critical", rule: "moat-shell-reverse-shell", family: "shell",
       title: "Fresh reverse shell", summary: "new", actions: ["kill"]
     }) + "\n"
 
@@ -241,12 +241,12 @@ TestCase {
     var first = Model.ingestText(store, suite.fixtureText)
     compare(first.reloaded, false)
 
-    // sentineld renamed alerts.jsonl to alerts.1.jsonl and opened a fresh file.
+    // moatd renamed alerts.jsonl to alerts.1.jsonl and opened a fresh file.
     // The new file is shorter, which is the only rotation signal a whole-file
     // reader gets.
     var rotated = JSON.stringify({
       v: 1, id: "01J8ZK6B4Q3M7N9P2R5S8T1W00", ts: "2026-09-03T18:00:00.000Z",
-      severity: "medium", rule: "sentinel-net-suspicious-egress", family: "net",
+      severity: "medium", rule: "moat-net-suspicious-egress", family: "net",
       title: "After rotation", summary: "post-rotation alert", actions: ["ignore"]
     }) + "\n"
 
@@ -259,7 +259,7 @@ TestCase {
     // Growing again from the rotated file is not a rotation.
     var grown = rotated + JSON.stringify({
       v: 1, id: "01J8ZK6B4Q3M7N9P2R5S8T1W01", ts: "2026-09-03T18:01:00.000Z",
-      severity: "low", rule: "sentinel-exec-new-binary-home", family: "exec",
+      severity: "low", rule: "moat-exec-new-binary-home", family: "exec",
       title: "Later", summary: "", actions: []
     }) + "\n"
     var after = Model.ingestText(store, grown)
@@ -302,7 +302,7 @@ TestCase {
     compare(alert.explain.evidence.length, 4)
     compare(alert.explain.next.length, 2)
     verify(alert.explain.expected.length > 0)
-    compare(alert.explain.if_expected.file, "/etc/sentinel/allowlist.d/user.toml")
+    compare(alert.explain.if_expected.file, "/etc/moat/allowlist.d/user.toml")
   }
 
   function test_alert_without_explain_still_normalizes() {
@@ -389,12 +389,12 @@ TestCase {
   function test_parse_allowlist_keeps_daemon_indices() {
     var parsed = Model.parseAllowlist(JSON.stringify({
       ok: true,
-      file: "/etc/sentinel/allowlist.d/user.toml",
+      file: "/etc/moat/allowlist.d/user.toml",
       rules: [
-        { index: 0, name: "sentinel-cred-ssh-private-key-read", scope: "exe",
+        { index: 0, name: "moat-cred-ssh-private-key-read", scope: "exe",
           comment: "# added 2026-09-01 from alert 01J8...: Private SSH key read",
           exe: "/usr/bin/git" },
-        { index: 3, name: "sentinel-x-mass-read", scope: "rule", comment: "" }
+        { index: 3, name: "moat-x-mass-read", scope: "rule", comment: "" }
       ]
     }))
 
@@ -510,8 +510,8 @@ TestCase {
       feeds: { updated: "2026-09-03T11:00:00Z" }, group_ok: true
     }))
     var summary = Model.statusSummary(status, { total: 9 }, Date.parse("2026-09-03T12:00:00Z"))
-    compare(summary, "Sentinel: mode monitor, tetragon running, 17 policies, feeds 1h ago, 9 unacked")
-    compare(Model.statusSummary(null, {}, 0), "Sentinel: daemon not reachable")
+    compare(summary, "Moat: mode monitor, tetragon running, 17 policies, feeds 1h ago, 9 unacked")
+    compare(Model.statusSummary(null, {}, 0), "Moat: daemon not reachable")
   }
 
   function test_normalize_mode() {
@@ -527,8 +527,8 @@ TestCase {
     var both = Model.setupSteps(true, true)
     compare(both.length, 4)
     verify(both[0].command.indexOf("makepkg -si") >= 0)
-    verify(both[1].command.indexOf("systemctl enable --now tetragon sentineld sentinel-feeds.timer") >= 0)
-    verify(both[2].command.indexOf("usermod -aG sentinel $USER") >= 0)
+    verify(both[1].command.indexOf("systemctl enable --now tetragon moatd moat-feeds.timer") >= 0)
+    verify(both[2].command.indexOf("usermod -aG moat $USER") >= 0)
 
     compare(Model.setupSteps(false, true).length, 2)
     compare(Model.setupSteps(false, false).length, 0)

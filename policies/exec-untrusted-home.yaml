@@ -1,20 +1,20 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-exec-untrusted-home
+  name: moat-exec-untrusted-home
   annotations:
-    sentinel.omarchy/severity: "medium"
-    sentinel.omarchy/title: "Binary executed from a cache or download directory"
-    sentinel.omarchy/enforce: "none"
-    sentinel.omarchy/actions: "kill,quarantine,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "medium"
+    moat.omarchy/title: "Binary executed from a cache or download directory"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,quarantine,ignore"
+    moat.omarchy/why: >-
       Nothing in ~/Downloads was reviewed and nothing in ~/.cache is meant to be code
       you run; a payload that lands in either and then executes is the last step before
       it has your session.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       Frequently. Playwright, Cypress, Puppeteer, bun, uv, mise and electron-builder all
       keep executables under ~/.cache and run them during ordinary builds.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

@@ -1,19 +1,19 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-persist-autostart-write
+  name: moat-persist-autostart-write
   annotations:
-    sentinel.omarchy/severity: "high"
-    sentinel.omarchy/title: "Desktop autostart or user systemd unit written"
-    sentinel.omarchy/enforce: "none"
-    sentinel.omarchy/actions: "kill,quarantine,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "Desktop autostart or user systemd unit written"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,quarantine,ignore"
+    moat.omarchy/why: >-
       A .desktop file in ~/.config/autostart or a user unit in ~/.config/systemd/user
       restarts a payload at every login without touching anything root-owned.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       Installing a desktop app or a user service on purpose (syncthing, mise, Docker
       Desktop, Flatpak wrappers), and GNOME/KDE settings dialogs.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

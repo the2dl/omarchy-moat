@@ -1,20 +1,20 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-rootkit-ldso-preload-write
+  name: moat-rootkit-ldso-preload-write
   annotations:
-    sentinel.omarchy/severity: "critical"
-    sentinel.omarchy/title: "/etc/ld.so.preload created or modified"
-    sentinel.omarchy/enforce: "kill"
-    sentinel.omarchy/actions: "kill,quarantine,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "critical"
+    moat.omarchy/title: "/etc/ld.so.preload created or modified"
+    moat.omarchy/enforce: "kill"
+    moat.omarchy/actions: "kill,quarantine,ignore"
+    moat.omarchy/why: >-
       /etc/ld.so.preload injects a shared object into every dynamically linked program
       on the machine. It does not exist on a clean Arch install, and the classic
       userland rootkits (Jynx, Azazel, HiddenWasp) all start by writing it.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       Nothing on a normal desktop. A few commercial agents and some libc debugging
       setups use it.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

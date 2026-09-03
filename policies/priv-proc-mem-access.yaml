@@ -1,20 +1,20 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-priv-proc-mem-access
+  name: moat-priv-proc-mem-access
   annotations:
-    sentinel.omarchy/severity: "medium"
-    sentinel.omarchy/title: "Another process's memory or maps read through /proc"
-    sentinel.omarchy/enforce: "none"
-    sentinel.omarchy/actions: "kill,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "medium"
+    moat.omarchy/title: "Another process's memory or maps read through /proc"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,ignore"
+    moat.omarchy/why: >-
       /proc/<pid>/mem and /proc/<pid>/maps give a reader the plaintext of another
       process: session cookies, decrypted vault entries, ssh-agent keys. The read goes
       through the same ptrace access check as a debugger attach, in read mode.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       Process viewers and profilers - htop, btop, ps, top, lsof, perf, the GNOME/KDE
       system monitors - whenever they inspect processes you own.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

@@ -1,20 +1,20 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-priv-setcap-xattr
+  name: moat-priv-setcap-xattr
   annotations:
-    sentinel.omarchy/severity: "high"
-    sentinel.omarchy/title: "File capability set on a binary"
-    sentinel.omarchy/enforce: "none"
-    sentinel.omarchy/actions: "kill,quarantine,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "File capability set on a binary"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,quarantine,ignore"
+    moat.omarchy/why: >-
       security.capability is setuid without the obvious bit: cap_setuid or cap_sys_admin
       on a private copy of a binary is a quiet, permanent privilege escalation that no
       permission listing makes obvious.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       pacman extracting a package that ships capabilities, and you running setcap by
       hand for a profiler, a debugger or a network tool.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

@@ -1,8 +1,8 @@
 {
   "id": "01M1M5XHBZTEYJ03KHCF0R5P32",
   "scope": "exe",
-  "file": "/etc/sentinel/allowlist.d/user.toml",
-  "block": "# added 2026-09-03 from alert 01M1M5XHBZTEYJ03KHCF0R5P32: Private SSH key read by an unexpected program — wire fixture\n[[rule]]\nname = \"sentinel-cred-ssh-private-key-read\"\nexe = \"/usr/bin/node\"\n",
+  "file": "/etc/moat/allowlist.d/user.toml",
+  "block": "# added 2026-09-03 from alert 01M1M5XHBZTEYJ03KHCF0R5P32: Private SSH key read by an unexpected program — wire fixture\n[[rule]]\nname = \"moat-cred-ssh-private-key-read\"\nexe = \"/usr/bin/node\"\n",
   "acked": true,
   "ok": true
 }

@@ -1,0 +1,433 @@
+#!/usr/bin/env bash
+# moat-sandbox - run a command under bubblewrap with the user's secrets
+# hidden and only the project directory + package caches writable.
+#
+# Part of omarchy-moat 0.1.0. See docs/CONTRACT.md section 8.
+#
+# Usage: moat-sandbox [--allow PATH]... [--keep-env NAME]... [--dry-run] -- cmd [args...]
+#
+# Environment:
+#   MOAT_SANDBOX=0         exec the command directly, no sandbox
+#   MOAT_SANDBOX_ACTIVE=1  set inside the sandbox; prevents nesting
+#   MOAT_QUIET=1           suppress the one-line notice on stderr
+
+set -euo pipefail
+
+readonly PROG=moat-sandbox
+readonly VERSION=0.1.0
+readonly SHIM_DIR=/usr/lib/moat/shims
+
+warn() { [[ ${MOAT_QUIET:-0} == 1 ]] || printf '[moat] %s\n' "$*" >&2; }
+die() {
+	printf '[moat] %s: %s\n' "$PROG" "$*" >&2
+	exit 1
+}
+
+# ---------------------------------------------------------------- defaults ---
+
+# Denied paths (contract section 8). A denied directory is covered with a
+# tmpfs; a denied file is replaced by an empty read-only file.
+DEFAULT_DENY=(
+	"$HOME/.ssh"
+	"$HOME/.aws"
+	"$HOME/.config/gh"
+	"$HOME/.claude"
+	"$HOME/.codex"
+	"$HOME/.gemini"
+	"$HOME/.gnupg"
+	"$HOME/.local/share/keyrings"
+	"$HOME/.mozilla"
+	"$HOME/.config/chromium"
+	"$HOME/.config/google-chrome"
+	"$HOME/.config/BraveSoftware"
+	"$HOME/.docker/config.json"
+	"$HOME/.kube"
+	"$HOME/.netrc"
+	"$HOME/.git-credentials"
+	"$HOME/.config/op"
+	"$HOME/.password-store"
+)
+
+# Package caches that must be writable for installs to work at all.
+DEFAULT_CACHES=(
+	"$HOME/.npm"
+	"$HOME/.cache"
+	"$HOME/.cache/pip"
+	"$HOME/.local/share/pnpm"
+	"$HOME/.cargo/registry"
+	"$HOME/.cargo/git"
+	"$HOME/.rustup"
+	"$HOME/.local/share/mise"
+	"$HOME/.local/share/uv"
+	"$HOME/.bun"
+	"$HOME/.yarn"
+)
+
+# Env names to strip. Globs are matched against every exported name.
+SECRET_GLOBS=('*_TOKEN' '*_SECRET' '*_KEY' 'AWS_*' 'GITHUB_TOKEN' 'NPM_TOKEN')
+
+# ------------------------------------------------------------------- utils ---
+
+# Expand a leading ~ or $HOME and strip a trailing slash (but keep "/").
+expand_path() {
+	local p=$1
+	# shellcheck disable=SC2088,SC2016 # matching the literal text, not expanding it
+	case $p in
+	'~') p=$HOME ;;
+	'~/'*) p=$HOME/${p#'~/'} ;;
+	'$HOME') p=$HOME ;;
+	'$HOME/'*) p=$HOME/${p#'$HOME/'} ;;
+	esac
+	while [[ $p == */ && $p != / ]]; do p=${p%/}; done
+	printf '%s' "$p"
+}
+
+# is_under CHILD PARENT -> true when CHILD == PARENT or CHILD is inside PARENT
+is_under() {
+	local child=$1 parent=$2
+	[[ $child == "$parent" || $child == "$parent"/* ]]
+}
+
+in_list() {
+	local needle=$1 item
+	shift
+	for item in "$@"; do
+		[[ $item == "$needle" ]] && return 0
+	done
+	return 1
+}
+
+# ------------------------------------------------------------------ config ---
+
+DENY=("${DEFAULT_DENY[@]}")
+ALLOW=()
+KEEP_ENV=()
+
+read_config() {
+	local file=$1 lineno=0 line key val
+	[[ -r $file ]] || return 0
+	while IFS= read -r line || [[ -n $line ]]; do
+		lineno=$((lineno + 1))
+		line=${line%%#*}
+		# trim
+		line=${line#"${line%%[![:space:]]*}"}
+		line=${line%"${line##*[![:space:]]}"}
+		[[ -z $line ]] && continue
+		if [[ $line != *=* ]]; then
+			warn "$file:$lineno: ignoring malformed line"
+			continue
+		fi
+		key=${line%%=*}
+		val=${line#*=}
+		key=${key%"${key##*[![:space:]]}"}
+		val=${val#"${val%%[![:space:]]*}"}
+		val=${val%"${val##*[![:space:]]}"}
+		[[ -z $val ]] && continue
+		case $key in
+		deny) DENY+=("$(expand_path "$val")") ;;
+		allow) ALLOW+=("$(expand_path "$val")") ;;
+		keep-env | keep_env) KEEP_ENV+=("$val") ;;
+		*) warn "$file:$lineno: unknown key '$key'" ;;
+		esac
+	done <"$file"
+}
+
+read_config /etc/moat/sandbox.conf
+read_config "${XDG_CONFIG_HOME:-$HOME/.config}/moat/sandbox.conf"
+
+# --------------------------------------------------------------- arguments ---
+
+DRY_RUN=0
+FORCE_NEW_SESSION=0
+CMD=()
+
+usage() {
+	cat <<EOF
+$PROG $VERSION
+Usage: $PROG [--allow PATH]... [--keep-env NAME]... [--dry-run]
+       [--force-new-session] -- cmd [args...]
+
+  --allow PATH      bind PATH writable inside the sandbox and drop it from the
+                    deny list (repeatable)
+  --keep-env NAME   do not strip NAME from the environment (repeatable)
+  --dry-run         print the bwrap command instead of running it
+  --force-new-session
+                    always pass --new-session to bwrap. By default it is used
+                    only on kernels that still allow TIOCSTI keystroke
+                    injection, because it also costs the sandboxed process its
+                    controlling terminal (Ctrl-C stops working).
+  -h, --help        this text
+
+Config: /etc/moat/sandbox.conf then \$XDG_CONFIG_HOME/moat/sandbox.conf
+        lines of deny=PATH / allow=PATH / keep-env=NAME, '#' starts a comment.
+EOF
+}
+
+while (($# > 0)); do
+	case $1 in
+	--allow)
+		[[ $# -ge 2 ]] || die "--allow needs a PATH"
+		ALLOW+=("$(expand_path "$2")")
+		shift 2
+		;;
+	--allow=*)
+		ALLOW+=("$(expand_path "${1#--allow=}")")
+		shift
+		;;
+	--keep-env)
+		[[ $# -ge 2 ]] || die "--keep-env needs a NAME"
+		KEEP_ENV+=("$2")
+		shift 2
+		;;
+	--keep-env=*)
+		KEEP_ENV+=("${1#--keep-env=}")
+		shift
+		;;
+	--dry-run)
+		DRY_RUN=1
+		shift
+		;;
+	--force-new-session)
+		FORCE_NEW_SESSION=1
+		shift
+		;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	--version)
+		printf '%s %s\n' "$PROG" "$VERSION"
+		exit 0
+		;;
+	--)
+		shift
+		CMD=("$@")
+		break
+		;;
+	-*) die "unknown option '$1' (did you forget '--'?)" ;;
+	*) die "expected '--' before the command, got '$1'" ;;
+	esac
+done
+
+((${#CMD[@]} > 0)) || {
+	usage >&2
+	exit 1
+}
+
+# --------------------------------------------------------------- bypasses ---
+
+if [[ ${MOAT_SANDBOX:-1} == 0 ]]; then
+	((DRY_RUN)) && {
+		printf 'MOAT_SANDBOX=0: would exec directly: %s\n' "${CMD[*]}"
+		exit 0
+	}
+	exec -- "${CMD[@]}"
+fi
+
+# Already inside a sandbox: nesting bubblewrap under an unprivileged user
+# namespace does not work, and the outer sandbox already applies.
+if [[ ${MOAT_SANDBOX_ACTIVE:-0} == 1 ]]; then
+	((DRY_RUN)) && {
+		printf 'already sandboxed: would exec directly: %s\n' "${CMD[*]}"
+		exit 0
+	}
+	exec -- "${CMD[@]}"
+fi
+
+command -v bwrap >/dev/null 2>&1 || die "bwrap (bubblewrap) is not installed"
+
+# ------------------------------------------------------- resolve deny/allow ---
+
+# An explicit allow wins: drop exact matches from the deny list.
+if ((${#ALLOW[@]} > 0)); then
+	filtered=()
+	for d in "${DENY[@]}"; do
+		in_list "$d" "${ALLOW[@]}" || filtered+=("$d")
+	done
+	DENY=("${filtered[@]}")
+fi
+
+# Dedupe the deny list, keeping order.
+uniq_deny=()
+for d in "${DENY[@]}"; do
+	((${#uniq_deny[@]})) && in_list "$d" "${uniq_deny[@]}" && continue
+	uniq_deny+=("$d")
+done
+DENY=("${uniq_deny[@]}")
+
+# --------------------------------------------------------------- workspace ---
+
+CWD=$PWD
+for d in "${DENY[@]}"; do
+	if is_under "$CWD" "$d"; then
+		die "refusing to run: the current directory $CWD is inside the denied path $d
+Either cd elsewhere, or add 'allow=$d' to ~/.config/moat/sandbox.conf."
+	fi
+done
+
+WRITABLE=()
+add_writable() {
+	local p=$1
+	((${#WRITABLE[@]})) && in_list "$p" "${WRITABLE[@]}" && return 0
+	WRITABLE+=("$p")
+}
+
+# The project directory. Never widen this to $HOME or / - the whole point is
+# that a compromised install script sees the project and nothing else.
+add_writable "$CWD"
+
+# The git toplevel, so a build in a subdirectory can still write to the repo.
+if [[ $CWD != "$HOME" ]]; then
+	toplevel=$(env -u GIT_DIR -u GIT_WORK_TREE git -C "$CWD" rev-parse --show-toplevel 2>/dev/null || true)
+	if [[ -n $toplevel && -d $toplevel && $toplevel != "$CWD" ]]; then
+		if [[ $toplevel == / || $toplevel == "$HOME" ]] || is_under "$HOME" "$toplevel"; then
+			# e.g. a bare dotfiles repo whose worktree is $HOME.
+			warn "ignoring git toplevel $toplevel (it contains \$HOME); binding only $CWD"
+		else
+			skip=0
+			for d in "${DENY[@]}"; do
+				is_under "$toplevel" "$d" && skip=1 && break
+			done
+			if ((skip)); then
+				warn "ignoring git toplevel $toplevel (denied path); binding only $CWD"
+			else
+				add_writable "$toplevel"
+			fi
+		fi
+	fi
+else
+	warn "\$PWD is \$HOME: binding \$HOME writable, denied paths still hidden"
+fi
+
+# Package caches. bwrap needs the source to exist, so create what is missing.
+for c in "${DEFAULT_CACHES[@]}"; do
+	if [[ ! -e $c ]]; then
+		mkdir -p -- "$c" 2>/dev/null || {
+			warn "could not create cache dir $c, skipping"
+			continue
+		}
+	fi
+	[[ -d $c ]] && add_writable "$c"
+done
+
+# Explicit allows, writable.
+for a in "${ALLOW[@]}"; do
+	if [[ -e $a ]]; then
+		add_writable "$a"
+	else
+		warn "--allow $a does not exist, skipping"
+	fi
+done
+
+# ------------------------------------------------------------ build command ---
+
+# --new-session (setsid) exists to block TIOCSTI keystroke injection back into
+# the terminal. It costs the sandboxed process its controlling terminal, so
+# Ctrl-C in the shell no longer reaches it - a daily annoyance for `npm
+# install`. Kernels since 6.2 gate TIOCSTI behind dev.tty.legacy_tiocsti, off
+# by default and compiled out entirely without CONFIG_LEGACY_TIOCSTI. When the
+# sysctl exists and reads 0 the attack is already impossible, so we skip
+# --new-session and keep Ctrl-C. A missing sysctl means an older kernel that
+# always allows TIOCSTI, so we keep --new-session there.
+# MOAT_TIOCSTI_FILE overrides the sysctl path (used by the test suite).
+need_new_session() {
+	((FORCE_NEW_SESSION)) && return 0
+	local f=${MOAT_TIOCSTI_FILE:-/proc/sys/dev/tty/legacy_tiocsti} v=""
+	[[ -r $f ]] || return 0
+	read -r v <"$f" 2>/dev/null || return 0
+	[[ $v == 0 ]] && return 1
+	return 0
+}
+
+ARGS=(
+	--ro-bind / /
+	--dev /dev
+	--proc /proc
+	--unshare-pid
+	--die-with-parent
+)
+if need_new_session; then
+	ARGS+=(--new-session)
+fi
+
+# tmpfs /tmp (and $TMPDIR, recreated inside the tmpfs when it lives under /tmp)
+ARGS+=(--tmpfs /tmp)
+tmp=${TMPDIR:-}
+while [[ $tmp == */ && $tmp != / ]]; do tmp=${tmp%/}; done
+if [[ -n $tmp && $tmp != /tmp ]]; then
+	if is_under "$tmp" /tmp; then
+		ARGS+=(--dir "$tmp")
+	elif [[ -d $tmp ]]; then
+		ARGS+=(--tmpfs "$tmp")
+	fi
+fi
+
+# Writable binds. Shorter paths first so a nested bind is applied last and wins.
+mapfile -t sorted_writable < <(printf '%s\n' "${WRITABLE[@]}" | awk '{print length"\t"$0}' | sort -n -k1,1 | cut -f2-)
+for w in "${sorted_writable[@]}"; do
+	ARGS+=(--bind "$w" "$w")
+done
+
+# Denied paths last, so they override any cache/allow bind above.
+# Directories get a tmpfs; files get an empty read-only file fed from /dev/null
+# on a spare file descriptor (no host temp files to clean up).
+next_fd=9
+deny_fds=()
+for d in "${DENY[@]}"; do
+	if [[ -d $d ]]; then
+		ARGS+=(--tmpfs "$d")
+	elif [[ -e $d ]]; then
+		eval "exec $next_fd</dev/null"
+		deny_fds+=("$next_fd")
+		ARGS+=(--ro-bind-data "$next_fd" "$d")
+		next_fd=$((next_fd + 1))
+	fi
+done
+
+# Environment: strip secrets, mark the sandbox, drop the shim dir from PATH so
+# a nested call inside the sandbox goes straight to the real binary.
+stripped=()
+while IFS= read -r name; do
+	[[ -n $name ]] || continue
+	((${#KEEP_ENV[@]})) && in_list "$name" "${KEEP_ENV[@]}" && continue
+	for g in "${SECRET_GLOBS[@]}"; do
+		# shellcheck disable=SC2053 # glob match is intentional
+		if [[ $name == $g ]]; then
+			stripped+=("$name")
+			break
+		fi
+	done
+done < <(compgen -e || true)
+
+for name in "${stripped[@]}"; do
+	ARGS+=(--unsetenv "$name")
+done
+
+ARGS+=(--setenv MOAT_SANDBOX_ACTIVE 1)
+
+newpath=""
+IFS=: read -r -a path_parts <<<"${PATH:-}"
+for p in "${path_parts[@]}"; do
+	[[ $p == "$SHIM_DIR" ]] && continue
+	newpath=${newpath:+$newpath:}$p
+done
+[[ -n $newpath ]] && ARGS+=(--setenv PATH "$newpath")
+
+ARGS+=(--chdir "$CWD")
+
+if ((DRY_RUN)); then
+	printf 'bwrap'
+	for a in "${ARGS[@]}" -- "${CMD[@]}"; do printf ' %q' "$a"; done
+	printf '\n'
+	if ((${#stripped[@]})); then
+		printf '# stripped env: %s\n' "${stripped[*]}"
+	fi
+	if ((${#deny_fds[@]})); then
+		printf '# fds %s are open on /dev/null (empty files for denied files)\n' "${deny_fds[*]}"
+	fi
+	exit 0
+fi
+
+warn "sandboxed: ${CMD[*]}"
+
+exec bwrap "${ARGS[@]}" -- "${CMD[@]}"

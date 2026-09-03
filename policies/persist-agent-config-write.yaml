@@ -1,20 +1,20 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-persist-agent-config-write
+  name: moat-persist-agent-config-write
   annotations:
-    sentinel.omarchy/severity: "medium"
-    sentinel.omarchy/title: "AI agent or editor task configuration written"
-    sentinel.omarchy/enforce: "none"
-    sentinel.omarchy/actions: "quarantine,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "medium"
+    moat.omarchy/title: "AI agent or editor task configuration written"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "quarantine,ignore"
+    moat.omarchy/why: >-
       CLAUDE.md, .claude/settings.json, .mcp.json and .vscode/tasks.json are executed or
       obeyed by tools that already have your permissions; a hook or MCP server added
       there is prompt-injection with a shell attached.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       Very often. The agents themselves rewrite these files, and so does every project
       you clone that ships one.
-    sentinel.omarchy/fp-hint: "exe+file"
+    moat.omarchy/fp-hint: "exe+file"
 spec:
   options:
   - name: "policy-mode"

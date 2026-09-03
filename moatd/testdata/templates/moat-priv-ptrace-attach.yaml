@@ -1,0 +1,36 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-priv-ptrace-attach
+  annotations:
+    moat.omarchy/severity: high
+    moat.omarchy/title: "Process attached to another process with ptrace"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill"
+    moat.omarchy/why: >-
+      ptrace attach reads another process's memory, which is how session tokens and
+      decrypted secrets are stolen without touching a file.
+    moat.omarchy/expected: >-
+      Debuggers (gdb, lldb), strace, perf, and crash handlers such as systemd-coredump.
+    moat.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: policy-mode
+    value: monitor
+  tracepoints:
+  - subsystem: "raw_syscalls"
+    event: "sys_enter"
+    args:
+    - index: 4
+      type: "syscall64"
+    selectors:
+    - matchArgs:
+      - index: 4
+        operator: "InMap"
+        values:
+        - "list:ptrace"
+  lists:
+  - name: ptrace
+    type: syscalls
+    values:
+    - "sys_ptrace"

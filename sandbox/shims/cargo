@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# omarchy-sentinel shim: runs cargo under sentinel-sandbox, but only for the
+# omarchy-moat shim: runs cargo under moat-sandbox, but only for the
 # subcommands that fetch code from the network or execute code from the
 # dependency tree (build scripts, proc macros, test/bench harnesses).
 #
@@ -15,12 +15,12 @@
 # via build.rs, which is exactly what the sandbox is for. `cargo fmt` is not,
 # and sandboxing it only costs startup time and breaks editor integrations.
 #
-# Installed as /usr/lib/sentinel/shims/cargo; active only while
-# /etc/sentinel/sandbox.enabled exists (see /etc/profile.d/sentinel-shims.sh).
+# Installed as /usr/lib/moat/shims/cargo; active only while
+# /etc/moat/sandbox.enabled exists (see /etc/profile.d/moat-shims.sh).
 set -euo pipefail
 SHIM_SELF=${BASH_SOURCE[0]}
 _shim_dir=${SHIM_SELF%/*}
-[[ $_shim_dir == "$SHIM_SELF" ]] && _shim_dir=/usr/lib/sentinel/shims
+[[ $_shim_dir == "$SHIM_SELF" ]] && _shim_dir=/usr/lib/moat/shims
 # shellcheck source-path=SCRIPTDIR source=shim-common.sh
 . "$_shim_dir/shim-common.sh"
 

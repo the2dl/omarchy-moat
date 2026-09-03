@@ -18,7 +18,7 @@
     "medium": 0
   },
   "sandbox": false,
-  "socket_group": "sentinel",
+  "socket_group": "moat",
   "uptime_secs": 2,
   "events_seen": 15,
   "alerts": 4,

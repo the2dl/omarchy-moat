@@ -1,21 +1,21 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-cred-etc-shadow-read
+  name: moat-cred-etc-shadow-read
   annotations:
-    sentinel.omarchy/severity: "critical"
-    sentinel.omarchy/title: "/etc/shadow read by a program that is not an authentication tool"
-    sentinel.omarchy/rotate: "local-password"
-    sentinel.omarchy/enforce: "kill"
-    sentinel.omarchy/actions: "kill,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "critical"
+    moat.omarchy/title: "/etc/shadow read by a program that is not an authentication tool"
+    moat.omarchy/rotate: "local-password"
+    moat.omarchy/enforce: "kill"
+    moat.omarchy/actions: "kill,ignore"
+    moat.omarchy/why: >-
       Only PAM helpers and the shadow-utils suite have any reason to read the local
       password hashes; anything else reading them is either already root and dumping
       them for offline cracking, or a misconfigured file mode you want to know about.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       Almost never. A screen locker, display manager or PAM module not in the allowlist,
       or a backup of /etc run as root.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

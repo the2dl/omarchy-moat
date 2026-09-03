@@ -1,20 +1,20 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-persist-shell-rc-write
+  name: moat-persist-shell-rc-write
   annotations:
-    sentinel.omarchy/severity: "high"
-    sentinel.omarchy/title: "Shell startup file modified by a non-editor"
-    sentinel.omarchy/enforce: "none"
-    sentinel.omarchy/actions: "kill,quarantine,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "Shell startup file modified by a non-editor"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,quarantine,ignore"
+    moat.omarchy/why: >-
       Appending one line to .bashrc or .zshrc is the cheapest persistence on Linux: it
       runs as you, every terminal, forever, and survives reinstalling the package that
       dropped it.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       Installers you ran on purpose - mise, rustup, nvm, conda, starship, atuin, oh-my-zsh
       - all append to shell rc files during setup.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

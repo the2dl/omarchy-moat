@@ -1,21 +1,21 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-pkg-subtree-downloader
+  name: moat-pkg-subtree-downloader
   annotations:
-    sentinel.omarchy/severity: "high"
-    sentinel.omarchy/title: "Package install ran a downloader or decoder"
-    sentinel.omarchy/enforce: "none"
-    sentinel.omarchy/actions: "kill,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "Package install ran a downloader or decoder"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,ignore"
+    moat.omarchy/why: >-
       A postinstall script that reaches for curl, wget or base64 is fetching or unpacking
       something the lockfile never pinned; this is the shape of every recent npm and AUR
       compromise.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       Prebuilt-binary downloaders (node-pre-gyp, sharp, esbuild, playwright, puppeteer),
       cargo build scripts that fetch toolchains, and PKGBUILDs that curl a release
       tarball.
-    sentinel.omarchy/fp-hint: "parent"
+    moat.omarchy/fp-hint: "parent"
 spec:
   options:
   - name: "policy-mode"

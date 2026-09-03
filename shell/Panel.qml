@@ -5,11 +5,11 @@ import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
 
-// Sentinel's panel. Declared as kind "panel" with keepLoaded, so the shell
+// Moat's panel. Declared as kind "panel" with keepLoaded, so the shell
 // mounts it once at startup and drives it through the standard verbs:
 //
-//   omarchy-shell shell toggle io.github.the2dl.sentinel '{}'
-//   omarchy-shell shell summon io.github.the2dl.sentinel '{"alert":"<id>"}'
+//   omarchy-shell shell toggle io.github.the2dl.moat '{}'
+//   omarchy-shell shell summon io.github.the2dl.moat '{"alert":"<id>"}'
 //
 // The shell's panel loader injects `shell`, `manifest` and `service` (the
 // matching service singleton) and calls open(payloadJson) / close(); `opened`
@@ -29,7 +29,7 @@ Item {
   property string tab: "alerts"          // "alerts" | "allowlist"
   property string notice: ""             // transient result line under the header
 
-  readonly property string pluginId: "io.github.the2dl.sentinel"
+  readonly property string pluginId: "io.github.the2dl.moat"
   readonly property var alerts: service ? service.alerts : []
   readonly property bool ready: !!service && service.available && service.groupOk
   readonly property var selected: {
@@ -105,7 +105,7 @@ Item {
   //
   // Kill and Quarantine are irreversible from the panel's side — one ends a
   // process tree, the other chmod 000s a file into
-  // /var/lib/sentinel/quarantine — so both go through a confirm, and so does
+  // /var/lib/moat/quarantine — so both go through a confirm, and so does
   // removing an allowlist rule (it silently re-arms a detection). Ack and the
   // allowlist writes do not: ack is a label, and an added rule is listed with a
   // Remove button one tab away.
@@ -118,7 +118,7 @@ Item {
 
   function requestQuarantine(id) {
     root._confirm("quarantine", id,
-      "Move this file into quarantine (chmod 000, under /var/lib/sentinel/quarantine)? Anything still using it will break.")
+      "Move this file into quarantine (chmod 000, under /var/lib/moat/quarantine)? Anything still using it will break.")
   }
 
   function requestUnignore(index) {
@@ -220,7 +220,7 @@ Item {
   readonly property int gap: Style.gapsOut
 
   IpcHandler {
-    target: "sentinel"
+    target: "moat"
 
     function open(payloadJson: string): string { root.open(payloadJson); return "ok" }
     function close(): string { root.close(); return "ok" }
@@ -239,7 +239,7 @@ Item {
     color: "transparent"
     exclusionMode: ExclusionMode.Ignore
 
-    WlrLayershell.namespace: "omarchy-sentinel-panel"
+    WlrLayershell.namespace: "omarchy-moat-panel"
     WlrLayershell.layer: WlrLayer.Overlay
     // Exclusive on map, then OnDemand. Hyprland focuses an OnDemand surface
     // when it first maps but not when a mapped one changes back to it, and the
@@ -370,7 +370,7 @@ Item {
 
               Text {
                 anchors.verticalCenter: parent.verticalCenter
-                text: "Sentinel"
+                text: "Moat"
                 color: card.fg
                 font.family: Style.font.family
                 font.pixelSize: Style.font.title
@@ -623,7 +623,7 @@ Item {
                 width: parent.width
                 visible: root.alerts.length === 0
                 text: root.service && root.service.logReadable
-                  ? "No alerts. Sentinel is watching."
+                  ? "No alerts. Moat is watching."
                   : "The alert log is not readable."
                 color: card.mutedFg
                 font.family: Style.font.family

@@ -1,20 +1,20 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-net-tmpfs-binary-egress
+  name: moat-net-tmpfs-binary-egress
   annotations:
-    sentinel.omarchy/severity: "critical"
-    sentinel.omarchy/title: "Binary running from /tmp or /dev/shm connected to the internet"
-    sentinel.omarchy/enforce: "kill"
-    sentinel.omarchy/actions: "kill,quarantine,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "critical"
+    moat.omarchy/title: "Binary running from /tmp or /dev/shm connected to the internet"
+    moat.omarchy/enforce: "kill"
+    moat.omarchy/actions: "kill,quarantine,ignore"
+    moat.omarchy/why: >-
       A program that lives in a world-writable directory and then talks to a public
       address is a dropped implant checking in. Legitimate software is installed, not
       dropped in /tmp.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       Rare. A downloaded installer you unpacked into /tmp and ran on purpose, or a build
       tool executing a temporary binary that fetches something.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

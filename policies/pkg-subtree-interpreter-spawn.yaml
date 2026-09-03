@@ -1,20 +1,20 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-pkg-subtree-interpreter-spawn
+  name: moat-pkg-subtree-interpreter-spawn
   annotations:
-    sentinel.omarchy/severity: "low"
-    sentinel.omarchy/title: "Package manager spawned a shell or interpreter"
-    sentinel.omarchy/enforce: "none"
-    sentinel.omarchy/actions: "ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "low"
+    moat.omarchy/title: "Package manager spawned a shell or interpreter"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "ignore"
+    moat.omarchy/why: >-
       Install-time scripts are where supply-chain payloads run. On its own a shell under
-      npm or cargo is normal, so this is a timeline signal: sentineld escalates it when
+      npm or cargo is normal, so this is a timeline signal: moatd escalates it when
       the same subtree also reads a credential or connects out.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       Constantly. Every npm lifecycle script, node-gyp build, cargo build script and pip
       setup.py runs a shell or a python interpreter.
-    sentinel.omarchy/fp-hint: "rule"
+    moat.omarchy/fp-hint: "rule"
 spec:
   options:
   - name: "policy-mode"

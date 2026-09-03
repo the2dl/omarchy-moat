@@ -1,21 +1,21 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-shell-reverse-shell-connect
+  name: moat-shell-reverse-shell-connect
   annotations:
-    sentinel.omarchy/severity: "critical"
-    sentinel.omarchy/title: "Shell or netcat opened an outbound connection to the internet"
-    sentinel.omarchy/enforce: "kill"
-    sentinel.omarchy/actions: "kill,quarantine,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "critical"
+    moat.omarchy/title: "Shell or netcat opened an outbound connection to the internet"
+    moat.omarchy/enforce: "kill"
+    moat.omarchy/actions: "kill,quarantine,ignore"
+    moat.omarchy/why: >-
       A shell process that opens a TCP socket is almost always a reverse shell: bash -i
       over /dev/tcp, nc -e, or socat exec. Shells do not talk to the network on their
       own, so the connection itself is the detection - the flags never have to be seen.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       Hand-written scripts that use bash /dev/tcp as a port check, and nc or socat used
       deliberately against a public host. Connections to RFC1918 and loopback addresses
       are excluded in-kernel and never fire.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

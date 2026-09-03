@@ -1,21 +1,21 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-cred-ssh-private-key-read
+  name: moat-cred-ssh-private-key-read
   annotations:
-    sentinel.omarchy/severity: "high"
-    sentinel.omarchy/title: "Private SSH key read by an unexpected program"
-    sentinel.omarchy/rotate: "ssh-key"
-    sentinel.omarchy/enforce: "kill"
-    sentinel.omarchy/actions: "kill,quarantine,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "Private SSH key read by an unexpected program"
+    moat.omarchy/rotate: "ssh-key"
+    moat.omarchy/enforce: "kill"
+    moat.omarchy/actions: "kill,quarantine,ignore"
+    moat.omarchy/why: >-
       Private keys are the first thing npm and PyPI stealers read; only ssh, git and a
       few backup tools ever need them, and a key that leaves the machine gives an
       attacker every host and forge you can reach.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       Backup tools (restic, borg), IDE git integrations, ansible/terraform runs, and
       custom scripts that call an ssh library instead of the ssh binary.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

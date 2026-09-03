@@ -1,36 +1,36 @@
 # shellcheck shell=bash
-# Common logic for the omarchy-sentinel PATH shims.
+# Common logic for the omarchy-moat PATH shims.
 #
-# Sourced by /usr/lib/sentinel/shims/<name>. Never executed directly.
+# Sourced by /usr/lib/moat/shims/<name>. Never executed directly.
 #
 # A shim must:
 #   1. work out its own directory,
 #   2. remove that directory from $PATH (so mise shims, ~/.local/bin and
 #      /usr/bin all still resolve normally),
 #   3. resolve the real binary from the reduced $PATH,
-#   4. exec `sentinel-sandbox -- <real> "$@"`.
+#   4. exec `moat-sandbox -- <real> "$@"`.
 #
-# Inside the sandbox SENTINEL_SANDBOX_ACTIVE=1, and shim_exec then runs the
+# Inside the sandbox MOAT_SANDBOX_ACTIVE=1, and shim_exec then runs the
 # real binary directly: bubblewrap cannot usefully nest under an unprivileged
 # user namespace, and the outer sandbox already applies.
 
-# Extra options handed to sentinel-sandbox. A shim may append to this after
+# Extra options handed to moat-sandbox. A shim may append to this after
 # sourcing this file and before calling shim_exec.
 SHIM_SANDBOX_ARGS=()
 
 shim_warn() {
-	[[ ${SENTINEL_QUIET:-0} == 1 ]] || printf '[sentinel] %s\n' "$*" >&2
+	[[ ${MOAT_QUIET:-0} == 1 ]] || printf '[moat] %s\n' "$*" >&2
 }
 
 shim_die() {
-	printf '[sentinel] %s\n' "$*" >&2
+	printf '[moat] %s\n' "$*" >&2
 	exit 127
 }
 
 # Where the shims live when installed from the package. Used only as a
 # fallback if argv[0] carries no directory (it normally does: the kernel gives
 # a #! script its full path in $0).
-SHIM_DIR_DEFAULT=${SHIM_DIR_DEFAULT:-/usr/lib/sentinel/shims}
+SHIM_DIR_DEFAULT=${SHIM_DIR_DEFAULT:-/usr/lib/moat/shims}
 
 # shim_self_dir: absolute, symlink-resolved directory holding this shim.
 # The shim sets SHIM_SELF=${BASH_SOURCE[0]} before sourcing this file.
@@ -62,7 +62,7 @@ shim_path_without() {
 		if [[ $entry == "$drop" ]]; then
 			continue
 		fi
-		# Resolve so /usr/lib/sentinel/shims and a symlink to it both go.
+		# Resolve so /usr/lib/moat/shims and a symlink to it both go.
 		if real=$(cd -- "$entry" 2>/dev/null && pwd -P); then
 			[[ $real == "$drop" ]] && continue
 		fi
@@ -90,8 +90,8 @@ shim_resolve() {
 }
 
 # shim_exec NAME "$@"
-# Runs the real NAME under sentinel-sandbox, or directly when the sandbox is
-# disabled / already active. Extra sentinel-sandbox options come from the
+# Runs the real NAME under moat-sandbox, or directly when the sandbox is
+# disabled / already active. Extra moat-sandbox options come from the
 # SHIM_SANDBOX_ARGS array, which a shim may set before calling; everything
 # after NAME is passed through to the real binary untouched (including "--").
 shim_exec() {
@@ -104,19 +104,19 @@ shim_exec() {
 
 	shim_resolve "$name"
 
-	if [[ ${SENTINEL_SANDBOX:-1} == 0 || ${SENTINEL_SANDBOX_ACTIVE:-0} == 1 ]]; then
+	if [[ ${MOAT_SANDBOX:-1} == 0 || ${MOAT_SANDBOX_ACTIVE:-0} == 1 ]]; then
 		PATH=$SHIM_PATH_REDUCED exec -- "$SHIM_REAL" "$@"
 	fi
 
-	if ! command -v sentinel-sandbox >/dev/null 2>&1; then
-		shim_warn "sentinel-sandbox not found, running $name unsandboxed"
+	if ! command -v moat-sandbox >/dev/null 2>&1; then
+		shim_warn "moat-sandbox not found, running $name unsandboxed"
 		PATH=$SHIM_PATH_REDUCED exec -- "$SHIM_REAL" "$@"
 	fi
 
 	if ((${#sandbox_args[@]})); then
-		exec sentinel-sandbox "${sandbox_args[@]}" -- "$SHIM_REAL" "$@"
+		exec moat-sandbox "${sandbox_args[@]}" -- "$SHIM_REAL" "$@"
 	fi
-	exec sentinel-sandbox -- "$SHIM_REAL" "$@"
+	exec moat-sandbox -- "$SHIM_REAL" "$@"
 }
 
 # shim_is_tty: true only when both stdin and stdout are terminals.

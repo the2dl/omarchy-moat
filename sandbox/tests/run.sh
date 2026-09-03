@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# omarchy-sentinel sandbox tests. Unprivileged, real bubblewrap, no fixtures
+# omarchy-moat sandbox tests. Unprivileged, real bubblewrap, no fixtures
 # outside a mktemp directory. Never touches the real ~/.ssh.
 #
 #   ./sandbox/tests/run.sh            run everything
@@ -7,7 +7,7 @@
 set -uo pipefail
 
 SANDBOX_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-SENTINEL_SANDBOX_BIN=$SANDBOX_DIR/sentinel-sandbox
+MOAT_SANDBOX_BIN=$SANDBOX_DIR/moat-sandbox
 SHIMS=$SANDBOX_DIR/shims
 
 VERBOSE=0
@@ -32,7 +32,7 @@ say() { printf '\n%s\n' "$*"; }
 
 # ------------------------------------------------------------- environment ---
 
-TMPROOT=$(mktemp -d "${TMPDIR:-/tmp}/sentinel-sandbox-test.XXXXXXXX") || exit 1
+TMPROOT=$(mktemp -d "${TMPDIR:-/tmp}/moat-sandbox-test.XXXXXXXX") || exit 1
 # shellcheck disable=SC2329 # invoked from the trap below
 cleanup() {
 	chmod -R u+rwX "$TMPROOT" 2>/dev/null || true
@@ -48,24 +48,24 @@ chmod 600 "$FAKE_HOME/.ssh/id_rsa"
 printf 'marker-visible\n' >"$FAKE_HOME/marker"
 printf 'nothing\n' >"$PROJ/README"
 
-# Run sentinel-sandbox with the fake HOME. Config files are read from
+# Run moat-sandbox with the fake HOME. Config files are read from
 # $XDG_CONFIG_HOME, which we point into the fake home so a developer's own
-# ~/.config/sentinel/sandbox.conf cannot change the results.
+# ~/.config/moat/sandbox.conf cannot change the results.
 sb() {
 	env HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" \
-		SENTINEL_QUIET=1 "$SENTINEL_SANDBOX_BIN" "$@"
+		MOAT_QUIET=1 "$MOAT_SANDBOX_BIN" "$@"
 }
 
 # ------------------------------------------------------------ preflight ------
 
 say "preflight"
 
-if [[ ! -x $SENTINEL_SANDBOX_BIN ]]; then
-	no "sentinel-sandbox is executable" "$SENTINEL_SANDBOX_BIN"
+if [[ ! -x $MOAT_SANDBOX_BIN ]]; then
+	no "moat-sandbox is executable" "$MOAT_SANDBOX_BIN"
 	printf '\nCannot continue.\n'
 	exit 1
 fi
-ok "sentinel-sandbox is executable"
+ok "moat-sandbox is executable"
 
 if ! command -v bwrap >/dev/null 2>&1; then
 	printf '\nbwrap (bubblewrap) is not installed; cannot run the sandbox tests.\n'
@@ -183,9 +183,9 @@ fi
 
 # Same check against the real $HOME, using a name that is neither $PWD, the
 # git toplevel, nor a package cache.
-real_victim=$HOME/.sentinel-sandbox-test-should-not-exist
-out=$(cd "$PROJ" && env HOME="$HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" SENTINEL_QUIET=1 \
-	"$SENTINEL_SANDBOX_BIN" -- sh -c "echo x > '$real_victim'" 2>&1)
+real_victim=$HOME/.moat-sandbox-test-should-not-exist
+out=$(cd "$PROJ" && env HOME="$HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" MOAT_QUIET=1 \
+	"$MOAT_SANDBOX_BIN" -- sh -c "echo x > '$real_victim'" 2>&1)
 rc=$?
 if ((rc != 0)) && [[ ! -e $real_victim ]]; then
 	ok "writing into the real \$HOME fails and creates nothing"
@@ -200,8 +200,8 @@ say "(d) secret-looking environment variables are stripped"
 
 env_out=$(cd "$PROJ" && env MY_SECRET=s1 GITHUB_TOKEN=t1 NPM_TOKEN=t2 \
 	AWS_ACCESS_KEY_ID=a1 SOME_API_KEY=k1 KEEP_ME=fine \
-	HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" SENTINEL_QUIET=1 \
-	"$SENTINEL_SANDBOX_BIN" -- env 2>&1)
+	HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" MOAT_QUIET=1 \
+	"$MOAT_SANDBOX_BIN" -- env 2>&1)
 stripped_ok=1
 for v in MY_SECRET GITHUB_TOKEN NPM_TOKEN AWS_ACCESS_KEY_ID SOME_API_KEY; do
 	if grep -q "^$v=" <<<"$env_out"; then
@@ -221,15 +221,15 @@ else
 	no "an ordinary variable is preserved"
 fi
 
-if grep -q '^SENTINEL_SANDBOX_ACTIVE=1$' <<<"$env_out"; then
-	ok "SENTINEL_SANDBOX_ACTIVE=1 is set inside the sandbox"
+if grep -q '^MOAT_SANDBOX_ACTIVE=1$' <<<"$env_out"; then
+	ok "MOAT_SANDBOX_ACTIVE=1 is set inside the sandbox"
 else
-	no "SENTINEL_SANDBOX_ACTIVE=1 is set inside the sandbox"
+	no "MOAT_SANDBOX_ACTIVE=1 is set inside the sandbox"
 fi
 
 env_out=$(cd "$PROJ" && env MY_SECRET=s1 \
-	HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" SENTINEL_QUIET=1 \
-	"$SENTINEL_SANDBOX_BIN" --keep-env MY_SECRET -- env 2>&1)
+	HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" MOAT_QUIET=1 \
+	"$MOAT_SANDBOX_BIN" --keep-env MY_SECRET -- env 2>&1)
 if grep -q '^MY_SECRET=s1$' <<<"$env_out"; then
 	ok "--keep-env MY_SECRET keeps it"
 else
@@ -237,8 +237,8 @@ else
 fi
 
 # keep-env via the user config file
-mkdir -p "$FAKE_HOME/.config/sentinel"
-cat >"$FAKE_HOME/.config/sentinel/sandbox.conf" <<EOF
+mkdir -p "$FAKE_HOME/.config/moat"
+cat >"$FAKE_HOME/.config/moat/sandbox.conf" <<EOF
 # test config
 keep-env=CONFIG_TOKEN
 deny=$FAKE_HOME/denied-by-config
@@ -246,8 +246,8 @@ EOF
 mkdir -p "$FAKE_HOME/denied-by-config"
 printf 'x\n' >"$FAKE_HOME/denied-by-config/f"
 env_out=$(cd "$PROJ" && env CONFIG_TOKEN=ct \
-	HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" SENTINEL_QUIET=1 \
-	"$SENTINEL_SANDBOX_BIN" -- env 2>&1)
+	HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" MOAT_QUIET=1 \
+	"$MOAT_SANDBOX_BIN" -- env 2>&1)
 if grep -q '^CONFIG_TOKEN=ct$' <<<"$env_out"; then
 	ok "keep-env= from the config file is honoured"
 else
@@ -260,7 +260,7 @@ if [[ -z ${out//[[:space:]]/} ]]; then
 else
 	no "deny= from the config file is honoured" "got: $out"
 fi
-rm -f "$FAKE_HOME/.config/sentinel/sandbox.conf"
+rm -f "$FAKE_HOME/.config/moat/sandbox.conf"
 
 # ------------------------------------------------------- (e) --dry-run -------
 
@@ -275,7 +275,7 @@ done
 grep -qF -- "--bind $PROJ $PROJ" <<<"$dry" || missing+=("--bind \$PWD")
 grep -qF -- "--tmpfs $FAKE_HOME/.ssh" <<<"$dry" || missing+=("--tmpfs \$HOME/.ssh")
 grep -qF -- "--ro-bind-data" <<<"$dry" || missing+=("--ro-bind-data (denied file)")
-grep -qF -- "--setenv SENTINEL_SANDBOX_ACTIVE 1" <<<"$dry" || missing+=("--setenv SENTINEL_SANDBOX_ACTIVE")
+grep -qF -- "--setenv MOAT_SANDBOX_ACTIVE 1" <<<"$dry" || missing+=("--setenv MOAT_SANDBOX_ACTIVE")
 grep -qE '^bwrap ' <<<"$dry" || missing+=("leading 'bwrap'")
 grep -qF -- "npm install" <<<"$dry" || missing+=("the command itself")
 if ((${#missing[@]} == 0)); then
@@ -299,28 +299,28 @@ has_ns() { grep -qF -- '--new-session' <<<"$1"; }
 printf '0\n' >"$TMPROOT/tiocsti-off"
 printf '1\n' >"$TMPROOT/tiocsti-on"
 
-d=$(cd "$PROJ" && SENTINEL_TIOCSTI_FILE="$TMPROOT/tiocsti-off" sb --dry-run -- true 2>&1)
+d=$(cd "$PROJ" && MOAT_TIOCSTI_FILE="$TMPROOT/tiocsti-off" sb --dry-run -- true 2>&1)
 if ! has_ns "$d"; then
 	ok "legacy_tiocsti=0: --new-session is omitted (Ctrl-C keeps working)"
 else
 	no "legacy_tiocsti=0: --new-session is omitted (Ctrl-C keeps working)"
 fi
 
-d=$(cd "$PROJ" && SENTINEL_TIOCSTI_FILE="$TMPROOT/tiocsti-on" sb --dry-run -- true 2>&1)
+d=$(cd "$PROJ" && MOAT_TIOCSTI_FILE="$TMPROOT/tiocsti-on" sb --dry-run -- true 2>&1)
 if has_ns "$d"; then
 	ok "legacy_tiocsti=1: --new-session is used"
 else
 	no "legacy_tiocsti=1: --new-session is used"
 fi
 
-d=$(cd "$PROJ" && SENTINEL_TIOCSTI_FILE="$TMPROOT/no-such-sysctl" sb --dry-run -- true 2>&1)
+d=$(cd "$PROJ" && MOAT_TIOCSTI_FILE="$TMPROOT/no-such-sysctl" sb --dry-run -- true 2>&1)
 if has_ns "$d"; then
 	ok "missing sysctl (old kernel): --new-session is used"
 else
 	no "missing sysctl (old kernel): --new-session is used"
 fi
 
-d=$(cd "$PROJ" && SENTINEL_TIOCSTI_FILE="$TMPROOT/tiocsti-off" sb --dry-run --force-new-session -- true 2>&1)
+d=$(cd "$PROJ" && MOAT_TIOCSTI_FILE="$TMPROOT/tiocsti-off" sb --dry-run --force-new-session -- true 2>&1)
 if has_ns "$d"; then
 	ok "--force-new-session overrides legacy_tiocsti=0"
 else
@@ -328,7 +328,7 @@ else
 fi
 
 # The real command still runs either way.
-out=$(cd "$PROJ" && SENTINEL_TIOCSTI_FILE="$TMPROOT/tiocsti-off" sb -- echo ns-off 2>&1)
+out=$(cd "$PROJ" && MOAT_TIOCSTI_FILE="$TMPROOT/tiocsti-off" sb -- echo ns-off 2>&1)
 out2=$(cd "$PROJ" && sb --force-new-session -- echo ns-on 2>&1)
 if [[ $out == "ns-off" && $out2 == "ns-on" ]]; then
 	ok "the sandbox runs with and without --new-session"
@@ -344,13 +344,13 @@ say "(f) shims resolve the real binary and never recurse"
 # even when it appears twice in PATH.
 cat >"$TMPROOT/bin/npm" <<'EOF'
 #!/usr/bin/env bash
-echo "REAL npm active:${SENTINEL_SANDBOX_ACTIVE:-0} argv:$*"
+echo "REAL npm active:${MOAT_SANDBOX_ACTIVE:-0} argv:$*"
 EOF
 chmod +x "$TMPROOT/bin/npm"
 
 shim_path="$SHIMS:$TMPROOT/bin:$SHIMS:$SANDBOX_DIR:/usr/bin:/bin"
 out=$(cd "$PROJ" && env PATH="$shim_path" HOME="$FAKE_HOME" \
-	XDG_CONFIG_HOME="$FAKE_HOME/.config" SENTINEL_SANDBOX=0 SENTINEL_QUIET=1 \
+	XDG_CONFIG_HOME="$FAKE_HOME/.config" MOAT_SANDBOX=0 MOAT_QUIET=1 \
 	"$SHIMS/npm" install left-pad 2>&1)
 rc=$?
 if ((rc == 0)) && [[ $out == "REAL npm active:0 argv:install left-pad" ]]; then
@@ -363,7 +363,7 @@ fi
 # the /tmp tmpfs.
 cp "$TMPROOT/bin/npm" "$PROJ/npm"
 out=$(cd "$PROJ" && env PATH="$SHIMS:$PROJ:$SANDBOX_DIR:/usr/bin:/bin" HOME="$FAKE_HOME" \
-	XDG_CONFIG_HOME="$FAKE_HOME/.config" SENTINEL_QUIET=1 \
+	XDG_CONFIG_HOME="$FAKE_HOME/.config" MOAT_QUIET=1 \
 	"$SHIMS/npm" ci 2>&1)
 rc=$?
 if ((rc == 0)) && [[ $out == "REAL npm active:1 argv:ci" ]]; then
@@ -374,17 +374,17 @@ fi
 
 # A shim for a name that has no real binary must die, not loop. Use a copy of
 # the shim under a name nothing on the system provides.
-cat >"$TMPROOT/bin/sentinel-shim-probe" <<EOF
+cat >"$TMPROOT/bin/moat-shim-probe" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 SHIM_SELF=\${BASH_SOURCE[0]}
 . "$SHIMS/shim-common.sh"
-shim_exec sentinel-no-such-binary-xyzzy "\$@"
+shim_exec moat-no-such-binary-xyzzy "\$@"
 EOF
-chmod +x "$TMPROOT/bin/sentinel-shim-probe"
+chmod +x "$TMPROOT/bin/moat-shim-probe"
 out=$(cd "$PROJ" && env PATH="$TMPROOT/bin:$PATH" HOME="$FAKE_HOME" \
-	XDG_CONFIG_HOME="$FAKE_HOME/.config" SENTINEL_QUIET=1 \
-	"$TMPROOT/bin/sentinel-shim-probe" foo 2>&1)
+	XDG_CONFIG_HOME="$FAKE_HOME/.config" MOAT_QUIET=1 \
+	"$TMPROOT/bin/moat-shim-probe" foo 2>&1)
 rc=$?
 if ((rc == 127)) && [[ $out == *"no real binary found"* ]]; then
 	ok "a shim with no real binary exits 127 instead of recursing"
@@ -406,11 +406,11 @@ fi
 # cargo passes through the subcommands that neither fetch nor build.
 cat >"$PROJ/cargo" <<'EOF'
 #!/usr/bin/env bash
-echo "REAL cargo active:${SENTINEL_SANDBOX_ACTIVE:-0} argv:$*"
+echo "REAL cargo active:${MOAT_SANDBOX_ACTIVE:-0} argv:$*"
 EOF
 chmod +x "$PROJ/cargo"
 cargo_env=(env PATH="$SHIMS:$PROJ:$SANDBOX_DIR:/usr/bin:/bin" HOME="$FAKE_HOME"
-	XDG_CONFIG_HOME="$FAKE_HOME/.config" SENTINEL_QUIET=1)
+	XDG_CONFIG_HOME="$FAKE_HOME/.config" MOAT_QUIET=1)
 
 out=$(cd "$PROJ" && "${cargo_env[@]}" "$SHIMS/cargo" fmt 2>&1)
 if [[ $out == "REAL cargo active:0 argv:fmt" ]]; then
@@ -434,12 +434,12 @@ else
 fi
 
 # The makepkg shim refuses on high findings when not interactive.
-cat >"$PROJ/sentinel-scan-pkgbuild" <<'EOF'
+cat >"$PROJ/moat-scan-pkgbuild" <<'EOF'
 #!/usr/bin/env bash
 echo "scan: HIGH finding (fixture)"
 exit 2
 EOF
-chmod +x "$PROJ/sentinel-scan-pkgbuild"
+chmod +x "$PROJ/moat-scan-pkgbuild"
 cat >"$PROJ/makepkg" <<'EOF'
 #!/usr/bin/env bash
 echo "REAL makepkg argv:$*"
@@ -447,7 +447,7 @@ EOF
 chmod +x "$PROJ/makepkg"
 printf 'pkgname=test\n' >"$PROJ/PKGBUILD"
 out=$(cd "$PROJ" && env PATH="$SHIMS:$PROJ:$SANDBOX_DIR:/usr/bin:/bin" HOME="$FAKE_HOME" \
-	XDG_CONFIG_HOME="$FAKE_HOME/.config" SENTINEL_QUIET=1 \
+	XDG_CONFIG_HOME="$FAKE_HOME/.config" MOAT_QUIET=1 \
 	"$SHIMS/makepkg" -f </dev/null 2>&1)
 rc=$?
 if ((rc == 1)) && [[ $out == *"HIGH severity"* ]] && [[ $out != *"REAL makepkg"* ]]; then
@@ -457,7 +457,7 @@ else
 fi
 
 # ...and warns but continues on medium findings.
-printf '#!/usr/bin/env bash\necho "scan: medium"\nexit 1\n' >"$PROJ/sentinel-scan-pkgbuild"
+printf '#!/usr/bin/env bash\necho "scan: medium"\nexit 1\n' >"$PROJ/moat-scan-pkgbuild"
 out=$(cd "$PROJ" && env PATH="$SHIMS:$PROJ:$SANDBOX_DIR:/usr/bin:/bin" HOME="$FAKE_HOME" \
 	XDG_CONFIG_HOME="$FAKE_HOME/.config" \
 	"$SHIMS/makepkg" -f </dev/null 2>&1)
@@ -468,7 +468,7 @@ else
 fi
 
 # ...and skips the scan with a warning when the scanner is not installed.
-rm -f "$PROJ/sentinel-scan-pkgbuild"
+rm -f "$PROJ/moat-scan-pkgbuild"
 out=$(cd "$PROJ" && env PATH="$SHIMS:$PROJ:$SANDBOX_DIR:/usr/bin:/bin" HOME="$FAKE_HOME" \
 	XDG_CONFIG_HOME="$FAKE_HOME/.config" \
 	"$SHIMS/makepkg" -f </dev/null 2>&1)
@@ -477,45 +477,45 @@ if [[ $out == *"skipping the PKGBUILD scan"* && $out == *"REAL makepkg argv:-f"*
 else
 	no "makepkg warns and continues when the scanner is missing" "got: $out"
 fi
-# ...and SENTINEL_SANDBOX=0 skips the scan as well as the sandbox, which is
-# what both the shim's own refusal message and sentinel-scan-pkgbuild's "build
+# ...and MOAT_SANDBOX=0 skips the scan as well as the sandbox, which is
+# what both the shim's own refusal message and moat-scan-pkgbuild's "build
 # anyway" hint promise the user.
-printf '#!/usr/bin/env bash\necho "scan: HIGH finding (fixture)"\nexit 2\n' >"$PROJ/sentinel-scan-pkgbuild"
-chmod +x "$PROJ/sentinel-scan-pkgbuild"
+printf '#!/usr/bin/env bash\necho "scan: HIGH finding (fixture)"\nexit 2\n' >"$PROJ/moat-scan-pkgbuild"
+chmod +x "$PROJ/moat-scan-pkgbuild"
 out=$(cd "$PROJ" && env PATH="$SHIMS:$PROJ:$SANDBOX_DIR:/usr/bin:/bin" HOME="$FAKE_HOME" \
-	XDG_CONFIG_HOME="$FAKE_HOME/.config" SENTINEL_SANDBOX=0 \
+	XDG_CONFIG_HOME="$FAKE_HOME/.config" MOAT_SANDBOX=0 \
 	"$SHIMS/makepkg" -f </dev/null 2>&1)
 rc=$?
 if ((rc == 0)) && [[ $out == *"REAL makepkg argv:-f"* ]] && [[ $out != *"HIGH severity"* ]]; then
-	ok "SENTINEL_SANDBOX=0 skips the PKGBUILD scan as well as the sandbox"
+	ok "MOAT_SANDBOX=0 skips the PKGBUILD scan as well as the sandbox"
 else
-	no "SENTINEL_SANDBOX=0 skips the PKGBUILD scan as well as the sandbox" "rc=$rc out=$out"
+	no "MOAT_SANDBOX=0 skips the PKGBUILD scan as well as the sandbox" "rc=$rc out=$out"
 fi
 
-rm -f "$PROJ/PKGBUILD" "$PROJ/makepkg" "$PROJ/cargo" "$PROJ/npm" "$PROJ/sentinel-scan-pkgbuild"
+rm -f "$PROJ/PKGBUILD" "$PROJ/makepkg" "$PROJ/cargo" "$PROJ/npm" "$PROJ/moat-scan-pkgbuild"
 
-# ------------------------------------------------- (g) SENTINEL_SANDBOX=0 ----
+# ------------------------------------------------- (g) MOAT_SANDBOX=0 ----
 
-say "(g) SENTINEL_SANDBOX=0 bypasses the sandbox"
+say "(g) MOAT_SANDBOX=0 bypasses the sandbox"
 
 out=$(cd "$PROJ" && env HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" \
-	SENTINEL_SANDBOX=0 SENTINEL_QUIET=1 \
-	"$SENTINEL_SANDBOX_BIN" -- cat "$FAKE_HOME/.ssh/id_rsa" 2>&1)
+	MOAT_SANDBOX=0 MOAT_QUIET=1 \
+	"$MOAT_SANDBOX_BIN" -- cat "$FAKE_HOME/.ssh/id_rsa" 2>&1)
 rc=$?
 if ((rc == 0)) && [[ $out == *FAKEKEYDONOTUSE* ]]; then
-	ok "SENTINEL_SANDBOX=0 runs the command unsandboxed"
+	ok "MOAT_SANDBOX=0 runs the command unsandboxed"
 else
-	no "SENTINEL_SANDBOX=0 runs the command unsandboxed" "rc=$rc out=$out"
+	no "MOAT_SANDBOX=0 runs the command unsandboxed" "rc=$rc out=$out"
 fi
 
 out=$(cd "$PROJ" && env HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" \
-	SENTINEL_SANDBOX_ACTIVE=1 SENTINEL_QUIET=1 \
-	"$SENTINEL_SANDBOX_BIN" -- cat "$FAKE_HOME/.ssh/id_rsa" 2>&1)
+	MOAT_SANDBOX_ACTIVE=1 MOAT_QUIET=1 \
+	"$MOAT_SANDBOX_BIN" -- cat "$FAKE_HOME/.ssh/id_rsa" 2>&1)
 rc=$?
 if ((rc == 0)) && [[ $out == *FAKEKEYDONOTUSE* ]]; then
-	ok "SENTINEL_SANDBOX_ACTIVE=1 does not nest a second sandbox"
+	ok "MOAT_SANDBOX_ACTIVE=1 does not nest a second sandbox"
 else
-	no "SENTINEL_SANDBOX_ACTIVE=1 does not nest a second sandbox" "rc=$rc out=$out"
+	no "MOAT_SANDBOX_ACTIVE=1 does not nest a second sandbox" "rc=$rc out=$out"
 fi
 
 # ------------------------------------------------------- extras --------------
@@ -533,18 +533,18 @@ for code in 0 3 42; do
 done
 
 out=$(cd "$PROJ" && env HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" \
-	"$SENTINEL_SANDBOX_BIN" -- true 2>&1)
-if [[ $out == "[sentinel] sandboxed: true" ]]; then
-	ok "the notice line is '[sentinel] sandboxed: <cmd>' on stderr"
+	"$MOAT_SANDBOX_BIN" -- true 2>&1)
+if [[ $out == "[moat] sandboxed: true" ]]; then
+	ok "the notice line is '[moat] sandboxed: <cmd>' on stderr"
 else
-	no "the notice line is '[sentinel] sandboxed: <cmd>' on stderr" "got: $out"
+	no "the notice line is '[moat] sandboxed: <cmd>' on stderr" "got: $out"
 fi
 
 out=$(cd "$PROJ" && sb -- true 2>&1)
 if [[ -z $out ]]; then
-	ok "SENTINEL_QUIET=1 suppresses the notice"
+	ok "MOAT_QUIET=1 suppresses the notice"
 else
-	no "SENTINEL_QUIET=1 suppresses the notice" "got: $out"
+	no "MOAT_QUIET=1 suppresses the notice" "got: $out"
 fi
 
 # Refuse to run from inside a denied directory.
@@ -583,12 +583,12 @@ if ((rc != 0)) && [[ $out != *host* ]]; then
 else
 	no "host files under /tmp are invisible inside the sandbox" "rc=$rc out=$out"
 fi
-out=$(cd "$PROJ" && sb -- sh -c 'echo inside > /tmp/sentinel-probe && echo wrote' 2>&1)
-if [[ $out == "wrote" && ! -e /tmp/sentinel-probe ]]; then
+out=$(cd "$PROJ" && sb -- sh -c 'echo inside > /tmp/moat-probe && echo wrote' 2>&1)
+if [[ $out == "wrote" && ! -e /tmp/moat-probe ]]; then
 	ok "writes to /tmp stay in the sandbox tmpfs"
 else
 	no "writes to /tmp stay in the sandbox tmpfs" "got: $out"
-	rm -f /tmp/sentinel-probe
+	rm -f /tmp/moat-probe
 fi
 
 # Network is deliberately left on.
@@ -602,8 +602,8 @@ fi
 
 # The mise shim directory stays usable.
 if [[ -d $HOME/.local/share/mise/shims ]]; then
-	out=$(cd "$PROJ" && env HOME="$HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" SENTINEL_QUIET=1 \
-		"$SENTINEL_SANDBOX_BIN" -- sh -c 'command -v node >/dev/null && node -e "process.stdout.write(\"node-ok\")"' 2>&1)
+	out=$(cd "$PROJ" && env HOME="$HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" MOAT_QUIET=1 \
+		"$MOAT_SANDBOX_BIN" -- sh -c 'command -v node >/dev/null && node -e "process.stdout.write(\"node-ok\")"' 2>&1)
 	if [[ $out == "node-ok" ]]; then
 		ok "mise-provided node runs inside the sandbox"
 	else
@@ -617,18 +617,18 @@ fi
 
 say "profile.d / fish snippets"
 
-if [[ -f $SANDBOX_DIR/profile.d/sentinel-shims.sh ]]; then
-	out=$(env -i /bin/sh -c "PATH=/usr/bin:/bin; . '$SANDBOX_DIR/profile.d/sentinel-shims.sh'; echo \"\$PATH\"")
+if [[ -f $SANDBOX_DIR/profile.d/moat-shims.sh ]]; then
+	out=$(env -i /bin/sh -c "PATH=/usr/bin:/bin; . '$SANDBOX_DIR/profile.d/moat-shims.sh'; echo \"\$PATH\"")
 	if [[ $out == "/usr/bin:/bin" ]]; then
-		ok "profile.d is a no-op without /etc/sentinel/sandbox.enabled"
+		ok "profile.d is a no-op without /etc/moat/sandbox.enabled"
 	else
-		no "profile.d is a no-op without /etc/sentinel/sandbox.enabled" "got: $out"
+		no "profile.d is a no-op without /etc/moat/sandbox.enabled" "got: $out"
 	fi
-	if [[ -e /etc/sentinel/sandbox.enabled ]]; then
-		note "/etc/sentinel/sandbox.enabled exists on this machine; the enabled-case check was skipped"
+	if [[ -e /etc/moat/sandbox.enabled ]]; then
+		note "/etc/moat/sandbox.enabled exists on this machine; the enabled-case check was skipped"
 	fi
 	if command -v shellcheck >/dev/null 2>&1; then
-		if shellcheck -s sh "$SANDBOX_DIR/profile.d/sentinel-shims.sh" >/dev/null 2>&1; then
+		if shellcheck -s sh "$SANDBOX_DIR/profile.d/moat-shims.sh" >/dev/null 2>&1; then
 			ok "profile.d snippet is clean POSIX sh (shellcheck)"
 		else
 			no "profile.d snippet is clean POSIX sh (shellcheck)"
@@ -637,7 +637,7 @@ if [[ -f $SANDBOX_DIR/profile.d/sentinel-shims.sh ]]; then
 fi
 
 if command -v fish >/dev/null 2>&1; then
-	if fish -n "$SANDBOX_DIR/fish/conf.d/sentinel-shims.fish" 2>/dev/null; then
+	if fish -n "$SANDBOX_DIR/fish/conf.d/moat-shims.fish" 2>/dev/null; then
 		ok "fish snippet parses"
 	else
 		no "fish snippet parses"
@@ -651,7 +651,7 @@ fi
 if command -v shellcheck >/dev/null 2>&1; then
 	say "shellcheck"
 	sc_out=$(cd "$SANDBOX_DIR" && shellcheck -x -s bash \
-		sentinel-sandbox shims/shim-common.sh shims/npm shims/npx shims/pnpm \
+		moat-sandbox shims/shim-common.sh shims/npm shims/npx shims/pnpm \
 		shims/yarn shims/bun shims/pip shims/pip3 shims/uv shims/cargo \
 		shims/makepkg tests/run.sh 2>&1)
 	if [[ -z $sc_out ]]; then

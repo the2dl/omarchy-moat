@@ -1,4 +1,4 @@
-# Tetragon v1.7.1 reference notes for omarchy-sentinel
+# Tetragon v1.7.1 reference notes for omarchy-moat
 
 Scope: upstream v1.7.1 as released, verified against its sources and docs at that tag, the
 local tarball, and this kernel (7.1.9-arch1-2, `CONFIG_BPF_LSM=y`, `lsm=...,bpf`, BTF,
@@ -14,9 +14,9 @@ Abbreviations: `SRC` = https://github.com/cilium/tetragon/blob/v1.7.1/, `DOC` =
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy            # cluster-scoped; TracingPolicyNamespaced also parses but needs metadata.namespace
 metadata:
-  name: sentinel-cred-ssh-key-read     # DNS-1123 rules apply (lowercase, '-', '.')
+  name: moat-cred-ssh-key-read     # DNS-1123 rules apply (lowercase, '-', '.')
   annotations:                          # free-form map, kept; keys must be qualified names
-    sentinel.omarchy/severity: high
+    moat.omarchy/severity: high
 spec:
   options:                              # []{name,value}; known: policy-mode, disable-kprobe-multi, disable-uprobe-multi
     - name: policy-mode
@@ -204,7 +204,7 @@ spec:
 Middle wildcard `/home/*/.ssh/` is **not expressible**: no glob/regex, and `SubString` is
 refused for `file`/`path`. Options: (a) Prefix `/home/` + Postfix list as above (same-index
 UNVERIFIED); (b) render the real `$HOME` into the policy; (c) Prefix `/home/` only and
-suffix-filter in sentineld. `resolve: "f_path.dentry.d_parent.d_name.name"` as `string`
+suffix-filter in moatd. `resolve: "f_path.dentry.d_parent.d_name.name"` as `string`
 Equal `.ssh` is plausible but **UNVERIFIED**.
 
 Upstream write-detection shape (`file_arg` + `int_arg` + `return`):
@@ -326,7 +326,7 @@ concepts/tracing-policy/selectors.md` (port ranges), `argument_types.md`, local 
 ## 6. Env / LD_PRELOAD, bpf, modules, ptrace, /proc/*/mem, setuid, setcap
 
 - **Env vars: no policy selector exists** (KProbeSelector has no env filter). Detect
-  `LD_PRELOAD` in sentineld from `process_exec.process.environment_variables` with
+  `LD_PRELOAD` in moatd from `process_exec.process.environment_variables` with
   `--enable-process-environment-variables` + `--filter-environment-variables LD_PRELOAD`.
   Also watch writes to `/etc/ld.so.preload` (section 3).
 - **bpf()**: LSM `bpf` = `(int cmd, union bpf_attr *attr, unsigned int size, bool kernel)`;
@@ -373,7 +373,7 @@ Verified at: local `/proc/kallsyms`, local BTF via `TARBALL usr/local/lib/tetrag
   `NoPost`, `TrackSock`, `GetUrl`, `DnsLookup` still run, the event is still emitted, and
   **`action` still reports the configured action** (`e->action = action` regardless of
   `enforce_mode`). `"action":"KPROBE_ACTION_SIGKILL"` therefore does NOT prove a kill:
-  sentineld keeps its own mode state and confirms via the next `process_exit` with
+  moatd keeps its own mode state and confirms via the next `process_exit` with
   `"signal":"SIGKILL"` for that `exec_id`.
 - `tetra tp list [-o json]` shows `MODE`; `tetra` needs the root-only gRPC socket.
 - `disable-kprobe-multi` forces classic kprobes (only if attach fails); `enable-policy-filter`
@@ -422,19 +422,19 @@ Export filter object = `tetragon.Filter` JSON (snake_case): `event_set`, `binary
 `parent_binary_regex`, `ancestor_binary_regex`, `arguments_regex`, `parent_arguments_regex`,
 `pid`, `policy_names` (**exact match**, no globs), `cel_expression`, `capabilities`,
 `container_id`, `in_init_tree`, k8s ones. Lines ORed, fields within a line ANDed.
-Allowlist for "exec/exit + `sentinel-*` policy events" (`/etc/tetragon/tetragon.conf.d/export-allowlist`):
+Allowlist for "exec/exit + `moat-*` policy events" (`/etc/tetragon/tetragon.conf.d/export-allowlist`):
 
 ```
 {"event_set":["PROCESS_EXEC","PROCESS_EXIT"]}
-{"event_set":["PROCESS_KPROBE"],"cel_expression":["process_kprobe.policy_name.startsWith('sentinel-')"]}
-{"event_set":["PROCESS_LSM"],"cel_expression":["process_lsm.policy_name.startsWith('sentinel-')"]}
-{"event_set":["PROCESS_TRACEPOINT"],"cel_expression":["process_tracepoint.policy_name.startsWith('sentinel-')"]}
+{"event_set":["PROCESS_KPROBE"],"cel_expression":["process_kprobe.policy_name.startsWith('moat-')"]}
+{"event_set":["PROCESS_LSM"],"cel_expression":["process_lsm.policy_name.startsWith('moat-')"]}
+{"event_set":["PROCESS_TRACEPOINT"],"cel_expression":["process_tracepoint.policy_name.startsWith('moat-')"]}
 ```
 
 CEL variables are the event names (`process_exec`, `process_kprobe`, `process_lsm`, …)
 typed as the proto messages; a CEL line is evaluated only for events it references.
 `startsWith` is standard CEL but **UNVERIFIED** live; fallback is an explicit
-`{"policy_names":["sentinel-a","sentinel-b"]}` line generated from the policy directory.
+`{"policy_names":["moat-a","moat-b"]}` line generated from the policy directory.
 
 Verified at: `TARBALL usr/local/bin/tetragon --help`, `TARBALL usr/local/lib/tetragon/tetragon.conf.d/*`,
 `TARBALL usr/lib/systemd/system/tetragon.service`, `SRC cmd/tetragon/main.go` (loadTpFromDir,
@@ -459,10 +459,10 @@ Samples (shape from proto + docs; values synthetic; one line each in the file):
 ```
 (`status` only when non-zero; `signal` only on signal death.)
 ```json
-{"process_kprobe":{"process":{"...":"..."},"parent":{"...":"..."},"function_name":"security_file_permission","args":[{"file_arg":{"path":"/home/dan/.ssh/id_rsa","permission":"-rw-------"}},{"int_arg":4}],"return":{"int_arg":0},"action":"KPROBE_ACTION_POST","policy_name":"sentinel-cred-ssh-private-key-read","return_action":"KPROBE_ACTION_POST","message":"SSH private key read","tags":["observability.filesystem"]},"node_name":"mars","time":"2026-09-03T16:21:07.001000000Z"}
+{"process_kprobe":{"process":{"...":"..."},"parent":{"...":"..."},"function_name":"security_file_permission","args":[{"file_arg":{"path":"/home/dan/.ssh/id_rsa","permission":"-rw-------"}},{"int_arg":4}],"return":{"int_arg":0},"action":"KPROBE_ACTION_POST","policy_name":"moat-cred-ssh-private-key-read","return_action":"KPROBE_ACTION_POST","message":"SSH private key read","tags":["observability.filesystem"]},"node_name":"mars","time":"2026-09-03T16:21:07.001000000Z"}
 ```
 ```json
-{"process_kprobe":{"process":{"...":"..."},"parent":{"...":"..."},"function_name":"tcp_connect","args":[{"sock_arg":{"family":"AF_INET","type":"SOCK_STREAM","protocol":"IPPROTO_TCP","saddr":"192.168.1.20","daddr":"1.2.3.4","sport":51234,"dport":4444,"cookie":"1234567","state":"TCP_SYN_SENT"}}],"action":"KPROBE_ACTION_SIGKILL","policy_name":"sentinel-net-reverse-shell","kernel_stack_trace":[{"address":"18446744072119856613","offset":"5","symbol":"tcp_connect"}]},"node_name":"mars","time":"2026-09-03T16:22:00.000000000Z"}
+{"process_kprobe":{"process":{"...":"..."},"parent":{"...":"..."},"function_name":"tcp_connect","args":[{"sock_arg":{"family":"AF_INET","type":"SOCK_STREAM","protocol":"IPPROTO_TCP","saddr":"192.168.1.20","daddr":"1.2.3.4","sport":51234,"dport":4444,"cookie":"1234567","state":"TCP_SYN_SENT"}}],"action":"KPROBE_ACTION_SIGKILL","policy_name":"moat-net-reverse-shell","kernel_stack_trace":[{"address":"18446744072119856613","offset":"5","symbol":"tcp_connect"}]},"node_name":"mars","time":"2026-09-03T16:22:00.000000000Z"}
 ```
 (Stack traces only with `kernelStackTrace: true`; addresses 0 unless `--expose-stack-addresses`.
 Other oneofs: `int_arg` (int32), `uint_arg`, `size_arg`, `long_arg`, `string_arg`,
@@ -470,11 +470,11 @@ Other oneofs: `int_arg` (int32), `uint_arg`, `size_arg`, `long_arg`, `string_arg
 `sockaddr_arg{family,addr,port}`, `bpf_prog_arg`, `syscall_id{id,abi}`, `module_arg`,
 `capability_arg{value,name}`; `label` sits beside the oneof.)
 ```json
-{"process_lsm":{"process":{"...":"..."},"parent":{"...":"..."},"function_name":"file_post_open","policy_name":"sentinel-cred-ssh-private-key-read","message":"SSH private key opened","args":[{"file_arg":{"path":"/home/dan/.ssh/id_ed25519","permission":"-rw-------"}},{"int_arg":4}],"action":"KPROBE_ACTION_POST","tags":["cred"]},"node_name":"mars","time":"2026-09-03T16:21:07.001000000Z"}
+{"process_lsm":{"process":{"...":"..."},"parent":{"...":"..."},"function_name":"file_post_open","policy_name":"moat-cred-ssh-private-key-read","message":"SSH private key opened","args":[{"file_arg":{"path":"/home/dan/.ssh/id_ed25519","permission":"-rw-------"}},{"int_arg":4}],"action":"KPROBE_ACTION_POST","tags":["cred"]},"node_name":"mars","time":"2026-09-03T16:21:07.001000000Z"}
 ```
 (`ima_hash` only with `imaHash: true`; LSM events have no `return`/`return_action`.)
 ```json
-{"process_tracepoint":{"process":{"...":"..."},"parent":{"...":"..."},"subsys":"raw_syscalls","event":"sys_enter","args":[{"syscall_id":{"id":101,"abi":"x64"}}],"policy_name":"sentinel-priv-ptrace","action":"KPROBE_ACTION_POST"},"node_name":"mars","time":"2026-09-03T16:23:00.000000000Z"}
+{"process_tracepoint":{"process":{"...":"..."},"parent":{"...":"..."},"subsys":"raw_syscalls","event":"sys_enter","args":[{"syscall_id":{"id":101,"abi":"x64"}}],"policy_name":"moat-priv-ptrace","action":"KPROBE_ACTION_POST"},"node_name":"mars","time":"2026-09-03T16:23:00.000000000Z"}
 ```
 
 `policy_name` exists on `process_kprobe|lsm|tracepoint|uprobe|usdt`, never on exec/exit.
@@ -507,7 +507,7 @@ Verified at: `DOC concepts/tracing-policy/selectors.md` (limits, NoPost pattern)
 `DOC concepts/tracing-policy/hooks.md`, `SRC pkg/selectors/kernel.go`, `tetragon --help`
 (`--cgroup-rate`, ring-buffer flags).
 
-## Gaps: what a policy cannot express (sentineld must)
+## Gaps: what a policy cannot express (moatd must)
 
 1. Ancestry beyond parent (except `matchParentBinaries followChildren` + parents map):
    "AI CLI with no terminal in its chain", "pkg-manager subtree" → daemon process table.
@@ -519,6 +519,6 @@ Verified at: `DOC concepts/tracing-policy/selectors.md` (limits, NoPost pattern)
 6. File age / sha256 of the executed file — only `binary_properties`; hash `process.binary`
    in userspace.
 7. Whether a kill happened — `action` is reported in both modes; use `process_exit.signal`.
-8. `sentinel-*` prefix in `policy_names` — exact names or CEL only.
+8. `moat-*` prefix in `policy_names` — exact names or CEL only.
 9. Policy hot-reload — none; `tetra tp add|delete` or restart.
 10. Scripts: `matchBinaries` sees the interpreter; the script path is in `arguments`.

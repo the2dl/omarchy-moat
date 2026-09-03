@@ -1,0 +1,1643 @@
+#!/usr/bin/env python3
+"""moat-scan-pkgbuild - static review of PKGBUILDs before you build them.
+
+Part of omarchy-moat 0.1.0.  Standard library only, no dependencies.
+
+Scans PKGBUILD, *.install and any local files named in source=() for the
+patterns seen in the real AUR supply-chain incidents (CHAOS RAT, July 2025;
+"Atomic Arch" npm dropper, June 2026) plus the generic persistence /
+obfuscation / privilege tricks that have no business in a package recipe.
+
+Exit codes: 0 = nothing (or only low), 1 = medium findings, 2 = high findings.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import re
+import sys
+import unicodedata
+from dataclasses import dataclass, field
+
+VERSION = "0.1.0"
+
+SEV_HIGH = "high"
+SEV_MEDIUM = "medium"
+SEV_LOW = "low"
+SEV_RANK = {SEV_HIGH: 3, SEV_MEDIUM: 2, SEV_LOW: 1}
+
+EVIDENCE_MAX = 160
+
+# --------------------------------------------------------------------------
+# host knowledge
+# --------------------------------------------------------------------------
+
+# Forges / CDNs that are fine as a source host no matter what url= says.
+KNOWN_HOSTS = (
+    "github.com",
+    "githubusercontent.com",  # raw./objects./release-assets.
+    "codeload.github.com",
+    "gitlab.com",
+    "codeberg.org",
+    "sourceforge.net",
+    "files.pythonhosted.org",
+    "pythonhosted.org",
+    "pypi.org",
+    "pypi.io",
+    "registry.npmjs.org",
+    "npmjs.org",
+    "crates.io",
+    "static.crates.io",
+    "gitlab.archlinux.org",
+    "archlinux.org",
+    "sr.ht",
+    "bitbucket.org",
+    "gnu.org",
+    "kernel.org",
+    "freedesktop.org",
+)
+
+# host -> forge family; sources on a forge but under a different account than
+# url= are the CHAOS RAT shape.
+FORGE_FAMILY = {
+    "github.com": "github",
+    "raw.githubusercontent.com": "github",
+    "objects.githubusercontent.com": "github",
+    "release-assets.githubusercontent.com": "github",
+    "codeload.github.com": "github",
+    "gitlab.com": "gitlab",
+    "codeberg.org": "codeberg",
+    "bitbucket.org": "bitbucket",
+    "git.sr.ht": "srht",
+    "hg.sr.ht": "srht",
+}
+
+SUSPICIOUS_HOST_SUBSTRINGS = (
+    "pastebin.com",
+    "paste.ee",
+    "hastebin",
+    "termbin.com",
+    "ngrok.io",
+    "ngrok-free.app",
+    "ngrok.app",
+    "trycloudflare.com",
+    "transfer.sh",
+    "anonfiles",
+    "gofile.io",
+    "0x0.st",
+    "file.io",
+    "bashupload.com",
+    "tmpfiles.org",
+)
+
+SUSPICIOUS_URL_SUBSTRINGS = (
+    "discord.com/api/webhooks",
+    "discordapp.com/api/webhooks",
+    "api.telegram.org/bot",
+)
+
+# Two-level public suffixes we care about, for registrable-domain comparison.
+MULTI_SUFFIXES = {
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "net.uk",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au",
+    "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp",
+    "com.br", "com.cn", "net.cn", "org.cn", "gov.cn",
+    "co.in", "co.nz", "co.za", "com.mx", "com.tr", "com.tw",
+    "com.hk", "com.sg", "com.ar", "com.pl", "co.kr", "or.kr",
+}
+
+URL_RE = re.compile(
+    r"\b(?:https?|ftps?|git|ssh|rsync)(?:\+[a-z]+)?://[^\s'\"`)|;<>&]+"
+    r"|\bgit\+https?://[^\s'\"`)|;<>&]+"
+)
+IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+# --------------------------------------------------------------------------
+# rule catalogue: id -> (default severity, why, proceed).
+# {pkg}/{host}/{id} in `proceed` are filled in per finding; ALLOW_USER is the
+# path users are told to edit.
+# --------------------------------------------------------------------------
+
+ALLOW_USER = "~/.config/moat/scanner-allow.conf"
+ALLOW_SYSTEM = "/etc/moat/scanner-allow.conf"
+
+_PROCEED_HOST = (
+    "If you trust {host}, add `host={host}` to " + ALLOW_USER + "; otherwise "
+    "fetch the file by hand and read it before building."
+)
+
+RULES: dict[str, tuple[str, str, str]] = {
+    "net.curl-pipe-shell": (
+        SEV_HIGH,
+        "downloads code and pipes it straight into a shell, so the build runs "
+        "whatever the server sends today",
+        "If upstream really ships an installer, pin it as a checksummed "
+        "source=() entry instead, or accept it with `pkg={pkg} rule={id}` in "
+        + ALLOW_USER
+        + ".",
+    ),
+    "obf.base64-exec": (
+        SEV_HIGH,
+        "decodes hidden data and executes it, which hides the payload from "
+        "anyone reading the PKGBUILD",
+        "Decode the blob yourself (pipe it to `less`, not to a shell) and, if "
+        "it is harmless, allow it with `pkg={pkg} rule={id}` in " + ALLOW_USER + ".",
+    ),
+    "obf.eval-var": (
+        SEV_HIGH,
+        "eval on an expanded value means the command actually run is not "
+        "visible in the recipe",
+        "Print the variable instead of eval-ing it to see what runs, then "
+        "allow it with `pkg={pkg} rule={id}` in " + ALLOW_USER + " if it is fine.",
+    ),
+    "pkg.nested-package-manager": (
+        SEV_HIGH,
+        "runs a language package manager, which fetches and executes "
+        "third-party install scripts outside makepkg's checksums",
+        "Expected for many electron/node packages: build it inside the "
+        "sandbox (the default) or allow it with `pkg={pkg} rule={id}` in "
+        + ALLOW_USER
+        + ".",
+    ),
+    "src.host-mismatch": (
+        SEV_MEDIUM,
+        "source is served from somewhere unrelated to url=, the shape used to "
+        "smuggle a payload into an otherwise real package",
+        _PROCEED_HOST,
+    ),
+    "src.suspicious-host": (
+        SEV_HIGH,
+        "host is a paste bin, tunnel, exfil endpoint or raw IP, never a "
+        "legitimate place to fetch package sources from",
+        "Do not build this unless you know exactly why it points there; if "
+        "you do, `host={host}` in " + ALLOW_USER + " silences it.",
+    ),
+    "src.skip-checksum": (
+        SEV_MEDIUM,
+        "SKIP on a remote non-VCS source means the tarball can change under "
+        "you with no integrity check",
+        "Run `updpkgsums` to pin the current file, or accept the risk with "
+        "`pkg={pkg} rule={id}` in " + ALLOW_USER + ".",
+    ),
+    "persist.shell-rc": (
+        SEV_HIGH,
+        "writes to a shell startup file, which re-runs the payload on every "
+        "new login shell",
+        "A package should ship a /etc/profile.d file under $pkgdir instead; "
+        "if you accept this one, add `pkg={pkg} rule={id}` to " + ALLOW_USER + ".",
+    ),
+    "persist.systemd-enable": (
+        SEV_HIGH,
+        "enables a unit from the package itself; Arch packages must never "
+        "start services, and this survives reboots",
+        "Enable the unit yourself after install (`systemctl enable ...`), or "
+        "allow the hook with `pkg={pkg} rule={id}` in " + ALLOW_USER + ".",
+    ),
+    "persist.autostart": (
+        SEV_HIGH,
+        "installs a desktop/user autostart entry outside $pkgdir, so it runs "
+        "on every session start and pacman does not track it",
+        "Check the entry with `cat` first; if you want it, allow it with "
+        "`pkg={pkg} rule={id}` in " + ALLOW_USER + ".",
+    ),
+    "persist.cron": (
+        SEV_HIGH,
+        "installs a scheduled job outside $pkgdir, giving the payload a "
+        "recurring trigger",
+        "Schedule it yourself with a systemd timer you can see, or allow this "
+        "hook with `pkg={pkg} rule={id}` in " + ALLOW_USER + ".",
+    ),
+    "persist.ld-preload": (
+        SEV_HIGH,
+        "ld.so.preload / LD_PRELOAD injects code into every process started "
+        "afterwards",
+        "Almost nothing legitimate needs this; if you are certain, add "
+        "`pkg={pkg} rule={id}` to " + ALLOW_USER + ".",
+    ),
+    "priv.suid": (
+        SEV_HIGH,
+        "sets the setuid/setgid bit, which is a direct local privilege "
+        "escalation if the binary is not audited",
+        "Confirm which binary gets the bit and who can run it, then allow it "
+        "with `pkg={pkg} rule={id}` in " + ALLOW_USER + ".",
+    ),
+    "priv.setcap": (
+        SEV_HIGH,
+        "grants file capabilities, handing extra kernel privileges to a "
+        "binary from an untrusted package",
+        "Normal for ping/mtr-style tools: allow it with `pkg={pkg} rule={id}` "
+        "in " + ALLOW_USER + " once you have checked which binary it targets.",
+    ),
+    "uni.invisible-chars": (
+        SEV_HIGH,
+        "invisible or bidi Unicode hides code from human review (the "
+        "GlassWorm technique)",
+        "View the line with `cat -v` or `sed -n 'Np' PKGBUILD | hexdump -C` "
+        "before trusting it; there is rarely a legitimate reason to allow it.",
+    ),
+    "install.network": (
+        SEV_HIGH,
+        ".install hooks run as root at pacman time; touching the network "
+        "there means root-level remote code execution",
+        "Whatever it downloads should be a checksummed source=() entry "
+        "instead; to accept it, add `pkg={pkg} rule={id}` to " + ALLOW_USER + ".",
+    ),
+}
+
+# --------------------------------------------------------------------------
+# shell-ish lexing
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Line:
+    """One physical line with comments removed."""
+
+    no: int
+    code: str
+    heredoc: bool = False
+
+
+@dataclass
+class LogicalLine:
+    """Continuation-joined, comment-stripped line."""
+
+    no: int
+    code: str
+    func: str | None = None
+    heredoc: bool = False
+
+
+HEREDOC_DELIM_RE = re.compile(r"^-?\s*(?:\"([^\"]+)\"|'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def strip_comments(text: str) -> list[Line]:
+    """Comment-strip every physical line, carrying quote state across lines.
+
+    Heredoc bodies are passed through verbatim and marked, both so that message
+    text like `cat <<EOM ... $ pacman -S foo ... EOM` is not mistaken for a
+    command and so that an apostrophe in prose cannot corrupt the quote state
+    for the rest of the file.
+    """
+    out: list[Line] = []
+    quote: str | None = None
+    pending_heredocs: list[str] = []
+    for idx, raw in enumerate(text.splitlines(), start=1):
+        if pending_heredocs:
+            out.append(Line(idx, raw.rstrip(), heredoc=True))
+            if raw.strip() == pending_heredocs[0]:
+                pending_heredocs.pop(0)
+            continue
+        buf: list[str] = []
+        i = 0
+        n = len(raw)
+        prev = "\n"  # start of line counts as a word boundary
+        while i < n:
+            ch = raw[i]
+            if quote == "'":
+                buf.append(ch)
+                if ch == "'":
+                    quote = None
+                i += 1
+                prev = ch
+                continue
+            if quote == '"':
+                buf.append(ch)
+                if ch == "\\" and i + 1 < n:
+                    buf.append(raw[i + 1])
+                    i += 2
+                    prev = ""
+                    continue
+                if ch == '"':
+                    quote = None
+                i += 1
+                prev = ch
+                continue
+            if ch == "\\":
+                buf.append(ch)
+                if i + 1 < n:
+                    buf.append(raw[i + 1])
+                    i += 2
+                else:
+                    i += 1
+                prev = ""
+                continue
+            if ch in "'\"":
+                quote = ch
+                buf.append(ch)
+                i += 1
+                prev = ch
+                continue
+            if ch == "#" and (prev in ("\n", "", " ", "\t", ";", "|", "&", "(", ")", "{")):
+                break
+            if ch == "<" and raw[i : i + 3] == "<<<":  # herestring, not heredoc
+                buf.append("<<<")
+                prev = "<"
+                i += 3
+                continue
+            if ch == "<" and raw[i : i + 2] == "<<":
+                m = HEREDOC_DELIM_RE.match(raw[i + 2 :])
+                if m:
+                    pending_heredocs.append(m.group(1) or m.group(2) or m.group(3))
+            buf.append(ch)
+            prev = ch
+            i += 1
+        out.append(Line(idx, "".join(buf).rstrip()))
+    return out
+
+
+def join_continuations(lines: list[Line]) -> list[LogicalLine]:
+    out: list[LogicalLine] = []
+    pending: list[str] = []
+    start = 0
+    heredoc = False
+    for ln in lines:
+        code = ln.code
+        cont = (
+            code.endswith("\\") and not code.endswith("\\\\") and not ln.heredoc
+        )
+        if cont:
+            code = code[:-1]
+        if not pending:
+            start = ln.no
+            heredoc = ln.heredoc
+        pending.append(code)
+        if not cont:
+            out.append(LogicalLine(start, "".join(pending), heredoc=heredoc))
+            pending = []
+    if pending:
+        out.append(LogicalLine(start, "".join(pending), heredoc=heredoc))
+    return out
+
+
+FUNC_RE = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_:.+-]*)\s*\(\s*\)\s*\{?\s*$")
+
+
+def find_functions(lines: list[Line]) -> dict[str, tuple[int, int]]:
+    """name -> (first line, last line) using brace counting."""
+    funcs: dict[str, tuple[int, int]] = {}
+    i = 0
+    while i < len(lines):
+        m = FUNC_RE.match(lines[i].code)
+        if not m:
+            i += 1
+            continue
+        name = m.group(1)
+        depth = lines[i].code.count("{") - lines[i].code.count("}")
+        start = lines[i].no
+        j = i + 1
+        if depth <= 0:
+            # opening brace on the following line
+            while j < len(lines) and not lines[j].code.strip():
+                j += 1
+            if j < len(lines) and lines[j].code.strip().startswith("{"):
+                depth = 1
+                j += 1
+            else:
+                i += 1
+                continue
+        while j < len(lines) and depth > 0:
+            depth += lines[j].code.count("{") - lines[j].code.count("}")
+            j += 1
+        funcs[name] = (start, lines[min(j, len(lines)) - 1].no)
+        i = j
+    return funcs
+
+
+@dataclass
+class ArrayEntry:
+    value: str
+    no: int
+
+
+def parse_arrays(lines: list[Line]) -> dict[str, list[ArrayEntry]]:
+    """Collect NAME=( ... ) arrays with the source line of each entry."""
+    arrays: dict[str, list[ArrayEntry]] = {}
+    assign = re.compile(r"^\s*(?:export\s+|declare\s+-\w+\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(\+?=)\s*\(")
+    i = 0
+    while i < len(lines):
+        m = assign.match(lines[i].code)
+        if not m:
+            i += 1
+            continue
+        name = m.group(1)
+        # char stream with line numbers, starting just after the '('
+        stream: list[tuple[str, int]] = []
+        depth = 0
+        j = i
+        pos = m.end()
+        done = False
+        while j < len(lines) and not done:
+            code = lines[j].code
+            k = pos if j == i else 0
+            if j == i:
+                depth = 1
+            while k < len(code):
+                ch = code[k]
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        done = True
+                        break
+                stream.append((ch, lines[j].no))
+                k += 1
+            if not done:
+                stream.append((" ", lines[j].no))
+            j += 1
+        entries = _split_entries(stream)
+        arrays.setdefault(name, []).extend(entries)
+        i = j if j > i else i + 1
+    return arrays
+
+
+def _split_entries(stream: list[tuple[str, int]]) -> list[ArrayEntry]:
+    entries: list[ArrayEntry] = []
+    cur: list[str] = []
+    cur_no = 0
+    quote: str | None = None
+    depth = 0
+    for ch, no in stream:
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                cur.append(ch)
+            continue
+        if ch in "'\"":
+            quote = ch
+            if not cur:
+                cur_no = no
+            continue
+        if ch in "({[":
+            depth += 1
+        elif ch in ")}]":
+            depth = max(0, depth - 1)
+        if ch.isspace() and depth == 0:
+            if cur:
+                entries.append(ArrayEntry("".join(cur), cur_no))
+                cur = []
+            continue
+        if not cur:
+            cur_no = no
+        cur.append(ch)
+    if cur:
+        entries.append(ArrayEntry("".join(cur), cur_no))
+    return entries
+
+
+SCALAR_RE = re.compile(
+    r"^\s*(?:export\s+|local\s+|declare\s+-\w+\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$"
+)
+
+
+def parse_scalars(lines: list[Line], funcs: dict[str, tuple[int, int]]) -> dict[str, str]:
+    """Top-level scalar assignments (outside any function)."""
+    in_func = set()
+    for start, end in funcs.values():
+        in_func.update(range(start, end + 1))
+    out: dict[str, str] = {}
+    for ln in lines:
+        if ln.no in in_func:
+            continue
+        m = SCALAR_RE.match(ln.code)
+        if not m:
+            continue
+        val = m.group(2).strip()
+        if val.startswith("("):
+            continue
+        out[m.group(1)] = dequote(val)
+    return out
+
+
+def dequote(s: str) -> str:
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"":
+        return s[1:-1]
+    return s
+
+
+VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)([^}]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def expand(value: str, vars: dict[str, str], depth: int = 0) -> str:
+    """Best-effort variable expansion; unknown names are left as-is."""
+    if depth > 6 or "$" not in value:
+        return value
+
+    def sub(m: re.Match[str]) -> str:
+        name = m.group(1) or m.group(3)
+        op = m.group(2) or ""
+        if name not in vars:
+            return m.group(0)
+        val = expand(vars[name], vars, depth + 1)
+        if op:
+            if op == "^":
+                val = val[:1].upper() + val[1:]
+            elif op == "^^":
+                val = val.upper()
+            elif op == ",":
+                val = val[:1].lower() + val[1:]
+            elif op == ",,":
+                val = val.lower()
+            elif op.startswith(("#", "%")):
+                pass  # pattern removal: keep the value, close enough for hosts
+            else:
+                return m.group(0)
+        return val
+
+    return VAR_RE.sub(sub, value)
+
+
+# --------------------------------------------------------------------------
+# url helpers
+# --------------------------------------------------------------------------
+
+
+def url_host(url: str) -> str | None:
+    m = re.match(r"^[A-Za-z0-9+.-]+://(?:[^/@\s]*@)?\[?([^/\]\s:]+)\]?", url)
+    if not m:
+        return None
+    host = m.group(1).lower().rstrip(".")
+    if "$" in host or not host:
+        return None
+    return host
+
+
+def url_path(url: str) -> str:
+    m = re.match(r"^[A-Za-z0-9+.-]+://[^/\s]+(/[^\s?#]*)", url)
+    return m.group(1) if m else "/"
+
+
+def registrable(host: str) -> str:
+    parts = host.split(".")
+    if len(parts) <= 2:
+        return host
+    if ".".join(parts[-2:]) in MULTI_SUFFIXES:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def is_known_host(host: str) -> bool:
+    for good in KNOWN_HOSTS:
+        if host == good or host.endswith("." + good):
+            return True
+    return False
+
+
+def is_raw_ip(host: str) -> bool:
+    if IPV4_RE.match(host):
+        octets = [int(p) for p in host.split(".")]
+        if any(o > 255 for o in octets):
+            return False
+        if octets[0] in (0, 127):  # loopback / unspecified: noise, not exfil
+            return False
+        return True
+    if ":" in host and re.match(r"^[0-9a-f:]+$", host):
+        return host not in ("::1", "::")
+    return False
+
+
+def first_url_host(code: str) -> str:
+    for url in URL_RE.findall(code):
+        host = url_host(url)
+        if host:
+            return host
+    return ""
+
+
+def suspicious_reason(url: str) -> str | None:
+    low = url.lower()
+    for pat in SUSPICIOUS_URL_SUBSTRINGS:
+        if pat in low:
+            return pat
+    host = url_host(url)
+    if not host:
+        return None
+    if host.endswith(".onion"):
+        return ".onion hidden service"
+    for pat in SUSPICIOUS_HOST_SUBSTRINGS:
+        if pat in host:
+            return host
+    if is_raw_ip(host):
+        return "raw IP literal %s" % host
+    return None
+
+
+# --------------------------------------------------------------------------
+# findings
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Finding:
+    id: str
+    severity: str
+    file: str
+    line: int
+    evidence: str
+    why: str
+    proceed: str
+    pkg: str = ""     # owning package, for allow-file matching
+    host: str = ""    # host involved, for allow-file matching
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "severity": self.severity,
+            "file": self.file,
+            "line": self.line,
+            "evidence": self.evidence,
+            "why": self.why,
+            "proceed": self.proceed,
+        }
+
+
+# --------------------------------------------------------------------------
+# allow file:  host=<domain> | rule=<id> | pkg=<pkgname>, '#' comments.
+# Keys on one line are ANDed, so `pkg=foo rule=src.skip-checksum` skips that
+# rule for that package only.  Globs are allowed (`rule=persist.*`).
+# --------------------------------------------------------------------------
+
+ALLOW_KEYS = ("host", "rule", "pkg")
+
+
+def allow_file_paths(extra: list[str] | None = None) -> list[str]:
+    env = os.environ.get("MOAT_SCANNER_ALLOW", "")
+    paths = [ALLOW_SYSTEM]
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+    paths.append(os.path.join(xdg, "moat", "scanner-allow.conf"))
+    paths.extend(p for p in env.split(":") if p)
+    paths.extend(extra or [])
+    return paths
+
+
+def load_allow(paths: list[str]) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    for path in paths:
+        try:
+            with open(os.path.expanduser(path), encoding="utf-8", errors="replace") as fh:
+                body = fh.read()
+        except OSError:
+            continue
+        for raw in body.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            entry: dict[str, str] = {}
+            for tok in re.split(r"[\s,]+", line):
+                key, _, val = tok.partition("=")
+                if key in ALLOW_KEYS and val:
+                    entry[key] = val.strip("'\"")
+            if entry:
+                entries.append(entry)
+    return entries
+
+
+def host_matches(host: str, pattern: str) -> bool:
+    host = host.lower()
+    pattern = pattern.lower().lstrip(".")
+    if not host:
+        return False
+    return host == pattern or host.endswith("." + pattern) or fnmatch.fnmatch(host, pattern)
+
+
+def is_allowed(f: Finding, entries: list[dict[str, str]]) -> bool:
+    for entry in entries:
+        ok = True
+        for key, val in entry.items():
+            if key == "rule":
+                ok = ok and (f.id == val or fnmatch.fnmatch(f.id, val))
+            elif key == "pkg":
+                ok = ok and bool(f.pkg) and (f.pkg == val or fnmatch.fnmatch(f.pkg, val))
+            elif key == "host":
+                ok = ok and host_matches(f.host, val)
+            if not ok:
+                break
+        if ok:
+            return True
+    return False
+
+
+def clean_evidence(text: str, escape_invisible: bool = False) -> str:
+    out: list[str] = []
+    for ch in text:
+        if escape_invisible and (is_invisible(ch) or (ord(ch) > 127 and unicodedata.category(ch) in ("Cf", "Cc", "Co", "Cs"))):
+            out.append("\\u%04x" % ord(ch) if ord(ch) <= 0xFFFF else "\\U%08x" % ord(ch))
+        elif ch in "\t\r\n":
+            out.append(" ")
+        else:
+            out.append(ch)
+    s = re.sub(r"\s+", " ", "".join(out)).strip()
+    if len(s) > EVIDENCE_MAX:
+        s = s[: EVIDENCE_MAX - 3] + "..."
+    return s
+
+
+INVISIBLE_RANGES = (
+    (0x00AD, 0x00AD),   # soft hyphen
+    (0x061C, 0x061C),   # arabic letter mark
+    (0x180E, 0x180E),   # mongolian vowel separator
+    (0x200B, 0x200F),   # zero width space .. RLM
+    (0x2028, 0x202E),   # line/para sep, bidi embedding/override
+    (0x2060, 0x2064),   # word joiner .. invisible plus
+    (0x2066, 0x206F),   # bidi isolates, deprecated formatting
+    (0x3164, 0x3164),   # hangul filler (GlassWorm)
+    (0xFE00, 0xFE0F),   # variation selectors
+    (0xFEFF, 0xFEFF),   # BOM / zero width no-break space
+    (0xFFA0, 0xFFA0),   # halfwidth hangul filler (GlassWorm)
+    (0xE0000, 0xE007F),  # tag characters
+    (0xE0100, 0xE01EF),  # variation selectors supplement (GlassWorm)
+)
+
+
+def is_invisible(ch: str) -> bool:
+    cp = ord(ch)
+    for lo, hi in INVISIBLE_RANGES:
+        if lo <= cp <= hi:
+            return True
+    return False
+
+
+# --------------------------------------------------------------------------
+# pattern helpers
+# --------------------------------------------------------------------------
+
+DOWNLOADER_RE = re.compile(
+    r"\b(curl|wget2?|aria2c|axel|httpie|lwp-download|snarf|hurl)\b"
+)
+SINKS = {
+    "bash", "sh", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "ash",
+    "python", "python2", "python3", "perl", "ruby", "node", "nodejs",
+    "php", "lua", "luajit", "eval", "source", ".",
+}
+PREFIX_WORDS = {"sudo", "doas", "env", "exec", "command", "time", "nohup", "setsid", "nice", "xargs"}
+
+DECODE_RE = re.compile(
+    r"base64\s+(?:-{1,2}[A-Za-z]*d[A-Za-z]*|--decode)\b"
+    r"|base32\s+-{1,2}[A-Za-z]*d\b"
+    r"|\bxxd\s+(?:-\S+\s+)*-r\b"
+    r"|\buudecode\b"
+    r"|\bopenssl\s+(?:enc|base64)\b[^|;]*\s-d\b"
+    r"|b64decode"
+    r"|\bgzip\s+-d\s*(?:$|\||<)"
+    r"|\bzcat\b"
+)
+EVAL_RE = re.compile(r"(?:^|[;&|(]|\bthen\b|\bdo\b|\belse\b|\s)eval\s+(?P<arg>\S.*)$")
+PKGMGR_RE = re.compile(
+    r"\b(?:npm|pnpm|yarn|bun)\s+(?:[-\w=./]+\s+)*(?:install|add|ci|i)\b"
+    r"|\b(?:npx|bunx|pnpx)\s+\S"
+    r"|\b(?:pip|pip3|pip2)\s+(?:[-\w=./]+\s+)*install\b"
+    r"|\bpython3?\s+-m\s+pip\s+(?:[-\w=./]+\s+)*install\b"
+    r"|\buv\s+(?:pip\s+)?(?:install|add|tool\s+install)\b"
+    r"|\bcargo\s+install\b"
+    r"|\bgem\s+install\b"
+    r"|\bgo\s+install\b"
+    r"|\bpoetry\s+(?:install|add)\b"
+    r"|\bcomposer\s+(?:install|require)\b"
+    r"|\bpipx\s+install\b"
+)
+WRITE_RE = re.compile(
+    r">>?|\btee\b|\bsed\s+-\S*i|\bcp\b|\bmv\b|\bln\s+-\S*s|\binstall\s+-|\bdd\b|\bpython3?\s+-c\b|\bcat\b"
+)
+REMOVE_RE = re.compile(r"\b(rm|rmdir|unlink|find)\b")
+STAGING_RE = re.compile(r"\$\{?(pkgdir|srcdir|DESTDIR)\b|\bDESTDIR=")
+
+SHELL_RC_RE = re.compile(
+    r"(?:~|\$\{?HOME\}?|/home/[^/\s\"']+|/root)/\.(?:bashrc|zshrc|profile|bash_profile"
+    r"|bash_login|zprofile|zshenv|zlogin|kshrc|config/fish/config\.fish)"
+    r"|/etc/profile(?:\.d/[^\s\"';]*)?\b"
+    r"|/etc/bash\.bashrc\b"
+    r"|/etc/zsh/z(?:shrc|shenv|profile)\b"
+)
+# NB: /usr/lib/systemd/user is where units are *shipped*; only the live
+# session dirs count as persistence.
+AUTOSTART_RE = re.compile(
+    r"(?:\.config/autostart|/etc/xdg/autostart|\.config/systemd/user"
+    r"|\.config/hypr/autostart)"
+)
+CRON_RE = re.compile(
+    r"\bcrontab\b|/etc/cron\.(?:d|daily|hourly|weekly|monthly)\b|/etc/crontab\b"
+    r"|/var/spool/cron\b|\bsystemd-run\b[^\n]*--on-(?:calendar|boot)"
+)
+LDPRELOAD_RE = re.compile(r"/etc/ld\.so\.preload\b|\bLD_PRELOAD\s*=")
+LDCONF_RE = re.compile(r"/etc/ld\.so\.conf(?:\.d[^\s\"';]*)?\b")
+SUID_RE = re.compile(
+    r"\bchmod\s+(?:-\S+\s+)*(?:[ugoa]*\+[rwxXst]*s[rwxXst]*|[0-7]*[2467][0-7]{3})\b"
+    r"|\binstall\b[^\n]*?-\w*m\s?0?[2467][0-7]{3}\b"
+)
+SETCAP_RE = re.compile(r"\bsetcap\b")
+# enable/start only: `systemctl disable --now` in pre_remove is legitimate.
+SYSTEMD_ENABLE_RE = re.compile(
+    r"\bsystemctl\b(?:\s+--[\w=/.:-]+)*\s+(?:enable|reenable|link|preset|start)\b"
+)
+SYSTEMD_WANTS_RE = re.compile(r"/etc/systemd/system/[^\s\"';]*\.(?:wants|requires)\b")
+NET_IN_INSTALL_RE = re.compile(
+    r"\b(curl|wget2?|aria2c|axel|lwp-download)\b"
+    r"|\bgit\s+(?:clone|pull|fetch|remote)\b"
+    r"|/dev/tcp/"
+    r"|\b(?:nc|ncat|netcat|socat)\s+-"
+    r"|\b(?:ssh|scp|sftp)\s+[^\s]*@"
+    r"|\brsync\s+[^\n]*(?:::|@)"
+    r"|\bopenssl\s+s_client\b"
+    r"|\bgpg\b[^\n]*--(?:recv-keys|keyserver|locate-key)"
+    r"|\bpython3?\s+-c\b[^\n]*(?:urllib|requests|socket|http\.client)"
+    r"|\bnpm\b|\bpip3?\b|\bcargo\s+install\b"
+)
+
+# Commands that only print text: a rule hit inside their quoted argument is a
+# help message, not an action (`echo "run: systemctl --user enable foo"`).
+PRINTERS = {
+    "echo", "printf", "print", "cat", "msg", "msg2", "note", "warning",
+    "error", "plain", "tee", "logger", "notify-send",
+}
+
+# A privilege change aimed at one of these is escalation, not packaging.
+HIGH_TARGET_RE = re.compile(
+    r"(?:~|\$\{?HOME\}?|/home/|/root/|/tmp/|/var/tmp/|/dev/shm/)"
+    r"|/(?:ba|z|da|k|a)?sh\b|/python[0-9.]*\b|/perl\b|/ruby\b|/node\b"
+    r"|/env\b|/find\b|/awk\b|/vim?\b|/nmap\b|/tar\b|/dd\b|/cp\b"
+)
+
+
+def split_pipeline(code: str) -> list[str]:
+    segs: list[str] = []
+    cur: list[str] = []
+    quote: str | None = None
+    depth = 0
+    i = 0
+    while i < len(code):
+        ch = code[i]
+        if quote:
+            cur.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < len(code):
+                cur.append(code[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            cur.append(ch)
+            i += 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        if ch == "|" and depth == 0:
+            if i + 1 < len(code) and code[i + 1] == "|":
+                cur.append("||")
+                i += 2
+                continue
+            segs.append("".join(cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(ch)
+        i += 1
+    segs.append("".join(cur))
+    return segs
+
+
+def first_word(seg: str) -> str:
+    for tok in seg.replace("(", " ").split():
+        t = tok.strip("{}();&")
+        if not t or "=" in t and not t.startswith("$"):
+            continue
+        if t in PREFIX_WORDS:
+            continue
+        return os.path.basename(t.strip("\"'"))
+    return ""
+
+
+def pipes_into_shell(code: str) -> bool:
+    segs = split_pipeline(code)
+    if len(segs) < 2:
+        return False
+    seen_dl = False
+    for seg in segs:
+        if seen_dl and first_word(seg) in SINKS:
+            return True
+        if DOWNLOADER_RE.search(seg):
+            seen_dl = True
+    return False
+
+
+def decode_into_shell(code: str) -> bool:
+    segs = split_pipeline(code)
+    seen = False
+    for seg in segs:
+        if seen and first_word(seg) in SINKS:
+            return True
+        if DECODE_RE.search(seg):
+            seen = True
+    return False
+
+
+SUBSHELL_EXEC_RE = re.compile(
+    r"\b(?:bash|sh|zsh|dash|python3?|perl|ruby|node|eval|source)\b(?:\s+-\S+)*\s*"
+    r"(?:[\"']?\$\(|<\()"
+)
+
+
+def quoted_spans(code: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    quote: str | None = None
+    start = 0
+    i = 0
+    while i < len(code):
+        ch = code[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 2
+                continue
+            if ch == quote:
+                spans.append((start, i))
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+            start = i
+        i += 1
+    if quote:
+        spans.append((start, len(code)))
+    return spans
+
+
+def in_printed_text(code: str, pos: int) -> bool:
+    """True if pos sits inside a quoted argument of a printing command."""
+    segs = split_pipeline(code)
+    if not segs:
+        return False
+    first = segs[0]
+    if len(first) <= pos:  # the hit is downstream of a pipe: it really runs
+        return False
+    if first_word(first) not in PRINTERS:
+        return False
+    return any(a < pos < b for a, b in quoted_spans(code))
+
+
+# --------------------------------------------------------------------------
+# per-file scanning
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class FileUnit:
+    path: str          # path as reported
+    kind: str          # "pkgbuild" | "install" | "source"
+    text: str
+    lines: list[Line] = field(default_factory=list)
+    logical: list[LogicalLine] = field(default_factory=list)
+    funcs: dict[str, tuple[int, int]] = field(default_factory=dict)
+    pkg: str = ""      # owning pkgname/pkgbase, for allow-file scoping
+
+
+def load_unit(path: str, display: str, kind: str) -> FileUnit | None:
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    if b"\x00" in data[:4096]:
+        return None  # binary
+    text = data.decode("utf-8", errors="surrogateescape")
+    unit = FileUnit(display, kind, text)
+    unit.lines = strip_comments(text)
+    unit.funcs = find_functions(unit.lines)
+    unit.logical = join_continuations(unit.lines)
+    ranges = {name: rng for name, rng in unit.funcs.items()}
+    for ll in unit.logical:
+        for name, (start, end) in ranges.items():
+            if start <= ll.no <= end:
+                ll.func = name
+                break
+    return unit
+
+
+class Scanner:
+    def __init__(self) -> None:
+        self.findings: list[Finding] = []
+        self._seen: set[tuple[str, str, int]] = set()
+
+    def add(
+        self,
+        rule: str,
+        unit: FileUnit,
+        line: int,
+        evidence: str,
+        severity: str | None = None,
+        why: str | None = None,
+        escape: bool = False,
+        host: str = "",
+    ) -> None:
+        default_sev, default_why, proceed = RULES[rule]
+        sev = severity or default_sev
+        key = (rule, unit.path, line)
+        if key in self._seen:
+            return
+        self._seen.add(key)
+        pkg = unit.pkg or "<pkgname>"
+        self.findings.append(
+            Finding(
+                id=rule,
+                severity=sev,
+                file=unit.path,
+                line=line,
+                evidence=clean_evidence(evidence, escape_invisible=escape),
+                why=why or default_why,
+                proceed=proceed.format(pkg=pkg, id=rule, host=host or "<host>"),
+                pkg=unit.pkg,
+                host=host,
+            )
+        )
+
+    # ---- rules over code lines -------------------------------------------
+
+    def scan_code(self, unit: FileUnit) -> None:
+        is_install = unit.kind == "install"
+        for ll in unit.logical:
+            code = ll.code
+            if not code.strip():
+                continue
+
+            def live(m: re.Match | None) -> bool:
+                """A real command here, not help text and not a heredoc body."""
+                if m is None:
+                    return False
+                if ll.heredoc:
+                    return False
+                return not in_printed_text(code, m.start())
+
+            line_host = first_url_host(code)
+
+            # --- net.curl-pipe-shell -------------------------------------
+            dl = DOWNLOADER_RE.search(code)
+            if live(dl) and (
+                pipes_into_shell(code) or (SUBSHELL_EXEC_RE.search(code) and dl)
+            ):
+                self.add("net.curl-pipe-shell", unit, ll.no, code, host=line_host)
+
+            # --- obf.base64-exec -----------------------------------------
+            dec = DECODE_RE.search(code)
+            if live(dec) and (
+                decode_into_shell(code)
+                or re.search(r"\beval\b", code)
+                or SUBSHELL_EXEC_RE.search(code)
+                or re.search(r"chmod\s+\S*\+x", code)
+            ):
+                self.add("obf.base64-exec", unit, ll.no, code)
+
+            # --- obf.eval-var --------------------------------------------
+            m = EVAL_RE.search(code)
+            if live(m) and m and "$" in m.group("arg"):
+                self.add("obf.eval-var", unit, ll.no, code)
+
+            # --- pkg.nested-package-manager ------------------------------
+            m = PKGMGR_RE.search(code)
+            if live(m):
+                sev = SEV_HIGH if is_install else SEV_MEDIUM
+                why = None
+                if not is_install:
+                    why = (
+                        "runs a language package manager during build, pulling "
+                        "code that makepkg's checksums do not cover"
+                    )
+                self.add("pkg.nested-package-manager", unit, ll.no, code, severity=sev, why=why)
+
+            staging = bool(STAGING_RE.search(code))
+            removing = bool(REMOVE_RE.search(code))
+
+            # --- persistence: only when the target is the live system -----
+            m = SHELL_RC_RE.search(code)
+            if live(m) and WRITE_RE.search(code) and not staging and not removing:
+                self.add("persist.shell-rc", unit, ll.no, code)
+
+            m = SYSTEMD_ENABLE_RE.search(code)
+            if live(m):
+                # `--global`/`--user enable` at install time is the socket
+                # activation idiom shipped by pipewire, gnome-keyring, ...
+                scoped = re.search(r"systemctl\s+(?:--\S+\s+)*--(?:global|user)\b", code)
+                self.add(
+                    "persist.systemd-enable",
+                    unit,
+                    ll.no,
+                    code,
+                    severity=SEV_MEDIUM if scoped else SEV_HIGH,
+                    why=(
+                        "enables a unit in every user session from the package "
+                        "itself, so it starts without the user asking"
+                        if scoped
+                        else None
+                    ),
+                )
+            else:
+                m = SYSTEMD_WANTS_RE.search(code)
+                if live(m) and WRITE_RE.search(code) and not staging:
+                    self.add("persist.systemd-enable", unit, ll.no, code)
+
+            m = AUTOSTART_RE.search(code)
+            if live(m) and WRITE_RE.search(code) and not staging and not removing:
+                self.add("persist.autostart", unit, ll.no, code)
+
+            m = CRON_RE.search(code)
+            if live(m) and not staging and not removing:
+                if re.search(r"\bcrontab\b", code) or WRITE_RE.search(code):
+                    self.add("persist.cron", unit, ll.no, code)
+
+            m = LDPRELOAD_RE.search(code)
+            if live(m) and not removing:
+                self.add("persist.ld-preload", unit, ll.no, code)
+            else:
+                m = LDCONF_RE.search(code)
+                if live(m) and WRITE_RE.search(code) and not staging:
+                    self.add(
+                        "persist.ld-preload",
+                        unit,
+                        ll.no,
+                        code,
+                        severity=SEV_MEDIUM,
+                        why="writes a linker search path onto the live system outside $pkgdir",
+                    )
+
+            # --- privilege ------------------------------------------------
+            m = SUID_RE.search(code)
+            if live(m):
+                sev, why = self._priv_severity(code, staging, "setuid/setgid bit")
+                self.add("priv.suid", unit, ll.no, code, severity=sev, why=why)
+            m = SETCAP_RE.search(code)
+            if live(m):
+                sev, why = self._priv_severity(code, staging, "file capabilities")
+                self.add("priv.setcap", unit, ll.no, code, severity=sev, why=why)
+
+            # --- .install talking to the network --------------------------
+            if is_install:
+                m = NET_IN_INSTALL_RE.search(code)
+                if live(m):
+                    self.add("install.network", unit, ll.no, code, host=line_host)
+
+            # --- suspicious hosts anywhere in the file --------------------
+            for url in URL_RE.findall(code):
+                reason = suspicious_reason(url)
+                if reason:
+                    self.add(
+                        "src.suspicious-host",
+                        unit,
+                        ll.no,
+                        code,
+                        why="fetches from %s, which is not a place package sources come from"
+                        % reason,
+                        host=url_host(url) or "",
+                    )
+
+    @staticmethod
+    def _priv_severity(code: str, staging: bool, what: str) -> tuple[str, str | None]:
+        if staging:
+            return (
+                SEV_LOW,
+                "package ships a binary with %s; review who is allowed to run it" % what,
+            )
+        if HIGH_TARGET_RE.search(code):
+            return (SEV_HIGH, None)
+        return (
+            SEV_MEDIUM,
+            "grants %s to a system path at install time; normal for a few network "
+            "tools, suspicious anywhere else" % what,
+        )
+
+    # ---- unicode ---------------------------------------------------------
+
+    def scan_unicode(self, unit: FileUnit) -> None:
+        for idx, raw in enumerate(unit.text.splitlines(), start=1):
+            bad: list[str] = []
+            for ch in raw:
+                cp = ord(ch)
+                if cp < 128:
+                    continue
+                if is_invisible(ch) or unicodedata.category(ch) in ("Cf", "Cc", "Co", "Cs"):
+                    label = "U+%04X" % cp
+                    if label not in bad:
+                        bad.append(label)
+            if not bad:
+                continue
+            bom_only = bad == ["U+FEFF"] and idx == 1 and raw.startswith("﻿")
+            sev = SEV_LOW if bom_only else SEV_HIGH
+            why = (
+                "file starts with a UTF-8 BOM; harmless but makepkg does not expect it"
+                if bom_only
+                else "line contains invisible/bidi Unicode (%s) that hides code from review"
+                % ", ".join(bad[:6])
+            )
+            self.add("uni.invisible-chars", unit, idx, raw, severity=sev, why=why, escape=True)
+
+    # ---- source array / checksum rules ----------------------------------
+
+    def scan_sources(self, unit: FileUnit) -> list[tuple[str, str]]:
+        """Returns [(local filename, ...)] found in source arrays."""
+        arrays = parse_arrays(unit.lines)
+        scalars = parse_scalars(unit.lines, unit.funcs)
+        url_val = expand(scalars.get("url", ""), scalars)
+        uhost = url_host(url_val)
+        ufamily = FORGE_FAMILY.get(uhost or "")
+        uowner = _forge_owner(uhost, url_path(url_val)) if uhost else None
+
+        locals_found: list[tuple[str, str]] = []
+        sums_names = ("sha256sums", "sha512sums", "sha384sums", "sha224sums",
+                      "sha1sums", "b2sums", "md5sums", "cksums")
+
+        for arr_name, entries in arrays.items():
+            if not (arr_name == "source" or arr_name.startswith("source_")):
+                continue
+            suffix = arr_name[len("source"):]
+            sums: dict[int, ArrayEntry] = {}
+            for sname in sums_names:
+                for key in (sname + suffix, sname):
+                    for i, e in enumerate(arrays.get(key, [])):
+                        if dequote(e.value).upper() == "SKIP":
+                            sums.setdefault(i, e)
+                    if key in arrays:
+                        break
+
+            for idx, entry in enumerate(entries):
+                raw = dequote(entry.value)
+                name, _, loc = raw.partition("::")
+                if not loc:
+                    loc, name = raw, ""
+                loc_x = expand(loc, scalars)
+                is_vcs = bool(
+                    re.match(r"^(git|hg|svn|bzr|fossil)(\+|://)", loc_x)
+                    or re.match(r"^[a-z]+\+(https?|ssh|file)://", loc_x)
+                )
+                remote = bool(re.match(r"^[A-Za-z0-9+.-]+://", loc_x))
+
+                if not remote:
+                    locals_found.append((loc_x, name))
+                    continue
+
+                reason = suspicious_reason(loc_x)
+                if reason:
+                    self.add(
+                        "src.suspicious-host",
+                        unit,
+                        entry.no,
+                        raw,
+                        why="source is fetched from %s, which is not a place package sources come from"
+                        % reason,
+                        host=url_host(loc_x) or "",
+                    )
+                else:
+                    shost = url_host(loc_x)
+                    if shost:
+                        self._host_mismatch(unit, entry, raw, shost, loc_x, uhost, ufamily, uowner, scalars)
+
+                if not is_vcs and idx in sums:
+                    e = sums[idx]
+                    self.add(
+                        "src.skip-checksum",
+                        unit,
+                        e.no,
+                        "%s -> %s" % (raw, dequote(e.value)),
+                    )
+        return locals_found
+
+    def _host_mismatch(
+        self,
+        unit: FileUnit,
+        entry: ArrayEntry,
+        raw: str,
+        shost: str,
+        loc: str,
+        uhost: str | None,
+        ufamily: str | None,
+        uowner: str | None,
+        scalars: dict[str, str],
+    ) -> None:
+        sfamily = FORGE_FAMILY.get(shost)
+        if sfamily and ufamily == sfamily and uowner:
+            sowner = _forge_owner(shost, url_path(loc))
+            if sowner and sowner.lower() != uowner.lower():
+                self.add(
+                    "src.host-mismatch",
+                    unit,
+                    entry.no,
+                    raw,
+                    why="source comes from %s account '%s' but url= points at '%s'"
+                    % (sfamily, sowner, uowner),
+                    host=shost,
+                )
+            return
+        if is_known_host(shost):
+            return
+        if uhost and registrable(shost) == registrable(uhost):
+            return
+        # vendor CDN heuristic: shares a >=4 char label with url= or pkgname
+        tokens = set()
+        if uhost:
+            tokens.update(re.split(r"[.-]", registrable(uhost))[:-1])
+        for key in ("pkgname", "pkgbase", "_pkgname"):
+            val = expand(scalars.get(key, ""), scalars)
+            tokens.update(re.split(r"[-_]", val))
+        tokens = {t.lower() for t in tokens if len(t) >= 4}
+        slabels = {t.lower() for t in re.split(r"[.-]", shost) if len(t) >= 4}
+        if tokens & slabels:
+            self.add(
+                "src.host-mismatch",
+                unit,
+                entry.no,
+                raw,
+                severity=SEV_LOW,
+                why="source host %s differs from url= host %s but looks like the same vendor"
+                % (shost, uhost or "?"),
+                host=shost,
+            )
+            return
+        self.add(
+            "src.host-mismatch",
+            unit,
+            entry.no,
+            raw,
+            why="source host %s is neither a known forge/CDN nor related to url= (%s)"
+            % (shost, uhost or "unset"),
+            host=shost,
+        )
+
+
+def _forge_owner(host: str | None, path: str) -> str | None:
+    if not host:
+        return None
+    parts = [p for p in path.split("/") if p]
+    if not parts:
+        return None
+    if host.endswith("sr.ht"):
+        return parts[0].lstrip("~")
+    return parts[0]
+
+
+# --------------------------------------------------------------------------
+# target discovery
+# --------------------------------------------------------------------------
+
+
+def classify(path: str) -> str:
+    base = os.path.basename(path)
+    if base == "PKGBUILD" or base.startswith("PKGBUILD."):
+        return "pkgbuild"
+    if base.endswith(".install"):
+        return "install"
+    return "source"
+
+
+def collect_targets(paths: list[str], warn) -> list[tuple[str, str, str]]:
+    """-> [(fs path, display path, kind)]"""
+    targets: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+
+    def push(fs: str, display: str, kind: str) -> None:
+        key = os.path.realpath(fs)
+        if key in seen or not os.path.isfile(fs):
+            return
+        seen.add(key)
+        targets.append((fs, display, kind))
+
+    for p in paths:
+        if os.path.isfile(p):
+            push(p, p, classify(p))
+            if classify(p) == "pkgbuild":
+                _push_dir_extras(os.path.dirname(p) or ".", p, push, warn)
+            continue
+        if os.path.isdir(p):
+            pkgbuild = os.path.join(p, "PKGBUILD")
+            if os.path.isfile(pkgbuild):
+                push(pkgbuild, os.path.normpath(pkgbuild), "pkgbuild")
+                _push_dir_extras(p, pkgbuild, push, warn)
+            else:
+                warn("no PKGBUILD in %s" % p)
+                for name in sorted(os.listdir(p)):
+                    if name.endswith(".install"):
+                        f = os.path.join(p, name)
+                        push(f, os.path.normpath(f), "install")
+            continue
+        warn("not found: %s" % p)
+    return targets
+
+
+def _push_dir_extras(directory: str, pkgbuild: str, push, warn) -> None:
+    for name in sorted(os.listdir(directory)):
+        if name.endswith(".install"):
+            f = os.path.join(directory, name)
+            push(f, os.path.normpath(f), "install")
+    unit = load_unit(pkgbuild, os.path.normpath(pkgbuild), "pkgbuild")
+    if not unit:
+        return
+    arrays = parse_arrays(unit.lines)
+    scalars = parse_scalars(unit.lines, unit.funcs)
+    for arr_name, entries in arrays.items():
+        if not (arr_name == "source" or arr_name.startswith("source_")):
+            continue
+        for entry in entries:
+            raw = dequote(entry.value)
+            name, _, loc = raw.partition("::")
+            if not loc:
+                loc = raw
+            loc = expand(loc, scalars)
+            if re.match(r"^[A-Za-z0-9+.-]+://", loc) or "$" in loc:
+                continue
+            f = os.path.join(directory, os.path.basename(loc))
+            if os.path.isfile(f):
+                push(f, os.path.normpath(f), classify(f))
+
+
+# --------------------------------------------------------------------------
+# output
+# --------------------------------------------------------------------------
+
+COLORS = {SEV_HIGH: "\033[1;31m", SEV_MEDIUM: "\033[1;33m", SEV_LOW: "\033[36m"}
+RESET = "\033[0m"
+DIM = "\033[2m"
+
+
+def render_table(findings: list[Finding], color: bool, out, suppressed: int = 0) -> None:
+    if not findings:
+        out.write("clean: no findings\n")
+        if suppressed:
+            out.write("(%d finding(s) hidden by allow rules)\n" % suppressed)
+        return
+    width = max(len(f.severity) for f in findings)
+    idw = max(len(f.id) for f in findings)
+    for f in findings:
+        loc = "%s:%d" % (f.file, f.line)
+        sev = f.severity.upper().ljust(width)
+        if color:
+            sev = "%s%s%s" % (COLORS[f.severity], sev, RESET)
+        out.write("%s  %s  %s\n" % (sev, f.id.ljust(idw), loc))
+        pad = " " * (width + 2)
+        if color:
+            out.write("%s%s%s%s\n" % (pad, DIM, f.evidence, RESET))
+            out.write("%s%swhy:     %s%s\n" % (pad, DIM, f.why, RESET))
+            out.write("%s%sproceed: %s%s\n" % (pad, DIM, f.proceed, RESET))
+        else:
+            out.write("%s%s\n" % (pad, f.evidence))
+            out.write("%swhy:     %s\n" % (pad, f.why))
+            out.write("%sproceed: %s\n" % (pad, f.proceed))
+    counts = summarize(findings)
+    out.write(
+        "\n%d finding(s): %d high, %d medium, %d low%s\n"
+        % (
+            len(findings),
+            counts["high"],
+            counts["medium"],
+            counts["low"],
+            " (%d hidden by allow rules)" % suppressed if suppressed else "",
+        )
+    )
+    render_footer(findings, out)
+
+
+def render_footer(findings: list[Finding], out) -> None:
+    """Short, copy-pasteable ways to move on."""
+    worst = max(findings, key=lambda f: SEV_RANK[f.severity])
+    pkg = worst.pkg or "<pkgname>"
+    host = next((f.host for f in findings if f.host), "")
+    out.write("\nIf this is expected:\n")
+    if host:
+        out.write(
+            "  trust that host       echo 'host=%s' >> %s\n" % (host, ALLOW_USER)
+        )
+    out.write(
+        "  accept one rule here  echo 'pkg=%s rule=%s' >> %s\n"
+        % (pkg, worst.id, ALLOW_USER)
+    )
+    out.write(
+        "  read it first         less %s   # then re-run this scan\n" % worst.file
+    )
+    out.write(
+        "  build anyway          MOAT_SANDBOX=0 makepkg -si"
+        "   # skips the sandbox and this scan\n"
+    )
+    out.write("  allow-file syntax     host=<domain> | rule=<id> | pkg=<pkgname>, '#' comments\n")
+
+
+def summarize(findings: list[Finding]) -> dict[str, int]:
+    counts = {SEV_HIGH: 0, SEV_MEDIUM: 0, SEV_LOW: 0}
+    for f in findings:
+        counts[f.severity] += 1
+    return counts
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+
+def pkgname_of(directory: str) -> str:
+    """pkgbase/pkgname of the PKGBUILD in `directory`, for allow-file scoping."""
+    pkgbuild = os.path.join(directory, "PKGBUILD")
+    unit = load_unit(pkgbuild, pkgbuild, "pkgbuild")
+    if unit is None:
+        return ""
+    scalars = parse_scalars(unit.lines, unit.funcs)
+    for key in ("pkgbase", "pkgname"):
+        if key in scalars:
+            val = expand(scalars[key], scalars).strip()
+            if val and "$" not in val:
+                return val
+    arrays = parse_arrays(unit.lines)
+    for key in ("pkgbase", "pkgname"):
+        if arrays.get(key):
+            val = expand(dequote(arrays[key][0].value), scalars).strip()
+            if val and "$" not in val:
+                return val
+    return ""
+
+
+def scan_paths(paths: list[str], warn=lambda m: None) -> list[Finding]:
+    scanner = Scanner()
+    pkg_cache: dict[str, str] = {}
+    for fs, display, kind in collect_targets(paths, warn):
+        unit = load_unit(fs, display, kind)
+        if unit is None:
+            continue
+        directory = os.path.dirname(fs) or "."
+        if directory not in pkg_cache:
+            pkg_cache[directory] = pkgname_of(directory)
+        unit.pkg = pkg_cache[directory]
+        scanner.scan_unicode(unit)
+        scanner.scan_code(unit)
+        if kind == "pkgbuild":
+            scanner.scan_sources(unit)
+    findings = scanner.findings
+    findings.sort(key=lambda f: (f.file, f.line, -SEV_RANK[f.severity], f.id))
+    return findings
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="moat-scan-pkgbuild",
+        description="Static review of PKGBUILD / .install / local source files.",
+    )
+    ap.add_argument("paths", metavar="PATH", nargs="*", default=None,
+                    help="files or directories to scan (default: .)")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--min-severity", choices=(SEV_LOW, SEV_MEDIUM, SEV_HIGH),
+                    default=SEV_LOW, help="drop findings below this severity")
+    ap.add_argument("--quiet", "-q", action="store_true",
+                    help="print nothing; use the exit code (JSON still prints with --json)")
+    ap.add_argument("--no-color", action="store_true", help="never colorize")
+    ap.add_argument("--allow-file", metavar="PATH", action="append", default=[],
+                    help="extra allow file (in addition to %s and %s)"
+                         % (ALLOW_SYSTEM, ALLOW_USER))
+    ap.add_argument("--no-allow", action="store_true",
+                    help="ignore all allow files")
+    ap.add_argument("--version", action="version", version="moat-scan-pkgbuild " + VERSION)
+    args = ap.parse_args(argv)
+
+    paths = args.paths or ["."]
+    warnings: list[str] = []
+    findings = scan_paths(paths, warnings.append)
+
+    allow = [] if args.no_allow else load_allow(allow_file_paths(args.allow_file))
+    if allow:
+        kept = [f for f in findings if not is_allowed(f, allow)]
+        suppressed = len(findings) - len(kept)
+        findings = kept
+    else:
+        suppressed = 0
+
+    floor = SEV_RANK[args.min_severity]
+    findings = [f for f in findings if SEV_RANK[f.severity] >= floor]
+    counts = summarize(findings)
+
+    if args.json:
+        json.dump(
+            {"findings": [f.as_dict() for f in findings],
+             "summary": {"high": counts[SEV_HIGH], "medium": counts[SEV_MEDIUM],
+                         "low": counts[SEV_LOW]}},
+            sys.stdout,
+            indent=2,
+        )
+        sys.stdout.write("\n")
+    elif not args.quiet:
+        color = (not args.no_color) and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+        render_table(findings, color, sys.stdout, suppressed)
+
+    if not args.quiet:
+        for w in warnings:
+            sys.stderr.write("moat-scan-pkgbuild: %s\n" % w)
+
+    if counts[SEV_HIGH]:
+        return 2
+    if counts[SEV_MEDIUM]:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

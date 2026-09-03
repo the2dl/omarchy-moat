@@ -1,19 +1,19 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-persist-authorized-keys-write
+  name: moat-persist-authorized-keys-write
   annotations:
-    sentinel.omarchy/severity: "critical"
-    sentinel.omarchy/title: "SSH authorized_keys modified"
-    sentinel.omarchy/enforce: "kill"
-    sentinel.omarchy/actions: "kill,quarantine,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "critical"
+    moat.omarchy/title: "SSH authorized_keys modified"
+    moat.omarchy/enforce: "kill"
+    moat.omarchy/actions: "kill,quarantine,ignore"
+    moat.omarchy/why: >-
       Adding a public key to authorized_keys is a permanent remote backdoor that needs
       no malware left on disk and survives every password change.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       ssh-copy-id, your editor, or a config-management run (ansible, chezmoi) that
       manages your keys.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

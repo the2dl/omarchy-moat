@@ -1,0 +1,44 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-net-reverse-shell
+  annotations:
+    moat.omarchy/severity: critical
+    moat.omarchy/title: "Outbound connection on a shell-handler port"
+    moat.omarchy/rotate: ""
+    moat.omarchy/enforce: "kill"
+    moat.omarchy/actions: "kill"
+    moat.omarchy/why: >-
+      Nothing on a developer desktop dials a public address on 4444, 1337 or a privileged
+      port; reverse-shell handlers do.
+    moat.omarchy/expected: >-
+      Self-hosted services on odd ports, VPN health checks, and CTF or pentest tooling.
+    moat.omarchy/fp-hint: "rule"
+spec:
+  options:
+  - name: policy-mode
+    value: monitor
+  kprobes:
+  - call: "tcp_connect"
+    syscall: false
+    message: "Connection to a shell-handler port"
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "NotDAddr"
+        values:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+        - "127.0.0.0/8"
+      - index: 0
+        operator: "DPort"
+        values:
+        - "4444"
+        - "1337"
+        - "9001"
+      matchActions:
+      - action: Sigkill

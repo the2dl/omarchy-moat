@@ -1,4 +1,4 @@
-"""Tests for sentinel-scan-pkgbuild.
+"""Tests for moat-scan-pkgbuild.
 
 Run with:  python3 -m unittest discover scanner/tests
 """
@@ -16,14 +16,14 @@ import unittest
 from contextlib import redirect_stdout, redirect_stderr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCANNER_PATH = os.path.join(os.path.dirname(HERE), "sentinel-scan-pkgbuild")
+SCANNER_PATH = os.path.join(os.path.dirname(HERE), "moat-scan-pkgbuild")
 FIXTURES = os.path.join(HERE, "fixtures")
 
 
 def _load_scanner():
     spec = importlib.util.spec_from_loader(
-        "sentinel_scan_pkgbuild",
-        importlib.machinery.SourceFileLoader("sentinel_scan_pkgbuild", SCANNER_PATH),
+        "moat_scan_pkgbuild",
+        importlib.machinery.SourceFileLoader("moat_scan_pkgbuild", SCANNER_PATH),
     )
     module = importlib.util.module_from_spec(spec)
     # dataclasses resolve annotations through sys.modules, so register first
@@ -201,7 +201,7 @@ class TestOutput(unittest.TestCase):
         _, payload = scan_fixture("systemd-persist")
         proceed = payload["findings"][0]["proceed"]
         self.assertIn("pkg=notes-sync rule=persist.systemd-enable", proceed)
-        self.assertIn("~/.config/sentinel/scanner-allow.conf", proceed)
+        self.assertIn("~/.config/moat/scanner-allow.conf", proceed)
 
     def test_proceed_names_the_host_for_host_rules(self):
         _, payload = scan_fixture("vendor-cdn")
@@ -216,7 +216,7 @@ class TestOutput(unittest.TestCase):
         self.assertIn("why:", out)
         self.assertIn("proceed:", out)
         self.assertIn("If this is expected:", out)
-        self.assertIn("SENTINEL_SANDBOX=0", out)
+        self.assertIn("MOAT_SANDBOX=0", out)
         self.assertIn("host=<domain> | rule=<id> | pkg=<pkgname>", out)
 
     def test_clean_human_output(self):
@@ -296,15 +296,15 @@ class TestAllowFile(unittest.TestCase):
 
     def test_env_var_allow_file(self):
         path = self._allow("rule=uni.invisible-chars\n")
-        old = os.environ.get("SENTINEL_SCANNER_ALLOW")
-        os.environ["SENTINEL_SCANNER_ALLOW"] = path
+        old = os.environ.get("MOAT_SCANNER_ALLOW")
+        os.environ["MOAT_SCANNER_ALLOW"] = path
         try:
             code, out, _ = run([os.path.join(FIXTURES, "hidden-unicode"), "--json"])
         finally:
             if old is None:
-                del os.environ["SENTINEL_SCANNER_ALLOW"]
+                del os.environ["MOAT_SCANNER_ALLOW"]
             else:
-                os.environ["SENTINEL_SCANNER_ALLOW"] = old
+                os.environ["MOAT_SCANNER_ALLOW"] = old
         self.assertEqual(json.loads(out)["findings"], [])
         self.assertEqual(code, 0)
 

@@ -1,21 +1,21 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-rootkit-bpf-prog-load
+  name: moat-rootkit-bpf-prog-load
   annotations:
-    sentinel.omarchy/severity: "high"
-    sentinel.omarchy/title: "eBPF program loaded by an unexpected binary"
-    sentinel.omarchy/enforce: "none"
-    sentinel.omarchy/actions: "kill,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "eBPF program loaded by an unexpected binary"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,ignore"
+    moat.omarchy/why: >-
       Modern Linux rootkits are eBPF programs: they hide processes and files and tamper
       with the very telemetry that would show them. On a desktop the only things that
       load BPF are systemd, container runtimes and this sensor.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       Docker, containerd, podman and Cilium load BPF on every container start; systemd
       loads it for cgroup and socket filters. bpftrace, bcc tools and perf if you use
       them.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

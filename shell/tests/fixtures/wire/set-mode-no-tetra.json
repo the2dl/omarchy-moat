@@ -4,134 +4,134 @@
   "policies": 32,
   "failed": [
     {
-      "policy": "sentinel-ai-cli-in-pkg-subtree",
+      "policy": "moat-ai-cli-in-pkg-subtree",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-cred-ai-credentials-read",
+      "policy": "moat-cred-ai-credentials-read",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-cred-browser-secrets-read",
+      "policy": "moat-cred-browser-secrets-read",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-cred-cloud-credentials-read",
+      "policy": "moat-cred-cloud-credentials-read",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-cred-etc-shadow-read",
+      "policy": "moat-cred-etc-shadow-read",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-cred-gnupg-keyring-read",
+      "policy": "moat-cred-gnupg-keyring-read",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-cred-registry-token-read",
+      "policy": "moat-cred-registry-token-read",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-cred-ssh-private-key-read",
+      "policy": "moat-cred-ssh-private-key-read",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-cred-vcs-token-read",
+      "policy": "moat-cred-vcs-token-read",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-exec-untrusted-home",
+      "policy": "moat-exec-untrusted-home",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-exec-untrusted-tmpfs",
+      "policy": "moat-exec-untrusted-tmpfs",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-net-pkg-subtree-egress",
+      "policy": "moat-net-pkg-subtree-egress",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-net-tmpfs-binary-egress",
+      "policy": "moat-net-tmpfs-binary-egress",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-persist-agent-config-write",
+      "policy": "moat-persist-agent-config-write",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-persist-authorized-keys-write",
+      "policy": "moat-persist-authorized-keys-write",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-persist-autostart-write",
+      "policy": "moat-persist-autostart-write",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-persist-desktop-config-write",
+      "policy": "moat-persist-desktop-config-write",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-persist-git-hook-write",
+      "policy": "moat-persist-git-hook-write",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-persist-shell-rc-write",
+      "policy": "moat-persist-shell-rc-write",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-persist-system-unit-write",
+      "policy": "moat-persist-system-unit-write",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-pkg-subtree-downloader",
+      "policy": "moat-pkg-subtree-downloader",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-pkg-subtree-interpreter-spawn",
+      "policy": "moat-pkg-subtree-interpreter-spawn",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-pkg-subtree-netcat-exec",
+      "policy": "moat-pkg-subtree-netcat-exec",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-priv-proc-mem-access",
+      "policy": "moat-priv-proc-mem-access",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-priv-ptrace-attach",
+      "policy": "moat-priv-ptrace-attach",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-priv-setcap-xattr",
+      "policy": "moat-priv-setcap-xattr",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-priv-setuid-chmod",
+      "policy": "moat-priv-setuid-chmod",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-rootkit-bpf-prog-load",
+      "policy": "moat-rootkit-bpf-prog-load",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-rootkit-bpffs-write",
+      "policy": "moat-rootkit-bpffs-write",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-rootkit-kernel-module-load",
+      "policy": "moat-rootkit-kernel-module-load",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-rootkit-ldso-preload-write",
+      "policy": "moat-rootkit-ldso-preload-write",
       "error": "No such file or directory (os error 2)"
     },
     {
-      "policy": "sentinel-shell-reverse-shell-connect",
+      "policy": "moat-shell-reverse-shell-connect",
       "error": "No such file or directory (os error 2)"
     }
   ],
-  "tetra": "/var/lib/sentinel/no-such-tetra",
+  "tetra": "/var/lib/moat/no-such-tetra",
   "ok": true
 }

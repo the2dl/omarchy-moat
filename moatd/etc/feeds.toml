@@ -1,0 +1,38 @@
+# /etc/moat/feeds.toml — threat feed configuration for `moat-feeds`.
+#
+# Contains a credential once you fill it in, so the package installs this
+# root:root 0600.
+
+# abuse.ch has required an Auth-Key header on every endpoint since 2025.
+# Get a free key at https://auth.abuse.ch/ and paste it here.
+#
+# With no key, `moat-feeds` logs one line, exits 0, and leaves the existing
+# feed files alone — the timer never fails and you never lose the cache you
+# already have. Only `moat-x-new-exec-ioc` depends on the feed; every other
+# rule works without it.
+auth_key = ""
+
+# Sources. MalwareBazaar gives recent sample sha256 (the only one the IOC rule
+# uses today); ThreatFox and URLhaus fill domains.txt and urls.txt, which the
+# plugin can show and future rules can use.
+malwarebazaar = true
+threatfox = true
+urlhaus = true
+
+# Endpoints, as documented at bazaar.abuse.ch/api, threatfox.abuse.ch/api and
+# urlhaus-api.abuse.ch. Override only if abuse.ch moves them.
+malwarebazaar_url = "https://mb-api.abuse.ch/api/v1/"
+threatfox_url = "https://threatfox-api.abuse.ch/api/v1/"
+urlhaus_url = "https://urlhaus-api.abuse.ch/v1/urls/recent/"
+
+# ThreatFox window in days; the API refuses more than 7.
+threatfox_days = 3
+
+# URLhaus rows per fetch; the API caps this at 1000.
+urlhaus_limit = 1000
+
+# Per-request timeout.
+timeout_secs = 30
+
+# Upper bound on hashes kept in hashes.txt; the daemon holds them in memory.
+max_hashes = 500000

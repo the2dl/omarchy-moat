@@ -1,20 +1,20 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-rootkit-bpffs-write
+  name: moat-rootkit-bpffs-write
   annotations:
-    sentinel.omarchy/severity: "medium"
-    sentinel.omarchy/title: "Write into the BPF filesystem by an unexpected binary"
-    sentinel.omarchy/enforce: "none"
-    sentinel.omarchy/actions: "kill,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "medium"
+    moat.omarchy/title: "Write into the BPF filesystem by an unexpected binary"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,ignore"
+    moat.omarchy/why: >-
       Pinning under /sys/fs/bpf is how a BPF implant survives the death of the process
       that loaded it, and how it tampers with pinned maps that other tools trust.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       Container runtimes and Cilium pin maps here; this sensor pins its own. Note that
       pinning through bpf(BPF_OBJ_PIN) does not open a file and is covered by the
       bpf-prog-load rule instead.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

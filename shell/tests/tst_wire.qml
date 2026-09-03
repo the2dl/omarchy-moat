@@ -1,16 +1,16 @@
 import QtQuick
 import QtTest
-import "../SentinelModel.js" as Model
+import "../MoatModel.js" as Model
 
-// Wire-level tests: SentinelModel.js against output the REAL daemon actually
+// Wire-level tests: MoatModel.js against output the REAL daemon actually
 // produced, not hand-written examples of what it ought to produce.
 //
-// fixtures/wire/* were captured from a live `sentineld run` (release build)
+// fixtures/wire/* were captured from a live `moatd run` (release build)
 // tailing a synthetic Tetragon export that fires one cred policy, one persist
 // policy, one pkg policy, a kill+exit pair and a dedupe repeat, then driven
-// through sentinelctl status/list/explain/ignore/allowlist/set --json. Only two
+// through moatctl status/list/explain/ignore/allowlist/set --json. Only two
 // substitutions were made: the scratch directory became the installed paths
-// from CONTRACT 2, and the socket group became `sentinel`. Everything else is
+// from CONTRACT 2, and the socket group became `moat`. Everything else is
 // byte-for-byte what the daemon wrote.
 //
 // tst_model.qml checks the model's own rules. This file checks the SEAM: that
@@ -22,7 +22,7 @@ import "../SentinelModel.js" as Model
 //     /usr/lib/qt6/bin/qmltestrunner -input shell/tests/tst_wire.qml
 TestCase {
   id: suite
-  name: "SentinelWire"
+  name: "MoatWire"
 
   property string alertsText: ""
   property var statusRaw: ""
@@ -69,9 +69,9 @@ TestCase {
     for (var i = 1; i < list.length; i++) {
       verify(list[i - 1].id > list[i].id, "newest first by ULID")
     }
-    verify(byRule(list, "sentinel-cred-ssh-private-key-read") !== null)
-    verify(byRule(list, "sentinel-persist-shell-rc-write") !== null)
-    verify(byRule(list, "sentinel-pkg-subtree-downloader") !== null)
+    verify(byRule(list, "moat-cred-ssh-private-key-read") !== null)
+    verify(byRule(list, "moat-persist-shell-rc-write") !== null)
+    verify(byRule(list, "moat-pkg-subtree-downloader") !== null)
   }
 
   // Every field the panel reads unconditionally must survive normalization
@@ -82,7 +82,7 @@ TestCase {
       var a = list[i]
       verify(a.id.length === 26, "ULID id: " + a.id)
       verify(Model.severityRank(a.severity) >= 0, "known severity: " + a.severity)
-      verify(a.rule.indexOf("sentinel-") === 0, "rule id: " + a.rule)
+      verify(a.rule.indexOf("moat-") === 0, "rule id: " + a.rule)
       verify(a.family.length > 0, "family on " + a.rule)
       verify(a.title.length > 0, "title on " + a.rule)
       verify(a.summary.length > 0, "summary on " + a.rule)
@@ -109,7 +109,7 @@ TestCase {
       if (list[i].file && String(list[i].file.path).indexOf("id_ed25519") > 0) killed = list[i]
     }
     verify(killed !== null, "the fixture's Sigkill alert is present")
-    compare(killed.rule, "sentinel-cred-ssh-private-key-read")
+    compare(killed.rule, "moat-cred-ssh-private-key-read")
     compare(killed.action_taken, "killed")
     compare(killed.acked, true, "the ignore in the transcript acked it")
   }
@@ -180,7 +180,7 @@ TestCase {
       for (var j = 0; j < options.length; j++) {
         var o = options[j]
         verify(Model.isIgnoreScope(o.scope), "scope " + o.scope)
-        compare(o.cmd, "sentinelctl ignore " + a.id + " --scope " + o.scope)
+        compare(o.cmd, "moatctl ignore " + a.id + " --scope " + o.scope)
         verify(o.line.indexOf("[[rule]]\n") === 0, "TOML block for " + o.scope)
         verify(o.line.indexOf('name = "' + a.rule + '"') > 0, "block names the rule")
         verify(o.label.length > 0, "button label for " + o.scope)
@@ -213,7 +213,7 @@ TestCase {
   // The pkg-family policies all hook bprm_check_security, so the file in the
   // event is the binary being executed. The `what` sentence must read that way.
   function test_pkg_family_what_describes_an_exec() {
-    var pkg = byRule(alerts(), "sentinel-pkg-subtree-downloader")
+    var pkg = byRule(alerts(), "moat-pkg-subtree-downloader")
     verify(pkg.explain.what.indexOf("package install") >= 0, pkg.explain.what)
     verify(pkg.explain.what.indexOf("read /usr/bin/curl") < 0,
            "a bprm hit is not a secret read: " + pkg.explain.what)
@@ -245,7 +245,7 @@ TestCase {
   }
 
   function test_rotate_items_come_from_the_real_alert() {
-    var cred = byRule(alerts(), "sentinel-cred-ssh-private-key-read")
+    var cred = byRule(alerts(), "moat-cred-ssh-private-key-read")
     var items = Model.rotateItems(cred)
     compare(items.length, 1)
     compare(items[0].kind, "ssh-key")
@@ -271,7 +271,7 @@ TestCase {
     // CONTRACT 5's example says group_ok; the daemon ships socket_group and
     // omits group_ok. Absent must not read as "not in the group".
     compare(s.group_ok, true)
-    compare(s.socket_group, "sentinel")
+    compare(s.socket_group, "moat")
     compare(s.error, "")
   }
 
@@ -286,7 +286,7 @@ TestCase {
     compare(Model.widgetState({ available: true, groupOk: true, daemonOk: s.ok,
                                 unacked: counts }), "red", "unacked high is red")
     compare(Model.setupSteps(false, true, s.socket_group)[0].command,
-            "sudo usermod -aG sentinel $USER")
+            "sudo usermod -aG moat $USER")
   }
 
   // ----------------------------------------------------------------- list
@@ -318,14 +318,14 @@ TestCase {
     compare(parsed.ok, true)
     compare(parsed.error, "")
     // The daemon calls it user_file; the panel's "writes to" label reads .file.
-    compare(parsed.file, "/etc/sentinel/allowlist.d/user.toml")
-    compare(parsed.dir, "/etc/sentinel/allowlist.d")
+    compare(parsed.file, "/etc/moat/allowlist.d/user.toml")
+    compare(parsed.dir, "/etc/moat/allowlist.d")
     compare(parsed.rules.length, 1)
     var rule = parsed.rules[0]
     // CONTRACT 5: the index is the handle `unignore` takes; never renumber it.
     compare(rule.index, 1)
     compare(rule.removable, true)
-    compare(rule.name, "sentinel-cred-ssh-private-key-read")
+    compare(rule.name, "moat-cred-ssh-private-key-read")
     compare(rule.comment.indexOf("added "), 0)
     verify(rule.comment.indexOf("Private SSH key") > 0, "the comment explains itself")
     // The daemon's per-rule `file` is the SOURCE fragment and `path` is the
@@ -342,7 +342,7 @@ TestCase {
     compare(response.ok, true)
     compare(response.scope, "exe")
     compare(response.acked, true)
-    compare(response.file, "/etc/sentinel/allowlist.d/user.toml")
+    compare(response.file, "/etc/moat/allowlist.d/user.toml")
     var block = String(response.block || response.line || response.rule || "")
     verify(block.indexOf("# added ") === 0, block)
     verify(block.indexOf("[[rule]]") > 0)
@@ -371,7 +371,7 @@ TestCase {
     var response = JSON.parse(suite.setSandboxRaw)
     compare(response.ok, true)
     compare(response.sandbox, true)
-    compare(response.flag, "/etc/sentinel/sandbox.enabled")
+    compare(response.flag, "/etc/moat/sandbox.enabled")
     verify(String(response.note).length > 0, "the re-login caveat is carried")
   }
 }

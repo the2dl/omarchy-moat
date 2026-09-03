@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run the Sentinel plugin's checks headless.
+# Run the Moat plugin's checks headless.
 #
 #   shell/tests/run-tests.sh
 #
@@ -7,7 +7,7 @@
 #
 #   1. A QML syntax pass over every file in shell/ (qmlformat parses and
 #      re-prints; a non-zero exit is a parse error).
-#   2. The SentinelModel.js unit suite under qmltestrunner.
+#   2. The MoatModel.js unit suite under qmltestrunner.
 #
 # Two environment quirks are load-bearing for the suite:
 #
@@ -48,7 +48,7 @@ echo "--- tst_model"
 QT_QPA_PLATFORM=offscreen QML_XHR_ALLOW_FILE_READ=1 \
   "$runner" -input "$here/tst_model.qml" || status=1
 
-# tst_wire runs the model over output captured from a live sentineld (see the
+# tst_wire runs the model over output captured from a live moatd (see the
 # header of tst_wire.qml). tst_model checks the model's rules; this checks that
 # the daemon's actual field names, nesting and vocabulary are the ones the
 # panel reads.

@@ -1,5 +1,5 @@
 # Maintainer: A Nonymous <nobody@example.org>
-# Synthetic fixture for omarchy-sentinel: an ordinary, well-behaved -bin package.
+# Synthetic fixture for omarchy-moat: an ordinary, well-behaved -bin package.
 # Modelled on the shape of a typical AUR `-bin` recipe. Must produce no findings.
 
 pkgname=lazygit-bin

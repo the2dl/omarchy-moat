@@ -2,9 +2,9 @@
 
 32 `TracingPolicy` templates for Tetragon **v1.7.1** on Arch (kernel 7.1, BTF,
 `lsm=...,bpf`). One file per rule, `policies/<family>-<rule>.yaml`, policy name
-`sentinel-<family>-<rule>`. Everything here was written against
+`moat-<family>-<rule>`. Everything here was written against
 `docs/TETRAGON-NOTES.md`; where the notes say something is not expressible in a
-policy it is **not faked here** — it is listed under [sentineld covers](#sentineld-covers).
+policy it is **not faked here** — it is listed under [moatd covers](#moatd-covers).
 
 Validate before packaging:
 
@@ -26,44 +26,44 @@ limits, and that the `enforce` annotation agrees with the actions in the policy.
 
 FP column = what actually fires on a workstation doing Rust, Node and Docker
 builds. Allowlist knob = the field to edit in the template (a rebuild of the
-package, or a drop-in override in `/usr/lib/sentinel/policies`), plus the
-userland escape hatch `sentinelctl ignore <id> --scope exe|exe+file|parent|rule`
+package, or a drop-in override in `/usr/lib/moat/policies`), plus the
+userland escape hatch `moatctl ignore <id> --scope exe|exe+file|parent|rule`
 which needs no policy change and no reload.
 
 | Policy | Sev | Hook (kind) | Enforce | Expected false positives | Allowlist knob |
 |---|---|---|---|---|---|
-| `sentinel-cred-ssh-private-key-read` | high | `file_post_open` (lsm) | **Sigkill** | restic/borg backups, ansible, terraform, IDE git plugins, any Python/Go tool using an ssh library instead of `ssh` | `matchBinaries NotPostfix` (ssh suite, git, rsync) |
-| `sentinel-cred-cloud-credentials-read` | high | `file_post_open` (lsm) | Post 60s | direnv/aws-vault wrappers, boto3 and other SDKs inside your own scripts, k9s plugins | `matchBinaries NotPostfix` (aws, gcloud, az, kubectl, terraform, docker) |
-| `sentinel-cred-vcs-token-read` | high | `file_post_open` (lsm) | Post 60s | `curl --netrc` in a script, custom git credential helpers, JetBrains/VS Code git integrations | `matchBinaries NotPostfix` (git, gh, glab, helpers) |
-| `sentinel-cred-registry-token-read` | medium | `file_post_open` (lsm) | Post 300s | **frequent**: every `npm install`, `pip install`, `cargo publish`, `docker pull` from a private registry | `matchBinaries NotPostfix` (node, bun, pip, uv, cargo, docker) |
-| `sentinel-cred-ai-credentials-read` | high | `file_post_open` (lsm) | Post 60s | any node/bun process is allowlisted, so this mostly fires on shell/python one-liners; a non-node agent build will fire | `matchBinaries NotPostfix` (node, bun, the CLIs) |
-| `sentinel-cred-gnupg-keyring-read` | high | `file_post_open` (lsm) | Post 60s | whole-home backups, `pass`-based scripts, git commit signing through a non-gpg wrapper | `matchBinaries NotPostfix` (gpg suite, keyring daemons) |
-| `sentinel-cred-browser-secrets-read` | high | `file_post_open` (lsm) | Post 60s | backups; and any unrelated file whose basename is `Cookies`, `Local State` or `Web Data` (Postfix match, no directory anchor) | `matchBinaries NotPostfix` (browsers, password managers) |
-| `sentinel-cred-etc-shadow-read` | critical | `file_post_open` (lsm) | **Sigkill** | a screen locker, display manager or PAM helper not in the list. **In enforce mode a miss here can break authentication** — keep this rule in monitor until you have seen a week of clean logs | `matchBinaries NotIn` (shadow-utils, PAM helpers, lockers) |
-| `sentinel-pkg-subtree-interpreter-spawn` | low | `bprm_check_security` (lsm) | Post 300s | **constant**: node-gyp, lifecycle scripts, `cargo` build scripts, `setup.py`. Kept as timeline context, not as an alert | `matchParentBinaries` values; drop the template to silence |
-| `sentinel-pkg-subtree-downloader` | high | `bprm_check_security` (lsm) | Post 60s | node-pre-gyp, `sharp`, `esbuild`, playwright/puppeteer browser downloads, PKGBUILDs that curl a tarball | `matchParentBinaries` values, or ignore `--scope parent` |
-| `sentinel-pkg-subtree-netcat-exec` | critical | `bprm_check_security` (lsm) | **Sigkill** | a Makefile that waits on a port with `nc`; otherwise none seen | `matchArgs Postfix` list |
-| `sentinel-persist-shell-rc-write` | high | `file_post_open` (lsm) | Post 60s | mise, rustup, nvm, conda, starship, atuin, oh-my-zsh installers | `matchBinaries NotPostfix` (editors) |
-| `sentinel-persist-autostart-write` | high | `file_post_open` (lsm) | Post 60s | installing a desktop app or user service, Flatpak, Docker Desktop, GNOME/KDE settings | `matchBinaries NotPostfix` (editors, systemctl, flatpak) |
-| `sentinel-persist-desktop-config-write` | medium | `file_post_open` (lsm) | Post 60s | omarchy-shell saving settings, theme switches. `/usr/bin/omarchy-*` is suppressed in-kernel by a `NoPost` selector | selector 0 `matchBinaries Prefix`, selector 1 `NotPostfix` |
-| `sentinel-persist-system-unit-write` | high | `file_post_open` (lsm) | Post 60s | `pacman -Syu` touching `/etc/systemd/system`, `sudo nvim /etc/sudoers.d/...`, `crontab -e` | `matchBinaries NotPostfix` (pacman, systemd, editors) |
-| `sentinel-persist-authorized-keys-write` | critical | `file_post_open` (lsm) | **Sigkill** | `ssh-copy-id` (allowlisted), chezmoi/ansible managing your keys | `matchBinaries NotPostfix` |
-| `sentinel-persist-git-hook-write` | high | `file_post_open` (lsm) | Post 60s | **frequent on Node repos**: husky, lefthook, pre-commit and direnv all write hooks during `npm install` | `matchBinaries NotPostfix`, or ignore `--scope exe+file` |
-| `sentinel-persist-agent-config-write` | medium | `file_post_open` (lsm) | Post 300s | **frequent**: the agents rewrite `CLAUDE.md`, `settings.local.json` and `.mcp.json` themselves | `matchBinaries NotPostfix` (editors) |
-| `sentinel-shell-reverse-shell-connect` | critical | `tcp_connect` (kprobe) | **Sigkill** | a script using `bash /dev/tcp` as a port check against a public host; `nc`/`socat` used deliberately. Private, loopback and link-local destinations never fire | `matchBinaries Postfix` list; add CIDRs to `NotDAddr` |
-| `sentinel-rootkit-bpf-prog-load` | high | `bpf` (lsm) | Post 60s | **Docker**: containerd/runc load BPF on every container start; also bpftrace, bcc, `perf`, `tc` | `matchBinaries NotIn` |
-| `sentinel-rootkit-kernel-module-load` | critical | `security_kernel_read_file` (kprobe) | **Sigkill** | dkms / NVIDIA / VirtualBox installs that insmod through a wrapper; matches both `READING_MODULE` (2) and `READING_MODULE_COMPRESSED` (7, Arch `.ko.zst`) | `matchBinaries NotIn` (kmod, systemd, dkms) |
-| `sentinel-rootkit-ldso-preload-write` | critical | `file_post_open` (lsm) | **Sigkill** | none on a clean Arch desktop | `matchBinaries NotIn` |
-| `sentinel-rootkit-bpffs-write` | medium | `file_post_open` (lsm) | Post 60s | container runtimes; note that `bpf(BPF_OBJ_PIN)` does not open a file, so real pinning shows up in the bpf-prog-load rule instead | `matchBinaries NotIn` |
-| `sentinel-priv-setuid-chmod` | high | `path_chmod` (lsm) | Post 60s | `pacman` installing a setuid binary, `install -m 4755` inside a build, `sudo chmod u+s` by hand | `matchBinaries NotIn` (pacman, bsdtar, install) |
-| `sentinel-priv-setcap-xattr` | high | `inode_setxattr` (lsm) | Post 60s | `sudo setcap` for a profiler or network tool (deliberately **not** allowlisted), pacman extracting capabilities | `matchBinaries NotIn` |
-| `sentinel-priv-ptrace-attach` | high | `ptrace_access_check` (lsm) | Post 60s | debuggers not in the list (`bpftrace -p`, `py-spy`, `jstack`, JetBrains debug helpers), systemd-coredump | `matchBinaries NotIn` |
-| `sentinel-priv-proc-mem-access` | medium | `ptrace_access_check` (lsm) | Post 300s | process viewers reading `/proc/<pid>/maps`: htop, btop, ps, lsof, py-spy, `docker stats` helpers | `matchBinaries NotIn` |
-| `sentinel-ai-cli-in-pkg-subtree` | high | `bprm_check_security` (lsm) | Post 60s | monorepo tooling that shells out to an agent, `npx claude` started from another node process | `matchParentBinaries` / `matchArgs Postfix` |
-| `sentinel-exec-untrusted-tmpfs` | high | `bprm_check_security` (lsm) | Post 60s | **build systems**: autoconf `conftest`, cargo/go temporary binaries, makepkg building under `/tmp`, AppImage extraction, `curl \| sh` installers | `matchArgs Prefix` values; ignore `--scope exe` |
-| `sentinel-exec-untrusted-home` | medium | `bprm_check_security` (lsm) | Post 300s | **frequent**: playwright, cypress, puppeteer, bun, uv, mise and electron-builder all execute from `~/.cache` | `matchArgs Prefix` values |
-| `sentinel-net-pkg-subtree-egress` | high | `tcp_connect` (kprobe) | Post 60s | git-over-SSH (port 22) inside a build, a private registry or corporate proxy on a custom port, dev servers calling a public API | `DPort` value lists, `NotDAddr` CIDRs |
-| `sentinel-net-tmpfs-binary-egress` | critical | `tcp_connect` (kprobe) | **Sigkill** | an installer you unpacked into `/tmp` and ran on purpose | `matchBinaries Prefix` values |
+| `moat-cred-ssh-private-key-read` | high | `file_post_open` (lsm) | **Sigkill** | restic/borg backups, ansible, terraform, IDE git plugins, any Python/Go tool using an ssh library instead of `ssh` | `matchBinaries NotPostfix` (ssh suite, git, rsync) |
+| `moat-cred-cloud-credentials-read` | high | `file_post_open` (lsm) | Post 60s | direnv/aws-vault wrappers, boto3 and other SDKs inside your own scripts, k9s plugins | `matchBinaries NotPostfix` (aws, gcloud, az, kubectl, terraform, docker) |
+| `moat-cred-vcs-token-read` | high | `file_post_open` (lsm) | Post 60s | `curl --netrc` in a script, custom git credential helpers, JetBrains/VS Code git integrations | `matchBinaries NotPostfix` (git, gh, glab, helpers) |
+| `moat-cred-registry-token-read` | medium | `file_post_open` (lsm) | Post 300s | **frequent**: every `npm install`, `pip install`, `cargo publish`, `docker pull` from a private registry | `matchBinaries NotPostfix` (node, bun, pip, uv, cargo, docker) |
+| `moat-cred-ai-credentials-read` | high | `file_post_open` (lsm) | Post 60s | any node/bun process is allowlisted, so this mostly fires on shell/python one-liners; a non-node agent build will fire | `matchBinaries NotPostfix` (node, bun, the CLIs) |
+| `moat-cred-gnupg-keyring-read` | high | `file_post_open` (lsm) | Post 60s | whole-home backups, `pass`-based scripts, git commit signing through a non-gpg wrapper | `matchBinaries NotPostfix` (gpg suite, keyring daemons) |
+| `moat-cred-browser-secrets-read` | high | `file_post_open` (lsm) | Post 60s | backups; and any unrelated file whose basename is `Cookies`, `Local State` or `Web Data` (Postfix match, no directory anchor) | `matchBinaries NotPostfix` (browsers, password managers) |
+| `moat-cred-etc-shadow-read` | critical | `file_post_open` (lsm) | **Sigkill** | a screen locker, display manager or PAM helper not in the list. **In enforce mode a miss here can break authentication** — keep this rule in monitor until you have seen a week of clean logs | `matchBinaries NotIn` (shadow-utils, PAM helpers, lockers) |
+| `moat-pkg-subtree-interpreter-spawn` | low | `bprm_check_security` (lsm) | Post 300s | **constant**: node-gyp, lifecycle scripts, `cargo` build scripts, `setup.py`. Kept as timeline context, not as an alert | `matchParentBinaries` values; drop the template to silence |
+| `moat-pkg-subtree-downloader` | high | `bprm_check_security` (lsm) | Post 60s | node-pre-gyp, `sharp`, `esbuild`, playwright/puppeteer browser downloads, PKGBUILDs that curl a tarball | `matchParentBinaries` values, or ignore `--scope parent` |
+| `moat-pkg-subtree-netcat-exec` | critical | `bprm_check_security` (lsm) | **Sigkill** | a Makefile that waits on a port with `nc`; otherwise none seen | `matchArgs Postfix` list |
+| `moat-persist-shell-rc-write` | high | `file_post_open` (lsm) | Post 60s | mise, rustup, nvm, conda, starship, atuin, oh-my-zsh installers | `matchBinaries NotPostfix` (editors) |
+| `moat-persist-autostart-write` | high | `file_post_open` (lsm) | Post 60s | installing a desktop app or user service, Flatpak, Docker Desktop, GNOME/KDE settings | `matchBinaries NotPostfix` (editors, systemctl, flatpak) |
+| `moat-persist-desktop-config-write` | medium | `file_post_open` (lsm) | Post 60s | omarchy-shell saving settings, theme switches. `/usr/bin/omarchy-*` is suppressed in-kernel by a `NoPost` selector | selector 0 `matchBinaries Prefix`, selector 1 `NotPostfix` |
+| `moat-persist-system-unit-write` | high | `file_post_open` (lsm) | Post 60s | `pacman -Syu` touching `/etc/systemd/system`, `sudo nvim /etc/sudoers.d/...`, `crontab -e` | `matchBinaries NotPostfix` (pacman, systemd, editors) |
+| `moat-persist-authorized-keys-write` | critical | `file_post_open` (lsm) | **Sigkill** | `ssh-copy-id` (allowlisted), chezmoi/ansible managing your keys | `matchBinaries NotPostfix` |
+| `moat-persist-git-hook-write` | high | `file_post_open` (lsm) | Post 60s | **frequent on Node repos**: husky, lefthook, pre-commit and direnv all write hooks during `npm install` | `matchBinaries NotPostfix`, or ignore `--scope exe+file` |
+| `moat-persist-agent-config-write` | medium | `file_post_open` (lsm) | Post 300s | **frequent**: the agents rewrite `CLAUDE.md`, `settings.local.json` and `.mcp.json` themselves | `matchBinaries NotPostfix` (editors) |
+| `moat-shell-reverse-shell-connect` | critical | `tcp_connect` (kprobe) | **Sigkill** | a script using `bash /dev/tcp` as a port check against a public host; `nc`/`socat` used deliberately. Private, loopback and link-local destinations never fire | `matchBinaries Postfix` list; add CIDRs to `NotDAddr` |
+| `moat-rootkit-bpf-prog-load` | high | `bpf` (lsm) | Post 60s | **Docker**: containerd/runc load BPF on every container start; also bpftrace, bcc, `perf`, `tc` | `matchBinaries NotIn` |
+| `moat-rootkit-kernel-module-load` | critical | `security_kernel_read_file` (kprobe) | **Sigkill** | dkms / NVIDIA / VirtualBox installs that insmod through a wrapper; matches both `READING_MODULE` (2) and `READING_MODULE_COMPRESSED` (7, Arch `.ko.zst`) | `matchBinaries NotIn` (kmod, systemd, dkms) |
+| `moat-rootkit-ldso-preload-write` | critical | `file_post_open` (lsm) | **Sigkill** | none on a clean Arch desktop | `matchBinaries NotIn` |
+| `moat-rootkit-bpffs-write` | medium | `file_post_open` (lsm) | Post 60s | container runtimes; note that `bpf(BPF_OBJ_PIN)` does not open a file, so real pinning shows up in the bpf-prog-load rule instead | `matchBinaries NotIn` |
+| `moat-priv-setuid-chmod` | high | `path_chmod` (lsm) | Post 60s | `pacman` installing a setuid binary, `install -m 4755` inside a build, `sudo chmod u+s` by hand | `matchBinaries NotIn` (pacman, bsdtar, install) |
+| `moat-priv-setcap-xattr` | high | `inode_setxattr` (lsm) | Post 60s | `sudo setcap` for a profiler or network tool (deliberately **not** allowlisted), pacman extracting capabilities | `matchBinaries NotIn` |
+| `moat-priv-ptrace-attach` | high | `ptrace_access_check` (lsm) | Post 60s | debuggers not in the list (`bpftrace -p`, `py-spy`, `jstack`, JetBrains debug helpers), systemd-coredump | `matchBinaries NotIn` |
+| `moat-priv-proc-mem-access` | medium | `ptrace_access_check` (lsm) | Post 300s | process viewers reading `/proc/<pid>/maps`: htop, btop, ps, lsof, py-spy, `docker stats` helpers | `matchBinaries NotIn` |
+| `moat-ai-cli-in-pkg-subtree` | high | `bprm_check_security` (lsm) | Post 60s | monorepo tooling that shells out to an agent, `npx claude` started from another node process | `matchParentBinaries` / `matchArgs Postfix` |
+| `moat-exec-untrusted-tmpfs` | high | `bprm_check_security` (lsm) | Post 60s | **build systems**: autoconf `conftest`, cargo/go temporary binaries, makepkg building under `/tmp`, AppImage extraction, `curl \| sh` installers | `matchArgs Prefix` values; ignore `--scope exe` |
+| `moat-exec-untrusted-home` | medium | `bprm_check_security` (lsm) | Post 300s | **frequent**: playwright, cypress, puppeteer, bun, uv, mise and electron-builder all execute from `~/.cache` | `matchArgs Prefix` values |
+| `moat-net-pkg-subtree-egress` | high | `tcp_connect` (kprobe) | Post 60s | git-over-SSH (port 22) inside a build, a private registry or corporate proxy on a custom port, dev servers calling a public API | `DPort` value lists, `NotDAddr` CIDRs |
+| `moat-net-tmpfs-binary-egress` | critical | `tcp_connect` (kprobe) | **Sigkill** | an installer you unpacked into `/tmp` and ran on purpose | `matchBinaries Prefix` values |
 
 7 critical, 18 high, 6 medium, 1 low. 8 policies carry `Sigkill`, 24 are
 report-only. Hook load: 17 programs on `file_post_open`, 6 on
@@ -76,8 +76,8 @@ each on `bpf`, `path_chmod`, `inode_setxattr`, `security_kernel_read_file`.
   so a policy is **monitor** the moment it loads, whatever its `matchActions`
   say. Nothing here can kill until someone opts in.
 * Precedence is `spec.options` < `tetra tp add --mode ...` < `tetra tp set-mode
-  <name> monitor|enforce`. sentineld calls `set-mode` for every `sentinel-*`
-  policy at start and whenever `sentinelctl set mode` changes it. `set-mode`
+  <name> monitor|enforce`. moatd calls `set-mode` for every `moat-*`
+  policy at start and whenever `moatctl set mode` changes it. `set-mode`
   rewrites a pinned per-policy BPF array in place: it takes effect immediately,
   with no reload and no dropped events.
 * Monitor mode **skips** `Sigkill`, `Signal`, `Override`, `NotifyEnforcer` and
@@ -85,7 +85,7 @@ each on `bpf`, `path_chmod`, `inode_setxattr`, `security_kernel_read_file`.
 * The event still reports `"action":"KPROBE_ACTION_SIGKILL"` in monitor mode —
   the action field is the configured action, not the taken one. **A kill is
   only proven by the matching `process_exit` with `"signal":"SIGKILL"` for that
-  `exec_id`**, which is what sentineld must use before writing
+  `exec_id`**, which is what moatd must use before writing
   `action_taken: killed`.
 * `Post` and `Sigkill` are never combined in one selector here: a `Sigkill`
   selector still emits its event, and combining them would spend both of the
@@ -102,14 +102,14 @@ quoted YAML scalar, always as a **whole leading path component**
 (`"{{HOME}}/.ssh/id_rsa"`, `"{{HOME}}/.config/autostart/"`). No other
 placeholder exists; `check.py` fails on any other `{{...}}`.
 
-`sentineld render-policies` (the `ExecStartPre` of `tetragon.service`):
+`moatd render-policies` (the `ExecStartPre` of `tetragon.service`):
 
 1. reads `/etc/passwd`, selects users with `uid >= 1000` whose home is under
    `/home` or `/var/home`;
-2. for each template in `/usr/lib/sentinel/policies/*.yaml`, expands `{{HOME}}`
+2. for each template in `/usr/lib/moat/policies/*.yaml`, expands `{{HOME}}`
    into **one value per home** inside every `values:` list — a template value
    becomes N values, the policy name and everything else stay identical;
-3. writes the result to `/run/sentinel/policies/` (`tracing-policy-dir`);
+3. writes the result to `/run/moat/policies/` (`tracing-policy-dir`);
 4. regenerates `/etc/tetragon/tetragon.conf.d/export-allowlist` with the exact
    policy names (see `export-allowlist.example`).
 
@@ -130,9 +130,9 @@ reload, so rendering must happen before the daemon starts, and a new user needs
 | File | Value | Why |
 |---|---|---|
 | `bpf-lib` | `/usr/lib/tetragon/bpf` | upstream CO-RE objects |
-| `tracing-policy-dir` | `/run/sentinel/policies` | rendered templates |
+| `tracing-policy-dir` | `/run/moat/policies` | rendered templates |
 | `parents-map-enabled` | `true` | required by `matchParentBinaries` (pkg, net, ai) |
-| `export-filename` | `/var/log/sentinel/tetragon.log` | sentineld tails this; gRPC is not used in v1 |
+| `export-filename` | `/var/log/moat/tetragon.log` | moatd tails this; gRPC is not used in v1 |
 | `export-file-max-size-mb` | `50` | |
 | `export-file-max-backups` | `3` | |
 | `export-file-compress` | `false` | keep rotated files readable for triage |
@@ -150,17 +150,17 @@ reload, so rendering must happen before the daemon starts, and a new user needs
 
 Not shipped, on purpose:
 
-* `export-allowlist` — generated by `sentineld render-policies`; see
+* `export-allowlist` — generated by `moatd render-policies`; see
   `export-allowlist.example` for the exact two JSON lines it must write
   (`PROCESS_EXEC`+`PROCESS_EXIT`, then the exact `policy_names` list; Tetragon
   matches policy names exactly, there is no prefix match).
-* `enable-ancestors` — sentineld builds the ancestry chain itself from
+* `enable-ancestors` — moatd builds the ancestry chain itself from
   `process_exec`/`process_exit` (contract section 6.2), which is cheaper.
 * `disable-kprobe-multi` — add it only if kprobe attachment fails on a kernel
   without `kprobe_multi`.
 
 `tetragon.service` is the upstream unit with FHS paths, `RuntimeDirectory=tetragon`,
-`ExecStartPre=/usr/bin/sentineld render-policies`, and sandboxing that keeps BPF
+`ExecStartPre=/usr/bin/moatd render-policies`, and sandboxing that keeps BPF
 working. Do not add `ProtectKernelTunables=yes` (remounts `/sys` read-only and
 breaks bpffs) or `PrivateMounts`/`PrivateUsers` (break process and path
 visibility).
@@ -195,10 +195,10 @@ visibility).
   `/usr/bin/makepkg`. The package-manager parent lists include both spellings,
   but the interpreter entries are the ones that actually match. See below.
 
-## sentineld covers
+## moatd covers
 
 Not expressible in a v1.7.1 policy. The policies emit the underlying event; the
-decision is sentineld's (contract section 6.4, rule ids `sentinel-x-*`).
+decision is moatd's (contract section 6.4, rule ids `moat-x-*`).
 
 1. **Process arguments.** No selector can look at argv. That means
    `nc -e /bin/sh`, `socat ... EXEC:`, `bash -i >& /dev/tcp/...`,
@@ -213,19 +213,19 @@ decision is sentineld's (contract section 6.4, rule ids `sentinel-x-*`).
    Version-managed interpreters (`~/.local/share/mise/installs/node/*/bin/node`,
    nvm, asdf, pyenv, uv-managed pythons) and script front-ends whose recorded
    binary is the interpreter (`makepkg` → bash, `npm` → node) are **not**
-   matched in-kernel. sentineld's process table must supply "is this in a
+   matched in-kernel. moatd's process table must supply "is this in a
    package-manager subtree" and "does this AI CLI have an interactive shell in
-   its chain" (`sentinel-x-ai-cli-headless`).
+   its chain" (`moat-x-ai-cli-headless`).
 3. **Middle-wildcard paths.** Browser profile directories
    (`~/.mozilla/firefox/<random>/`) are matched by basename `Postfix` only, so
    any file called `Cookies` matches; private SSH keys with non-standard names
    are not matched at all (only the `id_*` set is). Post-filter and extend in
    userland.
 4. **Hostnames, DNS and registry allowlists.** Kernel-side there are IPs, ports
-   and CIDRs only. `sentinel-x-pkg-egress` (destination not in the registry
+   and CIDRs only. `moat-x-pkg-egress` (destination not in the registry
    allowlist) is userland, resolving the IP from the event.
 5. **IOC lookups** — sha256 of a newly executed file, feed domains/URLs
-   (`sentinel-x-new-exec-ioc`). Policies carry no hashing; hash
+   (`moat-x-new-exec-ioc`). Policies carry no hashing; hash
    `process.binary` in userspace.
 6. **`LD_PRELOAD` and any other environment variable.** No selector exists;
    read it from `process_exec.process.environment_variables`, which is why
@@ -233,19 +233,19 @@ decision is sentineld's (contract section 6.4, rule ids `sentinel-x-*`).
    are in `tetragon.conf.d`. The `/etc/ld.so.preload` file itself *is* covered
    by a policy.
 7. **Counting and windows.** `rateLimit` suppresses, it never counts, and it
-   has no notion of "40 distinct files in 10 s" (`sentinel-x-mass-read`). Note
+   has no notion of "40 distinct files in 10 s" (`moat-x-mass-read`). Note
    the rate-limit key is *thread + the first 40 bytes of the arguments*: two
    credential paths that share a 40-byte prefix collapse into one event, so a
    userland count of distinct files read is a **lower bound**. If mass-read
    proves lossy, drop `rateLimit` from the `cred` policies and dedupe entirely
-   in sentineld.
+   in moatd.
 8. **Whether a kill actually happened** — see the monitor/enforce section.
    Confirm with `process_exit.signal == SIGKILL`.
 9. **Policy-name prefix matching in the export filter.** `policy_names` is an
-   exact match; sentineld writes the explicit list
+   exact match; moatd writes the explicit list
    (`export-allowlist.example`). The CEL `startsWith` form in the notes is
    untested live and is not used.
-10. **Policy hot reload.** There is none: `sentineld render-policies` runs as
+10. **Policy hot reload.** There is none: `moatd render-policies` runs as
     `ExecStartPre` and a policy change means restarting tetragon (or
     `tetra tp add|delete`).
 11. **Dedupe, severity escalation and correlation** — e.g. a

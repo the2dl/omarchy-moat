@@ -1,11 +1,11 @@
-# sentinel-scan-pkgbuild
+# moat-scan-pkgbuild
 
 Static review of an AUR package recipe *before* you build it. Pure Python 3
 standard library, no dependencies, no network, no execution of anything it
 reads.
 
 ```
-sentinel-scan-pkgbuild [PATH ...]        # default: .
+moat-scan-pkgbuild [PATH ...]        # default: .
 ```
 
 Each `PATH` may be a directory (its `PKGBUILD`, every `*.install` beside it and
@@ -79,9 +79,9 @@ Severity is the default; the "adjusted to" column lists context that moves it.
 
 ## Allow file
 
-`/etc/sentinel/scanner-allow.conf` (system) and
-`~/.config/sentinel/scanner-allow.conf` (user, `$XDG_CONFIG_HOME` honoured) are
-read on every run; `--allow-file PATH` and `$SENTINEL_SCANNER_ALLOW`
+`/etc/moat/scanner-allow.conf` (system) and
+`~/.config/moat/scanner-allow.conf` (user, `$XDG_CONFIG_HOME` honoured) are
+read on every run; `--allow-file PATH` and `$MOAT_SCANNER_ALLOW`
 (colon-separated) add more. Format:
 
 ```conf
@@ -99,17 +99,17 @@ silenced rule never becomes invisible.
 
 ## How the makepkg shim calls it
 
-`/usr/lib/sentinel/shims/makepkg` (see `sandbox/`) runs, before handing over to
+`/usr/lib/moat/shims/makepkg` (see `sandbox/`) runs, before handing over to
 the real `makepkg`:
 
 ```bash
-sentinel-scan-pkgbuild .          # exit 0/1 -> continue, exit 2 -> ask
+moat-scan-pkgbuild .          # exit 0/1 -> continue, exit 2 -> ask
 ```
 
 * exit `0` or `1`: build continues (findings were printed, nothing blocks).
 * exit `2`: interactive → `gum confirm "Build anyway?"`; non-interactive →
   refuse and exit non-zero.
-* `SENTINEL_SANDBOX=0` bypasses the shim entirely, scan included.
+* `MOAT_SANDBOX=0` bypasses the shim entirely, scan included.
 
 Use `--json` if you want to feed the result to something else; the schema above
 is stable.
@@ -119,7 +119,7 @@ is stable.
 1. **Pick an id** in the existing `family.rule` style (`net`, `obf`, `pkg`,
    `src`, `persist`, `priv`, `uni`, `install`). Ids are API: the allow file and
    the plugin both key on them, so never rename one.
-2. **Add it to `RULES`** in `sentinel-scan-pkgbuild` with
+2. **Add it to `RULES`** in `moat-scan-pkgbuild` with
    `(severity, why, proceed)`. `why` is one sentence on the attack; `proceed`
    is one sentence with a concrete escape hatch and may use `{pkg}`, `{id}`,
    `{host}`.

@@ -1,0 +1,36 @@
+# rendered by `moatd render-policies` — edit the template, not this file
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-priv-setuid-chmod
+  annotations:
+    moat.omarchy/severity: critical
+    moat.omarchy/title: setuid or setgid bit set on a file
+    moat.omarchy/enforce: kill
+    moat.omarchy/actions: kill,quarantine
+    moat.omarchy/why: A setuid file is a permanent root door. Package managers set them at install time through pacman; almost nothing else should.
+    moat.omarchy/expected: pacman and makepkg during an install, and container tooling such as newuidmap.
+    moat.omarchy/fp-hint: exe
+spec:
+  options:
+  - name: policy-mode
+    value: monitor
+  lsmhooks:
+  - hook: path_chmod
+    message: setuid bit set on a file
+    args:
+    - index: 0
+      type: path
+    - index: 1
+      type: uint32
+    selectors:
+    - matchBinaries:
+      - operator: NotIn
+        values:
+        - /usr/bin/pacman
+      matchArgs:
+      - index: 1
+        operator: Mask
+        values:
+        - '2048'
+        - '1024'

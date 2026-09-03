@@ -1,6 +1,6 @@
 {
   "sandbox": true,
-  "flag": "/etc/sentinel/sandbox.enabled",
+  "flag": "/etc/moat/sandbox.enabled",
   "note": "shims apply to new login sessions; log out and back in",
   "ok": true
 }

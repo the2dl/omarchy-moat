@@ -1,20 +1,20 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-persist-system-unit-write
+  name: moat-persist-system-unit-write
   annotations:
-    sentinel.omarchy/severity: "high"
-    sentinel.omarchy/title: "System unit, sudoers or cron entry written"
-    sentinel.omarchy/enforce: "none"
-    sentinel.omarchy/actions: "kill,quarantine,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "System unit, sudoers or cron entry written"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,quarantine,ignore"
+    moat.omarchy/why: >-
       These four trees are how a payload that got root once keeps root: a unit that
       restarts it, a sudoers drop-in that gives a user passwordless root, or a cron job
       that reinstalls it after you clean up.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       pacman installing or upgrading a package, systemd writing its own state, and you
       editing a unit or a sudoers drop-in with sudo and an editor.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

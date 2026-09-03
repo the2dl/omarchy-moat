@@ -1,0 +1,46 @@
+[package]
+name = "moatd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Userspace brain for omarchy-moat: tails Tetragon's JSON export, builds explainable alerts, serves a control socket."
+license = "MIT"
+
+[lib]
+name = "moatd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "moatd"
+path = "src/bin/moatd.rs"
+
+[[bin]]
+name = "moatctl"
+path = "src/bin/moatctl.rs"
+
+[[bin]]
+name = "moat-feeds"
+path = "src/bin/moat_feeds.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+ulid = "1"
+sha2 = "0.10"
+globset = "0.4"
+ureq = { version = "3", features = ["json"] }
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+libc = "0.2"
+serde_json = "1"
+tempfile = "3"
+
+[profile.release]
+strip = true

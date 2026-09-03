@@ -2,7 +2,7 @@ import QtQuick
 import qs.Commons
 import qs.Ui
 
-// Sentinel's bar slot: a shield glyph whose color is the whole security posture
+// Moat's bar slot: a shield glyph whose color is the whole security posture
 // at a glance, plus a count badge for the alerts that need a decision.
 //
 // The clickable thing MUST be a WidgetButton. The bar overlays its own
@@ -11,7 +11,7 @@ import qs.Ui
 // Item with a MouseArea or TapHandler never sees the press at all.
 BarWidget {
   id: root
-  moduleName: "io.github.the2dl.sentinel"
+  moduleName: "io.github.the2dl.moat"
 
   readonly property var service: root.bar && root.bar.shell
     && typeof root.bar.shell.serviceFor === "function"
@@ -35,9 +35,9 @@ BarWidget {
     : greyColor
 
   readonly property string tooltip: {
-    if (!service) return "Sentinel"
-    if (!service.available) return "Sentinel: not installed — click for setup steps"
-    if (!service.groupOk) return "Sentinel: not in the sentinel group — click for setup steps"
+    if (!service) return "Moat"
+    if (!service.available) return "Moat: not installed — click for setup steps"
+    if (!service.groupOk) return "Moat: not in the moat group — click for setup steps"
     return service.statusSummary
   }
 

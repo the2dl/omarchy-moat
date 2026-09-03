@@ -1,4 +1,4 @@
-# omarchy-sentinel interface contract
+# omarchy-moat interface contract
 
 Every component is built by a different agent in parallel. This file is the only
 shared truth. If you need to change something here, change it here first and say
@@ -8,18 +8,18 @@ so in your final report. Do not commit to git; the coordinator commits.
 
 | Dir          | Artifact                                    | Language | Runs as |
 |--------------|---------------------------------------------|----------|---------|
-| `pkg/`       | PKGBUILD for system package `omarchy-sentinel` | bash   | -       |
+| `pkg/`       | PKGBUILD for system package `omarchy-moat` | bash   | -       |
 | `policies/`  | Tetragon TracingPolicy YAML                  | yaml     | kernel  |
-| `sentineld/` | `sentineld`, `sentinelctl`, `sentinel-feeds` | Rust     | root / user |
-| `sandbox/`   | `sentinel-sandbox`, PATH shims               | bash     | user    |
-| `scanner/`   | `sentinel-scan-pkgbuild`                     | python3  | user    |
+| `moatd/` | `moatd`, `moatctl`, `moat-feeds` | Rust     | root / user |
+| `sandbox/`   | `moat-sandbox`, PATH shims               | bash     | user    |
+| `scanner/`   | `moat-scan-pkgbuild`                     | python3  | user    |
 | `shell/` + `manifest.json` | omarchy-shell plugin           | QML/JS   | user (inside omarchy-shell) |
 
 Tetragon itself is **upstream, unmodified**, v1.7.1, from
 `https://github.com/cilium/tetragon/releases/download/v1.7.1/tetragon-v1.7.1-amd64.tar.gz`
 (sha256 published next to it as `.sha256sum`). We never fork it.
 
-## 2. Filesystem layout after `pacman -U omarchy-sentinel`
+## 2. Filesystem layout after `pacman -U omarchy-moat`
 
 ```
 /usr/bin/tetragon                          upstream daemon
@@ -28,9 +28,9 @@ Tetragon itself is **upstream, unmodified**, v1.7.1, from
 /usr/lib/tetragon/{bpftool,gops}           upstream helpers
 /etc/tetragon/tetragon.conf.d/             one flag per file (Tetragon convention):
     bpf-lib                = /usr/lib/tetragon/bpf
-    tracing-policy-dir     = /run/sentinel/policies
+    tracing-policy-dir     = /run/moat/policies
     parents-map-enabled    = true                 (needed by matchParentBinaries)
-    export-filename        = /var/log/sentinel/tetragon.log
+    export-filename        = /var/log/moat/tetragon.log
     export-file-max-size-mb= 50
     export-file-max-backups= 3
     export-allowlist       = (see policies agent; filter to our policies + exec/exit)
@@ -38,46 +38,46 @@ Tetragon itself is **upstream, unmodified**, v1.7.1, from
     metrics-server         =                     (empty: disabled)
     gops-address           =                     (empty: disabled)
     log-format             = json
-/usr/lib/sentinel/policies/*.yaml          policy TEMPLATES from policies/ ({{HOME}} placeholder)
-/run/sentinel/policies/*.yaml              rendered policies; tracing-policy-dir points here.
-                                           `sentineld render-policies` (ExecStartPre of
+/usr/lib/moat/policies/*.yaml          policy TEMPLATES from policies/ ({{HOME}} placeholder)
+/run/moat/policies/*.yaml              rendered policies; tracing-policy-dir points here.
+                                           `moatd render-policies` (ExecStartPre of
                                            tetragon.service) expands {{HOME}} into one value
                                            per human user home (uid >= 1000 in /etc/passwd,
                                            home under /home or /var/home), writes the files,
                                            and regenerates the export-allowlist conf.d file
                                            with the exact policy names (Tetragon has no
                                            prefix match and no policy hot-reload).
-/etc/sentinel/sentinel.toml                sentineld config (root:root 0644)
-/etc/sentinel/allowlist.d/*.toml           user-editable allowlists, merged
-/etc/sentinel/feeds.toml                   feed URLs, optional abuse.ch auth key
-/etc/sentinel/sandbox.conf                 sandbox deny/allow paths
-/etc/sentinel/scanner-allow.conf           PKGBUILD scanner allow file (host=/rule=/pkg=),
+/etc/moat/moat.toml                moatd config (root:root 0644)
+/etc/moat/allowlist.d/*.toml           user-editable allowlists, merged
+/etc/moat/feeds.toml                   feed URLs, optional abuse.ch auth key
+/etc/moat/sandbox.conf                 sandbox deny/allow paths
+/etc/moat/scanner-allow.conf           PKGBUILD scanner allow file (host=/rule=/pkg=),
                                            root:root 0644, commented example; the user
-                                           copy is ~/.config/sentinel/scanner-allow.conf
-/usr/bin/sentineld  /usr/bin/sentinelctl  /usr/bin/sentinel-feeds
-/usr/bin/sentinel-sandbox  /usr/bin/sentinel-scan-pkgbuild
-/usr/lib/sentinel/shims/{npm,npx,pnpm,yarn,bun,pip,pip3,uv,cargo,makepkg}
-/etc/profile.d/sentinel-shims.sh           prepends shim dir to PATH iff
-                                           /etc/sentinel/sandbox.enabled exists
+                                           copy is ~/.config/moat/scanner-allow.conf
+/usr/bin/moatd  /usr/bin/moatctl  /usr/bin/moat-feeds
+/usr/bin/moat-sandbox  /usr/bin/moat-scan-pkgbuild
+/usr/lib/moat/shims/{npm,npx,pnpm,yarn,bun,pip,pip3,uv,cargo,makepkg}
+/etc/profile.d/moat-shims.sh           prepends shim dir to PATH iff
+                                           /etc/moat/sandbox.enabled exists
 /usr/lib/systemd/system/tetragon.service   hardened, After=local-fs
-/usr/lib/systemd/system/sentineld.service  Requires+After tetragon
-/usr/lib/systemd/system/sentinel-feeds.{service,timer}   hourly, RandomizedDelaySec=10min
-/usr/lib/sysusers.d/sentinel.conf          creates group `sentinel`
-/usr/lib/tmpfiles.d/sentinel.conf          /var/lib/sentinel 0750 root:sentinel
-                                           /var/log/sentinel 0750 root:sentinel
-                                           /run/sentinel     0750 root:sentinel
-                                           /var/lib/sentinel/quarantine 0700 root:root
-/var/lib/sentinel/alerts.jsonl             0640 root:sentinel, append-only
-/var/lib/sentinel/state.json               0640 root:sentinel, daemon status
-/var/lib/sentinel/feeds/{hashes.txt,domains.txt,urls.txt,meta.json}
-/run/sentinel/control.sock                 0660 root:sentinel
+/usr/lib/systemd/system/moatd.service  Requires+After tetragon
+/usr/lib/systemd/system/moat-feeds.{service,timer}   hourly, RandomizedDelaySec=10min
+/usr/lib/sysusers.d/moat.conf          creates group `moat`
+/usr/lib/tmpfiles.d/moat.conf          /var/lib/moat 0750 root:moat
+                                           /var/log/moat 0750 root:moat
+                                           /run/moat     0750 root:moat
+                                           /var/lib/moat/quarantine 0700 root:root
+/var/lib/moat/alerts.jsonl             0640 root:moat, append-only
+/var/lib/moat/state.json               0640 root:moat, daemon status
+/var/lib/moat/feeds/{hashes.txt,domains.txt,urls.txt,meta.json}
+/run/moat/control.sock                 0660 root:moat
 ```
 
-Post-install, the user runs `sudo usermod -aG sentinel $USER` and re-logs in.
+Post-install, the user runs `sudo usermod -aG moat $USER` and re-logs in.
 The plugin must detect a missing group membership and show a setup hint.
 The package `.install` file prints these steps; it does not enable services.
 
-## 3. Policy conventions (policies/ ↔ sentineld)
+## 3. Policy conventions (policies/ ↔ moatd)
 
 Each file in `policies/` is one `TracingPolicy` (not the namespaced kind).
 
@@ -85,20 +85,20 @@ Each file in `policies/` is one `TracingPolicy` (not the namespaced kind).
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-cred-ssh-private-key-read      # sentinel-<family>-<rule>, kebab
+  name: moat-cred-ssh-private-key-read      # moat-<family>-<rule>, kebab
   annotations:
-    sentinel.omarchy/severity: high              # critical | high | medium | low
-    sentinel.omarchy/title: "Private SSH key read by an unexpected program"
-    sentinel.omarchy/rotate: "ssh-key"           # comma list of secret kinds, optional
-    sentinel.omarchy/enforce: "kill"             # kill | none. What the policy does in
+    moat.omarchy/severity: high              # critical | high | medium | low
+    moat.omarchy/title: "Private SSH key read by an unexpected program"
+    moat.omarchy/rotate: "ssh-key"           # comma list of secret kinds, optional
+    moat.omarchy/enforce: "kill"             # kill | none. What the policy does in
                                                  # enforce mode. Monitor mode never kills.
-    sentinel.omarchy/actions: "kill,quarantine"  # what the UI may offer
-    sentinel.omarchy/why: >-                     # REQUIRED. One or two sentences a
+    moat.omarchy/actions: "kill,quarantine"  # what the UI may offer
+    moat.omarchy/why: >-                     # REQUIRED. One or two sentences a
       Private keys are the first thing npm and PyPI stealers read; only ssh, git and
       a few tools ever need them.                #   developer reads to understand the flag
-    sentinel.omarchy/expected: >-                # REQUIRED. When this fires legitimately
+    moat.omarchy/expected: >-                # REQUIRED. When this fires legitimately
       Backup tools, IDE git integrations, and custom scripts that call ssh libraries.
-    sentinel.omarchy/fp-hint: "exe"              # best ignore scope for a false positive:
+    moat.omarchy/fp-hint: "exe"              # best ignore scope for a false positive:
                                                  #   exe | exe+file | rule | parent
 spec: ...
 ```
@@ -108,34 +108,34 @@ Families: `cred`, `pkg` (package-manager process trees), `persist`, `shell`
 `net` (suspicious egress), `exec` (new binaries in $HOME,/tmp,/dev/shm).
 
 Tetragon events carry `policy_name` on `process_kprobe`, `process_lsm`,
-`process_tracepoint`, `process_uprobe`. sentineld reads
-`/run/sentinel/policies/*.yaml` (the rendered set) at start (and on SIGHUP) to map policy name →
-annotations. An event whose policy name does not start with `sentinel-` is
+`process_tracepoint`, `process_uprobe`. moatd reads
+`/run/moat/policies/*.yaml` (the rendered set) at start (and on SIGHUP) to map policy name →
+annotations. An event whose policy name does not start with `moat-` is
 ignored for alerting but still available for enrichment (exec/exit).
 
 Enforce vs monitor (verified in docs/TETRAGON-NOTES.md §7): policies carry their
 `matchActions` (Sigkill / Override) and set `spec.options: [{name: policy-mode,
-value: monitor}]` so the default is monitor. sentineld runs `tetra tp set-mode
-<name> monitor|enforce` for every `sentinel-*` policy at start and when
-`sentinelctl set mode` changes it; set-mode takes effect immediately. In monitor
-mode the event STILL reports `action: KPROBE_ACTION_SIGKILL`; sentineld must
+value: monitor}]` so the default is monitor. moatd runs `tetra tp set-mode
+<name> monitor|enforce` for every `moat-*` policy at start and when
+`moatctl set mode` changes it; set-mode takes effect immediately. In monitor
+mode the event STILL reports `action: KPROBE_ACTION_SIGKILL`; moatd must
 confirm a kill from the matching `process_exit` with `signal: SIGKILL` before
 recording `action_taken: killed`.
 
 Paths: Tetragon has Prefix/Postfix/Equal only, no middle wildcard, so policies
-are templates using `{{HOME}}` (e.g. `{{HOME}}/.ssh/`) that `sentineld
+are templates using `{{HOME}}` (e.g. `{{HOME}}/.ssh/`) that `moatd
 render-policies` expands into one value per user home. See section 2.
 
 Everything about Tetragon's grammar, hooks, flags and JSON shape is in
 docs/TETRAGON-NOTES.md. That file wins over guesses. Its "Gaps" section lists
-what sentineld must do in userland.
+what moatd must do in userland.
 
 Allowlisting lives in policies where Tetragon supports it (matchBinaries,
-matchArgs, matchPIDs) AND in sentineld (`/etc/sentinel/allowlist.d`) for what
+matchArgs, matchPIDs) AND in moatd (`/etc/moat/allowlist.d`) for what
 Tetragon cannot express (ancestry beyond one level, session context). Both
 agents document their side.
 
-## 4. Alert record (sentineld → alerts.jsonl → plugin)
+## 4. Alert record (moatd → alerts.jsonl → plugin)
 
 One JSON object per line, UTF-8, no pretty printing. Fields:
 
@@ -145,7 +145,7 @@ One JSON object per line, UTF-8, no pretty printing. Fields:
   "id": "01J8ZK6B4Q3M7N9P2R5S8T1V4W",           // ULID, sortable
   "ts": "2026-09-03T16:21:07.123Z",
   "severity": "high",                          // critical|high|medium|low
-  "rule": "sentinel-cred-ssh-private-key-read",// policy name or sentineld rule id
+  "rule": "moat-cred-ssh-private-key-read",// policy name or moatd rule id
   "family": "cred",
   "title": "Private SSH key read by an unexpected program",
   "summary": "node (pid 41233) read /home/dan/.ssh/id_rsa. Parent chain: npm -> node -> sh -> node.",
@@ -172,13 +172,13 @@ One JSON object per line, UTF-8, no pretty printing. Fields:
     "if_expected": {
       "hint": "exe",
       "options": [
-        {"scope": "exe",      "cmd": "sentinelctl ignore 01J8ZK... --scope exe",
-         "line": "[[rule]]\nname = \"sentinel-cred-ssh-private-key-read\"\nexe = \"/home/dan/.local/share/mise/installs/node/26.5.0/bin/node\""},
-        {"scope": "exe+file", "cmd": "sentinelctl ignore 01J8ZK... --scope exe+file", "line": "..."},
-        {"scope": "parent",   "cmd": "sentinelctl ignore 01J8ZK... --scope parent",   "line": "..."},
-        {"scope": "rule",     "cmd": "sentinelctl ignore 01J8ZK... --scope rule",     "line": "..."}
+        {"scope": "exe",      "cmd": "moatctl ignore 01J8ZK... --scope exe",
+         "line": "[[rule]]\nname = \"moat-cred-ssh-private-key-read\"\nexe = \"/home/dan/.local/share/mise/installs/node/26.5.0/bin/node\""},
+        {"scope": "exe+file", "cmd": "moatctl ignore 01J8ZK... --scope exe+file", "line": "..."},
+        {"scope": "parent",   "cmd": "moatctl ignore 01J8ZK... --scope parent",   "line": "..."},
+        {"scope": "rule",     "cmd": "moatctl ignore 01J8ZK... --scope rule",     "line": "..."}
       ],
-      "file": "/etc/sentinel/allowlist.d/user.toml"
+      "file": "/etc/moat/allowlist.d/user.toml"
     },
     "next": [
       "If you did not expect this: kill the process, then rotate the key (ssh-keygen -t ed25519, replace the public key on GitHub and servers).",
@@ -192,15 +192,15 @@ One JSON object per line, UTF-8, no pretty printing. Fields:
 }
 ```
 
-sentineld rewrites nothing in place. State changes (ack, action results) are
+moatd rewrites nothing in place. State changes (ack, action results) are
 appended as `{"v":1,"id":"<same id>","update":{"acked":true,"action_taken":"killed"}}`
-lines. Readers fold updates by id. The file is rotated by sentineld at 20 MB
+lines. Readers fold updates by id. The file is rotated by moatd at 20 MB
 (rename to `alerts.1.jsonl`); readers must handle truncation/rotation (re-open
 on inode change).
 
-## 5. Control socket (sentinelctl / plugin → sentineld)
+## 5. Control socket (moatctl / plugin → moatd)
 
-Unix stream socket `/run/sentinel/control.sock`, newline-delimited JSON, one
+Unix stream socket `/run/moat/control.sock`, newline-delimited JSON, one
 request → one response per connection.
 
 Requests:
@@ -209,7 +209,7 @@ Requests:
 {"cmd":"kill","id":"<alert id>"}          kills the process tree recorded in the alert
 {"cmd":"quarantine","id":"<alert id>"}    moves alert.file.path (or alert.process.exe if
                                           under $HOME,/tmp,/var/tmp,/dev/shm) to
-                                          /var/lib/sentinel/quarantine/<id>/ with a
+                                          /var/lib/moat/quarantine/<id>/ with a
                                           meta.json, chmod 000
 {"cmd":"ack","id":"<alert id>"}
 {"cmd":"ignore","id":"<alert id>","scope":"exe|exe+file|parent|rule","comment":"..."}
@@ -229,7 +229,7 @@ Responses: `{"ok":true,...}` or `{"ok":false,"error":"..."}`.
 
 **Actions reference alert ids, never raw pids or paths.** That is what makes the
 socket safe to expose to the user's group: a malicious user-level process cannot
-use sentineld to kill or move something the sensor did not already flag.
+use moatd to kill or move something the sensor did not already flag.
 
 `status` response:
 ```json
@@ -239,26 +239,26 @@ use sentineld to kill or move something the sensor did not already flag.
  "group_ok":true}
 ```
 
-`sentinelctl` is a thin CLI over this socket: `sentinelctl status|kill|quarantine|ack|ignore|unignore|allowlist|explain|set|list|feeds`.
-`sentinelctl explain <id>` prints the human-readable version: WHAT HAPPENED, WHY IT WAS
+`moatctl` is a thin CLI over this socket: `moatctl status|kill|quarantine|ack|ignore|unignore|allowlist|explain|set|list|feeds`.
+`moatctl explain <id>` prints the human-readable version: WHAT HAPPENED, WHY IT WAS
 FLAGGED, EVIDENCE, IF THIS IS EXPECTED (the options with the exact command and the
 exact TOML that would be written), WHAT TO DO IF NOT
 with `--json` for machine output. It also gains nothing from root; do not ship a
 sudoers rule.
 
-## 6. sentineld responsibilities
+## 6. moatd responsibilities
 
-1. Tail `/var/log/sentinel/tetragon.log` (JSON export; handle rotation). gRPC is
+1. Tail `/var/log/moat/tetragon.log` (JSON export; handle rotation). gRPC is
    not required in v1.
 2. Maintain a process table from `process_exec` / `process_exit` for ancestry
    (Tetragon gives parent, we keep the chain, capped at 8).
-3. For policy events with `sentinel-*` names: build an alert from annotations +
+3. For policy events with `moat-*` names: build an alert from annotations +
    event, apply `allowlist.d`, dedupe. Allowlist TOML shape (all fields optional except
    name; globs allowed; every field present must match):
    ```toml
    # added 2026-09-03 from alert 01J8ZK...: Private SSH key read by an unexpected program
    [[rule]]
-   name   = "sentinel-cred-ssh-private-key-read"   # or "sentinel-cred-*"
+   name   = "moat-cred-ssh-private-key-read"   # or "moat-cred-*"
    exe    = "/home/dan/.local/share/mise/installs/node/*/bin/node"
    file   = "/home/dan/.ssh/id_rsa"                # exe+file scope adds this
    parent = "/usr/bin/restic"                      # parent scope: any exe under this parent
@@ -269,25 +269,25 @@ sudoers rule.
    the ready-to-run command AND the exact TOML block for each scope, and `next` gives
    the response steps including rotation. Dedupe (same rule+exe+file within 60 s → one
    alert with a `count` update), append to alerts.jsonl.
-4. Userland rules Tetragon cannot express (rule ids `sentinel-x-*`):
-   - `sentinel-x-ai-cli-headless`: an AI CLI (`claude`,`codex`,`gemini`,`opencode`,`q`,`amp`)
+4. Userland rules Tetragon cannot express (rule ids `moat-x-*`):
+   - `moat-x-ai-cli-headless`: an AI CLI (`claude`,`codex`,`gemini`,`opencode`,`q`,`amp`)
      whose ancestry has no interactive shell/terminal, or whose args contain a
      permission-skipping flag (`--dangerously-skip-permissions`, `--yolo`,
      `--trust-all-tools`, `--full-auto`) while its parent is node/python/sh spawned
      by a package manager.
-   - `sentinel-x-pkg-egress`: a package-manager subtree opens a connection to a
+   - `moat-x-pkg-egress`: a package-manager subtree opens a connection to a
      host not in the registry allowlist (npmjs.org, pypi.org, crates.io,
      github.com, archlinux.org mirrors, plus config additions).
-   - `sentinel-x-new-exec-ioc`: sha256 of a newly executed file under $HOME,
+   - `moat-x-new-exec-ioc`: sha256 of a newly executed file under $HOME,
      /tmp, /var/tmp, /dev/shm matches `feeds/hashes.txt`.
-   - `sentinel-x-mass-read`: one process reads > N (default 40) distinct files
+   - `moat-x-mass-read`: one process reads > N (default 40) distinct files
      under $HOME dotdirs within 10 s (TruffleHog pattern). Requires the policies
      agent to emit read events for those dirs; coordinate via the `cred` family.
-5. Enforcement: in `enforce` mode Tetragon kills; sentineld records
+5. Enforcement: in `enforce` mode Tetragon kills; moatd records
    `action_taken: killed` when the event carries the action. In monitor mode
-   sentineld never kills unless asked over the socket.
+   moatd never kills unless asked over the socket.
 6. Serve the control socket. Write `state.json` every 5 s.
-7. `sentinel-feeds` (separate binary or subcommand, run by the timer): fetch
+7. `moat-feeds` (separate binary or subcommand, run by the timer): fetch
    abuse.ch MalwareBazaar recent sha256 list, ThreatFox recent IOCs (domains,
    ips, urls), URLhaus recent. abuse.ch requires an `Auth-Key` header since
    2025; read it from `feeds.toml`, and if absent, skip with a clear log line
@@ -338,7 +338,7 @@ omarchy-shell gotchas (verified on this machine):
 
 ## 8. Sandbox and shims (sandbox/)
 
-`sentinel-sandbox [--allow PATH]... -- <cmd> [args]` runs the command under
+`moat-sandbox [--allow PATH]... -- <cmd> [args]` runs the command under
 bubblewrap with:
 - `--ro-bind / /` baseline, `--dev /dev`, `--proc /proc`, `--unshare-pid`,
   `--die-with-parent`, `--new-session`
@@ -356,17 +356,17 @@ bubblewrap with:
 - network stays on (installs need it).
 - env: strip `*_TOKEN`, `*_SECRET`, `*_KEY`, `AWS_*`, `GITHUB_TOKEN`, `NPM_TOKEN`
   unless `--keep-env NAME`.
-- `/etc/sentinel/sandbox.conf` adds `deny=` / `allow=` / `keep-env=` lines.
+- `/etc/moat/sandbox.conf` adds `deny=` / `allow=` / `keep-env=` lines.
 
-Shims: `/usr/lib/sentinel/shims/<name>` finds the real binary by searching
+Shims: `/usr/lib/moat/shims/<name>` finds the real binary by searching
 `$PATH` with the shim dir removed (mise shims must keep working), and execs
-`sentinel-sandbox -- <real> "$@"`. `makepkg` shim first runs
-`sentinel-scan-pkgbuild .` and, on high findings, prompts (gum confirm if
-interactive, refuse if not) before continuing. `SENTINEL_SANDBOX=0` bypasses.
+`moat-sandbox -- <real> "$@"`. `makepkg` shim first runs
+`moat-scan-pkgbuild .` and, on high findings, prompts (gum confirm if
+interactive, refuse if not) before continuing. `MOAT_SANDBOX=0` bypasses.
 
 ## 9. Scanner (scanner/)
 
-`sentinel-scan-pkgbuild [PATH ...]` (default `.`) scans `PKGBUILD`, `*.install`,
+`moat-scan-pkgbuild [PATH ...]` (default `.`) scans `PKGBUILD`, `*.install`,
 and any `source=()` local files. Findings have `id`, `severity`, `line`, `evidence`.
 Rules at minimum: curl/wget piped to a shell; `base64 -d`/`xxd -r` feeding a
 shell or eval; `eval` on a variable; `npm install`/`pip install`/`cargo install`
@@ -381,7 +381,7 @@ include a synthetic reproduction of the AUR incidents.
 
 ## 10. Versioning and naming
 
-Everything is version `0.1.0`. Plugin id `io.github.the2dl.sentinel`, package
-`omarchy-sentinel`, binaries prefixed `sentinel`. Placeholder name; a rename is a
+Everything is version `0.1.0`. Plugin id `io.github.the2dl.moat`, package
+`omarchy-moat`, binaries prefixed `moat`. Placeholder name; a rename is a
 search-and-replace, so do not scatter the word into user-visible strings more
-than necessary. Use "Sentinel" in UI text.
+than necessary. Use "Moat" in UI text.

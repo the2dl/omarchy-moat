@@ -1,21 +1,21 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-cred-gnupg-keyring-read
+  name: moat-cred-gnupg-keyring-read
   annotations:
-    sentinel.omarchy/severity: "high"
-    sentinel.omarchy/title: "GPG private key or login keyring read by an unexpected program"
-    sentinel.omarchy/rotate: "gpg-key,keyring"
-    sentinel.omarchy/enforce: "none"
-    sentinel.omarchy/actions: "kill,quarantine,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "GPG private key or login keyring read by an unexpected program"
+    moat.omarchy/rotate: "gpg-key,keyring"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,quarantine,ignore"
+    moat.omarchy/why: >-
       The GnuPG private key store and the GNOME login keyring hold your signing key and
       every password an application ever saved; a copy of these plus a keylogged
       passphrase is a complete identity theft.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       gpg and its agents, gnome-keyring-daemon, seahorse, keepassxc, pass, secret-tool,
       and backup tools that archive your whole home directory.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

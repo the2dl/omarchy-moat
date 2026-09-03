@@ -4,16 +4,16 @@
     "id": "01M1M5XHBZTEYJ03KHCF0R5P32",
     "ts": "2026-09-03T17:43:56.543Z",
     "severity": "high",
-    "rule": "sentinel-cred-ssh-private-key-read",
+    "rule": "moat-cred-ssh-private-key-read",
     "family": "cred",
     "title": "Private SSH key read by an unexpected program",
-    "summary": "node (pid 5233) read /home/sentineltest/.ssh/id_ed25519. Parent chain: fish -> npm -> sh -> node.",
+    "summary": "node (pid 5233) read /home/moattest/.ssh/id_ed25519. Parent chain: fish -> npm -> sh -> node.",
     "process": {
       "pid": 5233,
       "uid": 1000,
       "exe": "/usr/bin/node",
-      "args": "/home/sentineltest/proj/node_modules/evil/setup.mjs",
-      "cwd": "/home/sentineltest/proj",
+      "args": "/home/moattest/proj/node_modules/evil/setup.mjs",
+      "cwd": "/home/moattest/proj",
       "start_ts": "2026-09-03T17:43:36.538Z",
       "ancestry": [
         {
@@ -31,7 +31,7 @@
       ]
     },
     "file": {
-      "path": "/home/sentineltest/.ssh/id_ed25519",
+      "path": "/home/moattest/.ssh/id_ed25519",
       "sha256": null
     },
     "rotate": [
@@ -41,12 +41,12 @@
       "what": "node read your private SSH key (id_ed25519).",
       "why": "Private keys are the first thing npm and PyPI stealers read; only ssh, git and a few backup tools ever need them, and a key that leaves the machine gives an attacker every host and forge you can reach.",
       "evidence": [
-        "hook: file_post_open on /home/sentineltest/.ssh/id_ed25519 (read)",
-        "process: /usr/bin/node pid 5233 uid 1000 args /home/sentineltest/proj/node_modules/evil/setup.mjs",
-        "ancestry: fish -> npm -> sh -> node (cwd /home/sentineltest/proj)",
+        "hook: file_post_open on /home/moattest/.ssh/id_ed25519 (read)",
+        "process: /usr/bin/node pid 5233 uid 1000 args /home/moattest/proj/node_modules/evil/setup.mjs",
+        "ancestry: fish -> npm -> sh -> node (cwd /home/moattest/proj)",
         "policy message: Private SSH key opened for reading",
         "policy action: KPROBE_ACTION_SIGKILL (mode monitor; a kill is only recorded once process_exit reports SIGKILL)",
-        "not in allowlist: none of the 0 rule(s) in /etc/sentinel/allowlist.d matches exe=/usr/bin/node file=/home/sentineltest/.ssh/id_ed25519"
+        "not in allowlist: none of the 0 rule(s) in /etc/moat/allowlist.d matches exe=/usr/bin/node file=/home/moattest/.ssh/id_ed25519"
       ],
       "expected": "Backup tools (restic, borg), IDE git integrations, ansible/terraform runs, and custom scripts that call an ssh library instead of the ssh binary.",
       "if_expected": {
@@ -54,32 +54,32 @@
         "options": [
           {
             "scope": "exe",
-            "cmd": "sentinelctl ignore 01M1M5XHBZTEYJ03KHCF0R5P32 --scope exe",
-            "line": "[[rule]]\nname = \"sentinel-cred-ssh-private-key-read\"\nexe = \"/usr/bin/node\"\n"
+            "cmd": "moatctl ignore 01M1M5XHBZTEYJ03KHCF0R5P32 --scope exe",
+            "line": "[[rule]]\nname = \"moat-cred-ssh-private-key-read\"\nexe = \"/usr/bin/node\"\n"
           },
           {
             "scope": "exe+file",
-            "cmd": "sentinelctl ignore 01M1M5XHBZTEYJ03KHCF0R5P32 --scope exe+file",
-            "line": "[[rule]]\nname = \"sentinel-cred-ssh-private-key-read\"\nexe = \"/usr/bin/node\"\nfile = \"/home/sentineltest/.ssh/id_ed25519\"\n"
+            "cmd": "moatctl ignore 01M1M5XHBZTEYJ03KHCF0R5P32 --scope exe+file",
+            "line": "[[rule]]\nname = \"moat-cred-ssh-private-key-read\"\nexe = \"/usr/bin/node\"\nfile = \"/home/moattest/.ssh/id_ed25519\"\n"
           },
           {
             "scope": "parent",
-            "cmd": "sentinelctl ignore 01M1M5XHBZTEYJ03KHCF0R5P32 --scope parent",
-            "line": "[[rule]]\nname = \"sentinel-cred-ssh-private-key-read\"\nparent = \"/usr/bin/sh\"\n"
+            "cmd": "moatctl ignore 01M1M5XHBZTEYJ03KHCF0R5P32 --scope parent",
+            "line": "[[rule]]\nname = \"moat-cred-ssh-private-key-read\"\nparent = \"/usr/bin/sh\"\n"
           },
           {
             "scope": "rule",
-            "cmd": "sentinelctl ignore 01M1M5XHBZTEYJ03KHCF0R5P32 --scope rule",
-            "line": "[[rule]]\nname = \"sentinel-cred-ssh-private-key-read\"\n"
+            "cmd": "moatctl ignore 01M1M5XHBZTEYJ03KHCF0R5P32 --scope rule",
+            "line": "[[rule]]\nname = \"moat-cred-ssh-private-key-read\"\n"
           }
         ],
-        "file": "/etc/sentinel/allowlist.d/user.toml"
+        "file": "/etc/moat/allowlist.d/user.toml"
       },
       "next": [
-        "If you did not expect this: stop it now with `sentinelctl kill <id>` (kills the recorded process tree), and `sentinelctl quarantine <id>` to move the file out of reach.",
+        "If you did not expect this: stop it now with `moatctl kill <id>` (kills the recorded process tree), and `moatctl quarantine <id>` to move the file out of reach.",
         "Rotate the SSH key: `ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519`, then replace the public key on GitHub (`gh ssh-key add`), on every host in ~/.ssh/config, and in any cloud console that pinned it.",
         "Check what was installed: diff the lockfile (`git diff -- package-lock.json pnpm-lock.yaml uv.lock Cargo.lock`) and read the new package's install/postinstall script before you run anything else.",
-        "If this was you, run one of the ignore commands above; otherwise `sentinelctl ack <id>` once you have finished checking."
+        "If this was you, run one of the ignore commands above; otherwise `moatctl ack <id>` once you have finished checking."
       ]
     },
     "action_taken": "killed",

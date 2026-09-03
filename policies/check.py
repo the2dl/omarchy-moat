@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Structural validator for the omarchy-sentinel Tetragon policy templates.
+"""Structural validator for the omarchy-moat Tetragon policy templates.
 
 Nothing here talks to the kernel: it checks the templates against the grammar
 verified in docs/TETRAGON-NOTES.md (Tetragon v1.7.1) so that a policy that
@@ -31,7 +31,7 @@ HOME = "/home/test"
 
 API_VERSION = "cilium.io/v1alpha1"
 KIND = "TracingPolicy"
-NAME_PREFIX = "sentinel-"
+NAME_PREFIX = "moat-"
 FAMILIES = {"cred", "pkg", "persist", "shell", "rootkit", "priv", "ai", "net", "exec"}
 
 # notes section 1: spec keys accepted by the CRD (parsed strictly).
@@ -111,15 +111,15 @@ RATE_LIMIT_SCOPES = {"thread", "process", "global"}
 DNS1123 = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
 
 REQUIRED_ANNOTATIONS = [
-    "sentinel.omarchy/severity",
-    "sentinel.omarchy/title",
-    "sentinel.omarchy/enforce",
-    "sentinel.omarchy/actions",
-    "sentinel.omarchy/why",
-    "sentinel.omarchy/expected",
-    "sentinel.omarchy/fp-hint",
+    "moat.omarchy/severity",
+    "moat.omarchy/title",
+    "moat.omarchy/enforce",
+    "moat.omarchy/actions",
+    "moat.omarchy/why",
+    "moat.omarchy/expected",
+    "moat.omarchy/fp-hint",
 ]
-OPTIONAL_ANNOTATIONS = ["sentinel.omarchy/rotate"]
+OPTIONAL_ANNOTATIONS = ["moat.omarchy/rotate"]
 SEVERITIES = {"critical", "high", "medium", "low"}
 ENFORCE = {"kill", "none"}
 FP_HINTS = {"exe", "exe+file", "rule", "parent"}
@@ -305,7 +305,7 @@ def check_policy(path, text):
         p.add(path, "metadata.name %r does not start with %r" % (name, NAME_PREFIX))
     if not DNS1123.match(name or ""):
         p.add(path, "metadata.name %r is not DNS-1123" % (name,))
-    expect = "sentinel-" + os.path.basename(path)[: -len(".yaml")]
+    expect = "moat-" + os.path.basename(path)[: -len(".yaml")]
     if name != expect:
         p.add(path, "metadata.name %r does not match the file name (expected %r)" % (name, expect))
     family = name[len(NAME_PREFIX):].split("-")[0]
@@ -319,15 +319,15 @@ def check_policy(path, text):
     for key in ann:
         if key not in REQUIRED_ANNOTATIONS + OPTIONAL_ANNOTATIONS:
             p.add(path, "unexpected annotation %s" % key)
-    sev = ann.get("sentinel.omarchy/severity")
+    sev = ann.get("moat.omarchy/severity")
     if sev not in SEVERITIES:
         p.add(path, "severity %r not in %s" % (sev, sorted(SEVERITIES)))
-    enf = ann.get("sentinel.omarchy/enforce")
+    enf = ann.get("moat.omarchy/enforce")
     if enf not in ENFORCE:
         p.add(path, "enforce %r not in %s" % (enf, sorted(ENFORCE)))
-    if ann.get("sentinel.omarchy/fp-hint") not in FP_HINTS:
-        p.add(path, "fp-hint %r not in %s" % (ann.get("sentinel.omarchy/fp-hint"), sorted(FP_HINTS)))
-    for a in str(ann.get("sentinel.omarchy/actions", "")).split(","):
+    if ann.get("moat.omarchy/fp-hint") not in FP_HINTS:
+        p.add(path, "fp-hint %r not in %s" % (ann.get("moat.omarchy/fp-hint"), sorted(FP_HINTS)))
+    for a in str(ann.get("moat.omarchy/actions", "")).split(","):
         if a.strip() and a.strip() not in UI_ACTIONS:
             p.add(path, "actions entry %r not in %s" % (a.strip(), sorted(UI_ACTIONS)))
 

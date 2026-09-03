@@ -1,10 +1,10 @@
-# sandbox/ — `sentinel-sandbox` and the PATH shims
+# sandbox/ — `moat-sandbox` and the PATH shims
 
 Package managers execute arbitrary code from strangers: npm lifecycle scripts,
 `setup.py`, `build.rs`, a PKGBUILD's `prepare()`. This directory makes that code
 run without seeing your credentials.
 
-`sentinel-sandbox` wraps a command in [bubblewrap](https://github.com/containers/bubblewrap)
+`moat-sandbox` wraps a command in [bubblewrap](https://github.com/containers/bubblewrap)
 so that:
 
 - the whole filesystem is **read-only**, except the project directory and the
@@ -23,17 +23,17 @@ Nothing here needs root. Everything here is user-level.
 
 | Source | Installed as |
 |---|---|
-| `sandbox/sentinel-sandbox` | `/usr/bin/sentinel-sandbox` (0755) |
-| `sandbox/shims/shim-common.sh` | `/usr/lib/sentinel/shims/shim-common.sh` (0644) |
-| `sandbox/shims/{npm,npx,pnpm,yarn,bun,pip,pip3,uv,cargo,makepkg}` | `/usr/lib/sentinel/shims/<name>` (0755) |
-| `sandbox/sandbox.conf` | `/etc/sentinel/sandbox.conf` (root:root 0644, `backup=` in the PKGBUILD) |
-| `sandbox/profile.d/sentinel-shims.sh` | `/etc/profile.d/sentinel-shims.sh` (0644) |
-| `sandbox/fish/conf.d/sentinel-shims.fish` | `/usr/share/fish/vendor_conf.d/sentinel-shims.fish` (0644) |
+| `sandbox/moat-sandbox` | `/usr/bin/moat-sandbox` (0755) |
+| `sandbox/shims/shim-common.sh` | `/usr/lib/moat/shims/shim-common.sh` (0644) |
+| `sandbox/shims/{npm,npx,pnpm,yarn,bun,pip,pip3,uv,cargo,makepkg}` | `/usr/lib/moat/shims/<name>` (0755) |
+| `sandbox/sandbox.conf` | `/etc/moat/sandbox.conf` (root:root 0644, `backup=` in the PKGBUILD) |
+| `sandbox/profile.d/moat-shims.sh` | `/etc/profile.d/moat-shims.sh` (0644) |
+| `sandbox/fish/conf.d/moat-shims.fish` | `/usr/share/fish/vendor_conf.d/moat-shims.fish` (0644) |
 
-The shims are only on `PATH` while `/etc/sentinel/sandbox.enabled` exists. The
-package does **not** create that file; `sentinelctl set sandbox on` (contract
+The shims are only on `PATH` while `/etc/moat/sandbox.enabled` exists. The
+package does **not** create that file; `moatctl set sandbox on` (contract
 section 5) does. New login shells pick it up; existing ones need a re-login or
-`export PATH=/usr/lib/sentinel/shims:$PATH`.
+`export PATH=/usr/lib/moat/shims:$PATH`.
 
 `bubblewrap` is a hard runtime dependency. `gum` is an optional dependency, used
 only for the `makepkg` prompt (a plain `read` prompt is the fallback).
@@ -41,19 +41,19 @@ only for the `makepkg` prompt (a plain `read` prompt is the fallback).
 ## Usage
 
 ```
-sentinel-sandbox [--allow PATH]... [--keep-env NAME]... [--dry-run]
+moat-sandbox [--allow PATH]... [--keep-env NAME]... [--dry-run]
                  [--force-new-session] -- cmd [args...]
 ```
 
 ```console
-$ sentinel-sandbox -- npm install
-[sentinel] sandboxed: npm install
+$ moat-sandbox -- npm install
+[moat] sandboxed: npm install
 
-$ sentinel-sandbox --dry-run -- pip install requests      # see the exact bwrap line
-$ sentinel-sandbox --allow ~/vendor -- cargo build        # one more writable path
-$ sentinel-sandbox --keep-env NPM_TOKEN -- npm publish    # keep one secret
-$ SENTINEL_SANDBOX=0 npm install                          # bypass everything
-$ SENTINEL_QUIET=1 sentinel-sandbox -- npm ci             # no notice line
+$ moat-sandbox --dry-run -- pip install requests      # see the exact bwrap line
+$ moat-sandbox --allow ~/vendor -- cargo build        # one more writable path
+$ moat-sandbox --keep-env NPM_TOKEN -- npm publish    # keep one secret
+$ MOAT_SANDBOX=0 npm install                          # bypass everything
+$ MOAT_QUIET=1 moat-sandbox -- npm ci             # no notice line
 ```
 
 The exit code is the command's own. `--dry-run` prints the `bwrap` invocation
@@ -69,7 +69,7 @@ process** — which you notice the first time you try to interrupt an
 
 Since Linux 6.2 that attack is gated behind `dev.tty.legacy_tiocsti`, which is
 `0` by default and compiled out entirely when `CONFIG_LEGACY_TIOCSTI` is unset
-(the Arch kernel does not set it). So `sentinel-sandbox` decides:
+(the Arch kernel does not set it). So `moat-sandbox` decides:
 
 | `/proc/sys/dev/tty/legacy_tiocsti` | `--new-session` |
 |---|---|
@@ -77,19 +77,19 @@ Since Linux 6.2 that attack is gated behind `dev.tty.legacy_tiocsti`, which is
 | reads `1` — injection possible | passed |
 | missing/unreadable — pre-6.2 kernel, always allows TIOCSTI | passed |
 
-`--force-new-session` passes it regardless. `SENTINEL_TIOCSTI_FILE` overrides
+`--force-new-session` passes it regardless. `MOAT_TIOCSTI_FILE` overrides
 the sysctl path and exists for the test suite; do not rely on it.
 
 Check what your machine does with `sysctl dev.tty.legacy_tiocsti` and
-`sentinel-sandbox --dry-run -- true`.
+`moat-sandbox --dry-run -- true`.
 
 ### Environment variables
 
 | Variable | Effect |
 |---|---|
-| `SENTINEL_SANDBOX=0` | `sentinel-sandbox` and every shim exec the real command directly. For the `makepkg` shim this also skips the `sentinel-scan-pkgbuild` gate — it is the single documented escape hatch, so it has to open all the way |
-| `SENTINEL_QUIET=1` | suppress the `[sentinel] …` notice and warnings on stderr |
-| `SENTINEL_SANDBOX_ACTIVE` | set to `1` **inside** the sandbox (`bwrap --setenv`). Do not set it yourself; it is how nested calls avoid a second, broken layer of bubblewrap. It deliberately does *not* skip the `makepkg` PKGBUILD scan: a nested `makepkg` is usually a different directory with a different PKGBUILD that the outer call never saw. **sentineld cannot see it**: `/etc/tetragon/tetragon.conf.d/filter-environment-variables` is `LD_PRELOAD`, so the export carries no other environment variable, and pkg-family alerts raised inside a sandbox cannot be down-ranked on that basis. See docs/INTEGRATION.md |
+| `MOAT_SANDBOX=0` | `moat-sandbox` and every shim exec the real command directly. For the `makepkg` shim this also skips the `moat-scan-pkgbuild` gate — it is the single documented escape hatch, so it has to open all the way |
+| `MOAT_QUIET=1` | suppress the `[moat] …` notice and warnings on stderr |
+| `MOAT_SANDBOX_ACTIVE` | set to `1` **inside** the sandbox (`bwrap --setenv`). Do not set it yourself; it is how nested calls avoid a second, broken layer of bubblewrap. It deliberately does *not* skip the `makepkg` PKGBUILD scan: a nested `makepkg` is usually a different directory with a different PKGBUILD that the outer call never saw. **moatd cannot see it**: `/etc/tetragon/tetragon.conf.d/filter-environment-variables` is `LD_PRELOAD`, so the export carries no other environment variable, and pkg-family alerts raised inside a sandbox cannot be down-ranked on that basis. See docs/INTEGRATION.md |
 
 ### What the sandbox looks like inside
 
@@ -107,7 +107,7 @@ Check what your machine does with `sysctl dev.tty.legacy_tiocsti` and
 --tmpfs <denied dirs>    ~/.ssh ~/.gnupg ~/.aws … (see sandbox.conf)
 --ro-bind-data <fd> <denied files>   ~/.netrc, ~/.git-credentials, …
 --unsetenv <secrets>     *_TOKEN *_SECRET *_KEY AWS_* GITHUB_TOKEN NPM_TOKEN
---setenv SENTINEL_SANDBOX_ACTIVE 1
+--setenv MOAT_SANDBOX_ACTIVE 1
 --chdir $PWD
 ```
 
@@ -125,22 +125,22 @@ skipped with a warning if it turns out to be `$HOME` or an ancestor of it —
 that is exactly what a bare dotfiles repo checked out over `$HOME` looks like,
 and binding it would hand the whole home directory to an install script.
 
-If `$PWD` is inside a denied path, `sentinel-sandbox` refuses to run rather
+If `$PWD` is inside a denied path, `moat-sandbox` refuses to run rather
 than quietly bind it:
 
 ```console
-$ cd ~/.ssh && sentinel-sandbox -- npm install
-[sentinel] sentinel-sandbox: refusing to run: the current directory /home/you/.ssh
+$ cd ~/.ssh && moat-sandbox -- npm install
+[moat] moat-sandbox: refusing to run: the current directory /home/you/.ssh
 is inside the denied path /home/you/.ssh
-Either cd elsewhere, or add 'allow=/home/you/.ssh' to ~/.config/sentinel/sandbox.conf.
+Either cd elsewhere, or add 'allow=/home/you/.ssh' to ~/.config/moat/sandbox.conf.
 ```
 
 ## Configuration
 
 Read in order, both optional, entries accumulate:
 
-1. `/etc/sentinel/sandbox.conf`
-2. `$XDG_CONFIG_HOME/sentinel/sandbox.conf` (i.e. `~/.config/sentinel/sandbox.conf`)
+1. `/etc/moat/sandbox.conf`
+2. `$XDG_CONFIG_HOME/moat/sandbox.conf` (i.e. `~/.config/moat/sandbox.conf`)
 
 ```conf
 # comments start with #
@@ -155,7 +155,7 @@ value that exactly matches a system `deny=` removes it — that is the only way 
 user can weaken the system policy, and it is deliberate: the sandbox is a
 convenience for the person running the build, not a boundary against them.
 
-The default deny list is compiled into `sentinel-sandbox` so it still applies
+The default deny list is compiled into `moat-sandbox` so it still applies
 with no config file at all; `sandbox.conf` restates it so the set is visible and
 so a line can be commented out or turned into an `allow=`.
 
@@ -176,7 +176,7 @@ or your GitHub token, but it is a real one.
 If you do not publish to or install from a private registry, close the hole:
 
 ```conf
-# ~/.config/sentinel/sandbox.conf
+# ~/.config/moat/sandbox.conf
 deny=~/.npmrc
 deny=~/.pypirc
 ```
@@ -185,18 +185,18 @@ Better still, keep registry tokens out of the file entirely and use a
 short-lived one in the environment only when publishing:
 
 ```console
-$ NPM_TOKEN=$(op read op://dev/npm/token) sentinel-sandbox --keep-env NPM_TOKEN -- npm publish
+$ NPM_TOKEN=$(op read op://dev/npm/token) moat-sandbox --keep-env NPM_TOKEN -- npm publish
 ```
 
 ## The shims
 
-`/usr/lib/sentinel/shims/<name>` is a small bash script that:
+`/usr/lib/moat/shims/<name>` is a small bash script that:
 
 1. works out its own directory from `$0`;
 2. removes that directory from `PATH` — every entry that *resolves* to it, so a
    symlinked shim dir goes too;
 3. resolves the real binary with `command -v` under the reduced `PATH`;
-4. execs `sentinel-sandbox -- <real> "$@"`.
+4. execs `moat-sandbox -- <real> "$@"`.
 
 Because resolution happens after step 2, mise keeps working: on a machine where
 `node`/`npm` come from `~/.local/share/mise/shims`, the shim finds the mise
@@ -205,11 +205,11 @@ shim, mise re-execs the real npm inside the sandbox, and
 `npm install left-pad`.
 
 A shim that resolves back to its own directory, or finds nothing, exits **127**
-with a message instead of looping. Inside the sandbox `SENTINEL_SANDBOX_ACTIVE=1`
+with a message instead of looping. Inside the sandbox `MOAT_SANDBOX_ACTIVE=1`
 is set and the shims exec the real binary directly, so a package manager that
 calls another package manager by name does not try to nest bubblewrap.
 
-If `sentinel-sandbox` is not on `PATH`, a shim warns and runs the command
+If `moat-sandbox` is not on `PATH`, a shim warns and runs the command
 unsandboxed rather than breaking your toolchain.
 
 ### `cargo` is only sandboxed for some subcommands
@@ -229,7 +229,7 @@ editor integrations, and protects nothing.
 
 ### `makepkg` scans first
 
-The `makepkg` shim runs `sentinel-scan-pkgbuild .` (scanner/, contract section 9)
+The `makepkg` shim runs `moat-scan-pkgbuild .` (scanner/, contract section 9)
 before doing anything:
 
 | Scanner exit | Shim behaviour |
@@ -250,7 +250,7 @@ the scan is skipped and `makepkg` reports the problem itself.
   binaries do not elevate. `makepkg -s` (install dependencies) and `makepkg -i`
   (install the result) both call `pacman` through `sudo` and will fail. Install
   the dependencies first and build with `-d`/`--nodeps`, install the resulting
-  package yourself afterwards, or run `SENTINEL_SANDBOX=0 makepkg -si`.
+  package yourself afterwards, or run `MOAT_SANDBOX=0 makepkg -si`.
 - **Output paths.** `$PWD` is writable, which covers the defaults: `srcdir`,
   `pkgdir`, `SRCDEST`, `PKGDEST`, `SRCPKGDEST` and `LOGDEST` all default to the
   build directory. If `makepkg.conf` points any of them elsewhere, the shim
@@ -271,7 +271,7 @@ the scan is skipped and `makepkg` reports the problem itself.
 The sandbox is damage limitation, not containment. Specifically:
 
 - **The network is open.** By design: installs need it. Anything a build can
-  read, it can exfiltrate. `sentinel-x-pkg-egress` (sentineld, contract 6.4) is
+  read, it can exfiltrate. `moat-x-pkg-egress` (moatd, contract 6.4) is
   what watches for that, not this.
 - **The project directory is writable.** A compromised dependency can backdoor
   the code you are about to run, commit, or publish. It cannot touch
@@ -289,7 +289,7 @@ The sandbox is damage limitation, not containment. Specifically:
   subdirectories. Anything that keeps a token in `~/.cache` is exposed. Add a
   `deny=` for it.
 - **First run creates empty cache directories.** bubblewrap requires a bind
-  source to exist, so `sentinel-sandbox` creates any missing cache directory
+  source to exist, so `moat-sandbox` creates any missing cache directory
   from the list above — you will see an empty `~/.bun`, `~/.yarn`, `~/.rustup`
   and `~/.cargo/{registry,git}` even if you never use those tools. Cosmetic,
   but surprising.
@@ -308,7 +308,7 @@ The sandbox is damage limitation, not containment. Specifically:
   hardcoded path, or anything invoked from a non-login shell that never read
   `/etc/profile.d` all bypass them. Real coverage of "npm ran and touched a
   secret" comes from the Tetragon policies, not from here.
-- **A user can turn it off.** `SENTINEL_SANDBOX=0`, or just calling the real
+- **A user can turn it off.** `MOAT_SANDBOX=0`, or just calling the real
   binary. This protects you from your dependencies, not from yourself.
 
 ## Tests
@@ -334,8 +334,8 @@ the `--new-session` decision for `legacy_tiocsti` 0 / 1 / missing plus
 on the test machine's kernel), shim resolution with the shim dir duplicated in
 `PATH`, the no-real-binary and
 no-recursion paths, `cargo` pass-through vs sandboxed subcommands, all three
-`makepkg` scanner outcomes, `SENTINEL_SANDBOX=0`, `SENTINEL_SANDBOX_ACTIVE=1`,
-exit-code propagation, the notice line, `SENTINEL_QUIET`, refusing a denied
+`makepkg` scanner outcomes, `MOAT_SANDBOX=0`, `MOAT_SANDBOX_ACTIVE=1`,
+exit-code propagation, the notice line, `MOAT_QUIET`, refusing a denied
 `$PWD`, `$PWD == $HOME`, and mise-provided `node` running inside the sandbox.
 
 `shellcheck -x` over every script (and `-s sh` over the profile.d snippet) runs

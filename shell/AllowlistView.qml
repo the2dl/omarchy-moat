@@ -3,8 +3,8 @@ import qs.Commons
 import qs.Ui
 
 // The Allowlist tab: every [[rule]] block the user has added to
-// /etc/sentinel/allowlist.d/user.toml through the "if this is expected" flow,
-// with the comment sentineld stamped on it and a Remove button.
+// /etc/moat/allowlist.d/user.toml through the "if this is expected" flow,
+// with the comment moatd stamped on it and a Remove button.
 //
 // The index is the handle CONTRACT 5's `unignore` takes, so it is displayed and
 // passed through exactly as the daemon reported it. Renumbering client-side

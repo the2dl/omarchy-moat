@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.the2dl.sentinel",
-  "name": "Sentinel",
+  "id": "io.github.the2dl.moat",
+  "name": "Moat",
   "version": "0.1.0",
   "author": "the2dl",
   "license": "MIT",
@@ -18,11 +18,11 @@
     "panel": "shell/Panel.qml"
   },
   "barWidget": {
-    "displayName": "Sentinel",
+    "displayName": "Moat",
     "description": "Shield glyph showing unacknowledged runtime security alerts. Click to open the alert panel.",
     "category": "System",
     "aliases": [
-      "sentinel",
+      "moat",
       "security",
       "tetragon"
     ],
@@ -55,7 +55,7 @@
         "max": 60,
         "step": 5,
         "defaultValue": 10,
-        "description": "How often sentinelctl status is polled for mode, tetragon state, policies and feed age."
+        "description": "How often moatctl status is polled for mode, tetragon state, policies and feed age."
       },
       {
         "key": "showCountBadge",

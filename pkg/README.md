@@ -1,16 +1,16 @@
-# pkg/ — the `omarchy-sentinel` Arch package
+# pkg/ — the `omarchy-moat` Arch package
 
-One `pacman` package holds everything the system half of Sentinel needs: the
-upstream Tetragon v1.7.1 sensor, our policy templates, `sentineld` and its
+One `pacman` package holds everything the system half of Moat needs: the
+upstream Tetragon v1.7.1 sensor, our policy templates, `moatd` and its
 units, the bubblewrap sandbox with its shims, and the PKGBUILD scanner. The
 omarchy-shell plugin is **not** in here — see "Package vs plugin" below.
 
 ```
 pkg/
 ├── PKGBUILD                  package recipe (version 0.1.0, x86_64)
-├── omarchy-sentinel.install  post_install / post_upgrade / pre_remove notices
+├── omarchy-moat.install  post_install / post_upgrade / pre_remove notices
 ├── LICENSE.MIT               our licence, shipped as /usr/share/licenses/…/LICENSE
-├── scanner-allow.conf        /etc/sentinel/scanner-allow.conf (commented example)
+├── scanner-allow.conf        /etc/moat/scanner-allow.conf (commented example)
 ├── .gitignore                makepkg's src/, pkg/ and fetched sources
 └── README.md                 this file
 ```
@@ -18,7 +18,7 @@ pkg/
 ## Build
 
 **Run `makepkg` from inside `pkg/`.** makepkg has no source type for a sibling
-directory of the PKGBUILD (`../sentineld` is not a valid `source=()` entry), so
+directory of the PKGBUILD (`../moatd` is not a valid `source=()` entry), so
 `prepare()` copies the components out of the repository working tree via
 `$startdir/..` — the usual pattern for a PKGBUILD that lives inside the repo it
 packages. That makes the working directory load-bearing; `prepare()` aborts with
@@ -29,7 +29,7 @@ cd pkg
 makepkg -f
 ```
 
-Result: `omarchy-sentinel-0.1.0-1-x86_64.pkg.tar.zst` (~75 MB compressed,
+Result: `omarchy-moat-0.1.0-1-x86_64.pkg.tar.zst` (~75 MB compressed,
 ~284 MB installed — most of it is Tetragon's 94 CO-RE BPF objects and the two
 Go binaries).
 
@@ -39,7 +39,7 @@ What the build does:
 |---|---|
 | download | the upstream Tetragon tarball, pinned to the sha256 published next to the release as `tetragon-v1.7.1-amd64.tar.gz.sha256sum` (never `SKIP`), plus Tetragon's `LICENSE` and `bpf/LICENSE.GPL-2.0` at tag `v1.7.1` |
 | `prepare()` | copy the working tree into `$srcdir`, drop any developer `target/`, `cargo fetch --locked` |
-| `build()` | `cargo build --release --locked` in the copied `sentineld/` (`Cargo.lock` is committed, so `--locked` is meaningful) |
+| `build()` | `cargo build --release --locked` in the copied `moatd/` (`Cargo.lock` is committed, so `--locked` is meaningful) |
 | `check()` | `cargo test --release --locked` · `python3 policies/check.py policies` · `python3 -m unittest discover tests` in `scanner/` · `bash sandbox/tests/run.sh` |
 | `package()` | install exactly the layout in `docs/CONTRACT.md` §2 |
 
@@ -64,46 +64,46 @@ tarball.
 ## Install
 
 ```bash
-sudo pacman -U omarchy-sentinel-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U omarchy-moat-0.1.0-1-x86_64.pkg.tar.zst
 ```
 
-pacman's own alpm hooks run `systemd-sysusers` (creating the `sentinel` group)
-and `systemd-tmpfiles --create` (creating `/var/lib/sentinel`,
-`/var/log/sentinel`, `/run/sentinel`, `/run/sentinel/policies` and the
+pacman's own alpm hooks run `systemd-sysusers` (creating the `moat` group)
+and `systemd-tmpfiles --create` (creating `/var/lib/moat`,
+`/var/log/moat`, `/run/moat`, `/run/moat/policies` and the
 quarantine dir), then reload the systemd manager. The `.install` file does not
 duplicate any of that, and it never enables or starts a unit.
 
 ## Enable
 
 ```bash
-sudo systemctl enable --now tetragon sentineld sentinel-feeds.timer
-sudo usermod -aG sentinel $USER
+sudo systemctl enable --now tetragon moatd moat-feeds.timer
+sudo usermod -aG moat $USER
 # log out and back in — a new group only reaches a fresh session
-omarchy plugin add https://github.com/the2dl/omarchy-sentinel --enable
-sentinelctl status
+omarchy plugin add https://github.com/the2dl/omarchy-moat --enable
+moatctl status
 ```
 
-Sentinel starts in **monitor** mode: it alerts, it never kills.
-`sentinelctl set mode enforce` switches it. The bubblewrap shims are off until
-`sentinelctl set sandbox on` creates `/etc/sentinel/sandbox.enabled`; the
+Moat starts in **monitor** mode: it alerts, it never kills.
+`moatctl set mode enforce` switches it. The bubblewrap shims are off until
+`moatctl set sandbox on` creates `/etc/moat/sandbox.enabled`; the
 `/etc/profile.d` and fish snippets are no-ops until then, and they only take
 effect in a new login shell.
 
 ## Uninstall
 
 ```bash
-sudo systemctl disable --now tetragon sentineld sentinel-feeds.timer
-sudo pacman -Rns omarchy-sentinel
+sudo systemctl disable --now tetragon moatd moat-feeds.timer
+sudo pacman -Rns omarchy-moat
 ```
 
 `pacman -Rns` leaves behind, on purpose:
 
-* `/var/lib/sentinel` (alerts, quarantine, feeds) and `/var/log/sentinel` — the
+* `/var/lib/moat` (alerts, quarantine, feeds) and `/var/log/moat` — the
   evidence trail outlives the package; delete by hand when you want it gone.
-* modified `backup=()` files under `/etc/sentinel` and `/etc/tetragon`, saved as
+* modified `backup=()` files under `/etc/moat` and `/etc/tetragon`, saved as
   `.pacsave`.
 
-`/run/sentinel` is tmpfs and disappears on reboot regardless.
+`/run/moat` is tmpfs and disappears on reboot regardless.
 
 ## Package vs plugin
 
@@ -111,19 +111,19 @@ They are two halves and they install through different channels.
 
 | | package | plugin |
 |---|---|---|
-| what | Tetragon, policies, `sentineld`, sandbox, scanner | the omarchy-shell bar widget and panel (`shell/`, `manifest.json`) |
+| what | Tetragon, policies, `moatd`, sandbox, scanner | the omarchy-shell bar widget and panel (`shell/`, `manifest.json`) |
 | installed by | `pacman -U` | `omarchy plugin add <repo-url> --enable` |
-| runs as | root (`tetragon`, `sentineld`) | your user, inside omarchy-shell |
-| talks over | — | `/run/sentinel/control.sock` + `/var/lib/sentinel/alerts.jsonl` |
+| runs as | root (`tetragon`, `moatd`) | your user, inside omarchy-shell |
+| talks over | — | `/run/moat/control.sock` + `/var/lib/moat/alerts.jsonl` |
 
 The plugin is deliberately **not** packaged: omarchy-shell manages plugins
 itself, out of a git checkout, and hot-reloads them. The package is what gives
 the plugin something to talk to. Without the package the plugin shows its setup
-screen; without the plugin the package is fully usable from `sentinelctl`.
+screen; without the plugin the package is fully usable from `moatctl`.
 
 The bridge between them is group membership. Both the socket
-(`/run/sentinel/control.sock`, 0660) and `alerts.jsonl` (0640) are
-`root:sentinel`, so a user not in the `sentinel` group sees a grey shield and a
+(`/run/moat/control.sock`, 0660) and `alerts.jsonl` (0640) are
+`root:moat`, so a user not in the `moat` group sees a grey shield and a
 setup hint no matter how healthy the daemon is.
 
 ## The upgrade caveat
@@ -134,14 +134,14 @@ match either. So an upgrade that adds, removes or edits a policy changes nothing
 until you restart the sensor:
 
 ```bash
-sudo systemctl restart tetragon sentineld
+sudo systemctl restart tetragon moatd
 ```
 
 `post_upgrade` prints this and stops there — restarting the sensor for you would
 tear down every loaded BPF program mid-`pacman`, which is exactly the moment you
 least want the machine unwatched. Restarting `tetragon.service` re-runs
-`ExecStartPre=/usr/bin/sentineld render-policies`, which re-expands `{{HOME}}`
-into `/run/sentinel/policies` and regenerates
+`ExecStartPre=/usr/bin/moatd render-policies`, which re-expands `{{HOME}}`
+into `/run/moat/policies` and regenerates
 `/etc/tetragon/tetragon.conf.d/export-allowlist` with the exact policy names.
 
 Two consequences worth knowing:
@@ -151,7 +151,7 @@ Two consequences worth knowing:
   in this version, so normally there is no drift — but after an upgrade that
   changes the policy set, expect a `.pacnew` and ignore it: the next
   `tetragon` start overwrites the live file correctly either way.
-* `sentineld` loads `sentinel.toml`, the policy annotations and `allowlist.d`
-  at start. `systemctl reload sentineld` (SIGHUP) re-reads all three without
+* `moatd` loads `moat.toml`, the policy annotations and `allowlist.d`
+  at start. `systemctl reload moatd` (SIGHUP) re-reads all three without
   dropping the process table; a full restart is only needed when the binary
   itself changed.

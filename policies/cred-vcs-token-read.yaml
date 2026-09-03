@@ -1,21 +1,21 @@
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: sentinel-cred-vcs-token-read
+  name: moat-cred-vcs-token-read
   annotations:
-    sentinel.omarchy/severity: "high"
-    sentinel.omarchy/title: "Git forge token or .netrc read by an unexpected program"
-    sentinel.omarchy/rotate: "github-token,git-credentials"
-    sentinel.omarchy/enforce: "none"
-    sentinel.omarchy/actions: "kill,quarantine,ignore"
-    sentinel.omarchy/why: >-
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "Git forge token or .netrc read by an unexpected program"
+    moat.omarchy/rotate: "github-token,git-credentials"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,quarantine,ignore"
+    moat.omarchy/why: >-
       A GitHub token in gh's hosts.yml, ~/.git-credentials or ~/.netrc lets an attacker
       push to every repository you can push to; supply-chain worms use exactly this to
       spread from one developer to their organisation.
-    sentinel.omarchy/expected: >-
+    moat.omarchy/expected: >-
       git and its credential helpers, gh, glab, curl invocations you started yourself
       that use .netrc, and IDE git plugins.
-    sentinel.omarchy/fp-hint: "exe"
+    moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"

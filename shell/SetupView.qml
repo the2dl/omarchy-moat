@@ -3,7 +3,7 @@ import qs.Commons
 import qs.Ui
 
 // Shown instead of the alert list whenever the plugin cannot see the truth:
-// the package is not installed, or this session is not in the `sentinel` group
+// the package is not installed, or this session is not in the `moat` group
 // (CONTRACT 2). Both cases would otherwise render as an empty alert list, which
 // reads as "all clear" — the one thing a security panel must never say when it
 // is blind.
@@ -38,7 +38,7 @@ Item {
 
       Text {
         width: parent.width
-        text: root.needsPackage ? "Sentinel is not installed" : "You are not in the sentinel group"
+        text: root.needsPackage ? "Moat is not installed" : "You are not in the moat group"
         color: root.foreground
         font.family: Style.font.family
         font.pixelSize: Style.font.heading
@@ -49,8 +49,8 @@ Item {
       Text {
         width: parent.width
         text: root.needsPackage
-          ? "The omarchy-sentinel package provides Tetragon, the policies, and the sentineld daemon. Until it is installed and its services are running there is nothing to monitor."
-          : "The control socket (/run/sentinel/control.sock) and the alert log (/var/lib/sentinel/alerts.jsonl) are both group-readable by `sentinel` only. Without that membership this panel cannot read alerts or act on them."
+          ? "The omarchy-moat package provides Tetragon, the policies, and the moatd daemon. Until it is installed and its services are running there is nothing to monitor."
+          : "The control socket (/run/moat/control.sock) and the alert log (/var/lib/moat/alerts.jsonl) are both group-readable by `moat` only. Without that membership this panel cannot read alerts or act on them."
         color: root.mutedForeground
         font.family: Style.font.family
         font.pixelSize: Style.font.body

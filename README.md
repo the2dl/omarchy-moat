@@ -1,4 +1,4 @@
-# omarchy-sentinel
+# omarchy-moat
 
 Developer-workstation EDR for Omarchy. Tetragon (eBPF, upstream, unmodified) as the
 kernel sensor, a Rust companion daemon for correlation and response, prevention
@@ -11,11 +11,11 @@ Root compromise is out of scope for enforcement; it is detected best-effort.
 
 Layout:
 
-    manifest.json   omarchy-shell plugin manifest (plugin id io.github.the2dl.sentinel)
+    manifest.json   omarchy-shell plugin manifest (plugin id io.github.the2dl.moat)
     shell/          QML: Service, bar widget, panel
-    pkg/            PKGBUILD for the system package `omarchy-sentinel`
+    pkg/            PKGBUILD for the system package `omarchy-moat`
     policies/       Tetragon TracingPolicy YAML (the detection rules)
-    sentineld/      Rust: sentineld (daemon) + sentinelctl (client) + sentinel-feeds
+    moatd/      Rust: moatd (daemon) + moatctl (client) + moat-feeds
     sandbox/        bubblewrap sandbox wrapper + PATH shims for npm/pip/cargo/makepkg
     scanner/        PKGBUILD / .install static scanner
     docs/           CONTRACT.md is the interface spec every component builds against
