@@ -195,9 +195,11 @@ Item {
   // --------------------------------------------------------- capability probe
   //
   // One bash call answers both halves of the setup screen: is the package
-  // installed, and is this session in the moat group. `id -nG` reflects the
-  // session's credentials, which is exactly the question — a usermod without a
-  // re-login must still read as "not yet".
+  // installed, and can this session reach the daemon. Access is what matters,
+  // not how it was granted: group membership after a re-login, or an ACL on
+  // the socket and the alerts file (the no-logout path), both count. `test -w`
+  // and `test -r` honour ACLs, so a usermod without a re-login and without ACLs
+  // still reads as "not yet".
   function probe() {
     if (probeProc.running) return
     probeProc.running = true
@@ -209,7 +211,9 @@ Item {
     id: probeProc
     command: ["bash", "-c",
       "if [ -x /usr/bin/moatctl ]; then a=true; else a=false; fi; " +
-      "if id -nG 2>/dev/null | tr ' ' '\\n' | grep -qx moat; then g=true; else g=false; fi; " +
+      "if id -nG 2>/dev/null | tr ' ' '\\n' | grep -qx moat; then g=true; " +
+      "elif [ -w /run/moat/control.sock ] && [ -r /var/lib/moat/alerts.jsonl ]; then g=true; " +
+      "else g=false; fi; " +
       "printf '{\"available\":%s,\"group\":%s}\\n' \"$a\" \"$g\""]
     stdout: StdioCollector { id: probeStdout; waitForEnd: true; onStreamFinished: root._probeOutput = text }
     onExited: function(exitCode) {
