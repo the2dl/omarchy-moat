@@ -50,6 +50,13 @@ function notifyUrgency(severity) {
 function widgetState(view) {
   var v = view || {}
   if (!v.available || !v.groupOk || !v.daemonOk) return "grey"
+  // A sensor that is not loaded outranks every alert count, because the alert
+  // counts are exactly what stops being trustworthy when it dies. On
+  // 2026-09-03 Tetragon crash-looped for 25 minutes with zero policies in the
+  // kernel; nothing here looked at that, so a quiet machine would have shown a
+  // green shield over no protection at all. Silence from a dead sensor is the
+  // most dangerous kind of quiet there is.
+  if (v.sensorUnhealthy) return "red"
   var unacked = v.unacked || {}
   if ((unacked.critical || 0) > 0 || (unacked.high || 0) > 0) return "red"
   if ((unacked.medium || 0) > 0) return "amber"
@@ -1702,6 +1709,11 @@ function normalizeStatus(raw) {
     mode: String(s.mode || "unknown"),
     tetragon: String(s.tetragon || "unknown"),
     policies: Number(s.policies || 0),
+    // How many of those the kernel is actually running. null when moatd could
+    // not read bpffs, which is "cannot tell", not "none".
+    sensorsLoaded: (s.sensors_loaded === null || s.sensors_loaded === undefined)
+      ? null : Number(s.sensors_loaded),
+    sensorUnhealthy: s.sensor_unhealthy === true,
     policies_failed: Array.isArray(s.policies_failed) ? s.policies_failed.slice() : [],
     feeds: {
       updated: String(feeds.updated || ""),

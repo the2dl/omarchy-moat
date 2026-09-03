@@ -621,7 +621,50 @@ exe = "/usr/bin/gnome-keyring-daemon"
             rules: Allowlist::load_file(&p).unwrap(),
             ..Default::default()
         };
-        assert_eq!(al.len(), 4, "two rules x two exe globs, nothing else");
+        assert_eq!(
+            al.len(),
+            5,
+            "two test-suite rules x two exe globs, plus the omarchy-shell plugin \
+             exec entry — nothing else"
+        );
+
+        // omarchy-shell running its own plugins' helper scripts. Scoped to that
+        // actor and that tree: everything else executing from there still fires,
+        // and quickshell executing from anywhere else still fires.
+        let plugin = "/home/dan/.config/omarchy/plugins/io.github.x.thing/scripts/config";
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-exec-untrusted-home",
+                exe: "/usr/bin/quickshell",
+                file: Some(plugin),
+                parents: vec!["/usr/bin/quickshell".to_string()],
+            })
+            .is_some(),
+            "the shell running its own plugin helper"
+        );
+        for (exe, file) in [
+            // Someone else executing out of the plugins tree is the actual threat.
+            ("/usr/bin/bash", plugin),
+            ("/home/dan/.cache/dropper", plugin),
+            // The shell executing something outside the plugins tree.
+            ("/usr/bin/quickshell", "/home/dan/.cache/evil"),
+            ("/usr/bin/quickshell", "/tmp/evil"),
+            // Adjacent path that only looks like the plugins tree.
+            ("/usr/bin/quickshell", "/home/dan/.config/omarchy-plugins-evil/x"),
+        ] {
+            assert!(
+                al.find(&Candidate {
+                    rule: "moat-exec-untrusted-home",
+                    exe,
+                    file: Some(file),
+                    parents: vec!["/usr/bin/quickshell".to_string()],
+                })
+                .is_none(),
+                "must still alert: {} executing {}",
+                exe,
+                file
+            );
+        }
 
         let parent = "/home/dan/Projects/omarchy-moat/moatd/target/debug/deps/moatd-16a3beb0";
         // The two rules the paragraph names, for both globs.

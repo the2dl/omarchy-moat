@@ -32,8 +32,13 @@ pub struct Paths {
     pub allowlist_dir: PathBuf,
     /// Presence of this file turns the PATH shims on.
     pub sandbox_flag: PathBuf,
-    /// Tetragon's gRPC unix socket; its presence is the liveness check.
+    /// Tetragon's gRPC unix socket. Its presence is NOT a liveness check: the
+    /// file outlives the process, so it reads "up" throughout a crash loop.
     pub tetragon_socket: PathBuf,
+    /// Where Tetragon pins one directory per loaded TracingPolicy. Counting
+    /// them is the only honest answer to "is the sensor actually loaded",
+    /// because it asks the kernel instead of asking systemd or a stat().
+    pub tetragon_bpf_dir: PathBuf,
     /// `tetra` CLI, used only for `tp set-mode`.
     pub tetra: PathBuf,
     /// `moat-feeds` binary, spawned by `feeds refresh`.
@@ -60,6 +65,7 @@ impl Default for Paths {
             allowlist_dir: d("/etc/moat/allowlist.d"),
             sandbox_flag: d("/etc/moat/sandbox.enabled"),
             tetragon_socket: d("/run/tetragon/tetragon.sock"),
+            tetragon_bpf_dir: d("/sys/fs/bpf/tetragon"),
             tetra: d("/usr/bin/tetra"),
             feeds_bin: d("/usr/bin/moat-feeds"),
             passwd: d("/etc/passwd"),

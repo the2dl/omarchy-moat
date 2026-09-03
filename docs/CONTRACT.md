@@ -234,10 +234,28 @@ use moatd to kill or move something the sensor did not already flag.
 `status` response:
 ```json
 {"ok":true,"version":"0.1.0","mode":"monitor","tetragon":"running","policies":32,
+ "sensors_loaded":32,"sensor_unhealthy":false,
  "policies_failed":[],"feeds":{"updated":"...","hashes":123456,"domains":5432},
  "unacked":{"critical":0,"high":2,"medium":5,"low":11},"sandbox":false,
  "socket_group":"moat"}
 ```
+
+`tetragon` is one of `running`, `degraded <n>/<m>`, `down`, `stale`, `stopped`
+or `unverified`, and `sensor_unhealthy` is true for every value except
+`running` and `unverified`. `sensors_loaded` counts the directories Tetragon
+pins under `/sys/fs/bpf/tetragon`, one per loaded TracingPolicy — what the
+kernel is running, as opposed to `policies`, which is what is on disk.
+`sensors_loaded` is `null` when moatd cannot read bpffs, which is "cannot
+tell" and not "none"; that is the `unverified` state, and it must not be
+rendered as an outage.
+
+Consumers must treat `sensor_unhealthy` as outranking the alert counts. A
+sensor that is not loaded raises nothing, so `unacked` all-zero next to an
+unhealthy sensor is the most dangerous shape a status response can take, not
+the safest. This is not hypothetical: on 2026-09-03 Tetragon crash-looped for
+25 minutes with zero policies loaded while `tetragon` read `running`, because
+the liveness check was the gRPC socket file's existence and the export log's
+mtime — and a crash loop keeps both fresh.
 
 Two corrections to that example, made by the integration review rather than
 guessed at: `policies` is 32, the number of templates in `policies/` after the

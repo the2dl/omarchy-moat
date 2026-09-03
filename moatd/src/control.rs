@@ -94,7 +94,7 @@ pub fn dispatch(d: &mut Daemon, req: &Value) -> Value {
             Some(a) => ok(json!({ "alert": a })),
             None => err(format!("no alert {}", id())),
         },
-        "ack" => cmd_ack(d, &id()),
+        "ack" => cmd_ack(d, req, &id()),
         "kill" => cmd_kill(d, &id()),
         "quarantine" => cmd_quarantine(d, &id()),
         "ignore" => cmd_ignore(d, req, &id()),
@@ -214,7 +214,37 @@ fn cmd_digest(d: &mut Daemon, req: &Value) -> Value {
     }
 }
 
-fn cmd_ack(d: &mut Daemon, id: &str) -> Value {
+fn cmd_ack(d: &mut Daemon, req: &Value, id: &str) -> Value {
+    // Bulk ack. Retuning the rule set leaves a backlog of alerts about rules
+    // that no longer exist — 1623 of them after the 2026-09-03 retune — and
+    // acking those one id at a time is not a thing anyone will do, so the
+    // backlog just sits there hiding real alerts and poisoning the learning
+    // window. `rule` and `before` are the two cuts that matter: "this rule was
+    // wrong" and "everything up to the point I fixed it".
+    let rule = req["rule"].as_str().unwrap_or("");
+    let before = req["before"].as_str().unwrap_or("");
+    let all = req["all"] == Value::Bool(true);
+    if all || !rule.is_empty() || !before.is_empty() {
+        let targets: Vec<String> = d
+            .store
+            .load()
+            .into_iter()
+            .filter(|a| !a.acked)
+            .filter(|a| rule.is_empty() || a.rule == rule)
+            // Ids are monotonic, so an id comparison is a time comparison.
+            .filter(|a| before.is_empty() || a.id.as_str() < before)
+            .map(|a| a.id)
+            .collect();
+        let mut acked = 0usize;
+        let mut failed = Vec::new();
+        for id in &targets {
+            match d.mark(id, "acked", Value::Bool(true)) {
+                Ok(()) => acked += 1,
+                Err(e) => failed.push(format!("{}: {}", id, e)),
+            }
+        }
+        return ok(json!({ "acked": acked, "matched": targets.len(), "failed": failed }));
+    }
     if d.find_alert(id).is_none() {
         return err(format!("no alert {}", id));
     }
@@ -745,13 +775,133 @@ fn feeds_binary(configured: &Path) -> PathBuf {
     configured.to_path_buf()
 }
 
+/// What the `moat` group looks like from where this process is standing.
+///
+/// EACCES on the control socket has three different causes that need three
+/// different fixes, and they are indistinguishable from the errno alone.
+/// Telling someone to run `usermod` when they are already in the group sends
+/// them round a loop that cannot terminate — the command succeeds, changes
+/// nothing, and the socket still says no.
+#[derive(Debug, PartialEq)]
+pub enum GroupState {
+    /// No `moat` line in /etc/group: the package is not fully installed.
+    NoSuchGroup,
+    /// The user is not listed as a member.
+    NotAMember,
+    /// Listed as a member, but this process does not carry the gid. Group
+    /// membership is resolved once, at login, so a session that started before
+    /// the `usermod` never picks it up — and neither does a new shell inside it.
+    StaleSession,
+    /// Member, and the gid is live in this process. Something else is wrong.
+    Member,
+}
+
+pub fn group_state(members: Option<(u32, Vec<String>)>, user: &str, gids: &[u32]) -> GroupState {
+    let Some((gid, members)) = members else {
+        return GroupState::NoSuchGroup;
+    };
+    if gids.contains(&gid) {
+        return GroupState::Member;
+    }
+    if members.iter().any(|m| m == user) {
+        GroupState::StaleSession
+    } else {
+        GroupState::NotAMember
+    }
+}
+
+/// The advice that goes with each state. `sock` is quoted so the reader can see
+/// which socket was refused when a non-default one is configured.
+pub fn permission_denied_help(sock: &str, state: GroupState) -> String {
+    match state {
+        GroupState::NoSuchGroup => format!(
+            "permission denied on {sock}.\nThere is no `moat` group on this system, so the \
+             package is not fully installed.\nReinstall it:\n  sudo pacman -S omarchy-moat"
+        ),
+        GroupState::NotAMember => format!(
+            "permission denied on {sock}.\nYou are not in the `moat` group. Run:\n  \
+             sudo usermod -aG moat $USER\nthen log out and back in (a new shell is not enough)."
+        ),
+        GroupState::StaleSession => format!(
+            "permission denied on {sock}.\nYou are already in the `moat` group — running \
+             `usermod` again will not help.\nThis login session started before you were added, \
+             and a session resolves its groups once, at login.\nLog out and back in; a new shell \
+             inside this session is not enough.\nTo get a shell that has it right now, without \
+             logging out:\n  newgrp moat"
+        ),
+        GroupState::Member => format!(
+            "permission denied on {sock}, and the `moat` group is not the reason: you are a \
+             member and this session carries it.\nSo the socket's own permissions are wrong. \
+             moatd recreates it 0660 root:moat every start:\n  ls -l {sock}\n  \
+             sudo systemctl restart moatd"
+        ),
+    }
+}
+
+/// `moat:x:960:dan,other` -> `(960, ["dan", "other"])`.
+fn moat_group(group_file: &Path) -> Option<(u32, Vec<String>)> {
+    let text = std::fs::read_to_string(group_file).ok()?;
+    for line in text.lines() {
+        let mut f = line.split(':');
+        if f.next()? != "moat" {
+            continue;
+        }
+        let _passwd = f.next()?;
+        let gid: u32 = f.next()?.parse().ok()?;
+        let members = f
+            .next()
+            .unwrap_or("")
+            .split(',')
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .collect();
+        return Some((gid, members));
+    }
+    None
+}
+
+/// The login name for this uid, from the passwd database. `$USER` is not used:
+/// it is inherited and can name someone else entirely after `su`.
+fn current_user(passwd_file: &Path) -> String {
+    let uid = unsafe { libc::getuid() };
+    let Ok(text) = std::fs::read_to_string(passwd_file) else {
+        return String::new();
+    };
+    for line in text.lines() {
+        let f: Vec<&str> = line.split(':').collect();
+        if f.len() > 2 && f[2].parse::<libc::uid_t>() == Ok(uid) {
+            return f[0].to_string();
+        }
+    }
+    String::new()
+}
+
+/// Every gid this process carries: the supplementary list plus real and
+/// effective, which `getgroups` does not promise to include.
+fn current_gids() -> Vec<u32> {
+    let mut gids = unsafe { vec![libc::getgid() as u32, libc::getegid() as u32] };
+    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if n > 0 {
+        let mut buf = vec![0 as libc::gid_t; n as usize];
+        let got = unsafe { libc::getgroups(n, buf.as_mut_ptr()) };
+        if got > 0 {
+            buf.truncate(got as usize);
+            gids.extend(buf.into_iter().map(|g| g as u32));
+        }
+    }
+    gids
+}
+
 /// Client half, shared by `moatctl` and the integration tests.
 pub fn request(socket: &Path, req: &Value) -> Result<Value, String> {
     let mut stream = UnixStream::connect(socket).map_err(|e| match e.kind() {
-        std::io::ErrorKind::PermissionDenied => format!(
-            "permission denied on {}.\nYou are not in the `moat` group. Run:\n  \
-             sudo usermod -aG moat $USER\nthen log out and back in (a new shell is not enough).",
-            socket.display()
+        std::io::ErrorKind::PermissionDenied => permission_denied_help(
+            &socket.display().to_string(),
+            group_state(
+                moat_group(Path::new("/etc/group")),
+                &current_user(Path::new("/etc/passwd")),
+                &current_gids(),
+            ),
         ),
         std::io::ErrorKind::NotFound => format!(
             "{} does not exist. Is moatd running? Try: systemctl status moatd",
@@ -784,6 +934,53 @@ pub fn rule_count(path: &Path) -> usize {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn permission_denied_tells_a_member_to_relogin_not_to_usermod() {
+        let members = Some((960u32, vec!["dan".to_string()]));
+
+        // In the group on disk, but the session predates it.
+        let stale = group_state(members.clone(), "dan", &[1000, 998]);
+        assert_eq!(stale, GroupState::StaleSession);
+        let msg = permission_denied_help("/run/moat/control.sock", stale);
+        assert!(msg.contains("already in the `moat` group"), "{}", msg);
+        assert!(msg.contains("newgrp moat"), "{}", msg);
+        assert!(
+            !msg.contains("usermod -aG moat"),
+            "usermod cannot help a member: {}",
+            msg
+        );
+
+        // Genuinely not a member: usermod is the right advice.
+        let absent = group_state(members.clone(), "eve", &[1001]);
+        assert_eq!(absent, GroupState::NotAMember);
+        assert!(permission_denied_help("s", absent).contains("usermod -aG moat"));
+
+        // Member and the gid is live: the socket itself is at fault.
+        let member = group_state(members, "dan", &[1000, 960]);
+        assert_eq!(member, GroupState::Member);
+        let msg = permission_denied_help("/run/moat/control.sock", member);
+        assert!(msg.contains("restart moatd"), "{}", msg);
+        assert!(!msg.contains("usermod"), "{}", msg);
+
+        // No group at all: the package is not installed properly.
+        assert_eq!(group_state(None, "dan", &[1000]), GroupState::NoSuchGroup);
+    }
+
+    #[test]
+    fn moat_group_parses_the_member_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("group");
+        std::fs::write(&f, "root:x:0:\nwheel:x:998:dan\nmoat:x:960:dan,ops\n").unwrap();
+        let (gid, members) = moat_group(&f).expect("moat line");
+        assert_eq!(gid, 960);
+        assert_eq!(members, vec!["dan".to_string(), "ops".to_string()]);
+
+        // An empty member list must not become a member named "".
+        std::fs::write(&f, "moat:x:960:\n").unwrap();
+        assert_eq!(moat_group(&f).unwrap().1, Vec::<String>::new());
+        assert_eq!(group_state(moat_group(&f), "", &[1]), GroupState::NotAMember);
+    }
     use super::*;
     use crate::config::Config;
 
@@ -857,6 +1054,52 @@ mod tests {
         let id = first_id(&d, "moat-cred-ssh-private-key-read");
         assert_eq!(dispatch(&mut d, &json!({"cmd":"ack","id":id}))["ok"], true);
         assert!(d.find_alert(&id).unwrap().acked);
+    }
+
+    /// A retune leaves a backlog about rules that no longer exist. Acking it
+    /// one id at a time is not something anyone does, so the backlog stays and
+    /// hides live alerts; these are the two cuts that clear it.
+    #[test]
+    fn bulk_ack_clears_a_backlog_by_rule_and_by_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let before: Vec<String> = d
+            .store
+            .load()
+            .into_iter()
+            .filter(|a| !a.acked)
+            .map(|a| a.id)
+            .collect();
+        assert!(before.len() > 2, "fixture must leave a backlog");
+        let rule = d.find_alert(&before[0]).unwrap().rule;
+
+        // By rule: only that rule's alerts, and nothing else, is touched.
+        let r = dispatch(&mut d, &json!({"cmd":"ack","rule":rule}));
+        assert_eq!(r["ok"], true);
+        let n = r["acked"].as_u64().unwrap();
+        assert!(n >= 1);
+        assert!(d
+            .store
+            .load()
+            .into_iter()
+            .filter(|a| a.rule == rule)
+            .all(|a| a.acked));
+
+        // A rule nobody has alerts for acks nothing rather than erroring.
+        let r = dispatch(&mut d, &json!({"cmd":"ack","rule":"moat-nope"}));
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["acked"], 0);
+
+        // --all takes the rest.
+        let r = dispatch(&mut d, &json!({"cmd":"ack","all":true}));
+        assert_eq!(r["ok"], true);
+        assert!(d.store.load().into_iter().all(|a| a.acked), "backlog cleared");
+
+        // A bare id still works and still rejects an unknown one.
+        assert_eq!(
+            dispatch(&mut d, &json!({"cmd":"ack","id":"01NOPE"}))["ok"],
+            false
+        );
     }
 
     #[test]

@@ -56,3 +56,17 @@ parent = "*/target/*/deps/moatd-*"
 name = "moat-pkg-subtree-netcat-exec"
 exe = "/tmp/.tmp*/moat-*"
 parent = "*/target/*/deps/moatd-*"
+
+# omarchy-shell runs its plugins' own scripts. A plugin is a directory under
+# ~/.config/omarchy/plugins holding QML plus executable helpers, and the shell
+# spawns those helpers as part of drawing the bar — `scripts/config` alone fires
+# every ~30s, which on 2026-09-03 was 8 high alerts a minute on an idle desktop.
+#
+# Scoped to quickshell as the actor and the plugins tree as the target, so this
+# does not weaken the rule generally: anything else executing out of the plugins
+# directory still fires, and a plugin *appearing or changing* is a different
+# question entirely, still covered by moat-persist-omarchy-plugin-write.
+[[rule]]
+name = "moat-exec-untrusted-home"
+exe = "/usr/bin/quickshell"
+file = "/home/*/.config/omarchy/plugins/*"

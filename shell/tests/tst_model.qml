@@ -99,6 +99,19 @@ TestCase {
                                 unacked: { medium: 3, high: 1 } }), "red")
     compare(Model.widgetState({ available: true, groupOk: true, daemonOk: true,
                                 unacked: { critical: 1 } }), "red")
+
+    // A sensor that is not loaded is red even when every counter is zero.
+    // This is the 2026-09-03 outage: Tetragon crash-looped for 25 minutes with
+    // no policies in the kernel, and a quiet machine would have shown green
+    // over no protection at all. Quiet from a dead sensor is not good news.
+    compare(Model.widgetState({ available: true, groupOk: true, daemonOk: true,
+                                sensorUnhealthy: true, unacked: {} }), "red")
+    compare(Model.widgetState({ available: true, groupOk: true, daemonOk: true,
+                                sensorUnhealthy: true,
+                                unacked: { medium: 3 } }), "red")
+    // "cannot tell" is not "dead": absent or false must not force red.
+    compare(Model.widgetState({ available: true, groupOk: true, daemonOk: true,
+                                sensorUnhealthy: false, unacked: {} }), "green")
   }
 
   // ---------------------------------------------------------------- folding

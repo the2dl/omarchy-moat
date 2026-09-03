@@ -29,6 +29,7 @@ pub mod new_exec_ioc;
 pub mod pkg_egress;
 pub mod pkg_subtree;
 pub mod pkgtree;
+pub mod self_proc_read;
 
 use crate::config::Config;
 use crate::event::{ExecEvent, HookHit};

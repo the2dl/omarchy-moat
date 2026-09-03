@@ -95,10 +95,39 @@ fn permission_denied_names_the_group_command() {
     }
     assert!(!out.status.success());
     assert!(
-        stderr.contains("usermod -aG moat"),
-        "expected the group hint, got: {}",
+        stderr.contains(sock.to_str().unwrap()),
+        "the refusal must name the socket it was refused on, got: {}",
         stderr
     );
+    assert!(
+        stderr.contains("moat"),
+        "expected group advice, got: {}",
+        stderr
+    );
+
+    // The advice has to match reality. Someone already in the group who is told
+    // to run `usermod -aG moat` is sent round a loop that cannot terminate: the
+    // command succeeds, changes nothing, and the socket still refuses them.
+    let already_a_member = std::fs::read_to_string("/etc/group")
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.starts_with("moat:"))
+        .any(|l| {
+            let user = std::env::var("USER").unwrap_or_default();
+            !user.is_empty()
+                && l.rsplit(':')
+                    .next()
+                    .unwrap_or("")
+                    .split(',')
+                    .any(|m| m == user)
+        });
+    if already_a_member {
+        assert!(
+            !stderr.contains("usermod -aG moat"),
+            "already in the group, so usermod is the one thing that cannot help: {}",
+            stderr
+        );
+    }
 }
 
 /// `moat-feeds` must exit 0 with no key and leave existing files alone.

@@ -53,7 +53,21 @@ enum Cmd {
     /// The full explanation for one alert.
     Explain { id: String },
     /// Mark an alert as seen.
-    Ack { id: String },
+    /// Mark an alert as seen. With no ID, use --all/--rule/--before to clear a
+    /// backlog: after a rule retune the old alerts are about rules that no
+    /// longer exist, and they hide the real ones until they are cleared.
+    Ack {
+        id: Option<String>,
+        /// Ack every unacked alert.
+        #[arg(long)]
+        all: bool,
+        /// Ack only alerts from this rule, e.g. moat-pkg-subtree-netcat-exec.
+        #[arg(long)]
+        rule: Option<String>,
+        /// Ack only alerts older than this alert id.
+        #[arg(long)]
+        before: Option<String>,
+    },
     /// SIGKILL the process tree the alert recorded.
     Kill { id: String },
     /// Move the alert's file into /var/lib/moat/quarantine.
@@ -165,7 +179,13 @@ fn main() -> ExitCode {
             json!({"cmd": "list", "since": since.clone().unwrap_or_default(), "limit": limit})
         }
         Cmd::Explain { id } => json!({"cmd": "explain", "id": id}),
-        Cmd::Ack { id } => json!({"cmd": "ack", "id": id}),
+        Cmd::Ack { id, all, rule, before } => json!({
+            "cmd": "ack",
+            "id": id.clone().unwrap_or_default(),
+            "all": all,
+            "rule": rule.clone().unwrap_or_default(),
+            "before": before.clone().unwrap_or_default(),
+        }),
         Cmd::Kill { id } => json!({"cmd": "kill", "id": id}),
         Cmd::Quarantine { id } => json!({"cmd": "quarantine", "id": id}),
         Cmd::Ignore { id, scope, comment } => json!({
@@ -380,7 +400,19 @@ fn print_human(cmd: &Cmd, r: &Value) {
             Ok(a) => print_explain(&a),
             Err(e) => eprintln!("moatctl: unreadable alert: {}", e),
         },
-        Cmd::Ack { id } => println!("acked {}", id),
+        Cmd::Ack { id, all, rule, before } => {
+            if *all || rule.is_some() || before.is_some() {
+                let n = r["acked"].as_u64().unwrap_or(0);
+                println!("acked {} alert(s)", n);
+                if let Some(f) = r["failed"].as_array() {
+                    for e in f {
+                        eprintln!("  failed: {}", e.as_str().unwrap_or("?"));
+                    }
+                }
+            } else {
+                println!("acked {}", id.clone().unwrap_or_default());
+            }
+        }
         Cmd::Kill { .. } => println!(
             "killed pids {}",
             r["killed"]
@@ -517,10 +549,25 @@ fn print_incidents(r: &Value) {
 fn print_status(r: &Value) {
     let u = &r["unacked"];
     println!("moatd  {}   mode {}", r["version"].as_str().unwrap_or("?"), r["mode"].as_str().unwrap_or("?"));
-    println!("tetragon   {}", r["tetragon"].as_str().unwrap_or("?"));
+    let state = r["tetragon"].as_str().unwrap_or("?");
     println!(
-        "policies   {}{}",
+        "tetragon   {}{}",
+        state,
+        // Loud, because a sensor that is not loaded makes every other line on
+        // this screen meaningless — including a reassuring 0 unacked.
+        if r["sensor_unhealthy"] == Value::Bool(true) {
+            "   *** NOT PROTECTED — check: systemctl status tetragon ***"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "policies   {}{}{}",
         r["policies"],
+        match r["sensors_loaded"].as_u64() {
+            Some(n) => format!("   ({} loaded in the kernel)", n),
+            None => "   (loaded count unavailable)".to_string(),
+        },
         match r["policies_failed"].as_array() {
             Some(f) if !f.is_empty() => format!("   ({} failed to render: {})", f.len(), join(f)),
             _ => String::new(),

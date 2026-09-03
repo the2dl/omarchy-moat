@@ -114,9 +114,30 @@ pub struct Daemon {
     pub digest_last_sent: u64,
     /// Incident snapshots taken since start, for the log and for `status`.
     pub incidents_captured: u64,
+    /// Monotonic ULID source. Alert ids are the timeline: `store.load()` keys a
+    /// BTreeMap on them, `moatctl list` calls the last one newest, and
+    /// `--since <id>` pages on them. A plain `Ulid::new()` only orders by the
+    /// millisecond it embeds, so two alerts in the same millisecond — a burst
+    /// from one process, or a sensor restart replaying `/proc` — sorted by
+    /// their random suffix and the "newest" was a coin flip. The generator
+    /// increments the suffix instead, so ids from one run are strictly
+    /// increasing whatever the clock resolution.
+    ids: ulid::Generator,
 }
 
 impl Daemon {
+    /// The next alert id, strictly increasing within this run.
+    ///
+    /// `Generator::generate` only fails after 2^80 ids inside one millisecond;
+    /// falling back to a random ULID there is correct-but-unordered, which is
+    /// the behaviour we had everywhere before.
+    fn next_id(&mut self) -> String {
+        self.ids
+            .generate()
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| ulid::Ulid::new().to_string())
+    }
+
     pub fn new(cfg: Config, cfg_path: &Path) -> std::io::Result<Daemon> {
         let store = AlertStore::open(
             &cfg.paths.alerts(),
@@ -188,6 +209,7 @@ impl Daemon {
             digest_enabled,
             digest_last_sent,
             incidents_captured: 0,
+            ids: ulid::Generator::new(),
         })
     }
 
@@ -372,6 +394,23 @@ impl Daemon {
         let proc = self.table.get(exec_id)?.clone();
         let path = hook.file_path();
         let hook_name = hook.hook_name();
+
+        // The environ rule matches `Postfix /environ` in the kernel, because a
+        // selector cannot compare the path's pid against the opener's. The exact
+        // cut is here: reading your own environment is not credential theft, and
+        // it is essentially all of the traffic on this path.
+        if name == "moat-cred-proc-environ-read" {
+            let is_proc_environ = path
+                .as_deref()
+                .and_then(crate::rules::self_proc_read::proc_target_pid)
+                .is_some();
+            if !is_proc_environ {
+                return None;
+            }
+            if crate::rules::self_proc_read::is_self_read(path.as_deref()?, proc.pid) {
+                return None;
+            }
+        }
 
         if let Err(m) = self
             .policies
@@ -564,9 +603,10 @@ impl Daemon {
         // incident snapshot is named after it and has to be taken while the
         // process still exists (LEARNING §4). A fold reuses the first id and is
         // not captured twice.
-        let id = folded
-            .clone()
-            .unwrap_or_else(|| ulid::Ulid::new().to_string());
+        let id = match folded.clone() {
+            Some(existing) => existing,
+            None => self.next_id(),
+        };
         let incident = if folded.is_none() {
             self.capture_incident(&f, &id)
         } else {
@@ -1298,21 +1338,64 @@ impl Daemon {
 
     // ----------------------------------------------------------------- status
 
-    pub fn tetragon_state(&self) -> &'static str {
-        if self.cfg.paths.tetragon_socket.exists() {
-            return "running";
-        }
-        // No socket (or no permission to see it): fall back to "is the export
-        // file being written?".
-        if let Ok(m) = std::fs::metadata(&self.cfg.paths.tetragon_log) {
-            use std::os::unix::fs::MetadataExt;
-            let age = util::unix_secs().saturating_sub(m.mtime().max(0) as u64);
-            if age < 300 {
-                return "running";
+    /// TracingPolicies the kernel is actually running, counted from the
+    /// directories Tetragon pins under its bpffs dir (one per loaded policy).
+    ///
+    /// `None` means the directory could not be read at all — not mounted, or
+    /// this process is not root — which is different from "zero loaded" and
+    /// must not be reported as an outage.
+    pub fn sensors_loaded(&self) -> Option<usize> {
+        let entries = std::fs::read_dir(&self.cfg.paths.tetragon_bpf_dir).ok()?;
+        Some(
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("moat-"))
+                .count(),
+        )
+    }
+
+    /// Is the sensor doing its job, in the only terms that matter: how many of
+    /// our policies are loaded in the kernel right now.
+    ///
+    /// The two obvious signals both lie. The gRPC socket is a file that
+    /// outlives the process that made it, and the export log keeps getting
+    /// fresh writes during a crash loop because every Tetragon start re-walks
+    /// `/proc` and re-emits an exec event per live process. On 2026-09-03 this
+    /// function returned "running" for 25 minutes while Tetragon was exiting
+    /// 255 every 13 seconds and **zero** policies were loaded — the machine was
+    /// completely unprotected and every surface said it was fine. Counting
+    /// pinned policies is the fix: it asks the kernel, and it goes to zero the
+    /// instant the sensor dies.
+    pub fn tetragon_state(&self) -> String {
+        let expected = self.policies.len();
+        match self.sensors_loaded() {
+            Some(0) if expected > 0 => "down".into(),
+            Some(n) if n < expected => format!("degraded {}/{}", n, expected),
+            Some(_) => "running".into(),
+            // Cannot see bpffs. Fall back to the old, weaker heuristics, but
+            // never claim more than "unverified" from them.
+            None => {
+                if self.cfg.paths.tetragon_socket.exists() {
+                    return "unverified".into();
+                }
+                if let Ok(m) = std::fs::metadata(&self.cfg.paths.tetragon_log) {
+                    use std::os::unix::fs::MetadataExt;
+                    let age = util::unix_secs().saturating_sub(m.mtime().max(0) as u64);
+                    if age < 300 {
+                        return "unverified".into();
+                    }
+                    return "stale".into();
+                }
+                "stopped".into()
             }
-            return "stale";
         }
-        "stopped"
+    }
+
+    /// True when the sensor is not fully loaded. The shield must not be green
+    /// here no matter how quiet the alert counts are: no alerts from a dead
+    /// sensor is the most dangerous shape of "quiet" there is.
+    pub fn sensor_unhealthy(&self) -> bool {
+        !matches!(self.tetragon_state().as_str(), "running" | "unverified")
     }
 
     pub fn sandbox_on(&self) -> bool {
@@ -1331,7 +1414,12 @@ impl Daemon {
             "version": crate::VERSION,
             "mode": self.mode,
             "tetragon": self.tetragon_state(),
+            // `policies` is what is on disk; `sensors_loaded` is what the
+            // kernel is running. They are equal on a healthy machine and the
+            // gap between them is the whole point of reporting both.
             "policies": self.policies.len(),
+            "sensors_loaded": self.sensors_loaded(),
+            "sensor_unhealthy": self.sensor_unhealthy(),
             "policies_failed": self.policies_failed,
             "feeds": {
                 "updated": self.feeds.meta.updated,
@@ -1631,6 +1719,85 @@ mod tests {
         d.homes = vec!["/home/dan".into()];
         d.provenance.set_homes(&d.homes);
         (d, cfg)
+    }
+
+    /// Alert ids are the timeline, so a burst inside one millisecond must still
+    /// come back in the order it was emitted. `Ulid::new()` only orders by the
+    /// embedded millisecond and tied on the random suffix, which made
+    /// `store.load().next_back()` — and `moatctl list`'s "newest last" — a coin
+    /// flip for same-millisecond alerts.
+    #[test]
+    fn alert_ids_are_monotonic_inside_one_millisecond() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        let ids: Vec<String> = (0..500).map(|_| d.next_id()).collect();
+        // Fast enough that the millisecond prefix repeats; if it never did the
+        // test would pass for the wrong reason.
+        let prefixes: std::collections::HashSet<&str> =
+            ids.iter().map(|i| &i[..10]).collect();
+        assert!(
+            prefixes.len() < ids.len(),
+            "no two ids shared a millisecond, so this proves nothing"
+        );
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "ids must sort into the order they were issued");
+    }
+
+    /// The regression for the 2026-09-03 outage: Tetragon crash-looped for 25
+    /// minutes while `status` said "running" and the shield stayed green,
+    /// because both signals were a file's existence and a log's mtime — and a
+    /// crash loop keeps both fresh. Health has to be counted from the kernel.
+    #[test]
+    fn sensor_health_is_counted_from_the_kernel_not_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        let expected = d.policies.len();
+        assert!(expected > 0, "fixture must ship policies");
+
+        let pins = dir.path().join("bpf");
+        std::fs::create_dir_all(&pins).unwrap();
+        d.cfg.paths.tetragon_bpf_dir = pins.clone();
+
+        // Nothing pinned: the sensor is down, however healthy systemd looks.
+        assert_eq!(d.sensors_loaded(), Some(0));
+        assert_eq!(d.tetragon_state(), "down");
+        assert!(d.sensor_unhealthy());
+
+        // Every policy pinned: running.
+        for name in d.policies.names() {
+            std::fs::create_dir_all(pins.join(&name)).unwrap();
+        }
+        // Tetragon's own sensors sit here too and must not be counted as ours.
+        std::fs::create_dir_all(pins.join("__base__")).unwrap();
+        assert_eq!(d.sensors_loaded(), Some(expected));
+        assert_eq!(d.tetragon_state(), "running");
+        assert!(!d.sensor_unhealthy());
+
+        // One policy fails to attach — the exact E2BIG shape — and the count
+        // names how many of how many, rather than rounding up to "running".
+        std::fs::remove_dir_all(pins.join(d.policies.names()[0].clone())).unwrap();
+        assert_eq!(
+            d.tetragon_state(),
+            format!("degraded {}/{}", expected - 1, expected)
+        );
+        assert!(d.sensor_unhealthy());
+
+        // bpffs unreadable is not the same claim as "zero loaded". With the
+        // socket there we genuinely cannot tell, so say "unverified" and do not
+        // cry wolf; with nothing there at all the old signals still convict.
+        d.cfg.paths.tetragon_bpf_dir = dir.path().join("does-not-exist");
+        assert_eq!(d.sensors_loaded(), None);
+
+        d.cfg.paths.tetragon_socket = dir.path().join("tetragon.sock");
+        std::fs::write(&d.cfg.paths.tetragon_socket, b"").unwrap();
+        assert_eq!(d.tetragon_state(), "unverified");
+        assert!(!d.sensor_unhealthy(), "unverified is not evidence of an outage");
+
+        std::fs::remove_file(&d.cfg.paths.tetragon_socket).unwrap();
+        d.cfg.paths.tetragon_log = dir.path().join("no-such.log");
+        assert_eq!(d.tetragon_state(), "stopped");
+        assert!(d.sensor_unhealthy());
     }
 
     fn replay(d: &mut Daemon) {

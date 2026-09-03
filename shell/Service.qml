@@ -81,6 +81,9 @@ Item {
     available: root.available,
     groupOk: root.groupOk,
     daemonOk: root.daemonOk,
+    // The sensor's own health, which outranks the alert counts: see
+    // Model.widgetState.
+    sensorUnhealthy: root.status ? root.status.sensorUnhealthy === true : false,
     unacked: root.unacked
   })
   readonly property int badgeCount: Model.badgeCount(root.unacked)
