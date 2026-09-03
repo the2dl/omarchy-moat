@@ -169,6 +169,55 @@ gets `acc_mode` = `ACC_MODE(flags)` (O_RDONLY→4, O_WRONLY→2, O_RDWR→6) | M
 
 `file_arg.flags` in JSON is **not** open flags: it is empty or `"unresolvedPathComponents"`.
 
+### At most 19 policies per LSM hook (verified the hard way, 2026-09-03)
+
+An LSM program is attached through a BPF trampoline, and a trampoline holds
+`BPF_MAX_TRAMP_LINKS = 38` programs. Tetragon attaches **two** per policy
+(`generic_lsm_event` and `generic_lsm_output`), so the **20th** policy on one
+hook fails and takes the whole daemon down:
+
+```
+sensor generic_lsm from collection moat-rootkit-bpffs-write failed to load:
+failed prog .../bpf_generic_lsm_output_v61.o loadInstance:
+attaching 'generic_lsm_output' failed: create tracing link: argument list too long
+```
+
+`argument list too long` is `E2BIG` from `bpf_trampoline_link_prog()`. It is not a
+policy error: the yaml is valid, the 19 policies before it loaded, and the count
+is what breaks. Tetragon exits 255, systemd restarts it, and it fails at the same
+policy forever — a crash loop, not a degraded mode. `moatd` follows it down
+through `PartOf=tetragon.service`. Each restart also re-walks `/proc` and re-emits
+an exec event per live process, so a crash loop *manufactures* alerts on
+long-lived processes while the sensor is actually dead.
+
+The cap is per hook, not per daemon: 21 policies on `file_post_open` plus 6 spread
+across `bprm_check_security`, `ptrace_access_check`, `path_chmod`, `inode_setxattr`
+and `bpf` fails, while the same 27 split across those hooks is fine.
+
+**The way out is a kprobe.** Every LSM hook has a `security_<hook>` global symbol in
+kallsyms (`T security_file_post_open`), a kprobe is not attached through a
+trampoline, and the prototype is identical — so the same `args` and `selectors`
+port across unchanged:
+
+```yaml
+-  lsmhooks:
+-  - hook: "file_post_open"
++  kprobes:
++  - call: "security_file_post_open"
++    syscall: false
+```
+
+The event arrives as `process_kprobe` instead of `process_lsm` with the same
+`policy_name`, `function_name` (now `security_file_post_open`) and args, so moatd
+needs nothing but the new name wherever it matches on hook names.
+
+What you give up is `Override`: blocking in-kernel needs the LSM boundary, because
+a kprobe can only override a function on the `ALLOW_ERROR_INJECTION` list and
+`security_file_post_open` is not on it. `Sigkill` still works from a kprobe. So
+keep the rules that may want to *block* on the LSM hook and move the rest.
+
+`policies/check.py` enforces the 19 limit at build time.
+
 Recommended (once per open, in-kernel; `Override` can block at this boundary):
 
 ```yaml

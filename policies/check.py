@@ -101,6 +101,14 @@ MAX_MATCHARGS = 5
 MAX_ACTIONS_PER_SELECTOR = 2
 MAX_NUMERIC_VALUES = 4
 MAX_BINARY_SELECTOR_ENTRIES = 1
+# notes section 3: the BPF trampoline behind an LSM hook takes BPF_MAX_TRAMP_LINKS = 38
+# programs, and Tetragon attaches two per policy (generic_lsm_event and
+# generic_lsm_output), so the 20th policy on one hook fails to load with E2BIG
+# ("argument list too long") and takes the whole daemon down with it. Kprobes are
+# not attached through a trampoline and have no such cap.
+BPF_MAX_TRAMP_LINKS = 38
+PROGS_PER_LSM_POLICY = 2
+MAX_POLICIES_PER_LSM_HOOK = BPF_MAX_TRAMP_LINKS // PROGS_PER_LSM_POLICY
 MAX_MESSAGE = 256
 MAX_TAGS = 16
 LEN_CAPS = {"Prefix": 256, "NotPrefix": 256, "Postfix": 127, "NotPostfix": 127,
@@ -369,6 +377,7 @@ def check_policy(path, text):
         "kind": ", ".join(sorted({kind for kind, _ in hooks})),
         "enforce": enf or "?",
         "sels": sum(len(h.get("selectors", [])) for _, h in hooks),
+        "attaches": [(kind, h.get("call") or h.get("hook") or kind) for kind, h in hooks],
     }
     return row, p
 
@@ -385,6 +394,23 @@ def main():
         if row:
             rows.append(row)
         problems.extend(p)
+
+    per_lsm_hook = {}
+    for r in rows:
+        for kind, hook in r["attaches"]:
+            if kind == "lsmhooks":
+                per_lsm_hook.setdefault(hook, []).append(r["name"])
+    for hook, names in sorted(per_lsm_hook.items()):
+        if len(names) > MAX_POLICIES_PER_LSM_HOOK:
+            problems.append(
+                "LSM hook %s: %d policies, limit is %d (%d BPF trampoline links, "
+                "cap %d). Tetragon fails to load the %dth with E2BIG and exits. "
+                "Move the surplus to a kprobe on security_%s, which needs no "
+                "trampoline: %s"
+                % (hook, len(names), MAX_POLICIES_PER_LSM_HOOK,
+                   len(names) * PROGS_PER_LSM_POLICY, BPF_MAX_TRAMP_LINKS,
+                   MAX_POLICIES_PER_LSM_HOOK + 1, hook,
+                   ", ".join(sorted(names)[MAX_POLICIES_PER_LSM_HOOK:])))
 
     order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "?": 4}
     rows.sort(key=lambda r: (r["family"], order[r["severity"]], r["name"]))

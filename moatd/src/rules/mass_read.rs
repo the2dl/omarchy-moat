@@ -21,6 +21,7 @@ pub const ID: &str = "moat-x-mass-read";
 const FILE_HOOKS: &[&str] = &[
     "file_open",
     "file_post_open",
+    "security_file_post_open",
     "security_file_open",
     "file_permission",
     "security_file_permission",

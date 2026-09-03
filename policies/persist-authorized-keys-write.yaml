@@ -18,8 +18,9 @@ spec:
   options:
   - name: "policy-mode"
     value: "monitor"
-  lsmhooks:
-  - hook: "file_post_open"
+  kprobes:
+  - call: "security_file_post_open"
+    syscall: false
     message: "SSH authorized_keys opened for writing"
     args:
     - index: 0
