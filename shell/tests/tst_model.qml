@@ -1455,4 +1455,36 @@ TestCase {
     compare(Model.setupSteps(false, true).length, 2)
     compare(Model.setupSteps(false, false).length, 0)
   }
+
+  // Quarantine holds rather than deletes, so the panel has to be able to show
+  // what is held and offer it back. "What got me" is the question a user has
+  // after an alert, and a store you cannot look into does not answer it.
+  function test_quarantine_view_carries_what_the_user_needs_to_decide() {
+    var r = Model.quarantineView({ quarantine: [{
+      alert: "01ABC", rule: "moat-exec-untrusted-home", title: "t",
+      original_path: "/home/dan/.cache/evil.so",
+      held_at: "/var/lib/moat/quarantine/01ABC/evil.so",
+      quarantined_at: "2026-09-03T23:00:00.000Z",
+      sha256: "abc123", bytes: 7, present: true
+    }] })
+    compare(r.length, 1)
+    compare(r[0].id, "01ABC")
+    compare(r[0].originalPath, "/home/dan/.cache/evil.so")
+    compare(r[0].heldAt, "/var/lib/moat/quarantine/01ABC/evil.so")
+    compare(r[0].bytes, 7)
+    compare(r[0].present, true)
+
+    // A held file that vanished must read as missing, not as fine: it means
+    // something removed it out from under moat.
+    var gone = Model.quarantineView({ quarantine: [{
+      alert: "01DEF", original_path: "/tmp/x", bytes: null, present: false
+    }] })
+    compare(gone[0].present, false)
+    compare(gone[0].bytes, -1)
+
+    // Nothing held, and a malformed answer, both mean an empty list.
+    compare(Model.quarantineView({ quarantine: [] }).length, 0)
+    compare(Model.quarantineView({}).length, 0)
+    compare(Model.quarantineView(null).length, 0)
+  }
 }

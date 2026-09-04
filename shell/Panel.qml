@@ -29,10 +29,10 @@ Item {
   // BASELINE 5 splits the alert list in two: Alerts is high + critical, the
   // things asking for a decision; Timeline is medium, low, demoted and (when
   // asked for) suppressed, grouped. Allowlist and Settings are the other two.
-  property string tab: "alerts"          // "alerts" | "timeline" | "allowlist" | "settings"
+  property string tab: "alerts"          // "alerts" | "timeline" | "quarantine" | "allowlist" | "settings"
   property string notice: ""             // transient result line under the header
 
-  readonly property var tabNames: ["alerts", "timeline", "allowlist", "settings"]
+  readonly property var tabNames: ["alerts", "timeline", "quarantine", "allowlist", "settings"]
 
   readonly property string pluginId: "io.github.the2dl.moat"
   // The Alerts tab's list: high + critical, not demoted, not suppressed,
@@ -147,6 +147,15 @@ Item {
       "Move this file into quarantine (chmod 000, under /var/lib/moat/quarantine)? Anything still using it will break.")
   }
 
+  // Putting a held file back where it came from. It asks, because the file was
+  // quarantined for a reason and restoring it undoes that — but the daemon is
+  // the one that refuses if the original path is occupied again or the held
+  // bytes no longer match what was recorded, so this cannot overwrite anything.
+  function requestRestoreQuarantined(id) {
+    root._confirm("quarantine-restore", id,
+      "Put this file back where it came from? It was quarantined because a rule matched it.")
+  }
+
   function requestUnignore(index, file) {
     root._pendingArg2 = String(file || "")
     root._confirm("unignore", String(index),
@@ -177,6 +186,8 @@ Item {
     confirm.message = message
     confirm.confirmText = command === "baseline-relearn"
       ? "Relearn"
+      : command === "quarantine-restore"
+      ? "Restore"
       : command.charAt(0).toUpperCase() + command.slice(1)
     confirm.selectedIndex = 0     // a destructive prompt defaults to Cancel
     confirm.opened = true
@@ -194,6 +205,7 @@ Item {
     else if (command === "quarantine") service.quarantine(arg)
     else if (command === "unignore") service.unignore(Number(arg), arg2)
     else if (command === "baseline-relearn") service.relearnBaseline()
+    else if (command === "quarantine-restore") service.restoreQuarantined(arg)
   }
 
   // ------------------------------------------------------------- keyboard nav
@@ -654,6 +666,20 @@ Item {
             onRemoveRequested: function(index, file) { root.requestUnignore(index, file) }
             onAcceptRequested: function(id) { root.requestAcceptProposal(id) }
             onDismissRequested: function(id) { root.requestDismissProposal(id) }
+          }
+
+          // What moat is holding. Quarantine moves a file aside rather than
+          // deleting it, and this is where that promise is kept: the user can
+          // see what caught them, where it came from, and put it back.
+          QuarantineView {
+            anchors.fill: parent
+            visible: root.ready && root.tab === "quarantine"
+            // Ask the daemon the first time the tab is looked at, rather than
+            // polling for something that changes only when the user acts.
+            onVisibleChanged: if (visible && root.service) root.service.loadQuarantine()
+            service: root.service
+            foreground: card.fg
+            onRestoreRequested: function(id) { root.requestRestoreQuarantined(id) }
           }
 
           SettingsView {

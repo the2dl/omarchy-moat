@@ -71,7 +71,15 @@ enum Cmd {
     /// SIGKILL the process tree the alert recorded.
     Kill { id: String },
     /// Move the alert's file into /var/lib/moat/quarantine.
-    Quarantine { id: String },
+    Quarantine {
+        id: Option<String>,
+        /// Show everything held, with where it came from and when.
+        #[arg(long)]
+        list: bool,
+        /// Put this one back where it came from.
+        #[arg(long)]
+        restore: bool,
+    },
     /// Stop alerting on this pattern; writes a [[rule]] block and acks.
     Ignore {
         id: String,
@@ -201,7 +209,11 @@ fn main() -> ExitCode {
             "before": before.clone().unwrap_or_default(),
         }),
         Cmd::Kill { id } => json!({"cmd": "kill", "id": id}),
-        Cmd::Quarantine { id } => json!({"cmd": "quarantine", "id": id}),
+        Cmd::Quarantine { id, list, restore } => json!({
+            "cmd": "quarantine",
+            "id": id.clone().unwrap_or_default(),
+            "action": if *list { "list" } else if *restore { "restore" } else { "" },
+        }),
         Cmd::Ignore { id, scope, comment } => json!({
             "cmd": "ignore", "id": id, "scope": scope,
             "comment": comment.clone().unwrap_or_default()
@@ -440,11 +452,39 @@ fn print_human(cmd: &Cmd, r: &Value) {
                 .map(|a| a.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "))
                 .unwrap_or_default()
         ),
-        Cmd::Quarantine { .. } => println!(
-            "moved {}\n   to {}\n   (mode 000; meta.json alongside it records how to restore)",
-            r["from"].as_str().unwrap_or(""),
-            r["to"].as_str().unwrap_or("")
-        ),
+        Cmd::Quarantine { list, restore, .. } => {
+            if *list {
+                match r["quarantine"].as_array() {
+                    Some(q) if !q.is_empty() => {
+                        println!("{} item(s) in {}\n", q.len(), r["dir"].as_str().unwrap_or(""));
+                        for x in q {
+                            println!(
+                                "{}\n  was      {}\n  rule     {}\n  held     {}{}\n  since    {}\n  restore  moatctl quarantine {} --restore\n",
+                                x["alert"].as_str().unwrap_or("?"),
+                                x["original_path"].as_str().unwrap_or("?"),
+                                x["rule"].as_str().unwrap_or("?"),
+                                x["held_at"].as_str().unwrap_or("?"),
+                                match x["bytes"].as_u64() {
+                                    Some(b) => format!(" ({} bytes)", b),
+                                    None => " (MISSING)".to_string(),
+                                },
+                                x["quarantined_at"].as_str().unwrap_or("?"),
+                                x["alert"].as_str().unwrap_or("?"),
+                            );
+                        }
+                    }
+                    _ => println!("nothing is quarantined"),
+                }
+            } else if *restore {
+                println!("restored {}", r["restored"].as_str().unwrap_or("?"));
+            } else {
+                println!(
+                    "moved {}\n   to {}\n   (mode 000; nothing is deleted — `moatctl quarantine --list` shows it, `--restore` puts it back)",
+                    r["from"].as_str().unwrap_or(""),
+                    r["to"].as_str().unwrap_or("")
+                );
+            }
+        }
         Cmd::Ignore { .. } => {
             println!(
                 "wrote to {} and acked the alert:\n",

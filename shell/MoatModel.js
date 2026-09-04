@@ -63,6 +63,36 @@ function widgetState(view) {
   return "green"
 }
 
+
+// ------------------------------------------------------- quarantine (held)
+//
+// Quarantine moves a file aside and chmods it 000; it never deletes. So the
+// panel's job is to show what is being held, where it came from, and to offer
+// it back — "what got me" is the question a user actually has after an alert,
+// and a store you cannot look into does not answer it.
+function quarantineView(response) {
+  var items = (response && response.quarantine) || []
+  if (!Array.isArray(items)) return []
+  var out = []
+  for (var i = 0; i < items.length; i++) {
+    var q = items[i] || {}
+    out.push({
+      id: String(q.alert || ""),
+      rule: String(q.rule || ""),
+      title: String(q.title || ""),
+      originalPath: String(q.original_path || ""),
+      heldAt: String(q.held_at || ""),
+      when: String(q.quarantined_at || ""),
+      sha256: String(q.sha256 || ""),
+      bytes: (q.bytes === null || q.bytes === undefined) ? -1 : Number(q.bytes),
+      // A held file that is no longer on disk is worth showing rather than
+      // hiding: it means something removed it out from under moat.
+      present: q.present === true
+    })
+  }
+  return out
+}
+
 // ------------------------------------------------------------------- parsing
 
 function parseLine(line) {

@@ -76,6 +76,9 @@ Item {
   property string lastError: ""
   property bool busy: false
   property int actionSerial: 0
+  /// Files held in quarantine: moved aside and mode 000, never deleted, so the
+  /// panel can show what caught you and put it back.
+  property var quarantineItems: []
 
   readonly property string widgetState: Model.widgetState({
     available: root.available,
@@ -458,6 +461,11 @@ Item {
     case "baseline-accept": return [root.ctlPath, "baseline", "accept", String(arg), "--json"]
     case "baseline-dismiss": return [root.ctlPath, "baseline", "dismiss", String(arg), "--json"]
     case "baseline-relearn": return [root.ctlPath, "baseline", "relearn", "--json"]
+    // Quarantine holds rather than deletes, so what is held has to be visible
+    // and reversible from the panel, not only from a terminal: the whole point
+    // of not deleting is that you can go and look at what caught you.
+    case "quarantine-list": return [root.ctlPath, "quarantine", "--list", "--json"]
+    case "quarantine-restore": return [root.ctlPath, "quarantine", String(arg), "--restore", "--json"]
     }
     return null
   }
@@ -528,6 +536,9 @@ Item {
         if (ok && actionProc.pendingCommand === "ignore") {
           root.lastIgnoreBlock = String(value.block || value.line || value.rule || "")
         }
+        if (ok && actionProc.pendingCommand === "quarantine-list") {
+          root.quarantineItems = Model.quarantineView(value)
+        }
       } catch (e) {
         // Not JSON. exitCode already decided ok; stderr already carries why.
       }
@@ -537,6 +548,11 @@ Item {
       if (ok && (actionProc.pendingCommand === "ignore" || actionProc.pendingCommand === "unignore"
                  || actionProc.pendingCommand.indexOf("baseline-") === 0))
         root.loadAllowlist()
+      // Quarantining or restoring changes what is held, and so does the very
+      // first look at the tab.
+      if (ok && (actionProc.pendingCommand === "quarantine"
+                 || actionProc.pendingCommand === "quarantine-restore"))
+        root.loadQuarantine()
       root.actionFinished(actionProc.pendingCommand, ok, message)
       root.actionSerial++
       root.busy = false
@@ -552,6 +568,9 @@ Item {
 
   function kill(id) { return root._enqueue("kill", id) }
   function quarantine(id) { return root._enqueue("quarantine", id) }
+  /// Everything currently held, for the Quarantine tab.
+  function loadQuarantine() { return root._enqueue("quarantine-list") }
+  function restoreQuarantined(id) { return root._enqueue("quarantine-restore", id) }
   function ack(id) { return root._enqueue("ack", id) }
   // scope is exe | exe+file | parent | rule (CONTRACT 5). Anything else is
   // narrowed to "exe" rather than widened.

@@ -96,7 +96,7 @@ pub fn dispatch(d: &mut Daemon, req: &Value) -> Value {
         },
         "ack" => cmd_ack(d, req, &id()),
         "kill" => cmd_kill(d, &id()),
-        "quarantine" => cmd_quarantine(d, &id()),
+        "quarantine" => cmd_quarantine(d, req, &id()),
         "ignore" => cmd_ignore(d, req, &id()),
         "unignore" => cmd_unignore(d, req),
         "allowlist" => cmd_allowlist(d),
@@ -323,7 +323,15 @@ pub fn verify_pid(pid: u32, start_ts: &str, exe: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_quarantine(d: &mut Daemon, id: &str) -> Value {
+fn cmd_quarantine(d: &mut Daemon, req: &Value, id: &str) -> Value {
+    // Quarantine is a move, never a delete, and the point of that is that you
+    // can go and look at what caught you — so listing and putting things back
+    // are part of the feature, not an afterthought.
+    match req["action"].as_str().unwrap_or("") {
+        "list" => return quarantine_list(d),
+        "restore" => return quarantine_restore(d, id),
+        _ => {}
+    }
     let Some(alert) = d.find_alert(id) else {
         return err(format!("no alert {}", id));
     };
@@ -353,6 +361,107 @@ fn cmd_quarantine(d: &mut Daemon, id: &str) -> Value {
         }
         Err(e) => err(e),
     }
+}
+
+/// Everything currently held, newest first, straight from the meta.json each
+/// entry was written with.
+fn quarantine_list(d: &Daemon) -> Value {
+    let base = d.cfg.paths.quarantine();
+    let mut items = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&base) {
+        for e in rd.flatten() {
+            let dir = e.path();
+            let Ok(text) = std::fs::read_to_string(dir.join("meta.json")) else {
+                continue;
+            };
+            let Ok(mut meta) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            // Whether the held file is still there, and how big it is, are
+            // facts about now rather than about when it was quarantined.
+            if let Some(o) = meta.as_object_mut() {
+                let name = util::basename(o["original_path"].as_str().unwrap_or(""));
+                let held = dir.join(if name.is_empty() { "file" } else { name });
+                o.insert("held_at".into(), Value::from(held.display().to_string()));
+                o.insert(
+                    "bytes".into(),
+                    match std::fs::metadata(&held) {
+                        Ok(m) => Value::from(m.len()),
+                        Err(_) => Value::Null,
+                    },
+                );
+                o.insert("present".into(), Value::Bool(held.exists()));
+            }
+            items.push(meta);
+        }
+    }
+    items.sort_by(|a, b| {
+        b["quarantined_at"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(a["quarantined_at"].as_str().unwrap_or(""))
+    });
+    ok(json!({ "quarantine": items, "dir": base.display().to_string() }))
+}
+
+/// Put one back where it came from.
+///
+/// Refuses rather than guesses in every ambiguous case: nothing held under
+/// that id, the original path occupied again, or the bytes no longer hashing
+/// to what was recorded. A restore that silently overwrote something, or that
+/// returned a file which had been altered while in quarantine, would be worse
+/// than no restore at all.
+fn quarantine_restore(d: &mut Daemon, id: &str) -> Value {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = d.cfg.paths.quarantine().join(id);
+    let Ok(text) = std::fs::read_to_string(dir.join("meta.json")) else {
+        return err(format!("nothing quarantined under {}", id));
+    };
+    let Ok(meta) = serde_json::from_str::<Value>(&text) else {
+        return err(format!("{}/meta.json is unreadable", dir.display()));
+    };
+    let original = meta["original_path"].as_str().unwrap_or("");
+    if original.is_empty() {
+        return err("meta.json names no original_path".to_string());
+    }
+    let name = util::basename(original);
+    let held = dir.join(if name.is_empty() { "file" } else { name });
+    if !held.exists() {
+        return err(format!("{} is not there any more", held.display()));
+    }
+    if Path::new(original).exists() {
+        return err(format!(
+            "{} exists again; restoring would overwrite it. Move it aside first.",
+            original
+        ));
+    }
+    // chmod 600 first: it was stored 000 and cannot be hashed or moved as-is.
+    if let Err(e) = std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o600)) {
+        return err(format!("chmod 600 {}: {}", held.display(), e));
+    }
+    if let (Some(want), Ok(got)) = (meta["sha256"].as_str(), util::sha256_file(&held)) {
+        if want != got {
+            let _ = std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o000));
+            return err(format!(
+                "{} no longer matches the sha256 recorded when it was quarantined                  ({} now, {} then); refusing to restore it",
+                held.display(),
+                &got[..16.min(got.len())],
+                &want[..16.min(want.len())]
+            ));
+        }
+    }
+    if std::fs::rename(&held, original).is_err() {
+        if let Err(e) = std::fs::copy(&held, original) {
+            let _ = std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o000));
+            return err(format!("copy back to {}: {}", original, e));
+        }
+        let _ = std::fs::remove_file(&held);
+    }
+    let _ = std::fs::remove_file(dir.join("meta.json"));
+    let _ = std::fs::remove_dir(&dir);
+    let _ = d.mark(id, "action_taken", Value::from("restored"));
+    log::info!("alert {}: restored {} from quarantine", id, original);
+    ok(json!({ "id": id, "restored": original }))
 }
 
 fn quarantine_file(
@@ -1085,6 +1194,23 @@ mod tests {
         d
     }
 
+    /// Drive a real event through the engine so the alert genuinely names
+    /// `path`; `mark` cannot rewrite an alert's file after the fact.
+    fn alert_naming(d: &mut Daemon, path: &Path) -> String {
+        let before: std::collections::HashSet<String> =
+            d.store.load().into_iter().map(|a| a.id).collect();
+        d.handle_line(&format!(
+            r#"{{"process_kprobe":{{"process":{{"exec_id":"q-1","pid":4242,"uid":1000,"binary":"/usr/bin/node","cwd":"/tmp","start_time":"2026-09-03T16:21:00.000000000Z"}},"function_name":"security_file_post_open","policy_name":"moat-cred-ssh-private-key-read","args":[{{"file_arg":{{"path":"{}"}}}},{{"int_arg":4}}]}},"time":"2026-09-03T16:21:00.100Z"}}"#,
+            path.display()
+        ));
+        d.store
+            .load()
+            .into_iter()
+            .find(|a| !before.contains(&a.id))
+            .expect("the event must have produced an alert")
+            .id
+    }
+
     fn first_id(d: &Daemon, rule: &str) -> String {
         d.store
             .load()
@@ -1132,6 +1258,99 @@ mod tests {
         let id = first_id(&d, "moat-cred-ssh-private-key-read");
         assert_eq!(dispatch(&mut d, &json!({"cmd":"ack","id":id}))["ok"], true);
         assert!(d.find_alert(&id).unwrap().acked);
+    }
+
+    /// Quarantine holds, it does not delete — so the round trip has to work,
+    /// and it has to refuse rather than guess when it cannot be safe.
+    #[test]
+    fn quarantine_holds_a_file_and_gives_it_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        d.homes = vec![home.display().to_string()];
+
+        let victim = home.join("evil.so");
+        std::fs::write(&victim, b"payload").unwrap();
+        let id = alert_naming(&mut d, &victim);
+
+        // Held, not destroyed: gone from where it was, present and unreadable
+        // in the store, and listed with where it came from.
+        let q = dispatch(&mut d, &json!({"cmd":"quarantine","id":id}));
+        assert_eq!(q["ok"], true, "{:?}", q);
+        assert!(!victim.exists(), "moved out of the way");
+        let held = d.cfg.paths.quarantine().join(&id).join("evil.so");
+        assert!(held.exists(), "still on disk — quarantine never deletes");
+        assert_eq!(
+            std::fs::metadata(&held).unwrap().permissions().mode() & 0o777,
+            0,
+            "held unreadable"
+        );
+
+        let r = dispatch(&mut d, &json!({"cmd":"quarantine","action":"list"}));
+        let items = r["quarantine"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["original_path"], json!(victim.display().to_string()));
+        assert_eq!(items[0]["bytes"], 7);
+        assert_eq!(items[0]["present"], true);
+
+        // Occupied original path: refuse rather than overwrite.
+        std::fs::write(&victim, b"something else").unwrap();
+        let r = dispatch(&mut d, &json!({"cmd":"quarantine","action":"restore","id":id}));
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap().contains("exists again"));
+        std::fs::remove_file(&victim).unwrap();
+
+        // And back, byte for byte.
+        let r = dispatch(&mut d, &json!({"cmd":"quarantine","action":"restore","id":id}));
+        assert_eq!(r["ok"], true, "{:?}", r["error"]);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"payload");
+        assert!(!held.exists(), "no longer held once it is back");
+        assert_eq!(
+            dispatch(&mut d, &json!({"cmd":"quarantine","action":"list"}))["quarantine"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // Nothing under that id any more, and an unknown id is refused.
+        assert_eq!(
+            dispatch(&mut d, &json!({"cmd":"quarantine","action":"restore","id":id}))["ok"],
+            false
+        );
+        assert_eq!(
+            dispatch(&mut d, &json!({"cmd":"quarantine","action":"restore","id":"01NOPE"}))["ok"],
+            false
+        );
+    }
+
+    /// A held file that changed while in quarantine must not be handed back as
+    /// if it were the original.
+    #[test]
+    fn restore_refuses_a_file_that_no_longer_matches_its_hash() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        d.homes = vec![home.display().to_string()];
+        let victim = home.join("evil.so");
+        std::fs::write(&victim, b"payload").unwrap();
+        let id = alert_naming(&mut d, &victim);
+        dispatch(&mut d, &json!({"cmd":"quarantine","id":id}));
+
+        let held = d.cfg.paths.quarantine().join(&id).join("evil.so");
+        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&held, b"tampered").unwrap();
+        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let r = dispatch(&mut d, &json!({"cmd":"quarantine","action":"restore","id":id}));
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap().contains("sha256"), "{:?}", r["error"]);
+        assert!(!victim.exists(), "nothing was put back");
+        assert!(held.exists(), "and nothing was destroyed either");
     }
 
     /// An alert killed by an individually-armed rule must not record itself as
