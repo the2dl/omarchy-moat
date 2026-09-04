@@ -126,9 +126,118 @@ pub fn launch_argv(bundle_path: &str) -> Vec<String> {
     ]
 }
 
+/// Where an agent keeps its own credentials.
+///
+/// The sandbox's default deny list covers `~/.claude` and `~/.codex`, which is
+/// right for a build tool and wrong for the agent itself: it authenticates with
+/// those, so denying them does not protect anything, it just produces an agent
+/// that cannot start. Allowing exactly one of them back grants the agent
+/// nothing it did not already have, while `~/.ssh`, `~/.aws`, `~/.gnupg`, the
+/// keyrings, the browser profiles and `~/.password-store` stay denied — which
+/// is the protection that matters when the thing it is reading is hostile.
+pub fn agent_home_dir(agent: &str) -> Option<&'static str> {
+    match agent.trim() {
+        "claude" => Some("~/.claude"),
+        "codex" => Some("~/.codex"),
+        "gemini" => Some("~/.gemini"),
+        "opencode" => Some("~/.opencode"),
+        _ => None,
+    }
+}
+
+/// The confinement wrapper, when `moat-sandbox` is on `$PATH`.
+///
+/// Analysis now stages the accused file for the agent to read (`evidence.rs`),
+/// and reading hostile content is the moment injection has something to gain.
+/// The agent keeps its network and its own configuration — it has to work —
+/// but it cannot reach the credential stores, so a successful injection cannot
+/// turn "analyse this dropper" into "read ~/.ssh and tell me what you find".
+///
+/// `agent_args` cannot deliver `--permission-mode plan` through
+/// `omarchy-agent`, which builds each agent's flags itself; this does not
+/// depend on that flag, and works for whichever agent the user actually has.
+pub fn sandbox_argv(agent: &str, sandbox_bin: &str, inner: &[String]) -> Vec<String> {
+    let mut v = vec![sandbox_bin.to_string()];
+    if let Some(home) = agent_home_dir(agent) {
+        v.push("--allow".into());
+        v.push(home.into());
+    }
+    v.push("--".into());
+    v.extend(inner.iter().cloned());
+    v
+}
+
+/// `moat-sandbox` on `$PATH`, or `None` when it is not installed.
+pub fn sandbox_bin() -> Option<String> {
+    if std::env::var("MOAT_SANDBOX").ok().as_deref() == Some("0") {
+        return None;
+    }
+    let name = std::env::var("MOAT_SANDBOX_BIN").unwrap_or_else(|_| "moat-sandbox".to_string());
+    let found = Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {}", shell_quote(&name)))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let path = String::from_utf8_lossy(&found.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The agent must keep its own credentials — it authenticates with them —
+    /// and must lose every other credential store, because the bundle now
+    /// stages a file that is assumed hostile.
+    #[test]
+    fn the_agent_is_confined_but_can_still_authenticate() {
+        let inner = vec![
+            "omarchy-agent".to_string(),
+            "--prompt".to_string(),
+            "read /var/lib/moat/incidents/01/bundle.md".to_string(),
+        ];
+        let argv = sandbox_argv("claude", "/usr/bin/moat-sandbox", &inner);
+        assert_eq!(argv[0], "/usr/bin/moat-sandbox");
+        assert_eq!(argv[1], "--allow");
+        assert_eq!(argv[2], "~/.claude", "claude needs its own auth to run");
+        assert_eq!(argv[3], "--");
+        assert_eq!(&argv[4..], &inner[..], "the agent command is passed through");
+
+        // Whatever the user actually has, not just claude.
+        assert_eq!(sandbox_argv("codex", "s", &inner)[2], "~/.codex");
+        assert_eq!(agent_home_dir("gemini"), Some("~/.gemini"));
+
+        // An agent we do not know still gets confined; it just gets no
+        // exception, which is the safe direction.
+        let unknown = sandbox_argv("someagent", "s", &inner);
+        assert_eq!(unknown[0], "s");
+        assert_eq!(unknown[1], "--");
+        assert_eq!(&unknown[2..], &inner[..]);
+        assert_eq!(agent_home_dir("someagent"), None);
+    }
+
+    /// Nothing in the wrapper depends on `--permission-mode plan`, which cannot
+    /// reach the agent through omarchy-agent anyway.
+    #[test]
+    fn confinement_does_not_rely_on_an_agent_flag() {
+        let inner = launch_argv("/var/lib/moat/incidents/01/bundle.md");
+        let argv = sandbox_argv("claude", "moat-sandbox", &inner);
+        assert!(
+            !argv.iter().any(|a| a.contains("--permission-mode")),
+            "the confinement is the sandbox, not a flag the launcher drops"
+        );
+        // And the launcher is still whatever the user's Omarchy provides.
+        assert!(argv.iter().any(|a| a == &agent_launcher()));
+    }
 
     #[test]
     fn the_preamble_is_the_documents_text_with_the_path_substituted() {

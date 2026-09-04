@@ -289,9 +289,26 @@ fn launch_agent(resp: &Value, dry_run: bool) -> ExitCode {
         eprintln!("moatctl analyze: {}", note);
     }
 
-    let argv = moatd::analysis::launch_argv(path);
+    let inner = moatd::analysis::launch_argv(path);
+    // The bundle now stages the accused file for the agent to read, and reading
+    // hostile content is exactly when injection has something to gain. Confine
+    // the agent so a successful injection cannot turn "analyse this dropper"
+    // into "read ~/.ssh". It keeps its network and its own config; it loses the
+    // credential stores.
+    let argv = match moatd::analysis::sandbox_bin() {
+        Some(bin) => moatd::analysis::sandbox_argv(&agent, &bin, &inner),
+        None => {
+            eprintln!(
+                "moatctl analyze: moat-sandbox is not available, so {} will run unconfined \
+                 and can read ~/.ssh, ~/.aws and the browser profiles. The bundle stages a \
+                 file that is already under suspicion; treat its analysis accordingly.",
+                agent
+            );
+            inner.clone()
+        }
+    };
     if dry_run {
-        println!("{} --prompt {:?}", argv[0], argv[2]);
+        println!("{}", argv.iter().map(|a| format!("{:?}", a)).collect::<Vec<_>>().join(" "));
         return ExitCode::SUCCESS;
     }
     println!("handing {} to {} …", path, agent);

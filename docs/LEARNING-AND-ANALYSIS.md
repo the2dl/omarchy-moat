@@ -115,12 +115,33 @@ bundle: they are assumed hostile, so nothing should execute one by accident,
 and the preamble tells the agent to treat every byte as data rather than
 instruction.
 
-**Open:** `[analysis] agent_args` cannot reach the agent through
+**Confinement.** `[analysis] agent_args` cannot reach the agent through
 `omarchy-agent`, which accepts only `--inline`, `--pick` and `--prompt` and
-builds each agent's flags itself. So the intended `claude --permission-mode
-plan` is advisory today. Pointing an agent at hostile files automatically
-should not depend on an advisory flag; that wants either a direct `claude`
-invocation or a `bwrap` confinement of the agent to the bundle directory.
+builds each agent's flags itself — so `claude --permission-mode plan` is
+advisory and always will be. The confinement therefore does not rest on it.
+`moatctl analyze` launches
+
+```
+moat-sandbox --allow ~/.<agent> -- omarchy-agent --prompt "<preamble>"
+```
+
+which keeps `omarchy-agent` as the entry point, so whichever agent the user
+has configured is the one that runs. The sandbox's default deny list already
+covers `~/.ssh`, `~/.aws`, `~/.gnupg`, the keyrings, the browser profiles and
+`~/.password-store`; exactly one directory is allowed back — the agent's own
+credentials — because it authenticates with those and denying them produces a
+broken agent rather than a safer one. It grants the agent nothing it did not
+already have.
+
+Verified on the machine: inside the sandbox `~/.ssh/id_rsa` and `~/.aws` are
+denied, `~/.claude` and the bundle directory are readable, and the network is
+up. An agent the table does not know is still confined; it simply gets no
+exception, which is the safe direction.
+
+If `moat-sandbox` is not installed the agent still runs, and `moatctl analyze`
+says on stderr exactly what is unprotected — the bundle stages a file that is
+already under suspicion, so that is a fact the user needs rather than a silent
+downgrade.
 
 ## 3. Install receipts: show the positive picture
 
