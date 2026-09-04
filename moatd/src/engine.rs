@@ -114,6 +114,20 @@ pub struct Daemon {
     pub digest_last_sent: u64,
     /// Incident snapshots taken since start, for the log and for `status`.
     pub incidents_captured: u64,
+    /// Policies armed for in-kernel enforcement individually, while the daemon
+    /// as a whole stays in monitor mode.
+    ///
+    /// Enforcement is all-or-nothing otherwise, and all-or-nothing is not
+    /// usable here: arming every Sigkill-carrying policy at once on a desktop
+    /// means a kernel module load on USB hotplug gets its loader killed, and
+    /// `ssh` gets killed for reading your own key. The only safe way to start
+    /// enforcing is one rule at a time, on a rule whose false-positive surface
+    /// you have already measured.
+    ///
+    /// This deliberately does NOT move `mode`: the userland kill path
+    /// (`maybe_enforce`) gates on that, so leaving it at monitor means only the
+    /// kernel policy named here can kill anything.
+    pub enforcing_rules: std::collections::BTreeSet<String>,
     /// Monotonic ULID source. Alert ids are the timeline: `store.load()` keys a
     /// BTreeMap on them, `moatctl list` calls the last one newest, and
     /// `--since <id>` pages on them. A plain `Ulid::new()` only orders by the
@@ -210,6 +224,7 @@ impl Daemon {
             digest_last_sent,
             incidents_captured: 0,
             ids: ulid::Generator::new(),
+            enforcing_rules: persisted_enforcing_rules(&state),
         })
     }
 
@@ -1426,6 +1441,7 @@ impl Daemon {
             "ok": true,
             "version": crate::VERSION,
             "mode": self.mode,
+            "enforcing_rules": self.enforcing_rules.iter().cloned().collect::<Vec<_>>(),
             "tetragon": self.tetragon_state(),
             // `policies` is what is on disk; `sensors_loaded` is what the
             // kernel is running. They are equal on a healthy machine and the
@@ -1529,6 +1545,21 @@ fn access_word(mask: Option<i64>) -> Option<String> {
 fn read_state(path: &Path) -> Option<Value> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+/// Per-rule enforcement survives a restart the same way `mode` does: through
+/// state.json, which is `status()` written back out.
+fn persisted_enforcing_rules(state: &Option<Value>) -> std::collections::BTreeSet<String> {
+    state
+        .as_ref()
+        .and_then(|s| s.get("enforcing_rules"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn persisted_mode(state: &Option<Value>) -> Option<String> {

@@ -650,7 +650,7 @@ fn cmd_set(d: &mut Daemon, req: &Value) -> Value {
     let key = req.get("key").and_then(|v| v.as_str()).unwrap_or("");
     let value = req.get("value").and_then(|v| v.as_str()).unwrap_or("");
     match key {
-        "mode" => set_mode(d, value),
+        "mode" => set_mode(d, value, req["rule"].as_str().unwrap_or("")),
         "sandbox" => set_sandbox(d, value),
         "digest" => set_digest(d, value),
         "" => err("missing `key`"),
@@ -682,12 +682,35 @@ fn set_digest(d: &mut Daemon, value: &str) -> Value {
 /// `tetra tp set-mode` takes effect immediately on the pinned `policy_conf` map
 /// (NOTES §7); there is no reload. We apply it to every loaded policy and keep
 /// our own copy in state.json, because the export cannot tell us the mode.
-fn set_mode(d: &mut Daemon, value: &str) -> Value {
+/// `set mode monitor|enforce [--rule NAME]`.
+///
+/// Without a rule this is the daemon-wide switch and every policy moves with
+/// it. With one, exactly that policy is armed in the kernel and `mode` is left
+/// alone — which also leaves the userland kill path off, because
+/// `maybe_enforce` gates on the daemon-wide mode.
+///
+/// That distinction is the whole point. Seven shipped policies carry Sigkill,
+/// and arming them together on a desktop kills the module loader on USB
+/// hotplug and kills `ssh` for reading your own key. Enforcement has to be
+/// something you can turn on one measured rule at a time.
+fn set_mode(d: &mut Daemon, value: &str, rule: &str) -> Value {
     if value != "monitor" && value != "enforce" {
         return err(format!("mode must be monitor or enforce, got {:?}", value));
     }
     let tetra = d.cfg.paths.tetra.clone();
-    let names = d.policies.names();
+    let all = d.policies.names();
+    let names: Vec<String> = if rule.is_empty() {
+        all
+    } else {
+        if !all.iter().any(|n| n == rule) {
+            return err(format!(
+                "no policy {:?}; `moatctl status` lists how many are loaded",
+                rule
+            ));
+        }
+        vec![rule.to_string()]
+    };
+
     let mut applied = Vec::new();
     let mut failed = Vec::new();
     for name in &names {
@@ -703,16 +726,47 @@ fn set_mode(d: &mut Daemon, value: &str) -> Value {
             Err(e) => failed.push(json!({"policy": name, "error": e.to_string()})),
         }
     }
-    d.mode = value.to_string();
+
+    // Record intent even when nothing applied, so a restart does not silently
+    // forget what the user asked for — but say so honestly below.
+    if rule.is_empty() {
+        d.mode = value.to_string();
+    } else if value == "enforce" {
+        d.enforcing_rules.insert(rule.to_string());
+    } else {
+        d.enforcing_rules.remove(rule);
+    }
     d.write_state();
     log::info!(
-        "mode set to {} ({} applied, {} failed)",
+        "mode {} for {} ({} applied, {} failed)",
         value,
+        if rule.is_empty() { "all policies" } else { rule },
         applied.len(),
         failed.len()
     );
+
+    // INTEGRATION §6.2: answering ok:true after applying to nothing told the
+    // user their machine was enforcing when it was not. An enforce switch that
+    // lies about whether it took is worse than not having one.
+    if applied.is_empty() {
+        return json!({
+            "ok": false,
+            "error": format!(
+                "{} applied to no policies; the mode is recorded but nothing is enforcing it",
+                value
+            ),
+            "mode": d.mode,
+            "enforcing_rules": d.enforcing_rules.iter().cloned().collect::<Vec<_>>(),
+            "applied": 0,
+            "failed": failed,
+        });
+    }
+
     ok(json!({
-        "mode": value,
+        "mode": d.mode,
+        "rule": rule,
+        "enforcing_rules": d.enforcing_rules.iter().cloned().collect::<Vec<_>>(),
+        "requested": value,
         "applied": applied.len(),
         "policies": names.len(),
         "failed": failed,
@@ -1080,6 +1134,55 @@ mod tests {
         assert!(d.find_alert(&id).unwrap().acked);
     }
 
+    /// Enforcement has to be arm-able one rule at a time. Seven shipped
+    /// policies carry Sigkill, and arming them together on a desktop kills the
+    /// module loader on USB hotplug and kills ssh for reading your own key.
+    #[test]
+    fn one_rule_can_enforce_without_arming_the_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let rule = d.policies.names()[0].clone();
+        assert_eq!(d.mode, "monitor");
+
+        // tetra is absent in tests, so nothing can apply — and that is exactly
+        // the case INTEGRATION §6.2 was about: it used to answer ok:true.
+        let r = dispatch(
+            &mut d,
+            &json!({"cmd":"set","key":"mode","value":"enforce","rule":rule}),
+        );
+        assert_eq!(r["ok"], false, "applying to nothing must not answer ok");
+        assert_eq!(r["applied"], 0);
+        assert!(r["error"].as_str().unwrap().contains("no policies"));
+        // The intent is still recorded, and the daemon is still not enforcing.
+        assert!(d.enforcing_rules.contains(&rule));
+        assert_eq!(d.mode, "monitor", "a per-rule arm must not move the daemon");
+
+        // It shows up where a user would look, and survives a write/read cycle.
+        let st = d.status();
+        assert_eq!(st["enforcing_rules"][0], json!(rule));
+        assert_eq!(st["mode"], "monitor");
+
+        // Turning it back off removes it.
+        dispatch(
+            &mut d,
+            &json!({"cmd":"set","key":"mode","value":"monitor","rule":rule}),
+        );
+        assert!(d.enforcing_rules.is_empty(), "disarmed");
+
+        // An unknown rule is refused rather than silently recorded.
+        let r = dispatch(
+            &mut d,
+            &json!({"cmd":"set","key":"mode","value":"enforce","rule":"moat-nope"}),
+        );
+        assert_eq!(r["ok"], false);
+        assert!(d.enforcing_rules.is_empty());
+
+        // The daemon-wide switch still works and still reports honestly.
+        let r = dispatch(&mut d, &json!({"cmd":"set","key":"mode","value":"enforce"}));
+        assert_eq!(r["ok"], false, "no tetra, so nothing applied");
+        assert_eq!(d.mode, "enforce", "but the mode is still persisted");
+    }
+
     /// Demotions outlive the noise that caused them by up to 24 h, and they
     /// silence whatever shares the board: a flood from unrelated rules demoted
     /// moat-cred-ssh-private-key-read on 2026-09-03.
@@ -1294,15 +1397,28 @@ mod tests {
         assert_eq!(dispatch(&mut d, &json!({"cmd":"set","key":"sandbox","value":"maybe"}))["ok"], false);
     }
 
+    /// The mode is persisted even when it could not be pushed to a single
+    /// policy — but the answer says so. This used to report ok:true after
+    /// applying to nothing, which told a user their machine was enforcing when
+    /// it was not (INTEGRATION §6.2). An enforce switch that lies about whether
+    /// it took is worse than not having one, and §6.2 named this test as the
+    /// one that would have to be rewritten.
     #[test]
-    fn set_mode_persists_even_when_tetra_is_missing() {
+    fn set_mode_persists_but_reports_honestly_when_tetra_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let mut d = daemon(dir.path());
         let r = dispatch(&mut d, &json!({"cmd":"set","key":"mode","value":"enforce"}));
-        assert_eq!(r["ok"], true);
-        assert_eq!(r["mode"], "enforce");
+        assert_eq!(r["ok"], false, "applied to nothing, so not ok");
         assert_eq!(r["applied"], 0);
+        assert!(
+            r["error"].as_str().unwrap().contains("nothing is enforcing it"),
+            "{}",
+            r["error"]
+        );
         assert!(!r["failed"].as_array().unwrap().is_empty(), "missing tetra is reported");
+
+        // Recorded regardless, so a restart does not forget what was asked for.
+        assert_eq!(r["mode"], "enforce");
         assert_eq!(d.mode, "enforce");
         assert_eq!(dispatch(&mut d, &json!({"cmd":"status"}))["mode"], "enforce");
         assert_eq!(dispatch(&mut d, &json!({"cmd":"set","key":"mode","value":"sideways"}))["ok"], false);

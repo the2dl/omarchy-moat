@@ -602,7 +602,16 @@ hardcoded `/usr/bin/moatctl`, `/var/lib/moat/alerts.jsonl`,
    testable against a real daemon instead of only in unit tests. The capture
    works around it with `learn_min_days = 1`.
 
-2. **`set mode` still answers `ok:true` when it applied to zero policies.**
+2. **RESOLVED.** `set mode` answers `ok:false` with the per-policy failures
+   when it applied to zero policies, while still persisting the mode so a
+   restart does not forget the intent. `set mode … --rule NAME` arms a single
+   policy in the kernel and deliberately leaves the daemon-wide mode alone, so
+   the userland kill path stays off; `status` lists `enforcing_rules`. This was
+   a prerequisite for ever turning enforcement on: seven shipped policies carry
+   Sigkill, and arming them together on a desktop kills the module loader on
+   USB hotplug and kills `ssh` for reading your own key.
+
+   ~~**`set mode` still answers `ok:true` when it applied to zero policies.**~~
    `moatctl` and the plugin both now report it as a failure, so no user is
    misled, but the socket response itself still says `ok`. The honest fix is
    daemon-side: keep persisting the mode, answer

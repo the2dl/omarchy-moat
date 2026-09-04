@@ -93,7 +93,15 @@ enum Cmd {
     /// List the merged allowlist rules with their index and comment.
     Allowlist,
     /// set mode monitor|enforce, or set sandbox on|off.
-    Set { key: String, value: String },
+    Set {
+        key: String,
+        value: String,
+        /// Only this policy, leaving every other one — and the daemon-wide
+        /// mode — untouched. The safe way to start enforcing: one rule whose
+        /// false-positive surface you have already measured.
+        #[arg(long)]
+        rule: Option<String>,
+    },
     /// feeds refresh
     Feeds {
         #[arg(default_value = "refresh")]
@@ -202,7 +210,10 @@ fn main() -> ExitCode {
             json!({"cmd": "unignore", "rule": rule, "index": rule, "file": file.clone().unwrap_or_default()})
         }
         Cmd::Allowlist => json!({"cmd": "allowlist"}),
-        Cmd::Set { key, value } => json!({"cmd": "set", "key": key, "value": value}),
+        Cmd::Set { key, value, rule } => json!({
+            "cmd": "set", "key": key, "value": value,
+            "rule": rule.clone().unwrap_or_default(),
+        }),
         Cmd::Feeds { action } => json!({"cmd": "feeds", "action": action}),
         Cmd::Baseline { action } => baseline_request(action),
         Cmd::Receipts { last } => json!({"cmd": "receipts", "last": last}),
@@ -369,7 +380,7 @@ fn exit_code(cmd: &Cmd, r: &Value) -> u8 {
     if r.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         return 2;
     }
-    if let Cmd::Set { key, value } = cmd {
+    if let Cmd::Set { key, value, .. } = cmd {
         if key == "mode" && r["applied"].as_u64() == Some(0) {
             let policies = r["policies"].as_u64().unwrap_or(0);
             eprintln!(
@@ -558,6 +569,14 @@ fn print_incidents(r: &Value) {
 fn print_status(r: &Value) {
     let u = &r["unacked"];
     println!("moatd  {}   mode {}", r["version"].as_str().unwrap_or("?"), r["mode"].as_str().unwrap_or("?"));
+    // What is actually armed to kill, which is never obvious from `mode` alone
+    // once rules can be enforced individually.
+    if let Some(e) = r["enforcing_rules"].as_array().filter(|e| !e.is_empty()) {
+        println!(
+            "enforcing  {}",
+            e.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")
+        );
+    }
     let state = r["tetragon"].as_str().unwrap_or("?");
     println!(
         "tetragon   {}{}",
@@ -945,13 +964,37 @@ fn print_export(r: &Value) {
 fn print_set(key: &str, r: &Value) {
     match key {
         "mode" => {
-            println!(
-                "mode is now {} ({} of {} policies updated via {})",
-                r["mode"].as_str().unwrap_or("?"),
-                r["applied"],
-                r["policies"],
-                r["tetra"].as_str().unwrap_or("tetra")
-            );
+            let rule = r["rule"].as_str().unwrap_or("");
+            if rule.is_empty() {
+                println!(
+                    "mode is now {} ({} of {} policies updated via {})",
+                    r["mode"].as_str().unwrap_or("?"),
+                    r["applied"],
+                    r["policies"],
+                    r["tetra"].as_str().unwrap_or("tetra")
+                );
+            } else {
+                println!(
+                    "{} is now {} in the kernel; the daemon stays in {} mode",
+                    rule,
+                    r["requested"].as_str().unwrap_or("?"),
+                    r["mode"].as_str().unwrap_or("?")
+                );
+            }
+            match r["enforcing_rules"].as_array() {
+                Some(e) if !e.is_empty() => println!(
+                    "enforcing: {}",
+                    e.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                _ => {
+                    if r["mode"].as_str() == Some("monitor") {
+                        println!("enforcing: nothing");
+                    }
+                }
+            }
             if let Some(f) = r["failed"].as_array().filter(|f| !f.is_empty()) {
                 eprintln!("could not set the mode on {} policies:", f.len());
                 for x in f {
@@ -1012,7 +1055,7 @@ mod tests {
 
     #[test]
     fn set_mode_with_nothing_applied_is_a_failure() {
-        let cmd = Cmd::Set { key: "mode".into(), value: "enforce".into() };
+        let cmd = Cmd::Set { key: "mode".into(), value: "enforce".into(), rule: None };
         assert_eq!(exit_code(&cmd, &set_mode_resp(0, 17)), 2, "0 of 17 is a failure");
         assert_eq!(exit_code(&cmd, &set_mode_resp(0, 0)), 2, "no policies at all is too");
         assert_eq!(exit_code(&cmd, &set_mode_resp(17, 17)), 0);
@@ -1085,7 +1128,7 @@ mod tests {
     #[test]
     fn other_commands_keep_the_old_contract() {
         // sandbox is unaffected by `applied`.
-        let sandbox = Cmd::Set { key: "sandbox".into(), value: "on".into() };
+        let sandbox = Cmd::Set { key: "sandbox".into(), value: "on".into(), rule: None };
         assert_eq!(exit_code(&sandbox, &json!({"ok": true, "applied": 0})), 0);
         // ok:false is always 2.
         assert_eq!(exit_code(&Cmd::Status, &json!({"ok": false, "error": "x"})), 2);

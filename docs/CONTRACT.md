@@ -234,7 +234,7 @@ use moatd to kill or move something the sensor did not already flag.
 `status` response:
 ```json
 {"ok":true,"version":"0.1.0","mode":"monitor","tetragon":"running","policies":32,
- "sensors_loaded":32,"sensor_unhealthy":false,
+ "sensors_loaded":32,"sensor_unhealthy":false,"enforcing_rules":[],
  "policies_failed":[],"feeds":{"updated":"...","hashes":123456,"domains":5432},
  "unacked":{"critical":0,"high":2,"medium":5,"low":11},"sandbox":false,
  "socket_group":"moat"}
