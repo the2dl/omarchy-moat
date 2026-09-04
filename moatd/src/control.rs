@@ -1134,6 +1134,28 @@ mod tests {
         assert!(d.find_alert(&id).unwrap().acked);
     }
 
+    /// An alert killed by an individually-armed rule must not record itself as
+    /// having happened in monitor mode. The first real enforcement on this
+    /// machine produced `action: killed` next to `mode: monitor`, which reads
+    /// as a contradiction to anyone auditing the record later.
+    #[test]
+    fn an_individually_armed_rule_records_enforce_not_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let armed = "moat-rootkit-ldso-preload-write".to_string();
+        let other = "moat-cred-ssh-private-key-read";
+        assert_eq!(d.mode, "monitor");
+
+        assert_eq!(d.mode_for(&armed), "monitor", "nothing armed yet");
+        d.enforcing_rules.insert(armed.clone());
+        assert_eq!(d.mode_for(&armed), "enforce", "this rule kills");
+        assert_eq!(d.mode_for(other), "monitor", "every other rule does not");
+
+        // The daemon-wide switch still governs everything that is not armed.
+        d.mode = "enforce".into();
+        assert_eq!(d.mode_for(other), "enforce");
+    }
+
     /// Enforcement has to be arm-able one rule at a time. Seven shipped
     /// policies carry Sigkill, and arming them together on a desktop kills the
     /// module loader on USB hotplug and kills ssh for reading your own key.

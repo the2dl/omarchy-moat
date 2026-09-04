@@ -454,7 +454,9 @@ impl Daemon {
         f.exec_id = exec_id.to_string();
         f.ancestry = self.table.ancestry(exec_id).into_iter().cloned().collect();
         f.ancestry_line = self.table.ancestry_line(exec_id);
-        f.mode = self.mode.clone();
+        // The mode that governed *this rule*, which is "enforce" for a rule
+        // armed individually even while the daemon stays in monitor.
+        f.mode = self.mode_for(name);
         f.kill_expected = hook.action_is_kill();
 
         if let Some(path) = path {
@@ -1365,6 +1367,22 @@ impl Daemon {
     }
 
     // ----------------------------------------------------------------- status
+
+    /// The mode that actually governed this rule, which is not always the
+    /// daemon's.
+    ///
+    /// A rule armed with `set mode enforce --rule NAME` kills in the kernel
+    /// while the daemon stays in monitor, so recording the daemon's mode
+    /// produced an alert reading `action: killed` next to `mode: monitor` —
+    /// a record that contradicts itself, and the third time today that a
+    /// stored field disagreed with what actually happened.
+    pub fn mode_for(&self, rule: &str) -> String {
+        if self.enforcing_rules.contains(rule) {
+            "enforce".to_string()
+        } else {
+            self.mode.clone()
+        }
+    }
 
     /// TracingPolicies the kernel is actually running, counted from the
     /// directories Tetragon pins under its bpffs dir (one per loaded policy).
