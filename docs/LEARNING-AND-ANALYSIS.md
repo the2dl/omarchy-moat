@@ -74,6 +74,54 @@ What it does:
    when they exist; otherwise plain launch). Configurable in `moat.toml`
    `[analysis] agent_args`.
 
+### 2b. What the agent may read: staged evidence
+
+Analysis is worth more when the agent can read the thing that was accused —
+deobfuscating a dropped `setup.mjs`, decoding a base64'd postinstall — than
+when it only reads a description of it. The configured agents (`claude`,
+`codex`) are cloud APIs, so whatever is staged leaves the machine, which makes
+"what may be staged" a security decision. It lives in `evidence.rs`, in code
+and under test, never in a prompt.
+
+**The rule: what is accused may be read; what was stolen may not.**
+
+Every finding has an actor (`process.exe`) and a target (`file`). For the
+`cred` family the target *is the secret*: `moat-cred-ssh-private-key-read`
+matches `~/.ssh/id_rsa`, `moat-cred-cloud-credentials-read` matches
+`~/.aws/credentials`. Staging a target's contents there would upload the
+user's private key to a cloud API — from the tool whose purpose is stopping
+credential theft. So:
+
+| | staged | why |
+|---|---|---|
+| actor binary or script | yes | it is the suspect; reading it is the analysis |
+| target of a non-`cred` rule | yes | for an exec rule the file *is* the accused thing |
+| target of a `cred` rule | **never** | it is the secret the rule protects |
+| anything matching `is_secret_path` | **never** | belt to the family check's braces |
+| over 1 MiB, or not a regular file | no | a model cannot usefully decode a 40 MB binary |
+
+`is_secret_path` is deliberately broad — `~/.ssh`, `~/.gnupg`, cloud and
+registry credential stores, `.pem`/`.key`/`.kdbx` and friends — and applies to
+both roles in every family, so a rule filed under the wrong family later is
+still safe. A false positive costs the agent some context; a false negative
+uploads a private key.
+
+Withheld is never hidden. The artefact is still listed with its path, size and
+sha256 and the reason its contents were withheld, and the preamble tells the
+agent not to go and open the original path itself.
+
+Staged copies are written mode `0400` with a `.suspect` extension beside the
+bundle: they are assumed hostile, so nothing should execute one by accident,
+and the preamble tells the agent to treat every byte as data rather than
+instruction.
+
+**Open:** `[analysis] agent_args` cannot reach the agent through
+`omarchy-agent`, which accepts only `--inline`, `--pick` and `--prompt` and
+builds each agent's flags itself. So the intended `claude --permission-mode
+plan` is advisory today. Pointing an agent at hostile files automatically
+should not depend on an advisory flag; that wants either a direct `claude`
+invocation or a `bwrap` confinement of the agent to the bundle directory.
+
 ## 3. Install receipts: show the positive picture
 
 For every package-manager subtree (pkgtree classifier), the daemon writes one

@@ -46,6 +46,7 @@ pub mod control;
 pub mod digest;
 pub mod engine;
 pub mod event;
+pub mod evidence;
 pub mod explain;
 pub mod feeds;
 pub mod incident;

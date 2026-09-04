@@ -1074,6 +1074,11 @@ impl Daemon {
         let meta: Option<Value> = std::fs::read_to_string(dir.join("meta.json"))
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok());
+        // Stage what the agent is allowed to read, into the same directory the
+        // bundle lives in. evidence.rs decides what may be copied; a cred
+        // rule's target never is.
+        let _ = std::fs::create_dir_all(&dir);
+        let artifacts = crate::evidence::stage(&alert, &dir, crate::evidence::MAX_STAGED_BYTES);
         let body = bundle::render(&bundle::Input {
             alert: &alert,
             mode: &self.mode,
@@ -1083,6 +1088,7 @@ impl Daemon {
             incident: meta.as_ref(),
             incident_dir: meta.as_ref().map(|_| dir.as_path()),
             allowlist_dir: &self.cfg.paths.allowlist_dir.display().to_string(),
+            artifacts: &artifacts,
             version: crate::VERSION,
         });
         bundle::write(&dir, &body, &self.cfg.group)
@@ -1915,6 +1921,63 @@ mod tests {
             bad.is_empty(),
             "fixtures name real paths on this machine, so the suite reads them: {:?}",
             bad
+        );
+    }
+
+    /// End to end: a cred alert's bundle stages the suspect so the agent can
+    /// actually deobfuscate it, and names the credential as withheld.
+    ///
+    /// The fixture policy requires the literal prefix `/home/dan/.ssh/id_`, so
+    /// the target path is a name under it that does not exist — this test will
+    /// not read a real private key to prove a point about not reading private
+    /// keys. That the *bytes* of a real secret never leave is proved with real
+    /// files in `evidence::tests::staging_copies_the_actor_and_withholds_the_secret`.
+    #[test]
+    fn a_bundle_stages_the_suspect_and_withholds_the_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+
+        let suspect = dir.path().join("stealer.mjs");
+        std::fs::write(&suspect, b"const p=atob('c3RlYWw=');require('fs').readFileSync(p)").unwrap();
+        let victim = "/home/dan/.ssh/id_rsa_moat_fixture";
+
+        d.handle_line(&format!(
+            r#"{{"process_lsm":{{"process":{{"exec_id":"b-1","pid":5150,"uid":1000,"binary":"{}","cwd":"/tmp","start_time":"2026-09-03T16:21:00.000000000Z"}},"function_name":"file_post_open","policy_name":"moat-cred-ssh-private-key-read","args":[{{"file_arg":{{"path":"{}"}}}},{{"int_arg":4}}]}},"time":"2026-09-03T16:21:00.100Z"}}"#,
+            suspect.display(),
+            victim
+        ));
+        let id = d
+            .store
+            .load()
+            .into_iter()
+            .find(|a| a.rule == "moat-cred-ssh-private-key-read")
+            .expect("the alert")
+            .id;
+
+        let path = d.write_bundle(&id).expect("bundle");
+        let md = std::fs::read_to_string(&path).unwrap();
+
+        // The suspect is staged and named, so the agent can read and decode it.
+        assert!(md.contains("## Files"), "{}", md);
+        assert!(md.contains("actor.stealer.mjs.suspect"), "{}", md);
+        let staged = path.parent().unwrap().join("actor.stealer.mjs.suspect");
+        assert!(staged.exists(), "the suspect script sits beside the bundle");
+        assert!(String::from_utf8_lossy(&std::fs::read(&staged).unwrap()).contains("atob"));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+            0o400,
+            "staged hostile files are not executable"
+        );
+
+        // The credential is named and explicitly withheld, and the agent is
+        // told not to go and open it itself.
+        assert!(md.contains("contents withheld"), "{}", md);
+        assert!(md.contains(victim), "the path is still disclosed: {}", md);
+        assert!(
+            md.contains("do not try to read the original path"),
+            "{}",
+            md
         );
     }
 
