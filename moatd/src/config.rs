@@ -141,6 +141,8 @@ pub struct RuleToggles {
     pub net_first_contact: bool,
     pub new_exec_ioc: bool,
     pub mass_read: bool,
+    pub exec_memfd: bool,
+    pub exec_privileges_raised: bool,
     /// The four rules that replaced the deleted `pkg` kernel policies.
     pub pkg_subtree_interpreter_spawn: bool,
     pub pkg_subtree_downloader: bool,
@@ -156,6 +158,8 @@ impl Default for RuleToggles {
             net_first_contact: true,
             new_exec_ioc: true,
             mass_read: true,
+            exec_memfd: true,
+            exec_privileges_raised: true,
             pkg_subtree_interpreter_spawn: true,
             pkg_subtree_downloader: true,
             pkg_subtree_netcat_exec: true,
@@ -212,13 +216,23 @@ impl Default for Thresholds {
     fn default() -> Self {
         Self {
             dedupe_secs: 60,
-            mass_read_files: 40,
-            mass_read_window_secs: 10,
+            // 3 distinct credential files in 30 seconds, not 40 in 10.
+            //
+            // 40 was a threshold nothing could ever reach: a real stealer
+            // reads a dozen, and this rule had never fired on this machine.
+            // Nothing legitimate reads four different credential KINDS -- an
+            // npm token, an AWS key, a kube config -- inside half a minute.
+            // Backup and indexing tools do, and they are a small, nameable
+            // set: allowlist them once, which is a thing the user can see and
+            // undo, rather than a threshold that silently disables the rule.
+            mass_read_files: 3,
+            mass_read_window_secs: 30,
             process_prune_secs: 60,
             ancestry_max: 8,
-            // 4 MiB, not 20: this bounds what the PANEL re-reads on every
-            // append, not what the disk holds. See the note in moat.toml.
-            alerts_max_bytes: 4 * 1024 * 1024,
+            // 20 MiB. The panel no longer reads this file (it asks moatd
+            // for the folded feed), so its size is a retention question again
+            // rather than a UI latency budget. See moat.toml.
+            alerts_max_bytes: 20 * 1024 * 1024,
             state_interval_secs: 5,
             feeds_poll_secs: 60,
         }
@@ -791,7 +805,7 @@ mod tests {
     fn missing_config_is_defaults() {
         let c = Config::load(Path::new("/nonexistent/moat.toml")).unwrap();
         assert_eq!(c.group, "moat");
-        assert_eq!(c.thresholds.mass_read_files, 40);
+        assert_eq!(c.thresholds.mass_read_files, 3);
     }
 
     #[test]

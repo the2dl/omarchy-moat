@@ -22,6 +22,7 @@
 //! a package install" without matching half the desktop (see `pkgtree`), so the
 //! subtree test moved to userland while the rule ids stayed put.
 
+pub mod exec_properties;
 pub mod ai_cli;
 pub mod mass_read;
 pub mod netmatch;
@@ -138,6 +139,8 @@ pub fn all() -> Vec<Box<dyn UserRule>> {
         Box::new(net_first_contact::NetFirstContact::default()),
         Box::new(new_exec_ioc::NewExecIoc::default()),
         Box::new(mass_read::MassRead::default()),
+        Box::new(exec_properties::ExecMemfd),
+        Box::new(exec_properties::ExecPrivilegesRaised),
         Box::new(pkg_subtree::InterpreterSpawn::default()),
         Box::new(pkg_subtree::Downloader),
         Box::new(pkg_subtree::NetcatExec),
@@ -521,7 +524,11 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), n, "rule ids must be unique");
-        assert_eq!(n, 9, "four gap rules, the four that replaced pkg policies, and net-first-contact");
+        assert_eq!(
+            n, 11,
+            "four gap rules, the four that replaced pkg policies, net-first-contact, \
+             and the two that read binary_properties (memfd, privileges raised)"
+        );
 
         // Every rule must be switchable off, or `[rules]` is a lie.
         let mut off = cfg();
@@ -531,6 +538,8 @@ mod tests {
             net_first_contact: false,
             new_exec_ioc: false,
             mass_read: false,
+            exec_memfd: false,
+            exec_privileges_raised: false,
             pkg_subtree_interpreter_spawn: false,
             pkg_subtree_downloader: false,
             pkg_subtree_netcat_exec: false,

@@ -295,6 +295,67 @@ TestCase {
     verify(Model.shouldNotify(critical, "low", false))
   }
 
+  /// The two ingest paths must agree.
+  ///
+  /// The panel reads the folded feed from moatd now; `ingestText` remains for
+  /// the fallback and for these tests. If they drift, the panel and the daemon
+  /// disagree about what is outstanding -- the exact class of bug that made a
+  /// suppressed alert count on the badge.
+  /// A proposal Moat is not vouching for must keep saying so.
+  ///
+  /// `normalizeProposal` is a whitelist, and a field it forgets vanishes in
+  /// silence -- which for this one would mean the panel showing a repeat-
+  /// offender offer as if the baseline were confident about it.
+  function test_a_proposals_reason_survives_normalisation() {
+    var confident = Model.normalizeProposal({ id: "01A", rule: "moat-x", toml: "[[rule]]" }, 0)
+    compare(confident.reason, "", "the ordinary route carries no caveat")
+
+    var offered = Model.normalizeProposal({
+      id: "01B", rule: "moat-exec-untrusted-tmpfs", toml: "[[rule]]",
+      reason: "the noise guard has had to quieten this pattern repeatedly"
+    }, 1)
+    verify(offered.reason.indexOf("quieten this pattern repeatedly") >= 0)
+    compare(offered.actionable, true)
+  }
+
+  function test_the_feed_path_matches_the_text_path() {
+    var fromText = Model.ingestText(Model.createStore(), suite.fixtureText)
+
+    // What moatd sends: the same records, already folded, OLDEST first.
+    var payload = { alerts: fromText.alerts.slice().reverse(), receipts: [] }
+    var fromFeed = Model.ingestFeed(Model.createStore(), payload)
+
+    compare(fromFeed.alerts.length, fromText.alerts.length, "same number of alerts")
+    compare(fromFeed.initialLoad, true, "a first feed is history, not events")
+    compare(fromFeed.newIds.length, 0)
+    for (var i = 0; i < fromText.alerts.length; i++)
+      compare(fromFeed.alerts[i].id, fromText.alerts[i].id, "same order at " + i)
+
+    // The badge is the thing that must not drift.
+    compare(fromFeed.unacked.critical, fromText.unacked.critical)
+    compare(fromFeed.unacked.high, fromText.unacked.high)
+    compare(fromFeed.unacked.medium, fromText.unacked.medium)
+    compare(fromFeed.unacked.low, fromText.unacked.low)
+
+    // And byId must be populated, because the notifier looks ids up in it.
+    verify(fromFeed.byId[fromFeed.alerts[0].id] !== undefined)
+  }
+
+  function test_a_new_alert_in_the_feed_notifies() {
+    var store = Model.createStore()
+    var first = Model.ingestText(store, suite.fixtureText)
+    var oldest = first.alerts.slice().reverse()
+
+    // Same records back, plus one that was not there before.
+    var extra = JSON.parse(JSON.stringify(oldest[oldest.length - 1]))
+    extra.id = "01ZZZZZZZZZZZZZZZZZZZZZZZZ"
+    var result = Model.ingestFeed(store, { alerts: oldest.concat([extra]), receipts: [] })
+
+    compare(result.initialLoad, false, "the store was already primed")
+    compare(result.newIds.length, 1, "only the unseen id is new")
+    compare(result.newIds[0], "01ZZZZZZZZZZZZZZZZZZZZZZZZ")
+  }
+
   function test_new_alert_after_priming_notifies() {
     var store = Model.createStore()
     Model.ingestText(store, suite.fixtureText)

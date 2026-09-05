@@ -96,8 +96,25 @@ net_first_contact = true
 # matching the abuse.ch hash feed.
 new_exec_ioc = true
 
-# One process reading many distinct files under $HOME dotdirs in seconds.
+# One process reading many distinct CREDENTIAL files in seconds -- the files
+# the cred-* policies posted, wherever they live. See [thresholds] below.
 mass_read = true
+
+# A binary executed from anonymous memory (memfd), shared memory, or a file
+# unlinked before it ran. Tetragon reports this directly in
+# `process.binary_properties.file`, which it populates for nothing else, so
+# there is no path-matching guesswork and no extra kernel cost -- exec events
+# are exported unconditionally. Rare, and deliberate when it happens: a program
+# that was never written to disk cannot be scanned, hashed or quarantined.
+exec_memfd = true
+
+# A process whose privileges the kernel raised as it executed: a setuid or
+# setgid binary, or one with file capabilities
+# (`binary_properties.privileges_changed`). This is privilege actually being
+# GAINED, as distinct from `priv-setuid-chmod`, which sees a setuid bit being
+# set -- something every package build does to its own staged files. Fires for
+# every sudo and pkexec, so it is a chain step rather than a finding.
+exec_privileges_raised = true
 
 # The four rules below replaced the `pkg` kernel policies of the same names.
 # Tetragon's `matchParentBinaries … followChildren` matched processes with no
@@ -141,9 +158,21 @@ headless_allowed_parents = [
 # `count` update instead of a new alert.
 dedupe_secs = 60
 
-# mass-read: more than this many distinct files inside the window fires.
-mass_read_files = 40
-mass_read_window_secs = 10
+# mass-read: this many distinct CREDENTIAL files inside the window fires (the
+# Nth read is the trigger, not the N+1th).
+# Counts only files the `cred-*` policies posted, so it is already
+# scoped to credential-shaped reads rather than to file activity in general.
+#
+# 3 in 30s. Nothing legitimate reads four different credential kinds -- an npm
+# token, an AWS key, a kube config -- inside half a minute; that is what a
+# secret scanner does. The previous 40-in-10s could not fire at all.
+#
+# Backup and indexing tools (restic, borg, rsync, an editor indexing your home)
+# will trip this. They are a small nameable set and the alert offers to allow
+# them by binary, which is visible and reversible -- unlike a threshold set so
+# high the rule is off.
+mass_read_files = 3
+mass_read_window_secs = 30
 
 # How long an exited process stays in the table. Kprobe events can be written
 # after the exit line, and kill confirmation arrives on the exit event.
@@ -152,27 +181,18 @@ process_prune_secs = 60
 # Ancestry chain cap recorded on each alert.
 ancestry_max = 8
 
-# alerts.jsonl is renamed to alerts.1.jsonl at this size (4 MiB).
+# alerts.jsonl is renamed to alerts.1.jsonl at this size (20 MiB).
 #
-# This is a PANEL budget, not a disk one. Quickshell's FileView has no
-# read-from-offset: every append makes it re-read the whole live file into a
-# JS string, and the panel then prefix-compares that string to decide the fold
-# is an append. Acking an incident appends one update line per member, so
-# "Close it" on a busy day meant re-reading and re-hashing ~10 MB on the UI
-# thread, several times -- the toast said "closed" and the panel then locked
-# for seconds.
+# Back to 20 MiB on 2026-09-05, once the panel stopped reading this file.
 #
-# The rotated half is read once and kept in front of the fold, so it costs
-# nothing per append. Only the LIVE half is re-read, which is why lowering
-# this is the fix: at 4 MiB the per-append cost drops about five-fold.
-#
-# The trade is real and worth stating: only ONE rotated file is kept, so total
-# retained history goes from ~40 MiB to ~8 MiB. That is a lot of alerts either
-# way (today's record averages 1.5 KiB), and the incident snapshots, receipts
-# and quarantine store -- the things an investigation actually needs -- are
-# separate files and are not affected. If retention matters more than panel
-# latency on a given machine, raise this; the cost is paid on every ack.
-alerts_max_bytes = 4194304
+# It was cut to 4 MiB that afternoon because quickshell's FileView has no
+# read-from-offset: every append had the panel re-read the whole live file on
+# the UI thread, so the log's size was a latency budget and history was being
+# traded for responsiveness. The panel now asks moatd for the folded feed over
+# the control socket it already used for everything else, so this is once again
+# only a question of how much history to keep -- and the answer for an EDR is
+# "as much as is reasonable".
+alerts_max_bytes = 20971520
 
 # state.json write interval, and feed-file mtime poll interval.
 state_interval_secs = 5

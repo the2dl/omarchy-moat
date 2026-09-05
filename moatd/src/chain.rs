@@ -197,6 +197,16 @@ pub struct Chain {
     /// load; `member_ids()` falls back to `steps` for those.
     #[serde(default)]
     pub members: Vec<String>,
+    /// How many of `steps_total` were TRIGGERS rather than context.
+    ///
+    /// Tracked because the headline has to say what moat is actually claiming
+    /// happened, and `steps` is capped: on a truncated chain the stored steps
+    /// cannot be counted to find out. Without it the summary said "128 things
+    /// happened" (context and allowlisted reads included) and then "26 more
+    /// were already allowed" -- adding a number that was already inside the
+    /// first one.
+    #[serde(default)]
+    pub triggers_total: usize,
     /// One plain sentence about the sequence, for the verdict line of 3a.
     pub summary: String,
 }
@@ -546,10 +556,19 @@ pub fn human_span(secs: u64) -> String {
 }
 
 /// The chain's own sentence: what happened, over how long, under what.
-fn summarise(steps: &[Step], ancestor: &Ancestor, span: u64, total: usize) -> String {
+fn summarise(
+    steps: &[Step],
+    ancestor: &Ancestor,
+    span: u64,
+    total: usize,
+    triggers_total: usize,
+) -> String {
     let triggers: Vec<&Step> = steps.iter().filter(|s| s.is_trigger()).collect();
     let families = ordered_families(&triggers);
-    let silenced = steps.len() - triggers.len();
+    // From the durable counters, not from the capped step list: on a truncated
+    // chain `steps` holds twelve of a hundred and twenty-eight, and counting
+    // it would understate both halves.
+    let silenced = total.saturating_sub(triggers_total);
     // The headline counts what moat is ACTUALLY saying happened.
     //
     // `total` counts every observation in the tree, including steps the user
@@ -563,13 +582,7 @@ fn summarise(steps: &[Step], ancestor: &Ancestor, span: u64, total: usize) -> St
     // `total` is also a checkpoint rather than a total on a growing chain --
     // republishing happens on powers of two -- which is a second reason not to
     // put it in the headline.
-    let counted = if total > steps.len() {
-        // Truncated: triggers seen is a floor, so scale honestly by saying so
-        // rather than printing a number the step list cannot support.
-        total
-    } else {
-        triggers.len()
-    };
+    let counted = triggers_total;
     let mut s = format!(
         "{} things happened in {} under {} (pid {}), crossing {}.",
         counted,
@@ -587,21 +600,14 @@ fn summarise(steps: &[Step], ancestor: &Ancestor, span: u64, total: usize) -> St
         // the allowed steps are in addition to it rather than a subset of it.
         // Getting this wrong would be the same class of error as the count
         // itself -- a sentence whose arithmetic does not close.
-        if total > steps.len() {
-            s.push_str(&format!(
-                " At least {} more {} already allowed on {} own.",
-                silenced,
-                if silenced == 1 { "was" } else { "were" },
-                if silenced == 1 { "its" } else { "their" },
-            ));
-        } else {
-            s.push_str(&format!(
-                " {} more {} already allowed on {} own.",
-                silenced,
-                if silenced == 1 { "was" } else { "were" },
-                if silenced == 1 { "its" } else { "their" },
-            ));
-        }
+        // Exact in both cases now: both numbers come from counters that keep
+        // counting after `steps` stops growing, so there is no "at least".
+        s.push_str(&format!(
+            " {} more {} already allowed on {} own.",
+            silenced,
+            if silenced == 1 { "was" } else { "were" },
+            if silenced == 1 { "its" } else { "their" },
+        ));
     }
     s
 }
@@ -692,6 +698,9 @@ impl ChainStore {
             let was_families = c.chain.families.clone();
             c.last_at = at;
             c.chain.steps_total += 1;
+            if step.is_trigger() {
+                c.chain.triggers_total += 1;
+            }
             // The member is recorded whether or not the story has room for it.
             if !c.chain.members.contains(&step.alert) {
                 c.chain.members.push(step.alert.clone());
@@ -716,6 +725,7 @@ impl ChainStore {
                 &c.chain.ancestor,
                 c.chain.span_secs,
                 c.chain.steps_total,
+                c.chain.triggers_total,
             );
             // Republishing costs one update line per member, so a tree that
             // trips a hundred distinct detections would otherwise write twelve
@@ -800,8 +810,15 @@ impl ChainStore {
             first_ts: steps[0].ts.clone(),
             last_ts: steps[steps.len() - 1].ts.clone(),
             span_secs: span,
-            summary: summarise(&steps, &ancestor, span, total),
+            summary: summarise(
+                &steps,
+                &ancestor,
+                span,
+                total,
+                steps.iter().filter(|x| x.is_trigger()).count(),
+            ),
             members: steps.iter().map(|x| x.alert.clone()).collect(),
+            triggers_total: steps.iter().filter(|x| x.is_trigger()).count(),
             steps,
             steps_total: total,
             truncated: formation_truncated,
@@ -1047,6 +1064,60 @@ mod tests {
         assert!(c.summary.contains("2 things happened"), "{}", c.summary);
         assert!(c.summary.contains("1 more was already allowed"), "{}", c.summary);
         assert_eq!(c.member_ids(), vec!["01A", "01B", "01C"]);
+    }
+
+    /// The headline counts triggers, and the two numbers add up.
+    ///
+    /// A truncated chain used to print `steps_total` (context and allowlisted
+    /// reads included) and then "N more were already allowed" -- a number that
+    /// was already inside the first one. Both now come from counters that keep
+    /// counting after `steps` stops growing.
+    #[test]
+    fn a_truncated_chains_headline_still_adds_up() {
+        let mut s = ChainStore::new();
+        let tree = || typed_at_a_shell(41233);
+        let mut last = None;
+        let (mut triggers, mut context) = (0usize, 0usize);
+        for i in 0..(MAX_STEPS * 3) {
+            let fam = if i % 2 == 0 { "exec" } else { "net" };
+            let sev = if i == 0 { "high" } else { "low" };
+            let mut o = obs(&format!("01ID{:03}", i), 1_000 + i as u64, fam, sev, tree());
+            o.rarity = if i == 1 { Rarity::FirstSeen } else { Rarity::Common };
+            // Every third one is allowlisted, i.e. context.
+            o.silenced = i > 1 && i % 3 == 0;
+            if o.silenced { context += 1 } else { triggers += 1 }
+            // Keep the LATEST published chain: `note` republishes only when
+            // something changed, so `.or(last)` would pin an early snapshot.
+            if let Some(c) = s.note(o) {
+                last = Some(c);
+            }
+        }
+        let c = last.expect("a chain forms");
+        assert!(c.truncated || c.steps_total > c.steps.len(), "this test needs a truncated chain");
+        assert!(triggers > 0 && context > 0, "the fixture must produce both kinds");
+
+        // The property that broke: the headline is the TRIGGER count, the
+        // "more" clause is everything else, and the two add to steps_total.
+        // Asserted against the chain's own counters rather than the numbers
+        // this test fed in -- how many observations the correlator accepts is
+        // a separate question from whether its arithmetic closes.
+        let context_total = c.steps_total - c.triggers_total;
+        assert!(
+            c.triggers_total > c.steps.len(),
+            "the counter must keep counting after `steps` is capped: {} vs {}",
+            c.triggers_total,
+            c.steps.len()
+        );
+        assert!(
+            c.summary.contains(&format!("{} things happened", c.triggers_total)),
+            "headline must count triggers: {}",
+            c.summary
+        );
+        assert!(
+            c.summary.contains(&format!("{} more", context_total)),
+            "and the allowed ones are IN ADDITION to it, not inside it: {}",
+            c.summary
+        );
     }
 
     /// Every alert that formed a chain is a member of it.

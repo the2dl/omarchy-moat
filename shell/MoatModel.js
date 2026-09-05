@@ -1735,6 +1735,53 @@ function ingestText(store, text, options) {
   }
 }
 
+/// The same result as `ingestText`, from alerts moatd has ALREADY folded.
+///
+/// This is the live path. `ingestText` folds raw JSONL and remains for the
+/// tests and as the fallback when the socket is unavailable, but the panel no
+/// longer reads the log: quickshell's `FileView` has no read-from-offset, so
+/// every append had it re-read the whole file into a JS string and prefix-
+/// compare it on the UI thread. On a 9.7 MB log that locked the panel for
+/// seconds every time an incident was closed -- and closing appends one line
+/// per member, so the biggest cards were the slowest.
+///
+/// Deliberately returns the identical shape, so everything downstream --
+/// decoration, the badge counts, `newIds` and the notifier -- is unchanged and
+/// the two paths cannot drift.
+function ingestFeed(store, payload, options) {
+  var raw = (payload && payload.alerts) || []
+  var receipts = (payload && payload.receipts) || []
+
+  // moatd folds; this side only decorates. `byId` is rebuilt here because the
+  // notifier looks ids up in it and there is no fold to borrow one from.
+  var alerts = decorateAlerts(raw.slice().reverse(), options)
+  var byId = {}
+  for (var b = 0; b < alerts.length; b++) byId[alerts[b].id] = alerts[b]
+
+  var initialLoad = !store.primed
+  var newIds = []
+  // Oldest first, for the same reason ingestText walks backwards: rememberSeen
+  // evicts from the front, so walking newest-first would remember the newest id
+  // and then be the first to forget it.
+  for (var i = alerts.length - 1; i >= 0; i--) {
+    var id = alerts[i].id
+    if (!store.seen[id] && !initialLoad) newIds.push(id)
+    rememberSeen(store, id, alerts.length)
+  }
+  store.primed = true
+
+  return {
+    alerts: alerts,
+    byId: byId,
+    receipts: receipts,
+    newIds: newIds,
+    initialLoad: initialLoad,
+    // A socket read is never a partial file, so there is no rotation to detect.
+    reloaded: false,
+    unacked: unackedCounts(alerts, options)
+  }
+}
+
 /// Hand the store the rotated half of the log, alerts.1.jsonl, once. From then
 /// on ingestText takes the LIVE file alone and folds it as if it were appended
 /// to this text -- which is what it is: an update in the live file lands on a
@@ -2402,7 +2449,12 @@ var ROTATE_GUIDANCE = {
   "kubeconfig": "Rotate the cluster credential (client cert or token) and redistribute the kubeconfig; every context in ~/.kube/config and $KUBECONFIG is compromised.",
   "gpg-key": "Revoke the affected subkey (gpg --gen-revoke), publish the revocation, and re-encrypt anything the key protected.",
   "keyring": "The login keyring was read. Change the account passwords it held and re-add them.",
-  "browser-passwords": "Change every password saved in that browser profile, starting with any you reused. The login database is decryptable with the keyring that process could reach.",
+  // Leads with the exposure and a PROPORTIONATE first step. "Change every
+  // password saved in that browser profile" is true, is what a thorough
+  // response looks like, and is an instruction essentially nobody carries out
+  // -- so as the opening words it reads as noise and costs the whole block its
+  // credibility. The reused ones are where the actual risk is.
+  "browser-passwords": "That profile's saved logins were readable: the database is decryptable with the keyring that process could reach. Change any you reused elsewhere first, then the rest as you get to them.",
   "browser-cookies": "Sign out of every session in that browser profile (this invalidates the stolen cookies) and change passwords for anything without 2FA.",
   "session-cookies": "Sign out everywhere on the affected accounts: a stolen session cookie is accepted without your password and without 2FA until it is invalidated.",
   "local-password": "/etc/shadow was read, so every local account hash is offline-crackable. Run passwd for each account and treat any reused password as public.",
@@ -2672,6 +2724,14 @@ function normalizeProposal(value, fallbackIndex) {
     // ignore flow shows its block: the user approves the bytes.
     toml: String(p.toml || p.line || p.block || ""),
     comment: String(p.comment || ""),
+    // Why this is being offered. Empty is the ordinary route -- a recurring,
+    // official, medium/low pattern the baseline is confident about. Non-empty
+    // means Moat is NOT vouching for it, and the card must say so: the TOML
+    // block looks identical either way, and accepting one writes a permanent
+    // allowlist entry. Whitelisted here explicitly, because a field this
+    // function forgets is a field that vanishes in silence -- which is how
+    // `chain`, `triage` and `surface` went missing from UPDATABLE.
+    reason: String(p.reason || ""),
     actionable: id !== ""
   }
 }

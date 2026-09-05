@@ -53,6 +53,12 @@ enum Cmd {
     /// The full explanation for one alert.
     Explain { id: String },
     /// Mark an alert as seen.
+    /// Everything the panel needs, already folded: alerts and receipts in one
+    /// response. Not meant to be read by a person; `list` is.
+    Feed {
+        #[arg(long, default_value_t = 500)]
+        limit: u64,
+    },
     /// Every decision the kill gate has made: what it spared, what it would
     /// have killed, and why. This is the evidence for whether `set kill kill`
     /// is safe on this machine -- read it before arming, not after.
@@ -263,6 +269,7 @@ fn main() -> ExitCode {
         Cmd::Explain { id } => json!({"cmd": "explain", "id": id}),
         Cmd::Forget { dst } => json!({"cmd": "forget", "dst": dst}),
         Cmd::Decisions { limit } => json!({"cmd": "decisions", "limit": limit}),
+        Cmd::Feed { limit } => json!({"cmd": "feed", "limit": limit}),
         Cmd::Ack { ids, all, rule, before, chain } => json!({
             "cmd": "ack",
             // The first id keeps the single-alert and --chain paths working
@@ -947,6 +954,13 @@ fn print_human(cmd: &Cmd, r: &Value) {
             r["forgotten"].as_u64().unwrap_or(0),
             dst
         ),
+        // Machine-readable only: `--json` carries it, and the plain form says
+        // so rather than printing 500 alerts at somebody.
+        Cmd::Feed { .. } => println!(
+            "{} alert(s), {} receipt(s) — use --json (this is what the panel reads)",
+            r["alerts"].as_array().map(|a| a.len()).unwrap_or(0),
+            r["receipts"].as_array().map(|a| a.len()).unwrap_or(0)
+        ),
         Cmd::Triage { .. } => {}
         Cmd::Explain { .. } => match serde_json::from_value::<Alert>(r["alert"].clone()) {
             Ok(a) => print_explain(&a),
@@ -1520,6 +1534,14 @@ fn print_baseline(a: &BaselineCmd, r: &Value) {
                         p["first_seen"].as_str().unwrap_or(""),
                         p["last_seen"].as_str().unwrap_or("")
                     );
+                    // A proposal that carries a reason is NOT the baseline
+                    // vouching for the pattern -- it is the noise guard saying
+                    // it keeps having to quieten this. Printing it above the
+                    // TOML matters: the block below looks identical either
+                    // way, and accepting one is a permanent allowlist entry.
+                    if let Some(why) = p["reason"].as_str().filter(|w| !w.is_empty()) {
+                        println!("    NOTE: {}", why);
+                    }
                     for l in p["toml"].as_str().unwrap_or("").lines() {
                         println!("      {}", l);
                     }

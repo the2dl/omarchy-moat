@@ -80,6 +80,7 @@ Item {
     // fresh file, or the file was truncated. ingestText already re-folded
     // from the new content and kept the seen-set, so rotated-out ids cannot
     // come back as "new" and re-notify.
+    // Say it once per window, not once per collapsed alert.
 
     id: root
 
@@ -239,7 +240,12 @@ Item {
     /// attacker in this threat model runs as that same person. From a panel that
     /// means asking polkit, which is the only way a GUI can raise privilege
     /// honestly -- with a prompt the user sees and can refuse.
-    readonly property var privilegedCommands: ["mode", "rule-mode", "contain", "kill", "sandbox", "ignore", "unignore"]
+    // `baseline-accept` is here for the same reason `ignore` is: accepting a
+    // proposal appends a permanent allowlist entry. It is the same act by a
+    // different route, so it must meet the same prompt -- and without this the
+    // button would simply fail against a daemon that now refuses it.
+    // `baseline-dismiss` is NOT privileged: refusing an offer weakens nothing.
+    readonly property var privilegedCommands: ["mode", "rule-mode", "contain", "kill", "sandbox", "ignore", "unignore", "baseline-accept", "baseline-relearn"]
     property var _queue: []
     property var _lastArg: undefined
     property var _lastArg2: undefined
@@ -294,6 +300,12 @@ Item {
     property string analyzeId: ""
     property string copyState: "" // "" | "running" | "copied" | "failed"
     property string copyMessage: ""
+    property string _feedOutput: ""
+    /// The last feed response, verbatim. Identical bytes mean nothing changed,
+    /// and skipping the parse keeps the delegate identity guards in `_apply`
+    /// meaningful -- `ingestFeed` builds fresh arrays every call, so without
+    /// this every poll would rebuild every row on the page.
+    property string _lastFeed: ""
 
     signal alertsUpdated()
     signal actionFinished(string command, bool ok, string message)
@@ -333,8 +345,29 @@ Item {
         };
     }
 
+    /// The live path: ask moatd for the folded feed.
+    ///
+    /// One small response instead of re-reading and re-folding the whole log.
+    /// moatd has already folded it -- it is the process that wrote it -- so
+    /// only one program on the machine has to know the file's format.
+    function _pollFeed() {
+        if (!root.available || feedProc.running)
+            return ;
+
+        feedProc.command = [root.ctlPath, "feed", "--json"];
+        feedProc.running = true;
+    }
+
+    function _applyFeed(payload) {
+        root._apply(Model.ingestFeed(root._store, payload, root.baselineOptions()));
+    }
+
     function _ingest(text) {
-        var result = Model.ingestText(root._store, text, root.baselineOptions());
+        root._apply(Model.ingestText(root._store, text, root.baselineOptions()));
+    }
+
+    /// Shared by both paths, so they cannot drift in how a result is applied.
+    function _apply(result) {
         // Identity guards, not micro-optimisation. FileView fires onFileChanged
         // more than once per append, and a re-read that folded nothing new hands
         // back the SAME arrays. Assigning them anyway would fire alertsChanged and
@@ -384,8 +417,6 @@ Item {
     }
 
     function _maybeNotify(alert, initialLoad) {
-        // Say it once per window, not once per collapsed alert.
-
         // The panel has no business announcing something that happened before it
         // was running, whatever the ingest thinks is new. This cannot be defeated
         // by a re-prime because it does not depend on the store at all.
@@ -828,7 +859,9 @@ Item {
     }
 
     function refresh() {
-        alertsFile.reload();
+        // Explicit refresh goes to the socket like everything else; the log is
+        // no longer the panel's read path.
+        root._pollFeed();
         root.pollStatus();
         root.loadAllowlist();
         root.loadBaselineExport();
@@ -1138,11 +1171,18 @@ Item {
     // reads everything that landed in it. One second is the most a
     // notification can lag behind the daemon for it.
     Timer {
+        // Ask moatd for the folded feed instead of re-reading the log.
+
         id: alertsReloadTimer
 
         interval: 1000
         repeat: false
-        onTriggered: alertsFile.reload()
+        // `FileView` is kept as a change SIGNAL and nothing else: it is how we
+        // learn an append happened, cheaply. What we must not do is call
+        // reload()/text(), because that allocates the entire live file as a JS
+        // string on the UI thread -- 9.7 MB on 2026-09-05, on every ack, which
+        // is what made "Close it" lock the panel for seconds.
+        onTriggered: root._pollFeed()
     }
 
     FileView {
@@ -1164,9 +1204,9 @@ Item {
                 alertsReloadTimer.start();
 
         }
-        // The live half only. The store already holds the rotated half in front
-        // of it -- the order moatd folds them in, so an update in the live file
-        // lands on a record that was rotated out.
+        // Nothing reads the content any more; see the timer above. Kept so a
+        // manual reload() during debugging still folds correctly, and as the
+        // fallback path if the socket is ever unreachable.
         onLoaded: {
             if (root._rotatedSettled)
                 root._ingest(text());
@@ -1223,6 +1263,42 @@ Item {
 
             waitForEnd: true
             onStreamFinished: root._probeOutput = text
+        }
+
+    }
+
+    Process {
+        // Silent on purpose, like the status poll: a background read
+        // that loses a race with the socket is not something the user
+        // asked for, and the file watcher will fire again.
+
+        id: feedProc
+
+        onExited: function(exitCode) {
+            var out = String(feedStdout.text || root._feedOutput || "").trim();
+            root._feedOutput = "";
+            if (exitCode !== 0 || !out)
+                return ;
+
+            if (out === root._lastFeed)
+                return ;
+
+            root._lastFeed = out;
+            try {
+                var payload = JSON.parse(out);
+                if (payload && payload.ok !== false)
+                    root._applyFeed(payload);
+
+            } catch (e) {
+                console.log("moat: unreadable feed:", e);
+            }
+        }
+
+        stdout: StdioCollector {
+            id: feedStdout
+
+            waitForEnd: true
+            onStreamFinished: root._feedOutput = text
         }
 
     }
@@ -1301,7 +1377,15 @@ Item {
         running: root.available
         repeat: true
         triggeredOnStart: false
-        onTriggered: root.pollStatus()
+        onTriggered: {
+            root.pollStatus();
+            // Also on the tick, not only when the watcher fires: an append is
+            // the usual trigger, but a chain restamp or an ack applied from
+            // moatctl changes the FOLD without necessarily looking like one to
+            // the watcher, and a panel that only updates on file-change can sit
+            // on a stale view indefinitely.
+            root._pollFeed();
+        }
     }
 
     Timer {

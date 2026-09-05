@@ -159,7 +159,29 @@ pub struct Proposal {
     /// Internal: which tuple it came from.
     #[serde(default)]
     pub key: String,
+    /// Why this is being proposed. Empty means the ordinary route: a
+    /// recurring, official, medium/low pattern that the baseline is confident
+    /// about. Non-empty means moat is NOT vouching for it and the sentence
+    /// says what it is instead -- see `REDEMOTED_REASON`.
+    #[serde(default)]
+    pub reason: String,
 }
+
+/// A pattern the noise guard has had to quieten again and again.
+///
+/// Deliberately worded as an observation rather than a recommendation. moat
+/// has no opinion on whether this is safe: it is reporting that the same shape
+/// keeps flooding, that the circuit breaker keeps tripping, and that a person
+/// could end the cycle with one decision. Auto-allowing it would be the exact
+/// mistake this project keeps finding -- repetition is not consent, and an
+/// attacker who runs daily can manufacture repetition.
+/// How many times one pattern may be demoted before Moat offers to make the
+/// decision permanent. Three: enough that it is clearly a habit of this
+/// machine and not one bad afternoon.
+pub const REDEMOTE_PROPOSE_AT: u64 = 3;
+
+pub const REDEMOTED_REASON: &str =
+    "the noise guard has had to quieten this pattern repeatedly; Moat is not vouching for      it, only noting that you keep being asked about it";
 
 /// A rule the noise guard put on the timeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +218,19 @@ pub struct BaselineState {
     /// rule that nobody has seen yet.
     #[serde(default)]
     pub demoted_tuples: BTreeMap<String, Demotion>,
+    /// How many times the noise guard has demoted each tuple, across clears.
+    ///
+    /// A demotion is a circuit breaker: it forgets on purpose, so a pattern
+    /// that recurs costs the same 20 badge alerts every time it comes back.
+    /// For an OFFICIAL actor the baseline eventually learns the pattern and
+    /// the cycle ends; for anything else -- a build tree under /tmp, an AUR
+    /// package, a locally compiled tool -- nothing ever graduates, because
+    /// automatic trust from repetition is precisely what an attacker can
+    /// manufacture. This counter is how the cycle becomes visible instead:
+    /// past `REDEMOTE_PROPOSE_AT` it is offered as a proposal for a person to
+    /// accept or refuse.
+    #[serde(default)]
+    pub redemotions: BTreeMap<String, u64>,
     /// rule -> hour bucket (unix hours) -> alerts in that hour.
     #[serde(default)]
     pub windows: HashMap<String, BTreeMap<u64, u64>>,
@@ -425,6 +460,8 @@ impl Baseline {
                 last_seen: stat.last_seen.clone(),
                 toml: stat.toml(),
                 key,
+                // The ordinary route: the baseline IS confident about this one.
+                reason: String::new(),
             });
             Learned::Proposed { id }
         }
@@ -491,6 +528,54 @@ impl Baseline {
     }
 
     // --------------------------------------------------------- the proposals
+
+    /// Offer a repeatedly-demoted pattern as a decision, once.
+    ///
+    /// Built from the tuple key rather than from a `TupleStat`, because the
+    /// patterns that reach here are exactly the ones the baseline refused to
+    /// track: not official, so `note` never recorded a stat for them. That is
+    /// the point -- this is the path for everything the ordinary route will
+    /// never propose, and it carries `reason` so no reader mistakes it for the
+    /// baseline vouching.
+    fn propose_redemoted(&mut self, rule: &str, tuple: &str, count: u64, times: u64, now: u64) {
+        // Once per tuple. Re-proposing every time it trips would turn a
+        // helpful offer into the same flood it is trying to end.
+        if self.state.proposals.iter().any(|p| p.key == tuple) {
+            return;
+        }
+        let parts: Vec<&str> = tuple.splitn(4, '|').collect();
+        if parts.len() != 4 {
+            return;
+        }
+        let (exe, parent, dir) = (parts[1].to_string(), parts[2].to_string(), parts[3].to_string());
+        let spec = RuleSpec {
+            name: rule.to_string(),
+            exe: (!exe.is_empty()).then(|| exe.clone()),
+            file: (!dir.is_empty()).then(|| format!("{}/*", dir.trim_end_matches('/'))),
+            parent: (!parent.is_empty()).then(|| parent.clone()),
+        };
+        let id = ulid::Ulid::new().to_string();
+        self.state.proposals.push(Proposal {
+            id,
+            rule: rule.to_string(),
+            exe,
+            parent,
+            dir,
+            count,
+            days: times as usize,
+            first_seen: crate::util::rfc3339_of(now),
+            last_seen: crate::util::rfc3339_of(now),
+            toml: render_block(&spec),
+            key: tuple.to_string(),
+            reason: REDEMOTED_REASON.to_string(),
+        });
+        self.dirty = true;
+        log::info!(
+            "noise guard: {} has been quietened {} times for one pattern; proposing it",
+            rule,
+            times
+        );
+    }
 
     pub fn proposals(&self) -> &[Proposal] {
         &self.state.proposals
@@ -574,6 +659,7 @@ impl Baseline {
                 last_seen: t.last_seen.clone(),
                 toml: t.toml(),
                 key: key.clone(),
+                reason: String::new(),
             };
             self.state.proposals.push(p.clone());
             out.push(p);
@@ -641,6 +727,12 @@ impl Baseline {
             last_seen: now,
         };
         self.state.demoted_tuples.insert(tuple.to_string(), d.clone());
+        let seen = self.state.redemotions.entry(tuple.to_string()).or_insert(0);
+        *seen += 1;
+        let times = *seen;
+        if times >= REDEMOTE_PROPOSE_AT {
+            self.propose_redemoted(rule, tuple, count, times, now);
+        }
         log::warn!(
             "noise guard: {} raised {} alerts in 24 h for one pattern; demoting that pattern \
              to the timeline (other patterns of this rule stay on the badge)",
@@ -1173,6 +1265,46 @@ mod tests {
     // ----------------------------------------------------------- noise guard
 
     #[test]
+    /// A pattern that keeps coming back becomes a decision, not a habit.
+    ///
+    /// The noise guard forgets on purpose, so an unofficial pattern that
+    /// recurs costs the same badge flood every time it returns and never
+    /// graduates -- the baseline only learns OFFICIAL actors, deliberately,
+    /// because automatic trust from repetition is what an attacker can
+    /// manufacture. This is the escape hatch that keeps a person in the loop.
+    #[test]
+    fn a_pattern_demoted_again_and_again_is_offered_as_a_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        let rule = "moat-exec-untrusted-tmpfs";
+        // A REAL tuple key: `propose_redemoted` parses it back into its four
+        // fields to build the allowlist block, so a placeholder would be
+        // silently ignored -- which is what this test caught first time.
+        let key = tuple_key(rule, "/usr/bin/bash", "/usr/bin/makepkg", "/tmp/build");
+        let tuple = key.as_str();
+        let mut now = NOW;
+
+        for round in 1..=REDEMOTE_PROPOSE_AT {
+            // Flood past the threshold, which demotes the pattern.
+            for _ in 0..=(b.noisy_rule_per_day + 1) {
+                b.note_alert(rule, tuple, now);
+                now += 1;
+            }
+            assert!(b.is_demoted_tuple(rule, tuple), "round {} must demote", round);
+            // A quiet day clears it, and the cycle begins again.
+            now += DAY * 2;
+            b.clear_stale_demotions(now);
+        }
+
+        let props: Vec<&Proposal> = b.proposals().iter().filter(|p| p.key == tuple).collect();
+        assert_eq!(props.len(), 1, "offered once, not once per flood");
+        assert!(
+            !props[0].reason.is_empty(),
+            "and marked as an observation, not the baseline vouching for it"
+        );
+        assert!(props[0].toml.contains(rule), "{}", props[0].toml);
+    }
+
     fn a_noisy_pattern_is_demoted_exactly_once_and_only_that_pattern() {
         let dir = tempfile::tempdir().unwrap();
         let mut b = baseline(dir.path(), NOW);

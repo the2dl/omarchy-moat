@@ -674,6 +674,7 @@ mod kill_tests {
             steps_total: 0,
             truncated: false,
             members: Vec::new(),
+            triggers_total: 0,
             summary: "s".into(),
         }
     }

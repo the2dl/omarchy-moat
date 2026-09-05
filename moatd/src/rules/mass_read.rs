@@ -87,9 +87,14 @@ impl UserRule for MassRead {
         let Some(path) = h.file_path() else {
             return Vec::new();
         };
-        if !ctx.in_home_dotdir(&path) {
-            return Vec::new();
-        }
+        // NOT gated on `in_home_dotdir` any more.
+        //
+        // The `moat-cred-*` policies above already decide what counts as a
+        // credential file; asking a second, narrower question here meant a
+        // harvest anywhere else was invisible to the counter -- a staged copy,
+        // a checked-out repo, an extracted archive, or (2026-09-05) a lab
+        // fixture that read eight credential-shaped files and produced nothing
+        // but two timeline entries. One question, one place that answers it.
         if exec_id.is_empty() {
             return Vec::new();
         }
@@ -116,7 +121,13 @@ impl UserRule for MassRead {
             w.entries.push_back((ctx.now, path.clone()));
         }
         let distinct: Vec<String> = w.entries.iter().map(|(_, p)| p.clone()).collect();
-        if distinct.len() <= threshold {
+        // `<`, not `<=`: `mass_read_files = 3` means THREE credential files
+        // fire it, not four. The config comment and the alert text both say
+        // "more than this many" -- but the number a person sets is the number
+        // they expect to be the trigger, and off-by-one in a security
+        // threshold is the kind of thing nobody notices until the rule fails
+        // to fire on a real harvest. Named explicitly in the config.
+        if distinct.len() < threshold {
             return Vec::new();
         }
         // Fired: reset so the next alert needs another full burst (the alert
@@ -242,19 +253,28 @@ mod tests {
     }
 
     #[test]
-    fn writes_and_non_dotdir_paths_are_ignored() {
+    fn writes_are_ignored_but_a_harvest_outside_a_dotdir_is_not() {
         let t = table();
         let mut c = cfg();
         c.thresholds.mass_read_files = 2;
         let mut rule = MassRead::default();
+
+        // A write is not a read, however many of them there are.
         for i in 0..10 {
-            // MAY_WRITE only.
             let w = ev(&format!("/home/dan/.cache/w{}", i), 2, "moat-cred-dotfile-read");
             assert!(fire(&mut rule, &t, &c, &w, 100).is_empty());
-            // Not a dotdir.
-            let p = ev(&format!("/home/dan/proj/f{}", i), 4, "moat-cred-dotfile-read");
-            assert!(fire(&mut rule, &t, &c, &p, 100).is_empty());
         }
+
+        // Credential reads OUTSIDE a home dotdir used to be dropped here, so a
+        // harvest of staged or extracted credentials counted for nothing. The
+        // cred-* policy already decided these are credential files; this rule
+        // counts what it is given.
+        let mut fired = 0;
+        for i in 0..4 {
+            let p = ev(&format!("/tmp/staged/proj-{}/.env", i), 4, "moat-cred-project-token-read");
+            fired += fire(&mut rule, &t, &c, &p, 100).len();
+        }
+        assert!(fired > 0, "four credential reads in one second must be counted");
     }
 
     #[test]
@@ -284,9 +304,15 @@ mod tests {
             );
             out.extend(fire(&mut rule, &t, &c, &e, 100));
         }
-        assert_eq!(out.len(), 1);
+        // threshold 2 means the SECOND read fires it, and the window resets
+        // after each finding, so four reads produce two findings.
+        assert_eq!(out.len(), 2, "N means N: {:?}", out.len());
         let f = &out[0];
-        assert!(f.what_override.as_ref().unwrap().contains("3 different private files"));
+        assert!(
+            f.what_override.as_ref().unwrap().contains("2 different private files"),
+            "{:?}",
+            f.what_override
+        );
         assert!(f.extra_evidence[1].contains("/home/dan/.ssh/k0"));
         assert_eq!(f.meta.family, "cred");
     }

@@ -199,6 +199,23 @@ const ROOT_ONLY: &[(&str, &str)] = &[
 /// prompt is meaningless -- which is how the meaningful one gets waved through.
 const ROOT_ONLY_SET_KEYS: &[&str] = &["mode", "sandbox", "contain", "kill"];
 
+/// `(command, action)` pairs that need root, where the COMMAND itself does not.
+///
+/// `baseline` is one verb with several actions and only some of them weaken
+/// anything. Accepting a proposal appends a permanent allowlist entry -- the
+/// same act as `ignore`, arrived at by a different route, so it gets the same
+/// gate. `relearn` reopens the window during which recurring official patterns
+/// are written to the allowlist with no further prompting, which is a bigger
+/// version of the same thing.
+///
+/// Reading is deliberately NOT gated: `list` is the evidence a person reviews
+/// before deciding, and putting the evidence behind sudo is how the review
+/// stops happening.
+const ROOT_ONLY_ACTIONS: &[(&str, &str, &str)] = &[
+    ("baseline", "accept", "writing an allowlist rule"),
+    ("baseline", "relearn", "reopening the automatic learning window"),
+];
+
 /// `Some(reason)` when this request needs root and the caller is not root.
 fn needs_root(req: &Value) -> Option<String> {
     let cmd = req.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
@@ -208,6 +225,10 @@ fn needs_root(req: &Value) -> Option<String> {
             return None;
         }
         "changing what Moat enforces"
+    } else if let Some(hit) = ROOT_ONLY_ACTIONS.iter().find(|(c, a, _)| {
+        *c == cmd && *a == req.get("action").and_then(|v| v.as_str()).unwrap_or("")
+    }) {
+        hit.2
     } else {
         ROOT_ONLY.iter().find(|(c, _)| *c == cmd)?.1
     };
@@ -254,6 +275,7 @@ pub fn dispatch(d: &mut Daemon, req: &Value) -> Value {
             ok(d.status())
         }
         "list" => cmd_list(d, req),
+        "feed" => cmd_feed(d, req),
         "explain" => match d.find_alert(&id()) {
             Some(a) => ok(json!({ "alert": a })),
             None => err(format!("no alert {}", id())),
@@ -282,6 +304,40 @@ pub fn dispatch(d: &mut Daemon, req: &Value) -> Value {
         "" => err("missing `cmd`"),
         other => err(format!("unknown command {:?}", other)),
     }
+}
+
+/// Everything the panel folds, already folded, in one response.
+///
+/// The panel used to read `/var/lib/moat/alerts.jsonl` itself. Its fold was
+/// incremental, but quickshell's `FileView` has no read-from-offset: every
+/// append made it re-read the WHOLE live file into a JS string and prefix-
+/// compare it, on the UI thread. Acking an incident appends one update line
+/// per member, so "Close it" on a 9.7 MB log locked the panel for seconds --
+/// the toast said "closed" and then nothing moved.
+///
+/// moatd has already folded this file and holds the result in memory. Serving
+/// it over the socket the panel ALREADY uses for status and actions costs one
+/// small response per poll instead of a re-read and re-parse of the lot, and
+/// it means only one process on the machine has to know the log's format.
+///
+/// Receipts ride along because the panel needs them in the same pass and they
+/// share the file (LEARNING §3); they take no part in the badge.
+fn cmd_feed(d: &Daemon, req: &Value) -> Value {
+    // Bounded by default. The panel renders a window, not the whole history,
+    // and an unbounded feed would swap one unbounded read for another.
+    let limit = req.get("limit").and_then(|v| v.as_u64()).unwrap_or(500) as usize;
+    let mut alerts = d.store.load();
+    if alerts.len() > limit {
+        alerts = alerts.split_off(alerts.len() - limit);
+    }
+    let receipts = d.receipt_list(50);
+    ok(json!({
+        "alerts": alerts,
+        "receipts": receipts,
+        // So the panel can tell "you have the whole history" from "you have a
+        // window of it" without counting.
+        "truncated": d.store.load().len() > limit,
+    }))
 }
 
 fn cmd_list(d: &Daemon, req: &Value) -> Value {
@@ -2230,6 +2286,12 @@ mod tests {
             json!({"cmd":"set","key":"kill","value":"off"}),
             json!({"cmd":"set","key":"kill","value":"kill"}),
             json!({"cmd":"ignore","id":"01X","scope":"rule"}),
+            // Accepting a proposal writes the same allowlist entry `ignore`
+            // does; arriving at it from the baseline must not be the cheap way
+            // round the gate. Reopening the learning window is the same act
+            // with a longer fuse.
+            json!({"cmd":"baseline","action":"accept","id":"01X"}),
+            json!({"cmd":"baseline","action":"relearn"}),
         ] {
             let r = dispatch(&mut d, &user(cmd.clone()));
             assert_eq!(r["ok"], false, "{:?} must be refused for a non-root caller", cmd);
@@ -2251,12 +2313,26 @@ mod tests {
         );
 
         // Reading is still ordinary group work -- no sudo to see your own alerts.
+        // `baseline list` is in here deliberately: it is the evidence a person
+        // reviews before deciding, and evidence behind sudo does not get read.
         for cmd in [
             json!({"cmd":"status"}),
             json!({"cmd":"list"}),
+            json!({"cmd":"baseline","action":"list"}),
         ] {
             assert_eq!(dispatch(&mut d, &user(cmd.clone()))["ok"], true, "{:?}", cmd);
         }
+
+        // Dismissing an offer weakens nothing, so it is not gated. It still
+        // fails for an unknown id -- but on the id, not on permission, and the
+        // difference is the whole point of checking it here.
+        let r = dispatch(&mut d, &user(json!({"cmd":"baseline","action":"dismiss","id":"nope"})));
+        assert_eq!(r["ok"], false);
+        assert!(
+            !r["error"].as_str().unwrap_or("").contains("needs root"),
+            "refusing an offer must not require sudo: {:?}",
+            r["error"]
+        );
 
         // And root is not obstructed by THIS gate. (It may still fail for an
         // honest reason -- there is no `tetra` in a test environment, and

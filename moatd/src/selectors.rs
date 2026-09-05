@@ -130,8 +130,24 @@ impl Selector {
             }
         }
         if !binary.is_empty() {
+            // The kernel tested the RESOLVED binary; we are handed the
+            // REPORTED one.
+            //
+            // `matchBinaries` compares against `d_path(current->mm->exe_file)`
+            // -- `/usr/bin/python3.14`. `process.binary` in the event comes
+            // from the execve tracepoint's filename, i.e. the path as invoked
+            // -- `/usr/bin/python`. So a clause like `NotPostfix "/python3"`
+            // does not match in the kernel and DOES match here, and moat
+            // reported `moat-x-sensor-mismatch` for a credential read that had
+            // really happened: the .npmrc read of 2026-09-05 18:43.
+            //
+            // Accept if EITHER name passes. Whichever one the kernel actually
+            // used, it used one of these two -- and re-validation exists to
+            // catch a kernel that matched something it should not have, not to
+            // second-guess which spelling of the same file it saw.
+            let names = crate::contain::binary_aliases(binary);
             for c in &self.binaries {
-                if !c.op.accepts(&c.values, binary) {
+                if !names.iter().any(|n| c.op.accepts(&c.values, n)) {
                     return Err((c.clone(), binary.to_string()));
                 }
             }

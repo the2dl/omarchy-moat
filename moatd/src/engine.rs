@@ -4353,6 +4353,7 @@ mod tests {
             steps_total: 0,
             truncated: false,
             members: Vec::new(),
+            triggers_total: 0,
             summary: "s".into(),
         };
         d.maybe_kill_tree(&c, util::unix_secs());
