@@ -127,8 +127,12 @@ impl UserRule for ExecMemfd {
                 // would point at the wrong object entirely.
                 format!("{}; it was executed through {}", measured, named)
             },
-            "a program that is never written to disk cannot be scanned, hashed or \
-             quarantined -- which is the reason to run one this way"
+            // "with no file on disk", matching the line above. "Never written
+            // to disk" would contradict it: the first line allows for deleted-
+            // before-exec, and the two sentences have to agree or the alert
+            // argues with itself in front of the person reading it.
+            "a program with no file on disk cannot be scanned, hashed or quarantined -- \
+             which is the reason to run one this way"
                 .to_string(),
         ];
         f.extra_evidence.push(
