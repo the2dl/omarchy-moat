@@ -299,6 +299,26 @@ Otherwise only `parent` + `process.parent_exec_id`.
 shm/deleted binaries only). **No** file-age or interpreter field; for scripts `binary` is the
 interpreter and the script is in `arguments`.
 
+**REQUIRES `--enable-process-cred`. The whole message, `file` included.** Without it
+`binary_properties` is never attached and the field simply does not appear -- silently, and
+identically to "this exec was ordinary". `pkg/grpc/exec/exec.go:317` passes
+`option.Config.EnableProcessCred` into `UpdateExecOutsideCache`, and
+`pkg/process/process.go:190` guards the whole struct on it (`if cred && pi.apiBinaryProp !=
+nil`), despite the doc comment eight lines above claiming the flag covers only the credential
+fields. Upstream `main` gates it the same way, so this is not fixed by a newer version. The
+kernel side is unconditional -- `tg_kp_bprm_committing_creds` is in the base sensor and fills
+`tg_execve_joined_info_map` regardless -- so the values are computed and then discarded.
+
+Also: `file.path` is never populated in v1.7.1 (`process.go` sets only `inode`). The name of a
+memfd/fexecve binary has to come from `process.binary`, which is the tracepoint filename:
+`/proc/self/fd/N`, `/proc/<pid>/fd/N`, or `/dev/fd/N` for `execveat(AT_EMPTY_PATH)`.
+
+Cost of the flag: no new BPF program. Every `process`/`parent` object gains `cap` and
+`process_credentials` -- empty for ordinary users, ~41 capability names per list for root. If
+the export grows uncomfortably, a `field-filters` fragment
+`{"fields":"process.cap,parent.cap","action":"EXCLUDE"}` drops the bulk without touching
+`binary_properties`.
+
 `process.flags` is space-separated from: `execve procFS errorEnvs truncArgs miss
 errorFilename errorArgs nocwd rootcwd errorCWD clone errorCgroupName errorCgroupID
 errorCgroupSubsysCgrp errorCgroupSubsys errorCgroups errorPathResolutionCwd dataFilename

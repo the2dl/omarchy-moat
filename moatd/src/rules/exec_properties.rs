@@ -61,25 +61,50 @@ impl UserRule for ExecMemfd {
         let Some(file) = props.file.as_ref() else {
             return Vec::new();
         };
+        // KEY ON THE INODE, not on the field's presence.
+        //
+        // `systemd --user` re-execs itself through /proc/self/fd/9 on every
+        // daemon-reexec -- 12 such execs in this machine's log. Its binary is
+        // an ordinary file with links on disk, so an fd-shaped-path heuristic
+        // (which is what this rule nearly became) would have raised 12 high
+        // alerts for the user manager restarting. A memfd, a /dev/shm image
+        // and a binary unlinked before exec all have NO remaining links; that
+        // is the actual distinction and it is the one thing worth matching.
+        //
+        // Absent reads as zero on purpose: protojson omits default values, so
+        // `links: 0` -- the case this rule exists for -- may not appear in the
+        // JSON at all. Only a POSITIVE link count means "this has a name on
+        // disk" and rules the exec out.
+        if file["inode"]["links"].as_u64().unwrap_or(0) != 0 {
+            return Vec::new();
+        }
         let m = self.meta();
         let Some(mut f) = ctx.finding(MEMFD_ID, m, exec_id) else {
             return Vec::new();
         };
-        let named = file["path"].as_str().unwrap_or_default().to_string();
+        // v1.7.1 never populates `file.path` -- `process.go` sets only the
+        // inode -- so the name has to come from `process.binary`, which for
+        // one of these is the fd the kernel executed through:
+        // `/proc/self/fd/N`, `/proc/<pid>/fd/N`, or `/dev/fd/N` for
+        // execveat(AT_EMPTY_PATH). Reading `file.path` was a branch that could
+        // never run.
+        let named = ev
+            .process
+            .as_ref()
+            .and_then(|p| p.binary.clone())
+            .unwrap_or_default();
         f.extra_evidence = vec![
             if named.is_empty() {
                 "the kernel had no path for this binary at all".to_string()
             } else {
-                format!("the kernel's name for it was {}", named)
+                format!("it was executed through {}", named)
             },
             "a program that is never written to disk cannot be scanned, hashed or \
              quarantined -- which is the reason to run one this way"
                 .to_string(),
         ];
-        if file["inode"]["links"].as_u64() == Some(0) {
-            f.extra_evidence
-                .push("its inode has no remaining links: the file was unlinked before it ran".into());
-        }
+        f.extra_evidence
+            .push("its inode has no remaining links: there is no file on disk to inspect".into());
         vec![f]
     }
 
@@ -208,10 +233,17 @@ mod tests {
     /// so its presence is the detection. No path shape is matched.
     #[test]
     fn a_binary_with_no_name_on_disk_is_reported() {
+        // The real v1.7.1 shape: an inode, no path. The name comes from
+        // `process.binary`, which for a memfd exec is the fd it ran through.
         let ev = exec(r#","binary_properties":{"file":{"inode":{"number":7,"links":0}}}"#);
         let out = run(&mut ExecMemfd, &ev);
         assert_eq!(out.len(), 1, "a memfd exec must be reported");
         assert_eq!(out[0].meta.severity, "high");
+        assert!(
+            out[0].extra_evidence[0].contains("/usr/bin/whatever"),
+            "the name must come from process.binary, not the never-populated file.path: {:?}",
+            out[0].extra_evidence
+        );
         assert!(
             out[0].extra_evidence.iter().any(|e| e.contains("no remaining links")),
             "an unlinked inode is worth saying out loud: {:?}",
@@ -228,6 +260,17 @@ mod tests {
         assert!(
             run(&mut ExecMemfd, &exec(r#","binary_properties":{"setuid":0}"#)).is_empty(),
             "setuid without `file` is not a memfd"
+        );
+        // The systemd case: re-exec through /proc/self/fd/9 of a binary that
+        // is still on disk. 12 of these are in this machine's log, and an
+        // fd-path heuristic would have called every one of them an implant.
+        assert!(
+            run(
+                &mut ExecMemfd,
+                &exec(r#","binary_properties":{"file":{"inode":{"number":42,"links":1}}}"#)
+            )
+            .is_empty(),
+            "a binary with a name on disk is not fileless, whatever fd it ran through"
         );
         assert!(
             run(&mut ExecPrivilegesRaised, &exec("")).is_empty(),

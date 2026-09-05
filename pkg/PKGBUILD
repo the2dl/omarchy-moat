@@ -14,7 +14,7 @@
 
 pkgname=omarchy-moat
 pkgver=0.1.0
-pkgrel=70
+pkgrel=73
 _tetragonver=1.7.1
 pkgdesc='eBPF supply-chain sensor for Omarchy: Tetragon policies, an alert daemon, a bubblewrap sandbox and pre-execution scanners for PKGBUILD, npm, cargo, pip and go'
 arch=('x86_64')
@@ -63,6 +63,7 @@ sha256sums=('2f36a7bbb2b3d77a011383a01c8f804fe7761d934a76ff2fdf99ebad6f3e89ae'
 _confd=(
 	bpf-lib
 	cgroup-rate
+	enable-process-cred
 	enable-process-environment-variables
 	event-queue-size
 	export-allowlist

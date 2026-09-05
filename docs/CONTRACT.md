@@ -30,6 +30,11 @@ Tetragon itself is **upstream, unmodified**, v1.7.1, from
     bpf-lib                = /usr/lib/tetragon/bpf
     tracing-policy-dir     = /run/moat/policies
     parents-map-enabled    = true                 (needed by matchParentBinaries)
+    enable-process-cred    = true                 (REQUIRED for process.binary_properties:
+                                                   without it moat-x-exec-memfd and
+                                                   moat-x-exec-privileges-raised are live,
+                                                   configured and permanently silent.
+                                                   `moatctl status` reports them as INERT.)
     export-filename        = /var/log/moat/tetragon.log
     export-file-max-size-mb= 50
     export-file-max-backups= 3

@@ -1272,6 +1272,22 @@ fn print_status(r: &Value) {
         r["feeds"]["domains"],
         r["feeds"]["updated"].as_str().unwrap_or("never")
     );
+    // A rule that is on and cannot fire is worse than one that is off: it
+    // reads as coverage. Printed above the counts, because it changes what
+    // those counts mean.
+    if let Some(inert) = r["inert_rules"].as_array().filter(|a| !a.is_empty()) {
+        println!(
+            "INERT      {} cannot fire: tetragon needs --enable-process-cred\n\
+             \x20          fix: echo true | sudo tee /etc/tetragon/tetragon.conf.d/enable-process-cred\n\
+             \x20          then: sudo systemctl restart tetragon",
+            inert
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.replace("moat-x-", ""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     println!(
         "unacked    critical {}  high {}  medium {}  low {}",
         u["critical"], u["high"], u["medium"], u["low"]
