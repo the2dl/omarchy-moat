@@ -101,26 +101,41 @@ impl UserRule for ExecMemfd {
         // builds an ELF, copies it into a memfd, and leaves the original in
         // place. Overclaiming in the first line is how an accurate detection
         // acquires an inaccurate reputation.
+        // The inode, and BOTH possibilities, spelled out.
+        //
+        // The deleted-binary case is where a vague line costs something real:
+        // a dropper writes /tmp/.x, execs it, unlinks it. If the alert only
+        // says "no file on disk", the natural response is to stop looking --
+        // when the write itself was probably recorded by
+        // `telemetry-file-became-executable`, the exec by
+        // `exec-untrusted-tmpfs`, and the path is still in the process's own
+        // record. Saying which of the two it might be is what keeps a
+        // responder pointed at evidence that exists.
+        let inode = file["inode"]["number"].as_u64();
+        let measured = format!(
+            "the kernel found no directory entry for this binary when it ran{}: it was \
+             either created in memory or deleted before exec",
+            inode.map(|n| format!(" (inode {}, 0 links)", n)).unwrap_or_default()
+        );
         f.extra_evidence = vec![
             if named.is_empty() {
-                "the kernel found no directory entry for this binary when it ran".to_string()
+                measured
             } else {
                 // The fd spelling stays the primary name. `resolve_exec_binary`
                 // will happily recover the PARENT's argv0 for one of these --
                 // `python`, for the scrim -- and an alert headed "python ran"
                 // would point at the wrong object entirely.
-                format!(
-                    "the kernel found no directory entry for this binary when it ran; \
-                     it was executed through {}",
-                    named
-                )
+                format!("{}; it was executed through {}", measured, named)
             },
             "a program that is never written to disk cannot be scanned, hashed or \
              quarantined -- which is the reason to run one this way"
                 .to_string(),
         ];
-        f.extra_evidence
-            .push("its inode has no remaining links: there is no file on disk to inspect".into());
+        f.extra_evidence.push(
+            "if it was deleted rather than created in memory, the write and the exec were \
+             probably recorded separately -- check the timeline around this alert"
+                .into(),
+        );
         vec![f]
     }
 
@@ -261,7 +276,12 @@ mod tests {
             out[0].extra_evidence
         );
         assert!(
-            out[0].extra_evidence.iter().any(|e| e.contains("no remaining links")),
+            out[0].extra_evidence[0].contains("inode 7, 0 links"),
+            "the measurement belongs in the evidence: {:?}",
+            out[0].extra_evidence
+        );
+        assert!(
+            out[0].extra_evidence.iter().any(|e| e.contains("recorded separately")),
             "an unlinked inode is worth saying out loud: {:?}",
             out[0].extra_evidence
         );
