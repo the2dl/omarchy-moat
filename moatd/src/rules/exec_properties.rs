@@ -93,11 +93,27 @@ impl UserRule for ExecMemfd {
             .as_ref()
             .and_then(|p| p.binary.clone())
             .unwrap_or_default();
+        // What was MEASURED, first. The kernel attests one fact -- no directory
+        // entry for this inode at exec -- and the rule used to dress that up as
+        // "never written to disk", which is a claim about history the kernel
+        // cannot make. A file compiled to disk and then unlinked looks
+        // identical here, and moat's own lab scrim is precisely that case: it
+        // builds an ELF, copies it into a memfd, and leaves the original in
+        // place. Overclaiming in the first line is how an accurate detection
+        // acquires an inaccurate reputation.
         f.extra_evidence = vec![
             if named.is_empty() {
-                "the kernel had no path for this binary at all".to_string()
+                "the kernel found no directory entry for this binary when it ran".to_string()
             } else {
-                format!("it was executed through {}", named)
+                // The fd spelling stays the primary name. `resolve_exec_binary`
+                // will happily recover the PARENT's argv0 for one of these --
+                // `python`, for the scrim -- and an alert headed "python ran"
+                // would point at the wrong object entirely.
+                format!(
+                    "the kernel found no directory entry for this binary when it ran; \
+                     it was executed through {}",
+                    named
+                )
             },
             "a program that is never written to disk cannot be scanned, hashed or \
              quarantined -- which is the reason to run one this way"
@@ -113,11 +129,11 @@ impl UserRule for ExecMemfd {
             MEMFD_ID,
             "exec",
             "high",
-            "A program ran that was never written to disk",
-            "The binary was executed from anonymous memory (memfd), shared memory, or a \
-             file deleted before it ran, so there is nothing on disk to inspect. This is \
-             the standard way to run an implant without leaving a file behind; almost \
-             nothing legitimate does it.",
+            "A program ran from a file with no name on disk",
+            "The binary had no directory entry when it ran: anonymous memory (memfd), \
+             shared memory, or a file unlinked before exec. Whichever it was, there is \
+             nothing on disk to inspect now. This is the standard way to run an implant \
+             without leaving a file behind; almost nothing legitimate does it.",
             "Rarely, and it is worth looking at every time. A few packers, some language \
              runtimes and container tooling load code this way.",
             &[],
