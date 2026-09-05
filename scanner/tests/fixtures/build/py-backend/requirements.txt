@@ -1,0 +1,5 @@
+requests==2.31.0
+--extra-index-url https://203.0.113.44:8080/simple
+--trusted-host 203.0.113.44
+internal-lib @ https://files.example.org/internal-1.0.tar.gz
+tool @ git+https://github.com/example/tool@v1.2.3

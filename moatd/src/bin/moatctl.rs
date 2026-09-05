@@ -53,11 +53,28 @@ enum Cmd {
     /// The full explanation for one alert.
     Explain { id: String },
     /// Mark an alert as seen.
+    /// Every decision the kill gate has made: what it spared, what it would
+    /// have killed, and why. This is the evidence for whether `set kill kill`
+    /// is safe on this machine -- read it before arming, not after.
+    Decisions {
+        #[arg(long, default_value_t = 50)]
+        limit: u64,
+    },
+    /// Make Moat forget what it has learned about one network destination, so
+    /// the next connection there is a first contact again. Needs root, and is
+    /// recorded. For a re-provisioned host, a changed network, or a lab.
+    Forget {
+        /// An address, e.g. 192.168.44.122
+        dst: String,
+    },
     /// Mark an alert as seen. With no ID, use --all/--rule/--before to clear a
     /// backlog: after a rule retune the old alerts are about rules that no
     /// longer exist, and they hide the real ones until they are cleared.
     Ack {
-        id: Option<String>,
+        /// One or more alert ids. Several ids are answered in ONE request:
+        /// the panel closes a whole card this way, and acking N alerts should
+        /// cost one round trip, not N.
+        ids: Vec<String>,
         /// Ack every unacked alert.
         #[arg(long)]
         all: bool,
@@ -67,6 +84,10 @@ enum Cmd {
         /// Ack only alerts older than this alert id.
         #[arg(long)]
         before: Option<String>,
+        /// Ack every alert in the same chain. One decision about a sequence
+        /// should not leave its other four steps on the badge.
+        #[arg(long)]
+        chain: bool,
     },
     /// SIGKILL the process tree the alert recorded.
     Kill { id: String },
@@ -100,7 +121,10 @@ enum Cmd {
     },
     /// List the merged allowlist rules with their index and comment.
     Allowlist,
-    /// set mode monitor|enforce, or set sandbox on|off.
+    /// set mode monitor|enforce, sandbox on|off, digest on|off, contain on|off,
+    /// or kill off|log|kill (what containment does to the processes involved).
+    /// Everything but `digest` needs root: they are the switches that can
+    /// weaken protection, and a hijacked package runs as you, not as root.
     Set {
         key: String,
         value: String,
@@ -139,8 +163,44 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// The unattended agent pass (LEARNING §2c). `--run` is what the user
+    /// timer runs; with no flags it prints what is waiting.
+    Triage {
+        /// Do the pass: bundle each pending alert, ask the agent, record the
+        /// verdict.
+        #[arg(long)]
+        run: bool,
+        /// At most this many; the daemon's `triage_max_per_run` otherwise.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Print the agent command for the first pending alert and stop.
+        #[arg(long)]
+        dry_run: bool,
+        /// Drop this alert's verdict and put it back on the badge.
+        #[arg(long, value_name = "ID")]
+        undo: Option<String>,
+    },
     /// How unusual this alert's tuple is on this machine (LEARNING §1).
     Rarity { id: String },
+    /// The sequence an alert is part of: what led here, with times (design 2b).
+    /// With no ID, list the chains on record.
+    Chain {
+        id: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: u64,
+    },
+    /// Binaries a rule has been told to stop watching, and how to undo that.
+    Exclusions {
+        /// Watch this binary again. Takes `<rule>:<binary>` as listed.
+        #[arg(long)]
+        remove: Option<String>,
+    },
+    /// What moatd is refusing on its own judgement right now, and how to stop it.
+    Contain {
+        /// Drop the containment for this chain immediately.
+        #[arg(long)]
+        release: Option<String>,
+    },
     /// The weekly digest (LEARNING §5). `--notify` is what the user timer runs.
     Digest {
         /// Send it through omarchy-notification-send, if it is due and on.
@@ -201,12 +261,18 @@ fn main() -> ExitCode {
             json!({"cmd": "list", "since": since.clone().unwrap_or_default(), "limit": limit})
         }
         Cmd::Explain { id } => json!({"cmd": "explain", "id": id}),
-        Cmd::Ack { id, all, rule, before } => json!({
+        Cmd::Forget { dst } => json!({"cmd": "forget", "dst": dst}),
+        Cmd::Decisions { limit } => json!({"cmd": "decisions", "limit": limit}),
+        Cmd::Ack { ids, all, rule, before, chain } => json!({
             "cmd": "ack",
-            "id": id.clone().unwrap_or_default(),
+            // The first id keeps the single-alert and --chain paths working
+            // unchanged; `ids` is what the daemon uses when there are several.
+            "id": ids.first().cloned().unwrap_or_default(),
+            "ids": ids,
             "all": all,
             "rule": rule.clone().unwrap_or_default(),
             "before": before.clone().unwrap_or_default(),
+            "chain": chain,
         }),
         Cmd::Kill { id } => json!({"cmd": "kill", "id": id}),
         Cmd::Quarantine { id, list, restore } => json!({
@@ -232,7 +298,25 @@ fn main() -> ExitCode {
         Cmd::Incidents { last } => json!({"cmd": "incidents", "last": last}),
         Cmd::Bundle { id } => json!({"cmd": "bundle", "id": id}),
         Cmd::Analyze { id, .. } => json!({"cmd": "analyze", "id": id}),
+        Cmd::Triage { limit, undo, .. } => match undo {
+            Some(id) => json!({"cmd": "triage", "action": "undo", "id": id}),
+            None => json!({"cmd": "triage", "action": "pending", "limit": limit}),
+        },
         Cmd::Rarity { id } => json!({"cmd": "rarity", "id": id}),
+        Cmd::Chain { id, limit } => json!({
+            "cmd": "chain", "id": id.clone().unwrap_or_default(), "limit": limit,
+        }),
+        Cmd::Exclusions { remove } => match remove {
+            Some(pair) => {
+                let (rule, exe) = pair.split_once(':').unwrap_or(("", ""));
+                json!({"cmd": "exclusions", "action": "remove", "rule": rule, "exe": exe})
+            }
+            None => json!({"cmd": "exclusions", "action": "list"}),
+        },
+        Cmd::Contain { release } => match release {
+            Some(chain) => json!({"cmd": "contain", "action": "release", "id": chain}),
+            None => json!({"cmd": "contain", "action": "list"}),
+        },
         Cmd::Digest { .. } => json!({"cmd": "digest"}),
     };
 
@@ -260,6 +344,9 @@ fn main() -> ExitCode {
     if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) {
         match &cli.cmd {
             Cmd::Analyze { dry_run, .. } => return launch_agent(&resp, *dry_run),
+            Cmd::Triage { run, dry_run, undo: None, .. } if *run || *dry_run => {
+                return run_triage(&resp, &socket, *dry_run, cli.json)
+            }
             Cmd::Digest { notify: true, force } => {
                 return send_digest(&resp, *force, &socket, cli.json)
             }
@@ -271,6 +358,311 @@ fn main() -> ExitCode {
 }
 
 /// LEARNING §2 step 2: `omarchy-agent --prompt "<preamble>"`, in this session.
+/// LEARNING §2c: the unattended pass, run from the user's session by
+/// `moat-triage.timer`.
+///
+/// The daemon cannot do this itself — it is root, has no session, and holds
+/// none of the agent's credentials — so the split mirrors `analyze` and
+/// `digest`: the daemon says what needs looking at and decides what the answer
+/// is allowed to do; this side does the looking.
+///
+/// Nothing here decides anything. It bundles, asks, parses, and posts the
+/// answer back; `cmd_triage` re-validates it and applies the ceiling. A crash,
+/// a timeout, a truncated answer or a hostile one all end the same way: the
+/// alert is left exactly as it was.
+fn run_triage(resp: &Value, socket: &std::path::Path, dry_run: bool, json_out: bool) -> ExitCode {
+    use moatd::triage;
+
+    let mode = resp["mode"].as_str().unwrap_or("off");
+    if mode == "off" {
+        if !json_out {
+            println!("auto_triage is off (`[analysis] auto_triage` in moat.toml)");
+        }
+        return ExitCode::SUCCESS;
+    }
+    let pending = resp["pending"].as_array().cloned().unwrap_or_default();
+    if pending.is_empty() {
+        if !json_out {
+            println!("nothing waiting to be triaged");
+        }
+        return ExitCode::SUCCESS;
+    }
+    let agent = match moatd::analysis::default_agent() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("moatctl triage: {}", e);
+            return ExitCode::from(2);
+        }
+    };
+    // The unattended path builds its own flags precisely so a config key cannot
+    // relax them; say so rather than appearing to honour the setting.
+    let cfg: BTreeMap<String, Vec<String>> =
+        serde_json::from_value(resp["agent_args"].clone()).unwrap_or_default();
+    if let Some(note) = triage::agent_args_ignored(&agent, &cfg) {
+        eprintln!("moatctl triage: {}", note);
+    }
+    let sandbox = moatd::analysis::sandbox_bin();
+    if sandbox.is_none() {
+        eprintln!(
+            "moatctl triage: moat-sandbox is not available, so {} will run unconfined over              content that is under suspicion. Auto-triage is the unattended path; consider              `[analysis] auto_triage = \"off\"` until the sandbox is installed.",
+            agent
+        );
+    }
+    let timeout = resp["timeout_secs"].as_u64().unwrap_or(180);
+
+    // Two passes must not overlap. systemd will not start a second
+    // moat-triage.service while one is active, but a hand-run `moatctl triage
+    // --run` races it happily: on the first live run here, the timer's pass and
+    // a manual one both picked the same pending alert and both spent a full
+    // agent call on it, because `pending` is a snapshot and nothing marks an
+    // alert as being worked on. The lock costs nothing and makes the manual
+    // command safe to type at any moment.
+    let _lock = match TriageLock::acquire() {
+        Ok(l) => l,
+        Err(e) => {
+            if !json_out {
+                println!("another triage pass is already running ({e})");
+            }
+            return ExitCode::SUCCESS;
+        }
+    };
+
+    let mut done = 0usize;
+    let mut checked_visibility: Option<bool> = None;
+    for item in &pending {
+        let id = item["id"].as_str().unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
+        let bundle = match request(socket, &json!({"cmd": "bundle", "id": id})) {
+            Ok(b) if b["ok"] == Value::Bool(true) => b["path"].as_str().unwrap_or("").to_string(),
+            Ok(b) => {
+                eprintln!("moatctl triage {}: {}", id, b["error"].as_str().unwrap_or("bundle failed"));
+                continue;
+            }
+            Err(e) => {
+                eprintln!("moatctl triage {}: {}", id, e);
+                continue;
+            }
+        };
+        // The agent reads the bundle from inside the sandbox, which is not the
+        // same filesystem view this process has: moat-sandbox gives the child a
+        // private /tmp, so a bundle_dir under /tmp is invisible to it while
+        // being perfectly readable from here. Without this check that costs a
+        // full agent call and records a confident-sounding "no evidence was
+        // examined" verdict on a real alert. Checked once — the whole directory
+        // is either visible or it is not.
+        if checked_visibility.is_none() {
+            checked_visibility = Some(bundle_is_visible(sandbox.as_deref(), &agent, &bundle));
+        }
+        if checked_visibility == Some(false) {
+            eprintln!(
+                "moatctl triage: {} cannot be read inside moat-sandbox, so the agent would have no evidence to read. A bundle_dir under /tmp cannot work — the sandbox gives the child a private /tmp. Nothing was triaged.",
+                bundle
+            );
+            return ExitCode::from(2);
+        }
+        let argv = match triage::launch_argv(&agent, &triage::preamble(&bundle), sandbox.as_deref()) {
+            Ok(a) => a,
+            // An agent with no read-only headless mode is not run at all. This
+            // is a per-machine fact, not a per-alert one, so stop rather than
+            // repeat it for every pending alert.
+            Err(e) => {
+                eprintln!("moatctl triage: {}", e);
+                return ExitCode::from(2);
+            }
+        };
+        if dry_run {
+            println!("{}", argv.iter().map(|a| format!("{:?}", a)).collect::<Vec<_>>().join(" "));
+            return ExitCode::SUCCESS;
+        }
+        let output = match capture(&argv, timeout) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("moatctl triage {}: {}", id, e);
+                continue;
+            }
+        };
+        let result = match triage::parse_result(&output.stdout) {
+            Ok(r) => r,
+            // The alert stays untouched and stays on the badge, which is the
+            // safe direction: an answer nobody can read is not a reason to stop
+            // showing the user the evidence.
+            //
+            // This is the one case where the agent's stderr earns its place in
+            // the log: it said something we could not use, and the reason is
+            // usually there rather than on stdout.
+            Err(e) => {
+                eprintln!("moatctl triage {}: {}", id, e);
+                let why = tail_lines(&output.stderr, 5);
+                if !why.is_empty() {
+                    eprintln!("moatctl triage {}: agent stderr: {}", id, why);
+                }
+                continue;
+            }
+        };
+        let submit = json!({
+            "cmd": "triage", "action": "submit", "id": id,
+            "agent": agent, "result": result,
+        });
+        match request(socket, &submit) {
+            Ok(r) if r["ok"] == Value::Bool(true) => {
+                done += 1;
+                if !json_out {
+                    println!("{}  {}  {}", id, r["outcome"].as_str().unwrap_or("?"), result.summary);
+                }
+            }
+            Ok(r) => eprintln!("moatctl triage {}: {}", id, r["error"].as_str().unwrap_or("refused")),
+            Err(e) => eprintln!("moatctl triage {}: {}", id, e),
+        }
+    }
+    if json_out {
+        println!("{}", json!({"ok": true, "triaged": done, "pending": pending.len()}));
+    }
+    ExitCode::SUCCESS
+}
+
+/// A non-blocking exclusive lock held for the duration of one pass.
+///
+/// `flock` rather than a pid file: the kernel drops it when the process dies,
+/// so a killed or crashed pass never leaves a stale lock that needs clearing by
+/// hand. Released on drop, and on exit either way.
+struct TriageLock(std::fs::File);
+
+impl TriageLock {
+    fn acquire() -> Result<TriageLock, String> {
+        let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+        let path = std::path::Path::new(&dir).join("moat-triage.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("{}: {}", path.display(), e))?;
+        // SAFETY: a plain flock on a fd this process owns for the call's duration.
+        let rc = unsafe {
+            libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB)
+        };
+        if rc != 0 {
+            return Err(format!("{} is held", path.display()));
+        }
+        Ok(TriageLock(file))
+    }
+}
+
+impl Drop for TriageLock {
+    fn drop(&mut self) {
+        // SAFETY: same fd, still open; the kernel would release it at exit anyway.
+        unsafe {
+            libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&self.0), libc::LOCK_UN);
+        }
+    }
+}
+
+/// Can the agent actually read the bundle from where it will run?
+///
+/// Answered by asking the sandbox, rather than by pattern-matching the path:
+/// the deny list, the private /tmp and `~/.config/moat/sandbox.conf` all shape
+/// what the child sees, and only the sandbox knows the result.
+fn bundle_is_visible(sandbox_bin: Option<&str>, agent: &str, bundle: &str) -> bool {
+    let Some(bin) = sandbox_bin else {
+        // Unconfined: this process and the agent share a filesystem view, and
+        // the daemon just wrote the file.
+        return std::path::Path::new(bundle).exists();
+    };
+    let probe = vec!["test".to_string(), "-r".to_string(), bundle.to_string()];
+    let argv = moatd::analysis::sandbox_argv(agent, bin, &probe);
+    Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// The last `n` non-blank lines of a stream, for a diagnostic that has to fit
+/// in a log line rather than reproduce the whole run.
+fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join(" | ")
+}
+
+struct AgentOutput {
+    stdout: String,
+    stderr: String,
+}
+
+/// Run the agent and collect its output, with a wall-clock ceiling.
+///
+/// Both streams are drained on their own threads rather than read after the
+/// wait: an agent that prints more than a pipe buffer would otherwise block
+/// forever while this side waits for an exit that cannot come. Killing on the
+/// deadline closes the pipes, which ends the readers too.
+///
+/// stderr is **captured, not inherited**. Inheriting put roughly 2 KB in the
+/// journal per alert per pass, because `moat-sandbox` echoes its whole argv —
+/// prompt included — in its `[moat] sandboxed:` banner. Silencing that with
+/// MOAT_QUIET would also lose the warnings that share the same `warn()`
+/// (`--allow <dir> does not exist`, the cwd-denied error), which are exactly
+/// what a failed pass needs. Capturing keeps all of it and shows it only when
+/// something went wrong.
+fn capture(argv: &[String], timeout_secs: u64) -> Result<AgentOutput, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run {}: {}", argv[0], e))?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_string(&mut s);
+            }
+            s
+        })
+    };
+    let out_reader = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err_reader = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(e) => return Err(format!("waiting for {}: {}", argv[0], e)),
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            timed_out = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+    if timed_out {
+        // The tail is what says WHY it hung -- a sandbox refusal, an auth
+        // prompt the agent could not show. Without it a timeout is unactionable.
+        let why = tail_lines(&stderr, 3);
+        return Err(if why.is_empty() {
+            format!("{} did not answer within {}s", argv[0], timeout_secs)
+        } else {
+            format!("{} did not answer within {}s: {}", argv[0], timeout_secs, why)
+        });
+    }
+    Ok(AgentOutput { stdout, stderr })
+}
+
 fn launch_agent(resp: &Value, dry_run: bool) -> ExitCode {
     let path = resp["path"].as_str().unwrap_or_default();
     let agent = match moatd::analysis::default_agent() {
@@ -445,12 +837,129 @@ fn print_human(cmd: &Cmd, r: &Value) {
     match cmd {
         Cmd::Status => print_status(r),
         Cmd::List { .. } => print_list(r),
+        Cmd::Exclusions { remove: Some(_) } => println!(
+            "{} is watched again by {}",
+            r["exe"].as_str().unwrap_or("?"),
+            r["rule"].as_str().unwrap_or("?")
+        ),
+        Cmd::Exclusions { remove: None } => {
+            let rows = r["exclusions"].as_array().cloned().unwrap_or_default();
+            if rows.is_empty() {
+                println!("no binary has been excluded from a rule");
+            }
+            for e in rows {
+                let (rule, exe) = (
+                    e["rule"].as_str().unwrap_or("?"),
+                    e["exe"].as_str().unwrap_or("?"),
+                );
+                println!(
+                    "{}\n  {} is not watched by this rule at all\n  undo: moatctl exclusions --remove {}:{}",
+                    rule, exe, rule, exe
+                );
+            }
+        }
+        Cmd::Contain { release: Some(chain) } => {
+            println!("released {}; that destination is reachable again", chain)
+        }
+        Cmd::Contain { release: None } => {
+            let live = r["live"].as_array().cloned().unwrap_or_default();
+            if !r["enabled"].as_bool().unwrap_or(false) {
+                println!("containment is off ([contain] enabled = false)");
+            }
+            if live.is_empty() {
+                println!("nothing contained");
+            }
+            for c in live {
+                let dests: Vec<String> = c["dests"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|d| d.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                // `exes`, plural. A containment named one binary until
+                // 2026-09-05, when it grew to name every binary in the chain
+                // that reached out -- and this reader was left behind, so the
+                // one screen you would use to check a containment is sane
+                // printed "?" for the thing it contains.
+                let exes: Vec<String> = c["exes"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|e| e.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                println!(
+                    "{}  {} may not reach {}\n  release: moatctl contain --release {}",
+                    c["chain"].as_str().unwrap_or("?"),
+                    if exes.is_empty() { "?".to_string() } else { exes.join(", ") },
+                    dests.join(", "),
+                    c["chain"].as_str().unwrap_or("?")
+                );
+            }
+        }
+        // `--run` prints its own progress line per alert as it goes; this is
+        // the bare `moatctl triage`, which only says what is waiting.
+        Cmd::Triage { undo: Some(id), .. } => println!(
+            "{} is back on the badge ({})",
+            id,
+            r["undone"].as_str().unwrap_or("verdict dropped")
+        ),
+        Cmd::Triage { run: false, dry_run: false, .. } => {
+            let pending = r["pending"].as_array().cloned().unwrap_or_default();
+            println!(
+                "auto_triage {}   {} alert(s) waiting",
+                r["mode"].as_str().unwrap_or("?"),
+                pending.len()
+            );
+            for p in &pending {
+                println!(
+                    "  {}  {:8}  {}",
+                    p["id"].as_str().unwrap_or("?"),
+                    p["severity"].as_str().unwrap_or("?"),
+                    p["title"].as_str().unwrap_or("?")
+                );
+            }
+        }
+        Cmd::Decisions { .. } => {
+            let d = r["decisions"].as_array().cloned().unwrap_or_default();
+            if d.is_empty() {
+                println!("no kill-gate decisions recorded yet");
+            }
+            for v in &d {
+                println!(
+                    "{}  {:<18} {:<9} {}",
+                    v["ts"].as_str().unwrap_or("?"),
+                    v["verdict"].as_str().unwrap_or("?"),
+                    v["severity"].as_str().unwrap_or("?"),
+                    v["reason"].as_str().unwrap_or("")
+                );
+                let t = v["targets"].as_array().cloned().unwrap_or_default();
+                if !t.is_empty() {
+                    println!("    {}", t.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "));
+                }
+            }
+            if !d.is_empty() {
+                println!(
+                    "\n{} spared, {} would have been killed, {} killed",
+                    r["spared"].as_u64().unwrap_or(0),
+                    r["would_have_killed"].as_u64().unwrap_or(0),
+                    r["killed"].as_u64().unwrap_or(0)
+                );
+            }
+        }
+        Cmd::Forget { dst } => println!(
+            "forgot {} counter(s) for {}; the next connection there reports as a first contact",
+            r["forgotten"].as_u64().unwrap_or(0),
+            dst
+        ),
+        Cmd::Triage { .. } => {}
         Cmd::Explain { .. } => match serde_json::from_value::<Alert>(r["alert"].clone()) {
             Ok(a) => print_explain(&a),
             Err(e) => eprintln!("moatctl: unreadable alert: {}", e),
         },
-        Cmd::Ack { id, all, rule, before } => {
-            if *all || rule.is_some() || before.is_some() {
+        Cmd::Ack { ids, all, rule, before, chain } => {
+            if *chain {
+                println!(
+                    "acked {} alert(s) — the whole of chain {}",
+                    r["acked"].as_u64().unwrap_or(0),
+                    r["chain"].as_str().unwrap_or("?")
+                );
+            } else if *all || rule.is_some() || before.is_some() {
                 let n = r["acked"].as_u64().unwrap_or(0);
                 println!("acked {} alert(s)", n);
                 if let Some(f) = r["failed"].as_array() {
@@ -459,7 +968,7 @@ fn print_human(cmd: &Cmd, r: &Value) {
                     }
                 }
             } else {
-                println!("acked {}", id.clone().unwrap_or_default());
+                println!("acked {}", ids.join(", "));
             }
         }
         Cmd::Kill { .. } => println!(
@@ -536,6 +1045,7 @@ fn print_human(cmd: &Cmd, r: &Value) {
             r["rarity"].as_str().unwrap_or("?"),
             r["rarity_text"].as_str().unwrap_or("")
         ),
+        Cmd::Chain { id, .. } => print_chain(id.as_deref(), r),
         Cmd::Digest { .. } => println!(
             "{}\n  {}   next {}{}",
             r["text"].as_str().unwrap_or(""),
@@ -576,6 +1086,90 @@ fn print_receipts(r: &Value) {
             Some(n) => format!(", {} install(s) still running", n),
             None => String::new(),
         }
+    );
+}
+
+/// Design 2b, "What led here": ancestry as a story with times.
+///
+/// The old panel had the data — `kernel -> systemd -> ... -> bash -> flea` —
+/// but as one line with no times and no sibling events. This prints the
+/// sequence instead: one row per step, the time it happened, and whether it was
+/// something the user had already allowed on its own.
+fn print_chain(id: Option<&str>, r: &Value) {
+    if id.is_none() {
+        let chains = r["chains"].as_array().cloned().unwrap_or_default();
+        if chains.is_empty() {
+            println!("no chains on record");
+            return;
+        }
+        println!(
+            "{} chain(s) on record   {} open now\n",
+            chains.len(),
+            r["open"].as_u64().unwrap_or(0)
+        );
+        for c in &chains {
+            println!(
+                "{}  {:8}  {}\n  {}\n  moatctl chain {}\n",
+                c["id"].as_str().unwrap_or("?"),
+                c["severity"].as_str().unwrap_or("?"),
+                c["last_ts"].as_str().unwrap_or("?"),
+                c["summary"].as_str().unwrap_or(""),
+                c["id"].as_str().unwrap_or("?"),
+            );
+        }
+        return;
+    }
+    let c = &r["chain"];
+    if c.is_null() {
+        println!(
+            "{} is not part of a chain",
+            r["alert"].as_str().unwrap_or("that alert")
+        );
+        return;
+    }
+    println!(
+        "CHAIN {}   {}\n{}\n",
+        c["id"].as_str().unwrap_or("?"),
+        c["severity"].as_str().unwrap_or("?").to_uppercase(),
+        c["summary"].as_str().unwrap_or("")
+    );
+    println!(
+        "  under    {} (pid {})",
+        c["ancestor"]["exe"].as_str().unwrap_or("?"),
+        c["ancestor"]["pid"]
+    );
+    println!("  severity {}", c["severity_reason"].as_str().unwrap_or(""));
+    println!("\nWHAT LED HERE\n");
+    for s in c["steps"].as_array().cloned().unwrap_or_default() {
+        // The time is the point of this screen, so it leads the row.
+        println!(
+            "  {}  {:8}  {}",
+            s["ts"].as_str().unwrap_or("?"),
+            s["family"].as_str().unwrap_or("?"),
+            s["title"].as_str().unwrap_or("?"),
+        );
+        println!(
+            "  {:24}  {} · pid {} · {}{}",
+            "",
+            s["rule"].as_str().unwrap_or("?"),
+            s["pid"],
+            s["alert"].as_str().unwrap_or("?"),
+            if s["role"] == "context" {
+                "  (you had already allowed this one)"
+            } else {
+                ""
+            },
+        );
+    }
+    if c["truncated"] == Value::Bool(true) {
+        println!(
+            "\n  ... {} more step(s) not shown",
+            c["steps_total"].as_u64().unwrap_or(0) - c["steps"].as_array().map(|a| a.len()).unwrap_or(0) as u64
+        );
+    }
+    println!(
+        "\nOne decision covers all of it: moatctl ack {} --chain",
+        c["id"].as_str().unwrap_or("?")
     );
 }
 
@@ -779,6 +1373,24 @@ fn print_explain(a: &Alert) {
         println!("  ioc:     {} {}", i.source, i.matched);
     }
     println!("  mode:    {}   action taken: {}", a.mode, a.action_taken);
+
+    // The single most important thing about an alert that is part of a
+    // sequence is that it is part of a sequence, so it goes above the
+    // rule's own reasoning rather than at the end: the rule below explains
+    // one event, and the chain is why that event matters.
+    if let Some(c) = &a.chain {
+        let step = c.steps.iter().position(|s| s.alert == a.id).map(|i| i + 1);
+        println!("\nTHIS IS PART OF A SEQUENCE");
+        println!("  {}", c.summary);
+        // `severity_reason` already names the severity, so printing it again
+        // above would read as two different answers to the same question.
+        println!("  as a sequence: {}", c.severity_reason);
+        match step {
+            Some(n) => println!("  this alert is step {} of {}", n, c.steps_total),
+            None => println!("  this alert is one of {} steps", c.steps_total),
+        }
+        println!("  see it whole: moatctl chain {}", c.id);
+    }
 
     println!("\nWHY IT WAS FLAGGED");
     for line in wrap(&a.explain.why, 76) {
@@ -1120,6 +1732,25 @@ mod tests {
     }
 
     #[test]
+    fn the_stderr_tail_is_a_diagnostic_not_a_transcript() {
+        // The whole point: moat-sandbox echoes its argv, prompt included, so a
+        // successful pass must not put that in the journal and a failed one
+        // must still say why.
+        let noisy = "[moat] sandboxed: claude -p -- moat, the runtime security monitor\n\
+                     \n   {\n  \"verdict\": ...\n\nPrefer `unclear` to a guess.\n\
+                     [moat] --allow /home/dan/.claude does not exist, skipping\n\
+                     Invalid API key\n";
+        let tail = tail_lines(noisy, 2);
+        assert!(tail.contains("Invalid API key"), "{tail}");
+        assert!(tail.contains("does not exist"), "{tail}");
+        assert!(!tail.contains("sandboxed:"), "the banner is not the diagnostic: {tail}");
+        // Blank lines are dropped rather than eating the budget.
+        assert_eq!(tail_lines("a\n\n\n b \n", 5), "a |  b");
+        assert_eq!(tail_lines("", 3), "");
+        assert_eq!(tail_lines("only", 3), "only");
+    }
+
+    #[test]
     fn every_baseline_subcommand_maps_to_its_socket_action() {
         let cases: Vec<(BaselineCmd, &str)> = vec![
             (BaselineCmd::List, "list"),
@@ -1152,9 +1783,11 @@ mod tests {
         let cases: Vec<(Cmd, &str)> = vec![
             (Cmd::Receipts { last: 5 }, "receipts"),
             (Cmd::Incidents { last: 5 }, "incidents"),
+            (Cmd::Triage { run: false, limit: None, dry_run: false, undo: None }, "triage"),
             (Cmd::Bundle { id: "01X".into() }, "bundle"),
             (Cmd::Analyze { id: "01X".into(), dry_run: true }, "analyze"),
             (Cmd::Rarity { id: "01X".into() }, "rarity"),
+            (Cmd::Chain { id: Some("01X".into()), limit: 20 }, "chain"),
             (Cmd::Digest { notify: true, force: false }, "digest"),
         ];
         for (cmd, want) in &cases {
@@ -1163,7 +1796,16 @@ mod tests {
                 Cmd::Incidents { last } => json!({"cmd": "incidents", "last": last}),
                 Cmd::Bundle { id } => json!({"cmd": "bundle", "id": id}),
                 Cmd::Analyze { id, .. } => json!({"cmd": "analyze", "id": id}),
+                Cmd::Triage { limit, undo, .. } => match undo {
+                    Some(id) => json!({"cmd": "triage", "action": "undo", "id": id}),
+                    None => json!({"cmd": "triage", "action": "pending", "limit": limit}),
+                },
                 Cmd::Rarity { id } => json!({"cmd": "rarity", "id": id}),
+                Cmd::Chain { id, limit } => json!({
+                    "cmd": "chain",
+                    "id": id.clone().unwrap_or_default(),
+                    "limit": limit,
+                }),
                 Cmd::Digest { .. } => json!({"cmd": "digest"}),
                 _ => unreachable!(),
             };

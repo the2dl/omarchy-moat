@@ -100,3 +100,20 @@ file = "/home/*/.claude/.credentials.json"
 name = "moat-exec-untrusted-tmpfs"
 file = "/tmp/moat-sandbox-test.*/*"
 parent = "*/sandbox/shims/*"
+
+# Moat's own unattended triage (LEARNING §2c) launches the user's agent with no
+# terminal, which is what `moat-x-ai-cli-headless` looks for. There is NO
+# allowlist entry for it, and two attempts to write one are worth recording so
+# nobody writes a third:
+#
+#   parent = "*/moat-sandbox"   -- can never match. moat-sandbox is a shell
+#     script ending in `exec bwrap`, so the process BECOMES bwrap and never
+#     appears in the ancestry at all.
+#   parent = "*/moatctl"        -- misses `/usr/bin/moatctl (deleted)`, which is
+#     what the ancestry reads after pacman replaces the binary mid-run.
+#
+# The real cause of the noise was neither: `claude` is a multi-call binary that
+# re-execs itself as its own bundled `rg`, so ordinary file searches arrived as
+# agent launches. That is fixed in `rules/ai_cli.rs` by looking at the argv
+# instead of the binary's name, which is where a discriminator of this kind
+# belongs -- an allowlist entry would have silenced the real case too.

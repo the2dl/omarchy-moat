@@ -15,9 +15,11 @@ Layout:
     shell/          QML: Service, bar widget, panel
     pkg/            PKGBUILD for the system package `omarchy-moat`
     policies/       Tetragon TracingPolicy YAML (the detection rules)
-    moatd/      Rust: moatd (daemon) + moatctl (client) + moat-feeds
-    sandbox/        bubblewrap sandbox wrapper + PATH shims for npm/pip/cargo/makepkg
-    scanner/        PKGBUILD / .install static scanner
+    moatd/      Rust: moatd (daemon) + moatctl (client) + moat-feeds + moat-ship
+    sandbox/        bubblewrap sandbox wrapper + PATH shims for npm/pip/cargo/go/makepkg
+    scanner/        pre-execution static scanners: PKGBUILD/.install, npm,
+                    and cargo/pip/go (build.rs, setup.py, go:generate)
     docs/           CONTRACT.md is the interface spec every component builds against
+                    SHIPPING.md covers the telemetry classes and log shipping
 
 See docs/CONTRACT.md before touching anything.

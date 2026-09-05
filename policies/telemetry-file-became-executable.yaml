@@ -1,0 +1,77 @@
+# TELEMETRY, not a detection. Rendered only when `telemetry.file = true`.
+#
+# The cheapest signal in the file class and often the best one. A dropper writes
+# a file - which may look like any other write - and then has to make it
+# runnable. The chmod is the moment the thing became a program, it is one event
+# rather than one per write, and unlike the write it has no legitimate high-rate
+# source once package tooling is excluded.
+#
+# moat already watches the *setuid* bit (moat-priv-setuid-chmod, an alert). This
+# is its ordinary sibling: any execute bit, recorded rather than alerted.
+#
+# Cost: essentially zero. path_chmod fires only on an explicit chmod(2) family
+# call, not on creating a file with a mode, and the binaries that do it in bulk
+# are excluded in the kernel below. Measured here: single digits per day outside
+# a package transaction.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-telemetry-file-became-executable
+  annotations:
+    moat.omarchy/telemetry-class: "file"
+    moat.omarchy/severity: "low"
+    moat.omarchy/title: "File made executable (telemetry)"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "ignore"
+    moat.omarchy/why: >-
+      Telemetry, not a finding. chmod +x is the moment a downloaded file becomes a
+      program, and it is a single cheap event where the write that preceded it may have
+      been thousands. moatd routes this policy past rule evaluation entirely.
+    moat.omarchy/expected: >-
+      Build scripts, installers you ran yourself, git checkouts restoring a mode, and
+      anything that unpacks an archive by hand. Package tooling is excluded in the
+      kernel below, so a pacman transaction does not appear here at all.
+    moat.omarchy/fp-hint: "rule"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  # path_chmod is called by chmod_common (fs/open.c), so it covers chmod,
+  # fchmod and fchmodat in one hook.
+  - hook: "path_chmod"
+    message: "File made executable (telemetry)"
+    args:
+    - index: 0
+      type: "path"
+    - index: 1
+      type: "uint16"
+    selectors:
+    - matchBinaries:
+      # The bulk chmod-ers. Excluding them in the kernel is what keeps this
+      # class free during a package transaction; a pacman install that also
+      # dropped something interesting is still covered by the exec-shape
+      # policy beside this one and by the pkg-subtree rules in moatd.
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/pacman"
+        - "/usr/bin/bsdtar"
+        - "/usr/bin/tar"
+        - "/usr/bin/install"
+        - "/usr/bin/fakeroot"
+        - "/usr/bin/rsync"
+        - "/usr/bin/cp"
+        - "/usr/bin/unzip"
+      matchArgs:
+      # S_IXUSR (0100) | S_IXGRP (0010) | S_IXOTH (0001), as three separate
+      # values rather than one 0111 mask: Mask semantics across values are
+      # verified as OR (moat-priv-setuid-chmod does the same with 04000/02000),
+      # a multi-bit single value is not, and three values is inside the
+      # four-value numeric cap.
+      - index: 1
+        operator: "Mask"
+        values: ["64", "8", "1"]
+      matchActions:
+      - action: Post
+        rateLimit: "30s"
+        rateLimitScope: "process"

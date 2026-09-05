@@ -1,0 +1,151 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-cred-project-token-read
+  annotations:
+    moat.omarchy/severity: "medium"
+    moat.omarchy/title: "Project-local credential file read (.env, .npmrc, .git-credentials)"
+    moat.omarchy/rotate: "npm-token,pypi-token,git-credentials,github-token"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "quarantine,ignore"
+    moat.omarchy/why: >-
+      Every other credential rule watches an absolute path under your home directory,
+      and real tokens do not live there: they live in the repository you are working in.
+      A .env beside the code, a project .npmrc with a registry token, a .git/config with
+      the token embedded in the remote URL. A postinstall script reads those with the
+      same permissions you have, and nothing in the rest of this ruleset would see it.
+    moat.omarchy/expected: >-
+      Constantly, and that is the point of scoring it by who is asking. Your dev server,
+      test runner and framework read .env every time they start; that is an ordinary
+      session and stays in the timeline. The same read from inside a package install is
+      what this exists for. Package managers, git, direnv, editors, container tools and
+      backup programs are excluded outright.
+    moat.omarchy/fp-hint: "exe+file"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  - call: "security_file_post_open"
+    syscall: false
+    message: "Project-local credential file opened for reading"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int"
+    selectors:
+    # Registry credentials. A project .npmrc is read by the package manager on
+    # every single command, so the registry clients are excluded here exactly as
+    # they are for the $HOME copy of the same files (cred-registry-token-read).
+    - matchBinaries:
+      - operator: "NotPostfix"
+        values:
+        - "/npm"
+        - "/npx"
+        - "/pnpm"
+        - "/yarn"
+        - "/bun"
+        - "/node"
+        - "/deno"
+        - "/pip"
+        - "/pip3"
+        - "/uv"
+        - "/poetry"
+        - "/twine"
+        - "/python"
+        - "/python3"
+        - "/cargo"
+        - "/docker"
+        - "/podman"
+        - "/rg"
+        - "/grep"
+        - "/rsync"
+        - "/tar"
+        - "/restic"
+        - "/borg"
+        - "/rclone"
+        - "/nvim"
+        - "/vim"
+        - "/code"
+        - "/zed"
+        - "/hx"
+      matchArgs:
+      - index: 0
+        operator: "Postfix"
+        values:
+        - "/.npmrc"
+        - "/.yarnrc.yml"
+        - "/.pypirc"
+        - "/.netrc"
+      - index: 1
+        operator: "Mask"
+        values: ["4"]
+      matchActions:
+      - action: Post
+        rateLimit: "300s"
+        rateLimitScope: "process"
+    # Secrets a repository carries. Deliberately NOT excluding node, python or
+    # the shells: a script reading .env *is* the attack this closes, and what
+    # separates your dev server from a postinstall script is the context the
+    # daemon scores it in, not the binary. Excluded here are only the programs
+    # whose entire job is these files, and the ones that read every file in the
+    # tree anyway (search, archive, backup).
+    - matchBinaries:
+      - operator: "NotPostfix"
+        values:
+        - "/git"
+        - "/git-remote-http"
+        - "/git-remote-https"
+        - "/git-credential-store"
+        - "/git-credential-libsecret"
+        - "/lazygit"
+        - "/gitui"
+        - "/tig"
+        - "/gh"
+        - "/glab"
+        - "/jj"
+        - "/starship"
+        - "/oh-my-posh"
+        - "/cargo"
+        - "/pre-commit"
+        - "/direnv"
+        - "/docker"
+        - "/docker-compose"
+        - "/podman"
+        - "/podman-compose"
+        - "/rg"
+        - "/grep"
+        - "/rsync"
+        - "/tar"
+        - "/restic"
+        - "/borg"
+        - "/rclone"
+        - "/nvim"
+        - "/vim"
+        - "/nano"
+        - "/emacs"
+        - "/code"
+        - "/zed"
+        - "/hx"
+      matchArgs:
+      - index: 0
+        operator: "Postfix"
+        values:
+        - "/.env"
+        - "/.env.local"
+        - "/.env.development"
+        - "/.env.development.local"
+        - "/.env.production"
+        - "/.env.production.local"
+        - "/.env.staging"
+        - "/.env.test"
+        - "/.git-credentials"
+        - "/.git/config"
+      - index: 1
+        operator: "Mask"
+        values: ["4"]
+      matchActions:
+      - action: Post
+        rateLimit: "300s"
+        rateLimitScope: "process"

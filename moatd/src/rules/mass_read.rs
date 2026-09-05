@@ -175,6 +175,7 @@ mod tests {
         let feeds = Feeds::default();
         let homes = vec!["/home/dan".to_string()];
         let ctx = RuleCtx {
+            rarity: &crate::rarity::RarityStore::default(),
             cfg: c,
             table: t,
             feeds: &feeds,

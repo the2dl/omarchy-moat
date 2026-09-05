@@ -17,11 +17,21 @@ use crate::event::HookHit;
 use crate::explain::Finding;
 use crate::alert::NetRef;
 use crate::policy::PolicyMeta;
-use crate::rules::netmatch::{contains_any, is_private, parse_all, Cidr};
+use crate::rules::netmatch::{contains_any, is_always_local, is_private, parse_all, Cidr};
 use crate::rules::pkgtree;
 use crate::rules::{meta, RuleCtx, UserRule};
 
 pub const ID: &str = "moat-x-pkg-egress";
+
+/// Has this machine never talked to this destination from this binary before?
+///
+/// The whole discrimination in one predicate. An internal registry is contacted
+/// on every install and is `common` within days; a beacon to a host nobody has
+/// seen is not, and gets exactly one alert.
+fn first_contact(ctx: &RuleCtx, exe: &str, ip: &str, port: u16) -> bool {
+    !ctx.rarity
+        .has_seen(&crate::rarity::Tuple::net(exe, ip, port, None))
+}
 
 #[derive(Default)]
 pub struct PkgEgress {
@@ -86,7 +96,24 @@ impl UserRule for PkgEgress {
             return Vec::new();
         };
         let (pkg, why) = (pkg.clone(), why);
-        if ctx.cfg.net.allow_private && is_private(&ip) {
+        // Loopback is always fine, whatever the config says: a local registry
+        // proxy or a devcontainer registry is ordinary and lives on 127.0.0.1.
+        if is_always_local(&ip) {
+            return Vec::new();
+        }
+        // RFC1918 stays excluded by default, and should -- an internal
+        // Artifactory, Nexus or PyPI mirror is how a great many real installs
+        // work, and alerting on all LAN traffic would make this useless in the
+        // environments that most need it.
+        //
+        // But "private" is not the same as "yours". A LAN address this machine
+        // has never talked to before is not the registry you use every day, so
+        // a first-contact destination is still worth one alert: on 2026-09-04 a
+        // simulated npm package beaconed to a WebSocket C2 on 192.168.44.122
+        // and the blanket exclusion said nothing. Your real registry becomes
+        // `common` within a few installs and goes quiet; a beacon to a host
+        // nobody has seen does not.
+        if ctx.cfg.net.allow_private && is_private(&ip) && !first_contact(ctx, ctx.table.get(exec_id).map(|p| p.exe.as_str()).unwrap_or(""), &ip_s, port) {
             return Vec::new();
         }
         let allowed = {
@@ -152,6 +179,7 @@ mod tests {
         let feeds = Feeds::default();
         let homes = vec!["/home/dan".to_string()];
         let ctx = RuleCtx {
+            rarity: &crate::rarity::RarityStore::default(),
             cfg,
             table,
             feeds: &feeds,
@@ -185,13 +213,74 @@ mod tests {
         assert!(run(&t, &cfg(), &sock_event("151.101.1.2", 443), "e-node").is_empty());
     }
 
+    /// `run`, but with a rarity store that already knows some destinations.
+    fn run_with_rarity(
+        table: &ProcTable,
+        cfg: &Config,
+        rarity: &crate::rarity::RarityStore,
+        ev: &HookEvent,
+        exec_id: &str,
+    ) -> Vec<Finding> {
+        let feeds = Feeds::default();
+        let homes = vec!["/home/dan".to_string()];
+        let ctx = RuleCtx {
+            rarity,
+            cfg,
+            table,
+            feeds: &feeds,
+            homes: &homes,
+            now: 100,
+            mode: "monitor",
+        };
+        let h = HookHit {
+            kind: HookKind::Kprobe,
+            ev,
+        };
+        PkgEgress::default().on_hook(&h, exec_id, &ctx)
+    }
+
     #[test]
-    fn private_addresses_are_allowed_by_default_but_configurable() {
+    fn a_lan_host_is_flagged_but_loopback_never_is() {
         let t = table_with_install();
-        assert!(run(&t, &cfg(), &sock_event("192.168.1.10", 8080), "e-node").is_empty());
-        let mut c = cfg();
-        c.net.allow_private = false;
-        assert_eq!(run(&t, &c, &sock_event("192.168.1.10", 8080), "e-node").len(), 1);
+        // Loopback is unconditional: a local registry proxy or a devcontainer
+        // registry on 127.0.0.1 is the ordinary case, and is what the old
+        // `allow_private` default was really protecting.
+        assert!(run(&t, &cfg(), &sock_event("127.0.0.1", 4873), "e-node").is_empty());
+        let mut allowing = cfg();
+        allowing.net.allow_private = true;
+        assert!(run(&t, &allowing, &sock_event("127.0.0.1", 4873), "e-node").is_empty());
+
+        // RFC1918 stays excluded -- an internal registry is how most real
+        // installs work -- EXCEPT on first contact. A LAN host this machine has
+        // never talked to is not the registry you use every day: on 2026-09-04
+        // a simulated npm package beaconed to a WebSocket C2 on 192.168.44.122
+        // and the blanket exclusion said nothing.
+        //
+        // `cfg()` builds an empty rarity store, so every destination is first
+        // contact here; the "seen before" half is asserted below.
+        assert_eq!(run(&t, &cfg(), &sock_event("192.168.44.122", 4873), "e-node").len(), 1);
+
+        // The other half, and the reason the exclusion stays: a LAN host this
+        // machine HAS talked to before is your internal registry, and it must
+        // stay silent without anyone configuring anything. One alert on first
+        // contact, then quiet forever.
+        let mut known = cfg();
+        let mut store = crate::rarity::RarityStore::default();
+        store.observe(
+            &crate::rarity::Tuple::net("/usr/bin/node", "192.168.44.122", 4873, None),
+            1_700_000_000,
+        );
+        assert!(
+            run_with_rarity(&t, &known, &store, &sock_event("192.168.44.122", 4873), "e-node")
+                .is_empty(),
+            "an internal registry seen before is not reported again"
+        );
+        known.net.allow_private = true;
+
+        // Naming it in registry_cidrs allows it without allowing the whole LAN.
+        let mut named = cfg();
+        named.net.registry_cidrs.push("192.168.44.0/24".into());
+        assert!(run(&t, &named, &sock_event("192.168.44.122", 4873), "e-node").is_empty());
     }
 
     #[test]

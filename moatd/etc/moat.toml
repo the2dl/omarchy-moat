@@ -79,6 +79,19 @@ ai_cli_headless = true
 # in net.registry_cidrs below.
 pkg_egress = true
 
+# An outbound connection to a destination this machine has never talked to.
+#
+# LOW on purpose: it stays on the timeline and never notifies, because the first
+# time you use any service is a first contact. It exists to be the second half
+# of a sequence -- a credential read and then a connection somewhere new, from
+# the same process tree, is exfiltration, and the chain correlator raises that
+# pair to at least high.
+#
+# Expect it to be chatty in the timeline for the first few days and then to go
+# quiet: each destination reports at most once, ever. It will not catch a beacon
+# to a host you already use, which is a real limit rather than an oversight.
+net_first_contact = true
+
 # sha256 of a newly executed file under $HOME, /tmp, /var/tmp or /dev/shm
 # matching the abuse.ch hash feed.
 new_exec_ioc = true
@@ -139,8 +152,27 @@ process_prune_secs = 60
 # Ancestry chain cap recorded on each alert.
 ancestry_max = 8
 
-# alerts.jsonl is renamed to alerts.1.jsonl at this size (20 MiB).
-alerts_max_bytes = 20971520
+# alerts.jsonl is renamed to alerts.1.jsonl at this size (4 MiB).
+#
+# This is a PANEL budget, not a disk one. Quickshell's FileView has no
+# read-from-offset: every append makes it re-read the whole live file into a
+# JS string, and the panel then prefix-compares that string to decide the fold
+# is an append. Acking an incident appends one update line per member, so
+# "Close it" on a busy day meant re-reading and re-hashing ~10 MB on the UI
+# thread, several times -- the toast said "closed" and the panel then locked
+# for seconds.
+#
+# The rotated half is read once and kept in front of the fold, so it costs
+# nothing per append. Only the LIVE half is re-read, which is why lowering
+# this is the fix: at 4 MiB the per-append cost drops about five-fold.
+#
+# The trade is real and worth stating: only ONE rotated file is kept, so total
+# retained history goes from ~40 MiB to ~8 MiB. That is a lot of alerts either
+# way (today's record averages 1.5 KiB), and the incident snapshots, receipts
+# and quarantine store -- the things an investigation actually needs -- are
+# separate files and are not affected. If retention matters more than panel
+# latency on a given machine, raise this; the cost is paid on every ack.
+alerts_max_bytes = 4194304
 
 # state.json write interval, and feed-file mtime poll interval.
 state_interval_secs = 5
@@ -163,8 +195,19 @@ registry_cidrs = [
 ]
 
 # RFC1918, loopback, link-local and CGNAT are allowed implicitly. Set false to
-# alert on LAN traffic from installs too (noisy on a machine with a local proxy
-# or a devcontainer registry).
+# Allow RFC1918 egress from inside a package install without alerting.
+#
+# Stays `true`, and should: an internal Artifactory, Nexus, Verdaccio or PyPI
+# mirror is how a great many real installs work, and alerting on all LAN
+# traffic would make moat useless in exactly the environments that most need it.
+# Loopback is allowed unconditionally, whatever this says.
+#
+# It is not a blanket pass. A LAN address this machine has NEVER talked to
+# before is not the registry you use every day, so a first-contact destination
+# is still reported once. Your registry becomes ordinary within a few installs
+# and goes quiet; a beacon to a host nobody has seen does not. On 2026-09-04 a
+# simulated npm package opened a WebSocket C2 to 192.168.44.122 and the blanket
+# exclusion said nothing at all.
 allow_private = true
 
 # Severity for a pkg-egress hit: critical | high | medium | low.
@@ -250,6 +293,75 @@ agent_args = { claude = ["--permission-mode", "plan"] }
 # it for dev mode.
 bundle_dir = "/var/lib/moat/incidents"
 
+# --- auto-triage (LEARNING §2c) ----------------------------------------------
+#
+# The same evidence, handed to the same agent, on a timer, with nobody
+# watching. `moat-triage.timer` runs `moatctl triage --run` from the user's
+# session; the daemon only says what is waiting and decides what the answer is
+# allowed to do.
+#
+#   off       never run.
+#   annotate  attach the verdict to the alert and nothing else.
+#   demote    also let a *benign* verdict at *high* confidence move an alert
+#             from the notification badge to the panel timeline.
+#
+# What no mode can do, whatever the agent returns: hide, ack, delete, or
+# re-severity an alert, write an allowlist file, or run a command. A proposed
+# allowlist block is stored as text with an Accept button; nothing applies it.
+# The ceiling lives in moatd's triage::decide, is re-checked daemon-side on
+# every submission, and is under test.
+#
+# Know the tradeoff before leaving this on `demote`: the alerts worth triaging
+# are the ones most likely to contain attacker-controlled text, so this is the
+# one place where a successful prompt injection buys something — a move off the
+# badge. It buys nothing beyond that, the alert stays in the panel and in the
+# store, the outcome is recorded on the alert as `triage.outcome`, and
+# `moatctl triage --undo <id>` reverses it.
+#
+# Unlike `moatctl analyze`, this path does NOT go through omarchy-agent, which
+# launches every agent auto-approving (`claude --permission-mode auto`,
+# `codex --approve-for-me`). Correct for a launcher a human is sitting in front
+# of; wrong for an unattended run over content under suspicion. moat resolves
+# the same default agent and builds a read-only, non-interactive invocation
+# itself. An agent with no such mode is not run at all — today that means
+# claude and codex work and the rest report why they do not.
+auto_triage = "demote"
+
+# The highest severity a triage demotion may touch. `critical` is the one place
+# where being wrong is unrecoverable in the moment, so the default leaves it on
+# the badge and lets the agent explain it instead.
+triage_demote_max_severity = "high"
+
+# How long an alert must have existed before it is offered to an agent.
+#
+# The buffer in "buffer, dedupe, then react". A package install fires several
+# alerts within a couple of seconds; reading the first while the rest are still
+# arriving spends a call on a partial picture. Waiting lets the burst settle so
+# one read covers it.
+triage_settle_secs = 20
+
+# PATTERNS per run, not alerts. The queue is deduplicated by the same
+# (rule, actor, parent, dir) tuple the baseline and the noise guard use, so ten
+# alerts of three shapes is three questions. The others inherit the verdict on
+# the next pass rather than each buying their own.
+triage_max_per_run = 3
+
+# Wall-clock ceiling for one agent call. On expiry the child is killed and the
+# alert is left exactly as it was.
+#
+# Measured, not guessed: an agent in plan mode reading one bundle plus its
+# staged evidence takes about three minutes, and the first live run on this
+# machine landed at 172s. A ceiling near that turns a normal answer into a
+# killed child and a wasted call, so this sits well clear of it.
+#
+# triage_max_per_run x triage_timeout_secs is the worst case for one pass, and
+# moat-triage.service's TimeoutStartSec has to stay above it.
+#
+# Lowered from 600 on 2026-09-04. The service is Type=oneshot, so a pass holds
+# the queue: at 600 one pass could block every other alert -- including a live
+# attack -- for half an hour. 300 is still well over the measured normal.
+triage_timeout_secs = 300
+
 [incidents]
 # LEARNING §4: capture before it is gone. On an alert at or above this severity
 # the daemon copies /proc/<pid>/{status,cmdline,environ,cwd,exe,fd}, the process
@@ -266,6 +378,37 @@ retain_days = 30
 
 # ...or when there are more than this many, oldest first.
 retain_max = 200
+
+[content]
+# When a chain reaches `high`, look at what is actually IN the files it
+# implicated: type from magic bytes, ELF imports and needed libraries, the
+# shebang and obfuscation vocabulary of a script, embedded URLs and addresses
+# with the private/loopback ranges classified, printable strings, and Shannon
+# entropy over the file and per section. The findings are attached to the alert
+# as evidence and rendered into bundle.md inside DATA fences.
+#
+# This is deliberately NOT an anti-virus. Nothing is scanned on write, on exec,
+# or on a timer; the only trigger is a sequence the correlator already
+# concluded was worth escalating. Findings never change a severity — they
+# annotate one.
+#
+# Credential paths (evidence.rs::is_secret_path) and anything under
+# /var/lib/moat are never read, whatever asks.
+enabled = true
+
+# Files bigger than this are listed as skipped, with the reason, and never read.
+# 8 MiB is the same cap the incident capture already uses for a binary, so this
+# adds no new class of cost to the event thread. Measured on this machine
+# (release build, warm page cache): a 4.9 MB ELF costs 20.5 ms to inspect plus
+# 1.8 ms to hash — about 4.4 ms per MB — so a file at this cap costs ~36 ms, and
+# a chain analyses at most 4 files per pass.
+max_bytes = 8388608
+
+# Analyses per rolling hour, counted from the first one and persisted through
+# state.json so a restart cannot refill the allowance. A high chain is rare by
+# design; reaching this cap means something is wrong, and the right response to
+# that is to stop reading files rather than to keep up.
+per_hour = 40
 
 [digest]
 # LEARNING §5: one notification a week — "moat: 0 incidents, 18 installs
@@ -284,3 +427,196 @@ enabled = true
 # user's morning.
 weekday = "monday"
 hour = 9
+
+[telemetry]
+# Selectable telemetry classes (docs/SHIPPING.md).
+#
+# An alert is a claim; telemetry is the record you go back to when the claim was
+# never made. moat has always collected the second kind — Tetragon exports every
+# exec and exit on this machine — but it went into /var/log/moat/tetragon.log,
+# 0600 root:root, rotated away in half an hour. Full telemetry nobody could
+# query. These switches turn it into named streams that land in
+# /var/lib/moat/telemetry.jsonl (0640 root:moat), which `moat-ship` can send
+# somewhere it survives.
+#
+# EVERY NUMBER BELOW WAS MEASURED ON THIS MACHINE, not estimated. See
+# docs/SHIPPING.md section 4 for how.
+#
+# Changing `network` or `file` changes what the KERNEL is asked to do, which
+# means new policy files and a Tetragon restart. Do it with:
+#
+#     sudo moatd telemetry --apply
+#
+# That command validates the config, renders the policies, re-runs
+# policies/check.py over what it wrote, restarts tetragon then moatd in that
+# order, and then VERIFIES that the policies came back pinned in the kernel.
+# Editing this file and restarting by hand skips every one of those steps, and
+# a bad policy load is a silent outage: on 2026-09-03 the sensor was dead for 25
+# minutes while systemd, the gRPC socket and the export log all read "running".
+#
+# `process` and `alerts` need no policy and no restart: SIGHUP is enough
+# (`systemctl reload moatd`).
+
+# alerts.jsonl as it is today. A handful of records a day, every one of them
+# something a person would want to read. Leave this on.
+alerts = true
+
+# exec/exit with parent mapping.
+#
+# ALREADY EXPORTED whatever you set here: exec cannot be filtered in the kernel
+# (TETRAGON-NOTES section 10), so Tetragon writes it either way. This switch
+# only decides whether moatd ALSO writes a compact projection that can be
+# shipped and queried.
+#
+# Measured: 42 events/s, ~3.1 KB each in the raw export = 127 KB/s = 11 GB/day,
+# which is why the raw log rotates every 6-7 minutes. The projection below is
+# ~450 bytes for an exec and ~150 for an exit, so about 1.4 GB/day. Still the
+# most expensive class by an order of magnitude. Off.
+process = false
+
+# Outbound connects, from moat-telemetry-network-connect.
+#
+# Measured: 0.26 connects/s against exec's 42/s — 160x cheaper — because
+# private, loopback and link-local destinations are excluded in the kernel.
+# About 8 MB/day. This is the class that answers "what did this machine talk to
+# on Tuesday" and it is affordable. Off by default because shipping anything is
+# a decision, not because it is expensive.
+network = false
+
+# Executable-shaped file writes and chmod +x, from moat-telemetry-file-*.
+#
+# The expensive one, and the one that had to be designed rather than switched
+# on. Measured during an `npm install` of 171 packages:
+#
+#   every write under $HOME .................. 42.3 events/s
+#   this class's KERNEL filter ............... 19.2 events/s   (45%)
+#   after the create/modify ladder ............ 0.32 events/s  (0.8%)
+#
+# The kernel filter alone is not enough. What makes it affordable is that the
+# class is keyed on the FILE rather than on the operation:
+#
+#   create of something executable-shaped ......... recorded
+#   modify of something that already existed ...... recorded, and worth more
+#   create inside a build tree ..................... dropped (quiet_creates_under)
+#   anything else .................................. never seen by the kernel
+#
+# The second line is the point. On 2026-09-04 a simulated npm package took a
+# command over a WebSocket and rewrote its own node_modules/express/index.js so
+# the payload would survive every future require(). moat said nothing. An
+# installed script being rewritten after install is close to unambiguous, and no
+# amount of "log every write" would have made it findable.
+file = false
+
+# Repeat the whole parent block on every exec record, as the raw export does.
+# Off: parent_exec_id plus a join at the collector is the same graph for roughly
+# half the bytes. Turn it on for a collector that cannot join.
+inline_parent = false
+
+# --- file class scope --------------------------------------------------------
+# These become the kernel policy's own Prefix and Postfix lists, so the
+# filtering happens before anything is written to disk — it saves the export
+# write and moatd's parse as well as the collector's storage. {{HOME}} fans out
+# over every human home in /etc/passwd.
+#
+# Locations where ANYTHING written is worth a record, whatever it is.
+file_scope = [
+  "/usr/bin/",
+  "/usr/local/bin/",
+  "/usr/lib/systemd/system/",
+  "/etc/systemd/system/",
+  "/etc/cron.d/",
+  "/etc/profile.d/",
+  "{{HOME}}/.local/bin/",
+  "{{HOME}}/.config/systemd/user/",
+  "{{HOME}}/.config/autostart/",
+  "{{HOME}}/.local/share/applications/",
+]
+
+# Suffixes that make a file executable-shaped anywhere on the system. ELF
+# magic-byte detection is not expressible in a kernel selector, so moatd reads
+# the first four bytes in userspace on the paths these already caught — a
+# `chmod +x`'d binary with no extension still comes out `shape: "elf"`.
+file_suffixes = [
+  ".sh", ".bash", ".zsh", ".py", ".pl", ".rb",
+  ".js", ".mjs", ".cjs", ".ts", ".php", ".lua",
+]
+
+# Path fragments under which a CREATE is not recorded. This is where the 19/s
+# becomes 0.32/s: build and cache trees are almost all of the volume and almost
+# none of the value.
+#
+# NEVER applied to a modify. A rewrite of node_modules/<pkg>/index.js is exactly
+# what this class exists for, and suppressing it here would delete the one
+# finding that made the class worth having.
+quiet_creates_under = [
+  "/node_modules/",
+  "/.cache/",
+  "/.npm/",
+  "/target/",
+  "/.git/",
+  "/__pycache__/",
+  "/.venv/",
+  "/site-packages/",
+  "/.local/share/mise/",
+  "/.cargo/registry/",
+]
+
+# A file whose birth time (statx btime) is younger than this counts as a create.
+# 0 means "call everything a modify".
+create_window_secs = 5
+
+# Attach the body of a small script to its record.
+#
+# OFF, and think before turning it on: this is the only switch in moat that puts
+# file CONTENTS anywhere they can leave the machine. It is worth having — the
+# body of a freshly written dropper is the evidence — and it inherits
+# evidence.rs's is_secret_path wholesale, so a path that looks like key material
+# is never read no matter what. Text only; an ELF is described, never carried.
+capture_body = false
+capture_body_max_bytes = 65536
+
+# telemetry.jsonl is renamed to telemetry.1.jsonl at this size (16 MiB).
+max_bytes = 16777216
+
+# ----------------------------------------------------------------- [contain]
+#
+# Correlation-driven containment. OFF by default, and deliberately so: it is
+# the only thing moat does on its own judgement rather than on a single rule you
+# armed, so it asks first.
+#
+# What it does: when chain correlation concludes a sequence is `high` AND that
+# sequence includes a connection to a destination this machine had never used,
+# moatd writes a TracingPolicy naming that one binary and that one destination,
+# loads it with `tetra tracingpolicy add`, and deletes it when the TTL expires.
+# The connection is refused with EPERM. Nothing is killed, nothing else on the
+# machine is affected, and `moatctl contain` lists what is live.
+#
+# Why it exists: `moat-net-tmpfs-binary-egress` cannot enforce against a LAN
+# address, because a kernel selector cannot tell your own package registry from
+# a C2 on the same subnet. Userspace can -- it knows the destination is a first
+# contact and that it happened inside a correlated sequence -- so the decision
+# is made there and the enforcement handed back to the kernel.
+[contain]
+enabled = false
+# Ending processes a chain implicates: off | log | kill.
+#
+# `log` by default, and deliberately. A design review on 2026-09-05 ran the
+# first version of these rules against this machine's own records: they would
+# have SIGKILLed the developer's own build four times that day, thirteen
+# processes at a time, while failing to kill the lab payload they were written
+# for. Rules for an action with no undo get judged against real traffic before
+# they act -- which is how the industry ships this too: detect first, promote to
+# prevent after a tuning period.
+#
+# `log` runs the whole decision and writes "WOULD HAVE KILLED ..." to the
+# journal. A week of that with nothing wrong in it is the argument for `kill`.
+# Requires `enabled = true` for the containment half; the log half runs anyway.
+kill = "log"
+# Minutes, not hours: long enough to stop an exfil in progress, short enough
+# that a wrong call costs one failed connection and then fixes itself.
+ttl_secs = 600
+# These share the `socket_connect` LSM hook with the detection policies, and the
+# kernel caps how many policies one hook can carry. The oldest containment is
+# released to make room rather than being allowed to accumulate until a
+# detection policy fails to load: running out of room must never cost coverage.
+max = 4

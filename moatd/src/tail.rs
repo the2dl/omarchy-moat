@@ -11,6 +11,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+/// The most one poll will read. 8 MiB is ~40 seconds of this machine's idle
+/// Tetragon output and several seconds of a flood, so a real burst still drains
+/// within a few polls while a hostile one cannot size the buffer at will.
+const MAX_POLL_BYTES: u64 = 8 * 1024 * 1024;
+
 pub struct Tailer {
     path: PathBuf,
     file: Option<File>,
@@ -48,13 +53,24 @@ impl Tailer {
 
     /// Return every complete line that appeared since the last poll.
     /// Never blocks; a missing file yields an empty vector.
+    ///
+    /// At most `MAX_POLL_BYTES` per call: whatever is left is read by the next
+    /// poll, 200 ms later, so a burst is drained steadily instead of in one
+    /// unbounded allocation.
     pub fn poll(&mut self) -> Vec<String> {
         self.reopen_if_needed();
         let Some(file) = self.file.as_mut() else {
             return Vec::new();
         };
+        // Bounded per poll. An unbounded `read_to_end` hands the attacker the
+        // size of this daemon's working set: an exec loop that outruns one poll
+        // makes the next buffer bigger, which makes the next poll slower.
         let mut buf = Vec::new();
-        if file.read_to_end(&mut buf).is_err() {
+        if file
+            .take(MAX_POLL_BYTES)
+            .read_to_end(&mut buf)
+            .is_err()
+        {
             self.file = None;
             return Vec::new();
         }
@@ -64,12 +80,28 @@ impl Tailer {
         self.pos += buf.len() as u64;
         self.pending.push_str(&String::from_utf8_lossy(&buf));
 
+        // ONE drain, not one per line.
+        //
+        // `String::drain(..=idx)` memmoves everything after the cut to the
+        // front, so draining line by line is quadratic in the size of the
+        // buffer. Measured on this machine: 1 MB of pending took 12 ms, 8 MB
+        // took 864 ms, 16 MB took 3.48 s -- 16x the data for 290x the time.
+        //
+        // That curve is a weapon. Any unprivileged exec loop that pushes one
+        // poll past its 200 ms interval leaves a bigger buffer for the next
+        // poll, which is then slower still, and the daemon never catches up:
+        // the sensor is blind for exactly as long as the attacker keeps going,
+        // and nothing reports that it happened. Cutting once at the last
+        // newline makes the work linear and the feedback loop impossible.
         let mut out = Vec::new();
-        while let Some(idx) = self.pending.find('\n') {
-            let line: String = self.pending.drain(..=idx).collect();
-            let line = line.trim_end_matches(['\n', '\r']).to_string();
-            if !line.is_empty() {
-                out.push(line);
+        let keep = self.pending.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        if keep > 0 {
+            let complete: String = self.pending.drain(..keep).collect();
+            for line in complete.lines() {
+                let line = line.trim_end_matches(['\n', '\r']);
+                if !line.is_empty() {
+                    out.push(line.to_string());
+                }
             }
         }
         // A partial line stays in `pending` until its newline arrives; the JSON

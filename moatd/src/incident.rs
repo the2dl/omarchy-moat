@@ -129,7 +129,8 @@ pub fn capture(t: &Target) -> Incident {
     step(
         &mut errors,
         "tree.txt",
-        util::atomic_write(&dir.join("tree.txt"), t.tree.as_bytes(), 0o640).map(|_| ()),
+        util::atomic_write(&dir.join("tree.txt"), t.tree.as_bytes(), 0o640)
+            .and_then(|_| util::secure_path(&dir.join("tree.txt"), t.group, 0o640)),
     );
 
     // --- net.txt -----------------------------------------------------------
@@ -141,6 +142,7 @@ pub fn capture(t: &Target) -> Incident {
         &mut errors,
         "net.txt",
         util::atomic_write(&dir.join("net.txt"), net_text(&inodes, &sockets).as_bytes(), 0o640)
+            .and_then(|_| util::secure_path(&dir.join("net.txt"), t.group, 0o640))
             .map(|_| ()),
     );
 
@@ -154,8 +156,19 @@ pub fn capture(t: &Target) -> Incident {
         // is still captured.
         let live = format!("/proc/{}/exe", t.pid);
         let src = if Path::new(&live).exists() { live } else { t.exe.to_string() };
-        if !t.exe.is_empty() && !util::is_proc_self_fd(t.exe) {
-            match copy_capped(Path::new(&src), &files_dir, util::basename(t.exe), MAX_BINARY_BYTES) {
+        // Not the distro's own binaries.
+        //
+        // 190 of the 201 incident directories on this machine held an identical
+        // 1,195,144-byte copy of /usr/bin/bash -- 227 MB of the same
+        // interpreter, copied because it happened to be the actor. It is
+        // recoverable from the package manager, its sha256 is on the alert
+        // either way, and every one of those copies pushed a real incident out
+        // of the retention window. What is worth keeping is a binary that will
+        // NOT be there later: a dropper in /tmp, something in a cache
+        // directory, an unpacked build artefact.
+        let system_binary = t.exe.starts_with("/usr/") || t.exe.starts_with("/bin/");
+        if !t.exe.is_empty() && !util::is_proc_self_fd(t.exe) && !system_binary {
+            match copy_capped(Path::new(&src), &files_dir, util::basename(t.exe), MAX_BINARY_BYTES, t.group) {
                 Ok(Some(v)) => copied.push(json!({"role": "binary", "from": t.exe, "as": v})),
                 Ok(None) => errors.push(format!(
                     "file/: {} is larger than the {} MB binary cap; not copied",
@@ -166,13 +179,28 @@ pub fn capture(t: &Target) -> Incident {
             }
         }
         // The alerted file, only where LEARNING §4 allows it.
-        if let Some(f) = t.file.filter(|f| in_user_space(f, t.homes)) {
+        // `in_user_space` was the ONLY gate here, and it asks "is this under a
+        // home or a temp dir" -- which every credential on a developer's
+        // machine is. `evidence::stage` refuses to copy a secret and this path,
+        // writing into the same incident directory, never consulted it: on
+        // 2026-09-04 an audit found a real Chrome `Login Data` sitting in
+        // `incidents/<id>/file/`, byte-for-byte, hash-matching the original.
+        //
+        // Worse than a copy: a copy OUTSIDE $HOME, in the one directory moat's
+        // own credential rules are explicitly told not to alert on, unreachable
+        // by any $HOME-scoped sandbox or backup exclusion the user has set.
+        // An EDR must not manufacture an unwatched second copy of the secrets
+        // it exists to protect.
+        if let Some(f) = t
+            .file
+            .filter(|f| in_user_space(f, t.homes) && !crate::evidence::is_secret_path(f))
+        {
             let name = if util::basename(f) == util::basename(t.exe) {
                 format!("alerted-{}", util::basename(f))
             } else {
                 util::basename(f).to_string()
             };
-            match copy_capped(Path::new(f), &files_dir, &name, MAX_FILE_BYTES) {
+            match copy_capped(Path::new(f), &files_dir, &name, MAX_FILE_BYTES, t.group) {
                 Ok(Some(v)) => copied.push(json!({"role": "alerted file", "from": f, "as": v})),
                 Ok(None) => errors.push(format!(
                     "file/: {} is larger than the 1 MB file cap; not copied",
@@ -565,22 +593,39 @@ pub fn copy_capped(
     dest_dir: &Path,
     name: &str,
     max: u64,
+    group: &str,
 ) -> std::io::Result<Option<String>> {
-    let meta = std::fs::metadata(src)?;
-    if meta.is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "is a directory",
-        ));
-    }
+    // Symlink-safe, for the same reason as `evidence::stage`: this runs as root
+    // over a path an attacker may have chosen, and `metadata`/`copy` both
+    // follow links. A snapshot that followed one would read whatever the link
+    // pointed at -- /etc/shadow, a root SSH key -- into an incident directory
+    // the `moat` group can read.
+    let (mut f, _real) = crate::util::open_suspect(src)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let meta = f.metadata()?;
     if meta.len() > max {
         return Ok(None);
     }
     let name = if name.is_empty() { "file" } else { name };
     let dest = dest_dir.join(name);
-    std::fs::copy(src, &dest)?;
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o440));
+    {
+        let mut out = std::fs::File::create(&dest)?;
+        std::io::copy(&mut f, &mut out)?;
+    }
+    // 0440 **root:<group>**, not root:root. The daemon is root and the analysis
+    // agent runs as the user, so a root-owned copy is impounded evidence the
+    // only process meant to examine it cannot open.
+    //
+    // On 2026-09-04 this cost a verdict. A simulated npm supply-chain attack
+    // dropped a 25-byte payload into /tmp and ran it; the payload was deleted
+    // before the bundle staged it, but the incident snapshot HAD captured a
+    // copy and the bundle told the agent so, with its size and hash. The agent
+    // could not read it. What it could read was the package's own retained
+    // artifacts, so it reasoned from the suspect's account of itself and
+    // returned benign. Capturing evidence and then withholding it from the
+    // reader is worse than not capturing it: it produces a confident answer
+    // drawn from whatever is left, which is the attacker's material.
+    let _ = crate::util::secure_path(&dest, group, 0o440);
     Ok(Some(name.to_string()))
 }
 
@@ -720,11 +765,56 @@ pub fn ids(base: &Path) -> Vec<String> {
 
 /// LEARNING §4 retention: `retain_days` or `retain_max`, oldest first.
 /// Returns the ids it removed.
-pub fn prune(base: &Path, retain_days: u64, retain_max: usize, now: u64) -> Vec<String> {
+/// `keep` names incidents that still want a human: unacked and surfaced. They
+/// are evicted only after everything else has been, and never quietly.
+pub fn prune(
+    base: &Path,
+    retain_days: u64,
+    retain_max: usize,
+    now: u64,
+    keep: &std::collections::HashSet<String>,
+) -> Vec<String> {
     let all = ids(base);
     let mut doomed: Vec<String> = Vec::new();
     if retain_max > 0 && all.len() > retain_max {
-        doomed.extend(all[..all.len() - retain_max].iter().cloned());
+        // Oldest first, but answered incidents before unanswered ones.
+        //
+        // Straight oldest-first made this an evidence-destruction primitive:
+        // 200 cheap high-severity alerts flush everything before them, and on
+        // 2026-09-04 exactly that happened by accident -- a test harness filled
+        // the window and the one incident holding a real staged credential was
+        // evicted. An attacker can do it deliberately for the price of a loop.
+        let mut over = all.len() - retain_max;
+        for id in &all {
+            if over == 0 {
+                break;
+            }
+            if !keep.contains(id) {
+                doomed.push(id.clone());
+                over -= 1;
+            }
+        }
+        // Still over the cap with nothing but unanswered incidents left. Drop
+        // the oldest of those rather than growing without bound, but say so:
+        // this is evidence going away while it was still wanted.
+        if over > 0 {
+            log::warn!(
+                "incident retention: at the {} cap with {} unanswered incidents; \
+                 evicting {} that still wanted a human",
+                retain_max,
+                keep.len(),
+                over
+            );
+            for id in &all {
+                if over == 0 {
+                    break;
+                }
+                if !doomed.contains(id) {
+                    doomed.push(id.clone());
+                    over -= 1;
+                }
+            }
+        }
     }
     if retain_days > 0 {
         let cutoff = retain_days * 86_400;
@@ -934,11 +1024,11 @@ mod tests {
         std::fs::write(&big, vec![7u8; 4096]).unwrap();
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).unwrap();
-        assert_eq!(copy_capped(&big, &out, "big", 100).unwrap(), None);
+        assert_eq!(copy_capped(&big, &out, "big", 100, "moat").unwrap(), None);
         assert!(!out.join("big").exists());
-        assert_eq!(copy_capped(&big, &out, "big", 8192).unwrap().as_deref(), Some("big"));
+        assert_eq!(copy_capped(&big, &out, "big", 8192, "moat").unwrap().as_deref(), Some("big"));
         assert_eq!(std::fs::metadata(out.join("big")).unwrap().len(), 4096);
-        assert!(copy_capped(Path::new("/nonexistent/x"), &out, "x", 8192).is_err());
+        assert!(copy_capped(Path::new("/nonexistent/x"), &out, "x", 8192, "moat").is_err());
     }
 
     #[test]
@@ -977,20 +1067,20 @@ mod tests {
             std::fs::write(d.join("meta.json"), b"{}").unwrap();
         }
         assert_eq!(count(dir.path()), 5);
-        let gone = prune(dir.path(), 0, 3, util::unix_secs());
+        let gone = prune(dir.path(), 0, 3, util::unix_secs(), &Default::default());
         assert_eq!(gone.len(), 2);
         assert_eq!(gone[0], format!("01{:024}", 0));
         assert_eq!(count(dir.path()), 3);
         assert_eq!(ids(dir.path())[0], format!("01{:024}", 2));
 
         // A generous retention removes nothing.
-        assert!(prune(dir.path(), 30, 200, util::unix_secs()).is_empty());
+        assert!(prune(dir.path(), 30, 200, util::unix_secs(), &Default::default()).is_empty());
         // An age cutoff in the future removes everything.
-        assert_eq!(prune(dir.path(), 1, 0, util::unix_secs() + 10 * 86_400).len(), 3);
+        assert_eq!(prune(dir.path(), 1, 0, util::unix_secs() + 10 * 86_400, &Default::default()).len(), 3);
         assert_eq!(count(dir.path()), 0);
         // A missing directory is not an error.
         assert_eq!(count(Path::new("/nonexistent/incidents")), 0);
-        assert!(prune(Path::new("/nonexistent/incidents"), 1, 1, 0).is_empty());
+        assert!(prune(Path::new("/nonexistent/incidents"), 1, 1, 0, &Default::default()).is_empty());
     }
 
     #[test]
@@ -1010,5 +1100,90 @@ mod tests {
         assert_eq!(rows[0]["severity"], "critical");
         assert_eq!(rows[0]["bundle"], false);
         assert_eq!(rows[0]["files"][0]["name"], "tree.txt");
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    /// The 2026-09-04 audit finding, pinned.
+    ///
+    /// `evidence::stage` refuses to copy a credential. `incident::capture`
+    /// writes into the SAME directory and never asked. The result was a real
+    /// Chrome `Login Data` on disk, hash-matching the original -- an unwatched
+    /// second copy of the exact secrets moat exists to protect, sitting outside
+    /// $HOME where its own rules are told not to look.
+    #[test]
+    fn a_credential_is_never_copied_into_an_incident() {
+        for p in [
+            "/home/dan/.ssh/id_ed25519",
+            "/home/dan/.claude/.credentials.json",
+            "/home/dan/.aws/credentials",
+            // The ones that were actually found staged, and the reason the
+            // name list exists: every Electron app ships these.
+            "/home/dan/.config/google-chrome/Default/Login Data",
+            "/home/dan/.cache/spotify/Default/Cookies",
+            "/home/dan/.config/discord/Local State",
+            "/home/dan/.mozilla/firefox/x.default/logins.json",
+            "/home/dan/.mozilla/firefox/x.default/key4.db",
+            // The single most common credential file on a dev workstation.
+            "/home/dan/src/app/.env",
+            "/home/dan/src/app/.env.production",
+        ] {
+            assert!(
+                crate::evidence::is_secret_path(p),
+                "{} must never be staged",
+                p
+            );
+        }
+
+        // ...and ordinary evidence still is, or the snapshot is worthless.
+        for p in [
+            "/tmp/moat-aur-lab-x/browser-helper",
+            "/home/dan/.config/autostart/evil.desktop",
+            "/home/dan/proj/.git/config",
+        ] {
+            assert!(!crate::evidence::is_secret_path(p), "{} is real evidence", p);
+        }
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Retention must not be an evidence-destruction primitive.
+    ///
+    /// Straight oldest-first meant 200 cheap alerts flushed everything before
+    /// them. On 2026-09-04 that happened by accident -- a test harness filled
+    /// the window and the one incident holding a real staged credential was
+    /// evicted -- and an attacker can do it deliberately for the price of a
+    /// loop. An incident nobody has answered is the last thing to go.
+    #[test]
+    fn an_unanswered_incident_is_evicted_last() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["01A", "01B", "01C", "01D", "01E"] {
+            std::fs::create_dir_all(dir.path().join(id)).unwrap();
+        }
+        // The oldest two are the ones that still want a human.
+        let keep: HashSet<String> = ["01A", "01B"].iter().map(|s| s.to_string()).collect();
+
+        let gone = prune(dir.path(), 0, 3, util::unix_secs(), &keep);
+        assert_eq!(gone.len(), 2);
+        assert!(
+            !gone.contains(&"01A".to_string()) && !gone.contains(&"01B".to_string()),
+            "the unanswered ones survived; {:?} went instead",
+            gone
+        );
+        assert!(dir.path().join("01A").exists());
+
+        // When everything left is unanswered the cap still holds -- growing
+        // without bound is not the alternative -- but the oldest go and the
+        // daemon says so.
+        // What is left is 01A, 01B and 01E; mark all of them unanswered.
+        let keep_all: HashSet<String> = ["01A", "01B", "01E"].iter().map(|s| s.to_string()).collect();
+        let gone = prune(dir.path(), 0, 2, util::unix_secs(), &keep_all);
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0], "01A", "with nothing answered left, the oldest goes");
     }
 }

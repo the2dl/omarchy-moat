@@ -1,0 +1,75 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-priv-container-socket-connect
+  annotations:
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "Connection to the Docker or Podman control socket"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,ignore"
+    moat.omarchy/why: >-
+      Whoever can talk to /var/run/docker.sock can start a container with the host's
+      root filesystem mounted inside it and write anywhere as root. On a machine with
+      Docker installed, reaching that socket is equivalent to having root, and it needs
+      no password prompt and no exploit.
+    moat.omarchy/expected: >-
+      docker, podman, compose, and the container tooling in your editor - all excluded.
+      Test suites using testcontainers reach the socket through a language runtime and
+      will show up here; that is one ack, and it is worth knowing which of your test
+      runs can rewrite the host.
+    moat.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  - call: "security_socket_connect"
+    syscall: false
+    message: "Program connected to the container control socket"
+    args:
+    - index: 1
+      type: "sockaddr_un"
+    selectors:
+    - matchBinaries:
+      - operator: "NotPostfix"
+        values:
+        - "/docker"
+        - "/dockerd"
+        - "/docker-compose"
+        - "/docker-credential-secretservice"
+        - "/containerd"
+        - "/containerd-shim"
+        - "/ctr"
+        - "/nerdctl"
+        - "/podman"
+        - "/podman-compose"
+        - "/crictl"
+        - "/lazydocker"
+        - "/ctop"
+        - "/dive"
+        - "/kubectl"
+        - "/kind"
+        - "/minikube"
+        - "/skaffold"
+        - "/k3d"
+        - "/code"
+        - "/zed"
+      matchArgs:
+      # Fixed, well-known paths, so Equal is enough. The rootless podman socket
+      # under /run/user/<uid>/podman/ is not expressible: sockaddr_un has Equal
+      # and Prefix only, and the user id is a middle component.
+      - index: 1
+        operator: "Equal"
+        values:
+        - "/var/run/docker.sock"
+        - "/run/docker.sock"
+        - "/var/run/podman/podman.sock"
+        - "/run/podman/podman.sock"
+        - "/run/containerd/containerd.sock"
+        - "/var/run/containerd/containerd.sock"
+        - "/var/run/crio/crio.sock"
+        - "{{HOME}}/.docker/run/docker.sock"
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

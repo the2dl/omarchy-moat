@@ -1,0 +1,8 @@
+{
+  "name": "pnpm-app",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "esbuild": "^0.20.0"
+  }
+}

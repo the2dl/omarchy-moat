@@ -11,9 +11,71 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::alert::{fold, parse_record, Alert, Record, UpdateLine};
+use crate::receipt::{Receipt, ReceiptLine};
+
+/// (inode, length) of the live and rotated files when the fold was last
+/// brought up to date. Two stats say whether the files are still what the
+/// fold was built from; anything else -- a rotation, a truncation, a write by
+/// something that is not this store -- and the fold is rebuilt from disk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Stamp {
+    live: Option<(u64, u64)>,
+    rotated: Option<(u64, u64)>,
+}
+
+impl Stamp {
+    fn of(live: &Path, rotated: &Path) -> Stamp {
+        let one = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.ino(), m.len()));
+        Stamp {
+            live: one(live),
+            rotated: one(rotated),
+        }
+    }
+}
+
+/// The folded log, held between reads.
+///
+/// PERFORMANCE, and it is the whole reason this exists. `status()` is computed
+/// by the panel's poll every 10 s and by `write_state` every 5 s, and each one
+/// used to parse both files -- 30 MB, ~30k lines -- from the top, twice
+/// (`unacked` and `digest`), plus two more passes for the receipts. Measured
+/// on this machine: 0.49 CPU-seconds per `moatctl status`, which at that
+/// cadence was ~16% of a core with nothing happening. The store is the only
+/// writer, so it folds each line as it appends it and the parse never has to
+/// happen again; the stamp catches the cases where that is not true.
+struct Cache {
+    map: BTreeMap<String, Alert>,
+    receipts: Vec<Receipt>,
+    stamp: Stamp,
+}
+
+impl Cache {
+    fn fold_line(&mut self, line: &str) {
+        match parse_record(line) {
+            Some(Record::Full(a)) => {
+                self.map.insert(a.id.clone(), *a);
+            }
+            Some(Record::Update(u)) => {
+                if let Some(a) = self.map.get_mut(&u.id) {
+                    fold(a, &u.update);
+                }
+            }
+            None => {
+                // Cheap pre-filter: most lines are alerts.
+                if line.contains("\"receipt\"") {
+                    if let Ok(r) = serde_json::from_str::<ReceiptLine>(line) {
+                        self.receipts.push(r.receipt);
+                    }
+                }
+            }
+        }
+    }
+}
 
 pub struct AlertStore {
     path: PathBuf,
@@ -22,6 +84,7 @@ pub struct AlertStore {
     group: String,
     file: Option<File>,
     size: u64,
+    cache: Mutex<Option<Cache>>,
 }
 
 impl AlertStore {
@@ -33,6 +96,7 @@ impl AlertStore {
             group: group.to_string(),
             file: None,
             size: 0,
+            cache: Mutex::new(None),
         };
         s.reopen()?;
         Ok(s)
@@ -62,6 +126,12 @@ impl AlertStore {
         f.write_all(b"\n")?;
         f.flush()?;
         self.size += line.len() as u64 + 1;
+        // Keep the fold current rather than throw it away: this line is the
+        // only thing that changed, and we are the ones who wrote it.
+        if let Some(c) = self.cache_lock().as_mut() {
+            c.fold_line(line);
+            c.stamp = Stamp::of(&self.path, &self.rotated);
+        }
         if self.size >= self.max_bytes {
             self.rotate()?;
         }
@@ -76,6 +146,9 @@ impl AlertStore {
             self.rotated.display()
         );
         self.file = None;
+        // The old rotated file is gone with this rename, and so are its
+        // alerts; the fold has to be rebuilt from what is left.
+        *self.cache_lock() = None;
         std::fs::rename(&self.path, &self.rotated)?;
         self.reopen()
     }
@@ -94,75 +167,93 @@ impl AlertStore {
     /// `{"v":1,"receipt":{…}}`. It shares the file with the alerts so the
     /// timeline is one stream, and `parse_record` returns `None` for it, so no
     /// reader can mistake it for an alert or count it in the badge.
-    pub fn append_receipt(&mut self, r: &crate::receipt::Receipt) -> std::io::Result<()> {
+    pub fn append_receipt(&mut self, r: &Receipt) -> std::io::Result<()> {
         let line = serde_json::to_string(&r.line())?;
         self.write_line(&line)
     }
 
-    /// Every receipt, oldest first.
-    pub fn receipts(&self) -> Vec<crate::receipt::Receipt> {
-        let mut out = Vec::new();
+    fn cache_lock(&self) -> std::sync::MutexGuard<'_, Option<Cache>> {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Fold both files from the top: rotated first, then live, so an update
+    /// in the live file lands on a record that was rotated out.
+    fn fold_from_disk(&self) -> Cache {
+        // Stamped BEFORE reading: a write that lands mid-read makes the next
+        // call's stamp differ, and it re-folds.
+        let stamp = Stamp::of(&self.path, &self.rotated);
+        let mut c = Cache {
+            map: BTreeMap::new(),
+            receipts: Vec::new(),
+            stamp,
+        };
         for p in [&self.rotated, &self.path] {
             let Ok(text) = std::fs::read_to_string(p) else {
                 continue;
             };
             for line in text.lines() {
-                // Cheap pre-filter: most lines are alerts.
-                if !line.contains("\"receipt\"") {
-                    continue;
-                }
-                if let Ok(r) = serde_json::from_str::<crate::receipt::ReceiptLine>(line) {
-                    out.push(r.receipt);
-                }
+                c.fold_line(line);
             }
         }
-        out
+        c
+    }
+
+    /// Run `f` over the current fold, rebuilding it first if the files on
+    /// disk are not the ones it was built from.
+    fn with_fold<R>(&self, f: impl FnOnce(&Cache) -> R) -> R {
+        let mut guard = self.cache_lock();
+        let fresh = guard
+            .as_ref()
+            .map(|c| c.stamp == Stamp::of(&self.path, &self.rotated))
+            .unwrap_or(false);
+        if !fresh {
+            *guard = Some(self.fold_from_disk());
+        }
+        f(guard.as_ref().expect("folded above"))
+    }
+
+    /// Every receipt, oldest first.
+    pub fn receipts(&self) -> Vec<Receipt> {
+        self.with_fold(|c| c.receipts.clone())
     }
 
     /// Every alert, updates folded, oldest first. ULIDs sort chronologically so
     /// the map order is the timeline.
     pub fn load(&self) -> Vec<Alert> {
-        let mut map: BTreeMap<String, Alert> = BTreeMap::new();
-        for p in [&self.rotated, &self.path] {
-            let Ok(text) = std::fs::read_to_string(p) else {
-                continue;
-            };
-            for line in text.lines() {
-                match parse_record(line) {
-                    Some(Record::Full(a)) => {
-                        map.insert(a.id.clone(), *a);
-                    }
-                    Some(Record::Update(u)) => {
-                        if let Some(a) = map.get_mut(&u.id) {
-                            fold(a, &u.update);
-                        }
-                    }
-                    None => {}
-                }
-            }
-        }
-        map.into_values().collect()
+        self.with_fold(|c| c.map.values().cloned().collect())
+    }
+
+    /// How many alerts satisfy `pred`, without cloning any of them.
+    pub fn count_alerts(&self, pred: impl Fn(&Alert) -> bool) -> usize {
+        self.with_fold(|c| c.map.values().filter(|a| pred(a)).count())
     }
 
     pub fn find(&self, id: &str) -> Option<Alert> {
-        self.load().into_iter().find(|a| a.id == id)
+        self.with_fold(|c| c.map.get(id).cloned())
     }
 
-    /// Unacked counts by severity, for `status`.
+    /// Unacked counts by severity, for `status` -- and it means the BADGE.
     ///
     /// Suppressed alerts (an allowlist or baseline entry matched) are recorded
-    /// but never counted — BASELINE §8. A demoted rule is *not* suppressed; it
-    /// carries `surface: "timeline"` and the plugin keeps it out of the badge.
+    /// but never counted — BASELINE §8. Neither is anything on the timeline:
+    /// every medium and low is there by construction, and a demoted or
+    /// triage-demoted high carries `surface: "timeline"` precisely so that it
+    /// is not waiting on anyone. This used to count them anyway, so `moatctl
+    /// status` printed "unacked critical 5 high 243 medium 627 low 776" over
+    /// a badge of 1, and the watchdog kept its own filter with the surface
+    /// clause this one lacked. One predicate, used by both.
     pub fn unacked(&self) -> BTreeMap<String, u64> {
         let mut counts: BTreeMap<String, u64> = ["critical", "high", "medium", "low"]
             .iter()
             .map(|s| (s.to_string(), 0))
             .collect();
-        for a in self.load() {
-            if !a.acked && !a.is_suppressed() {
-                *counts.entry(a.severity.clone()).or_insert(0) += 1;
+        self.with_fold(|c| {
+            for a in c.map.values() {
+                if !a.acked && !a.is_suppressed() && a.surface == "alerts" {
+                    *counts.entry(a.severity.clone()).or_insert(0) += 1;
+                }
             }
-        }
+        });
         counts
     }
 }
@@ -324,5 +415,30 @@ mod tests {
         }
         s.append_alert(&demo_alert("01BBBBBBBBBBBBBBBBBBBBBBBB")).unwrap();
         assert_eq!(s.load().len(), 2);
+    }
+
+    /// Timing probe, not a test: `MOAT_BENCH_DIR=<dir with alerts.jsonl and
+    /// alerts.1.jsonl> cargo test --release --lib store::tests::bench_load -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_load() {
+        let Ok(dir) = std::env::var("MOAT_BENCH_DIR") else { return };
+        let dir = std::path::PathBuf::from(dir);
+        let s = AlertStore::open(&dir.join("alerts.jsonl"), &dir.join("alerts.1.jsonl"), u64::MAX, "moat").unwrap();
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let n = s.load().len();
+            let t_load = t.elapsed();
+            let t = std::time::Instant::now();
+            let r = s.receipts().len();
+            let t_rec = t.elapsed();
+            let t = std::time::Instant::now();
+            let u = s.unacked();
+            let t_un = t.elapsed();
+            let t = std::time::Instant::now();
+            let cnt = s.count_alerts(|a| !a.is_suppressed());
+            let t_cnt = t.elapsed();
+            eprintln!("BENCH load() {} alerts in {:?}; receipts() {} in {:?}; unacked() {:?} in {:?}; count_alerts {} in {:?}", n, t_load, r, t_rec, u, t_un, cnt, t_cnt);
+        }
     }
 }

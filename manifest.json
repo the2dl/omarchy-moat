@@ -34,9 +34,18 @@
       "pollSeconds": 10,
       "showCountBadge": true,
       "showSuppressed": false,
-      "weeklyDigest": true
+      "weeklyDigest": true,
+      "notifyMuted": false,
+      "rawDetail": false
     },
     "schema": [
+      {
+        "key": "notifyMuted",
+        "type": "boolean",
+        "label": "Never interrupt me",
+        "defaultValue": false,
+        "description": "Turns every desktop notification off, including the weekly note. Everything still lands in the panel and the bar glyph still changes; nothing is dropped. This is the 'Never' answer to Settings' \"When should Moat interrupt you?\" -- the severity threshold below cannot express it, because 'critical only' is not 'never'."
+      },
       {
         "key": "minNotifySeverity",
         "type": "enum",
@@ -83,6 +92,13 @@
         "label": "Show suppressed alerts",
         "defaultValue": false,
         "description": "Include alerts a learned or user allowlist entry already covers in the panel timeline, greyed out. They never notify and never count toward the badge either way."
+      },
+      {
+        "key": "rawDetail",
+        "type": "boolean",
+        "label": "Show raw detection detail",
+        "defaultValue": false,
+        "description": "Renders the panel in the detection's own words instead of the plain-language ones: the daemon's titles, the rule id and the severity beside every incident, the process, pid, uid, args, working directory, full parent chain, rarity and suppression as plain fields, and the evidence open rather than behind a disclosure. Presentation only -- it changes nothing about what is detected, scored, surfaced or notified."
       },
       {
         "key": "weeklyDigest",

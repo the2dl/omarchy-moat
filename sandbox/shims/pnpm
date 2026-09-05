@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# omarchy-moat shim: runs the real pnpm under moat-sandbox.
+# omarchy-moat shim for pnpm.
+#
+#   1. for install-shaped subcommands, scan the package tree with
+#      moat-scan-npm before any lifecycle script can run (same contract as
+#      the npm and makepkg shims: 0 clean, 1 medium warns, 2 high asks).
+#   2. run the real pnpm under moat-sandbox.
+#
 # Installed as /usr/lib/moat/shims/pnpm; active only while
 # /etc/moat/sandbox.enabled exists (see /etc/profile.d/moat-shims.sh).
 set -euo pipefail
@@ -8,4 +14,22 @@ _shim_dir=${SHIM_SELF%/*}
 [[ $_shim_dir == "$SHIM_SELF" ]] && _shim_dir=/usr/lib/moat/shims
 # shellcheck source-path=SCRIPTDIR source=shim-common.sh
 . "$_shim_dir/shim-common.sh"
+
+pnpm_installs() {
+	case $1 in
+	install | i | add | update | up | upgrade | rebuild | rb) return 0 ;;
+	install-test | it | import | fetch | dedupe) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# Bare `pnpm` prints help, but `pnpm --frozen-lockfile` style invocations with
+# no subcommand do install, so an argv of options only is treated as install.
+subcmd=$(shim_js_subcmd "$@")
+if [[ -z $subcmd ]]; then
+	(($#)) && shim_scan_js_tree pnpm "$@"
+elif pnpm_installs "$subcmd"; then
+	shim_scan_js_tree pnpm "$@"
+fi
+
 shim_exec pnpm "$@"

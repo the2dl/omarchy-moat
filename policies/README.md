@@ -1,6 +1,6 @@
 # policies/ — Tetragon TracingPolicy templates
 
-32 `TracingPolicy` templates for Tetragon **v1.7.1** on Arch (kernel 7.1, BTF,
+42 `TracingPolicy` templates for Tetragon **v1.7.1** on Arch (kernel 7.1, BTF,
 `lsm=...,bpf`). One file per rule, `policies/<family>-<rule>.yaml`, policy name
 `moat-<family>-<rule>`. Everything here was written against
 `docs/TETRAGON-NOTES.md`; where the notes say something is not expressible in a
@@ -69,11 +69,30 @@ which needs no policy change and no reload.
 | `moat-net-suspicious-port-egress` | medium | `tcp_connect` (kprobe) | Post 60s | git-over-SSH (port 22), IRC/XMPP/game clients, a private registry or proxy on a custom port, dev servers calling a public API. Applies to every process now, so moatd raises it to high when the process is in a package-manager subtree | `DPort` value lists, `NotDAddr` CIDRs |
 | `moat-net-tmpfs-binary-egress` | critical | `tcp_connect` (kprobe) | **Sigkill** | an installer you unpacked into `/tmp` and ran on purpose | `matchBinaries Prefix` values |
 
-6 critical, 16 high, 9 medium, 1 low (32 policies). 7 policies carry `Sigkill`,
-25 are report-only. Hook load: 19 programs on `file_post_open`, 3 on
-`tcp_connect`, 2 on `bprm_check_security`, and one each on
-`ptrace_access_check`, `proc_mem_open`, `bpf`, `path_chmod`, `inode_setxattr`,
-`security_kernel_read_file`. `python3 policies/check.py` prints this table from
+| `moat-rootkit-evidence-tamper` | critical | `security_path_unlink`, `security_path_truncate`, `security_path_rename` (kprobe) | Post 60s | none: only moatd, moatctl, moat-feeds and the sensor write in `/var/lib/moat` and `/var/log/moat`, and all four are excluded | `matchBinaries NotIn` (moat's own binaries) |
+| `moat-rootkit-sensor-tamper` | critical | `security_file_post_open`, `security_path_unlink` (kprobe) | Post 60s | a package upgrade (pacman excluded), `moatctl` writing a learned silence, `sudo nvim /etc/moat/moat.toml` (editors excluded) | `matchBinaries NotPostfix`, `matchArgs Prefix` values |
+| `moat-rootkit-trust-store-write` | high | `security_file_post_open` (kprobe) | Post 60s | `update-ca-trust`/`p11-kit` rebuilding the bundle, pacman, the network manager rewriting `/etc/hosts`, `sudo nvim /etc/hosts` | `matchBinaries NotPostfix` |
+| `moat-rootkit-system-log-tamper` | high | `security_path_unlink`, `security_path_truncate` (kprobe) | Post 60s | `journalctl --vacuum-*` run as a disk clean-up, which is deliberately **not** excluded; journald's own deletions and logrotate are | `matchBinaries NotIn` |
+| `moat-rootkit-history-tamper` | medium | `security_path_unlink`, `security_path_truncate` (kprobe) | Post 60s | you clearing your own history, a dotfile manager replacing it. The shells are excluded because a shell rewrites its own history on exit | `matchBinaries NotPostfix` |
+| `moat-cred-project-token-read` | medium | `security_file_post_open` (kprobe) | Post 300s | **frequent**: every dev server, test run and framework start reads `.env`; scored down to the timeline in an interactive session and up inside an install (BASELINE 2b) | selector 0 `NotPostfix` (registry clients) for `.npmrc`; selector 1 `NotPostfix` (git, direnv, containers, editors, search/backup) for `.env` and `.git/config` |
+| `moat-cred-ssh-recon-read` | medium | `security_file_post_open` (kprobe) | Post 300s | shell host-name completion (shells excluded), ansible, vagrant, `kitten ssh` | `matchBinaries NotPostfix` (the ssh suite, git, rsync, shells) |
+| `moat-cred-ssh-agent-socket` | high | `security_socket_connect` (kprobe) | Post 60s | none seen; ssh, git, ssh-add and the password-manager agents are excluded. Only covers `/tmp/ssh-*` and `$HOME` sockets — see blind spots | `matchBinaries NotPostfix`, `matchArgs Prefix` values |
+| `moat-priv-container-socket-connect` | high | `security_socket_connect` (kprobe) | Post 60s | testcontainers and other libraries that reach the socket through a language runtime rather than the `docker` CLI | `matchBinaries NotPostfix` (the container toolchain) |
+| `moat-persist-git-config-write` | high | `security_file_post_open` (kprobe) | Post 60s | git itself on clone/`git config`/fetch (excluded), TUIs and editors | `matchBinaries NotPostfix` |
+
+8 critical, 21 high, 12 medium, 1 low (42 **detection** policies), plus 3
+`moat-telemetry-*` policies which are records rather than detections and are
+rendered only when their class is on — see docs/SHIPPING.md. 7 policies carry
+`Sigkill`, 38 are report-only. Hook load: 26 programs on the `file_post_open` path (8 as
+LSM hooks, 18 as kprobes on `security_file_post_open`), 4 on
+`security_path_unlink`, 3 on `security_path_truncate`, 3 on `tcp_connect`, 2 on
+`security_socket_connect`, 2 on `bprm_check_security`, and one each on
+`security_path_rename`, `ptrace_access_check`, `proc_mem_open`, `bpf`,
+`path_chmod`, `inode_setxattr`, `security_kernel_read_file`. With every
+telemetry class on that becomes 27 on the `file_post_open` path, 4 on
+`tcp_connect` and 2 on `path_chmod`. Everything added
+after the first live run is a **kprobe**: the 19-policy trampoline cap is per
+LSM hook, and a kprobe is not attached through a trampoline. `python3 policies/check.py` prints this table from
 the templates themselves; it is the source of truth if the two disagree.
 
 ## What the first live run changed
@@ -386,3 +405,35 @@ decision is moatd's (contract section 6.4, rule ids `moat-x-*`).
   a directory this list does not enumerate.
 * **Container-internal activity** is seen as host activity; there is no
   per-container scoping on a single-user desktop.
+* **An agent socket under `/run/user/<uid>/`.** `sockaddr_un` takes `Equal` and
+  `Prefix` only — no `Postfix` — and the user id sits in the middle of the path,
+  so the systemd, gcr and gnome-keyring ssh-agents cannot be named in a
+  template. A `Prefix` of `/run/user/` would match every desktop socket on the
+  machine. `moat-cred-ssh-agent-socket` covers `/tmp/ssh-*` and `$HOME` agents
+  only; the rest needs a `{{UID}}` placeholder in the renderer, or a userspace
+  match on `SSH_AUTH_SOCK`.
+* **`> ~/.bash_history` typed at a prompt.** The shell performs that redirection
+  itself, and a shell truncates its own history file on every exit when
+  `histappend` is off, so the two are the same event from the kernel's side.
+  `moat-rootkit-history-tamper` excludes the shells and therefore sees only a
+  non-shell erasing history.
+* **Stopping the sensor by signal.** `systemctl stop moatd` and `kill -9` reach
+  `security_task_kill`, whose victim is a `task_struct` — no operator can match
+  "the target is moatd", so a policy there would fire on every signal on the
+  machine. Noticing that the sensor died stays a userspace job
+  (`moat-x-sensor-mismatch`), as does `systemctl mask`, which creates a symlink
+  rather than writing a file.
+* **Lockfile tampering** (`package-lock.json`, `Cargo.lock`, …). The
+  discriminator is whether an install is running, not who is writing: the
+  legitimate writers are node, python and cargo, which is also what an attacker
+  edits them with. An in-kernel exclusion list would be "every package manager",
+  which leaves the rule matching nothing. It belongs in userspace, where the
+  install context of BASELINE 2b is already known.
+* **Timestomping and `chattr +i`.** `utimensat` is what `tar`, `cp -p`, `rsync`
+  and every package manager do thousands of times per build, and `chattr` goes
+  through `security_file_ioctl`, which fires on every ioctl on the machine. Both
+  would cost more than they detect; an immutable flag on moat's own files is
+  better checked periodically from userspace.
+* **`~/.pki/nssdb`.** Adding a certificate there is real, but browsers and
+  Electron apps rewrite that database on their own schedule; the system trust
+  store (`moat-rootkit-trust-store-write`) is covered instead.

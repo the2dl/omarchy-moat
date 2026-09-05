@@ -123,3 +123,145 @@ shim_exec() {
 shim_is_tty() {
 	[[ -t 0 && -t 1 ]]
 }
+
+# --------------------------------------------------------------- scanning ---
+#
+# The pre-execution scan contract, shared by every shim that runs a
+# moat-scan-* tool before handing over. It is the one the makepkg shim
+# established; the scanners all use the same exit codes:
+#
+#   0            nothing, or only low findings   -> continue silently
+#   1            medium findings                 -> warn, continue
+#   2            high findings                   -> ask, or refuse when there
+#                                                   is no terminal to ask at
+#   anything else / scanner missing              -> warn, continue
+#
+# The last line matters most: a scanner that crashes, or is not installed,
+# must never be able to stop an install. Refusal is reserved for findings the
+# scanner is sure about.
+#
+# MOAT_SANDBOX=0 skips the scan as well as the sandbox, because that is what
+# both this refusal message and the scanner's own "install anyway" hint tell
+# the user to do; scanning anyway would make both of them lie.
+#
+# MOAT_SANDBOX_ACTIVE=1 deliberately does NOT skip the scan: a nested install
+# inside the sandbox is usually a different directory with a different tree
+# that the outer invocation never saw.
+
+# shim_run_scan LABEL SCANNER [ARG...]
+shim_run_scan() {
+	local label=$1 scanner=$2
+	shift 2
+	[[ ${MOAT_SANDBOX:-1} == 0 ]] && return 0
+	# An explicit override, so a local build can be pointed at without touching
+	# PATH -- and so the "scanner is absent" contract can be tested for real
+	# rather than by relying on it not being installed yet.
+	local var="MOAT_SCANNER_${scanner//-/_}"
+	local override=${!var:-}
+	[[ -n $override ]] && scanner=$override
+	if ! command -v "$scanner" >/dev/null 2>&1; then
+		shim_warn "$scanner not found, skipping the $label scan"
+		return 0
+	fi
+
+	local rc=0
+	"$scanner" "$@" || rc=$?
+
+	case $rc in
+	0) return 0 ;;
+	1)
+		shim_warn "$label scan: medium findings above. Continuing."
+		return 0
+		;;
+	2) ;;
+	*)
+		shim_warn "$scanner failed (exit $rc), continuing without a scan"
+		return 0
+		;;
+	esac
+
+	# High findings.
+	if ! shim_is_tty; then
+		printf '[moat] %s scan found HIGH severity findings and this is not an interactive terminal. Refusing to continue.\n' "$label" >&2
+		printf '[moat] Review the findings, then re-run from a terminal or set MOAT_SANDBOX=0 to bypass everything.\n' >&2
+		exit 1
+	fi
+	if command -v gum >/dev/null 2>&1; then
+		if gum confirm "Continue anyway?"; then
+			shim_warn "continuing at your request despite HIGH findings"
+			return 0
+		fi
+	else
+		local reply=""
+		read -r -p "[moat] HIGH findings. Continue anyway? [y/N] " reply || reply=""
+		if [[ $reply == [yY]* ]]; then
+			shim_warn "continuing at your request despite HIGH findings"
+			return 0
+		fi
+	fi
+	printf '[moat] aborted.\n' >&2
+	exit 1
+}
+
+# shim_subcmd_n N "$@": echo the Nth (1-based) bare word of an argv, i.e. the
+# subcommand and, for `uv pip install`, the one after it. Options are skipped.
+shim_subcmd_n() {
+	local want=$1 seen=0 arg
+	shift
+	for arg in "$@"; do
+		case $arg in
+		--) ;;
+		-*) ;;
+		*)
+			seen=$((seen + 1))
+			if ((seen == want)); then
+				printf '%s' "$arg"
+				return 0
+			fi
+			;;
+		esac
+	done
+	return 0
+}
+
+# shim_subcmd "$@": the first bare word of an argv.
+shim_subcmd() { shim_subcmd_n 1 "$@"; }
+
+# Historical name, kept because the JS shims and their tests use it.
+shim_js_subcmd() { shim_subcmd_n 1 "$@"; }
+
+# shim_js_has_global "$@": true when the argv asks for a global install, which
+# has no local package tree worth scanning.
+shim_js_has_global() {
+	local arg
+	for arg in "$@"; do
+		case $arg in
+		-g | --global | --location=global) return 0 ;;
+		esac
+	done
+	return 1
+}
+
+# shim_scan_js_tree LABEL "$@": scan the JavaScript package tree in $PWD
+# before an install-shaped command runs. Silent when there is nothing here
+# that npm would read, so `npm install -g` from $HOME costs nothing.
+shim_scan_js_tree() {
+	local label=$1
+	shift
+	shim_js_has_global "$@" && return 0
+	[[ -f ./package.json || -f ./package-lock.json || -f ./npm-shrinkwrap.json ||
+		-f ./yarn.lock || -f ./pnpm-lock.yaml ]] || return 0
+	shim_run_scan "$label" moat-scan-npm .
+}
+
+# shim_scan_python_tree LABEL: scan the Python project in $PWD before pip or
+# uv builds anything from it. Silent when there is nothing here that pip would
+# read, so `pip install requests` from $HOME costs nothing.
+shim_scan_python_tree() {
+	local label=$1
+	[[ -f ./setup.py || -f ./setup.cfg || -f ./pyproject.toml ||
+		-f ./pip.conf || -f ./pip.ini ]] ||
+		compgen -G './requirements*.txt' >/dev/null 2>&1 ||
+		return 0
+	shim_run_scan "$label" moat-scan-pip --for python .
+}

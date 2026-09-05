@@ -1,0 +1,1724 @@
+#!/usr/bin/env python3
+"""moat-scan-npm - static review of a JavaScript package tree before its
+install scripts run.
+
+Part of omarchy-moat 0.1.0.  Standard library only, no dependencies, no
+network, no execution of anything it reads.
+
+Companion to moat-scan-pkgbuild: same finding shape, same allow file, same
+exit codes, same "here is how to proceed" posture.  Where the PKGBUILD scanner
+reads a build recipe, this one reads package.json, the lockfile and - when it
+is already on disk - node_modules, and answers one question:
+
+    if I let npm/pnpm/yarn/bun run right now, what would execute?
+
+The three things it looks at, in order of how much they matter:
+
+  1. lifecycle scripts (preinstall/install/postinstall/prepare).  Presence in
+     a package *you* chose is ordinary; presence in a transitive dependency
+     you never named is the actual npm attack shape.
+  2. what those scripts do: pipe a download into a shell, reach for ~/.ssh or
+     ~/.npmrc, talk to a bare IP, or run a decoded string.
+  3. what survives `npm ci` and a fresh clone: lockfile entries resolved off
+     the configured registry, and entries with no integrity hash.
+
+Obfuscation heuristics (obf.*) work on JavaScript *and* Python source, so the
+same engine covers an unpacked sdist.
+
+Exit codes: 0 = nothing (or only low), 1 = medium findings, 2 = high findings.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import fnmatch
+import glob
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass, field
+
+VERSION = "0.1.0"
+
+SEV_HIGH = "high"
+SEV_MEDIUM = "medium"
+SEV_LOW = "low"
+SEV_RANK = {SEV_HIGH: 3, SEV_MEDIUM: 2, SEV_LOW: 1}
+
+EVIDENCE_MAX = 160
+
+# Scan budget.  A scan runs in front of every `npm install`, so it has to be
+# cheap and it has to terminate on a hostile tree.
+MAX_LOCKFILE_BYTES = 64 * 1024 * 1024
+MAX_SOURCE_BYTES = 4 * 1024 * 1024
+MAX_DEEP_FILES = 4000
+MAX_PACKAGES = 20000
+
+LIFECYCLE_SCRIPTS = ("preinstall", "install", "postinstall", "prepare")
+
+# --------------------------------------------------------------------------
+# host knowledge
+# --------------------------------------------------------------------------
+
+DEFAULT_REGISTRY = "https://registry.npmjs.org/"
+
+# Hosts that are the public npm registry under another name.  yarn v1 writes
+# registry.yarnpkg.com into every lockfile no matter what registry= says, so
+# treating it as foreign would flag every yarn project on earth.
+REGISTRY_ALIASES = {
+    "registry.npmjs.org",
+    "registry.npmjs.com",
+    "registry.yarnpkg.com",
+}
+
+# Forges a lockfile legitimately points at for a tarball or a git dependency.
+KNOWN_FORGES = (
+    "github.com",
+    "githubusercontent.com",
+    "codeload.github.com",
+    "npm.pkg.github.com",
+    "gitlab.com",
+    "codeberg.org",
+    "bitbucket.org",
+    "sr.ht",
+)
+
+SUSPICIOUS_HOST_SUBSTRINGS = (
+    "pastebin.com",
+    "paste.ee",
+    "hastebin",
+    "termbin.com",
+    "ngrok.io",
+    "ngrok-free.app",
+    "ngrok.app",
+    "trycloudflare.com",
+    "transfer.sh",
+    "anonfiles",
+    "gofile.io",
+    "0x0.st",
+    "file.io",
+    "bashupload.com",
+    "tmpfiles.org",
+    "webhook.site",
+    "requestbin",
+    "pipedream.net",
+    "oast.fun",
+    "oastify.com",
+    "interact.sh",
+    "burpcollaborator.net",
+)
+
+SUSPICIOUS_URL_SUBSTRINGS = (
+    "discord.com/api/webhooks",
+    "discordapp.com/api/webhooks",
+    "api.telegram.org/bot",
+    ".onion",
+)
+
+URL_RE = re.compile(r"\b(?:https?|ftp|ws|wss)://[^\s'\"`)|;<>&\\]+")
+IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+# Node core modules whose reconstruction from pieces is never a coincidence.
+SENSITIVE_MODULES = {
+    "child_process", "node:child_process",
+    "fs", "node:fs", "fs/promises", "node:fs/promises",
+    "net", "node:net", "dgram", "node:dgram",
+    "http", "node:http", "https", "node:https",
+    "dns", "node:dns", "tls", "node:tls",
+    "vm", "node:vm", "module", "node:module",
+    "os", "node:os", "worker_threads", "node:worker_threads",
+    "cluster", "node:cluster", "v8", "node:v8", "inspector", "repl",
+}
+
+# --------------------------------------------------------------------------
+# rule catalogue: id -> (default severity, why, proceed).
+# --------------------------------------------------------------------------
+
+ALLOW_USER = "~/.config/moat/scanner-allow.conf"
+ALLOW_SYSTEM = "/etc/moat/scanner-allow.conf"
+
+RULES: dict[str, tuple[str, str, str]] = {
+    "npm.lifecycle-script": (
+        SEV_MEDIUM,
+        "a dependency you did not choose runs a script at install time, which "
+        "is the shape every recent npm worm has used",
+        "Read it first (`npm view {pkg} scripts`, or open the file the script "
+        "names), then accept it with `pkg={pkg} rule={id}` in " + ALLOW_USER + ".",
+    ),
+    "npm.script-shell-pipe": (
+        SEV_HIGH,
+        "an install script downloads code and pipes it into a shell, so the "
+        "install runs whatever that server sends today",
+        "Nothing legitimate needs this at install time. If you are certain, "
+        "add `pkg={pkg} rule={id}` to " + ALLOW_USER + ".",
+    ),
+    "npm.script-net-literal": (
+        SEV_HIGH,
+        "an install script talks to a bare IP, a paste bin, a tunnel or a "
+        "webhook endpoint, which is where stolen data goes",
+        "Fetch that URL yourself and look at it before installing; if it is "
+        "genuine, `host={host}` in " + ALLOW_USER + " silences it.",
+    ),
+    "npm.script-credential-path": (
+        SEV_HIGH,
+        "an install script reads a credential file (ssh key, npm token, cloud "
+        "credentials); this is the Shai-Hulud token-theft shape",
+        "There is no build reason to touch these paths. Do not install unless "
+        "you know exactly why; `pkg={pkg} rule={id}` in " + ALLOW_USER + " overrides.",
+    ),
+    "npm.script-home-access": (
+        SEV_MEDIUM,
+        "an install script reaches outside the package into $HOME, past the "
+        "usual build caches",
+        "Check which file it touches; native builds normally stay in "
+        "~/.cache or ~/.node-gyp. Accept with `pkg={pkg} rule={id}` in "
+        + ALLOW_USER
+        + ".",
+    ),
+    "npm.bin-outside-package": (
+        SEV_HIGH,
+        "a bin entry points outside the package directory, so linking it puts "
+        "a file the package does not own on your PATH",
+        "Open the package.json and look at the bin entry; a real package "
+        "always points inside itself.",
+    ),
+    "lock.foreign-registry": (
+        SEV_MEDIUM,
+        "the lockfile pins a tarball from somewhere other than your "
+        "configured registry, and it will be fetched again on every fresh clone",
+        "If {host} is your registry or mirror, add `host={host}` to "
+        + ALLOW_USER
+        + "; otherwise re-resolve the lockfile against the right registry.",
+    ),
+    "lock.missing-integrity": (
+        SEV_MEDIUM,
+        "a registry tarball is pinned with no integrity hash, so what arrives "
+        "is whatever the server serves at install time",
+        "Delete the lockfile entry and re-run the install to re-pin it, or "
+        "accept it with `pkg={pkg} rule={id}` in " + ALLOW_USER + ".",
+    ),
+    "obf.eval-decoded": (
+        SEV_HIGH,
+        "decoded data is handed straight to eval/new Function/exec, which "
+        "hides the payload from anyone reading the source",
+        "Print the decoded string instead of running it (`node -e` on the "
+        "decode half alone) and read what it actually is.",
+    ),
+    "obf.computed-require": (
+        SEV_HIGH,
+        "a module name is assembled from pieces or decoded at runtime, which "
+        "is done only to keep a grep from finding it",
+        "Reconstruct the name by hand; a legitimate dynamic require uses a "
+        "path starting with ./ or a plain variable, not string arithmetic.",
+    ),
+    "obf.charcode-chain": (
+        SEV_MEDIUM,
+        "a long String.fromCharCode chain builds a string the reader cannot "
+        "see, the classic dropper encoding",
+        "Decode the chain (`node -e 'console.log(String.fromCharCode(...))'`) "
+        "and judge the result; minifiers do not emit chains this long.",
+    ),
+    "obf.long-blob": (
+        SEV_LOW,
+        "a very long encoded literal; on its own this is usually an embedded "
+        "asset, but it is where a payload would hide",
+        "Only interesting next to an eval/Function/exec finding in the same "
+        "file; ignore it otherwise.",
+    ),
+    "obf.long-line": (
+        SEV_LOW,
+        "a single line of thousands of characters: either minified output or "
+        "code packed to defeat review",
+        "Run it through `npx prettier` (or `python -m json.tool` for data) "
+        "before judging it; expected in dist/ and *.min.js.",
+    ),
+}
+
+# --------------------------------------------------------------------------
+# findings
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Finding:
+    id: str
+    severity: str
+    file: str
+    line: int
+    evidence: str
+    why: str
+    proceed: str
+    pkg: str = ""     # owning package name, for allow-file matching
+    host: str = ""    # host involved, for allow-file matching
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "severity": self.severity,
+            "file": self.file,
+            "line": self.line,
+            "evidence": self.evidence,
+            "why": self.why,
+            "proceed": self.proceed,
+            "pkg": self.pkg,
+        }
+
+
+class Scanner:
+    def __init__(self) -> None:
+        self.findings: list[Finding] = []
+        self._seen: set[tuple[str, str, int]] = set()
+
+    def add(
+        self,
+        rule: str,
+        file: str,
+        line: int,
+        evidence: str,
+        severity: str | None = None,
+        why: str | None = None,
+        pkg: str = "",
+        host: str = "",
+    ) -> None:
+        default_sev, default_why, proceed = RULES[rule]
+        key = (rule, file, line)
+        if key in self._seen:
+            return
+        self._seen.add(key)
+        self.findings.append(
+            Finding(
+                id=rule,
+                severity=severity or default_sev,
+                file=file,
+                line=line,
+                evidence=clean_evidence(evidence),
+                why=why or default_why,
+                proceed=proceed.format(
+                    pkg=pkg or "<package>", id=rule, host=host or "<host>"
+                ),
+                pkg=pkg,
+                host=host,
+            )
+        )
+
+
+# --------------------------------------------------------------------------
+# allow file:  host=<domain> | rule=<id> | pkg=<name>, '#' comments.
+# Identical syntax and identical files to moat-scan-pkgbuild, so one
+# `rule=obf.*` line covers both tools.
+# --------------------------------------------------------------------------
+
+ALLOW_KEYS = ("host", "rule", "pkg")
+
+
+def allow_file_paths(extra: list[str] | None = None) -> list[str]:
+    env = os.environ.get("MOAT_SCANNER_ALLOW", "")
+    paths = [ALLOW_SYSTEM]
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+    paths.append(os.path.join(xdg, "moat", "scanner-allow.conf"))
+    paths.extend(p for p in env.split(":") if p)
+    paths.extend(extra or [])
+    return paths
+
+
+def load_allow(paths: list[str]) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    for path in paths:
+        try:
+            with open(os.path.expanduser(path), encoding="utf-8", errors="replace") as fh:
+                body = fh.read()
+        except OSError:
+            continue
+        for raw in body.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            entry: dict[str, str] = {}
+            for tok in re.split(r"[\s,]+", line):
+                key, _, val = tok.partition("=")
+                if key in ALLOW_KEYS and val:
+                    entry[key] = val.strip("'\"")
+            if entry:
+                entries.append(entry)
+    return entries
+
+
+def host_matches(host: str, pattern: str) -> bool:
+    host = host.lower()
+    pattern = pattern.lower().lstrip(".")
+    if not host:
+        return False
+    return host == pattern or host.endswith("." + pattern) or fnmatch.fnmatch(host, pattern)
+
+
+def is_allowed(f: Finding, entries: list[dict[str, str]]) -> bool:
+    for entry in entries:
+        ok = True
+        for key, val in entry.items():
+            if key == "rule":
+                ok = ok and (f.id == val or fnmatch.fnmatch(f.id, val))
+            elif key == "pkg":
+                ok = ok and bool(f.pkg) and (f.pkg == val or fnmatch.fnmatch(f.pkg, val))
+            elif key == "host":
+                ok = ok and host_matches(f.host, val)
+            if not ok:
+                break
+        if ok:
+            return True
+    return False
+
+
+def clean_evidence(text: str) -> str:
+    s = re.sub(r"\s+", " ", text.replace("\t", " ")).strip()
+    if len(s) > EVIDENCE_MAX:
+        s = s[: EVIDENCE_MAX - 3] + "..."
+    return s
+
+
+# --------------------------------------------------------------------------
+# url helpers
+# --------------------------------------------------------------------------
+
+
+def url_host(url: str) -> str:
+    m = re.match(r"[a-zA-Z][a-zA-Z0-9+.\-]*://(?:[^/@\s]*@)?([^/:\s?#]+)", url)
+    if not m:
+        return ""
+    return m.group(1).lower().rstrip(".")
+
+
+def is_raw_ip(host: str) -> bool:
+    if not IPV4_RE.match(host):
+        return False
+    parts = [int(p) for p in host.split(".") if p.isdigit()]
+    if len(parts) != 4 or any(p > 255 for p in parts):
+        return False
+    return True
+
+
+def is_private_ip(host: str) -> bool:
+    if not is_raw_ip(host):
+        return False
+    a, b = (int(x) for x in host.split(".")[:2])
+    if a == 127 or a == 10 or a == 0:
+        return True
+    if a == 192 and b == 168:
+        return True
+    if a == 172 and 16 <= b <= 31:
+        return True
+    if a == 169 and b == 254:
+        return True
+    return False
+
+
+def is_known_forge(host: str) -> bool:
+    host = host.lower()
+    return any(host == h or host.endswith("." + h) for h in KNOWN_FORGES)
+
+
+def suspicious_reason(url: str) -> str | None:
+    low = url.lower()
+    for frag in SUSPICIOUS_URL_SUBSTRINGS:
+        if frag in low:
+            return frag
+    host = url_host(url)
+    if not host:
+        return None
+    for frag in SUSPICIOUS_HOST_SUBSTRINGS:
+        if frag in host:
+            return frag
+    if is_raw_ip(host) and not is_private_ip(host):
+        return host
+    return None
+
+
+# --------------------------------------------------------------------------
+# .npmrc  (offline: plain file parsing, no npm invocation)
+# --------------------------------------------------------------------------
+
+
+def npmrc_paths(project: str) -> list[str]:
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+    return [
+        "/etc/npmrc",
+        os.path.join(xdg, "npm", "npmrc"),
+        os.path.join(os.path.expanduser("~"), ".npmrc"),
+        os.path.join(project, ".npmrc"),
+    ]
+
+
+def load_registries(project: str) -> tuple[str, dict[str, str]]:
+    """-> (default registry url, {'@scope': url}). Later files win."""
+    default = os.environ.get("npm_config_registry") or DEFAULT_REGISTRY
+    scoped: dict[str, str] = {}
+    for path in npmrc_paths(project):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                body = fh.read()
+        except OSError:
+            continue
+        for raw in body.splitlines():
+            line = raw.split(";", 1)[0].split("#", 1)[0].strip()
+            if "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip("'\"")
+            if not val:
+                continue
+            if key == "registry":
+                default = val
+            elif key.startswith("@") and key.endswith(":registry"):
+                scoped[key[: -len(":registry")]] = val
+    return default, scoped
+
+
+def registry_hosts(default: str, scoped: dict[str, str]) -> set[str]:
+    hosts = {url_host(default)} | {url_host(v) for v in scoped.values()}
+    hosts.discard("")
+    # yarn and npm write different hostnames for the same public registry.
+    if hosts & REGISTRY_ALIASES or url_host(DEFAULT_REGISTRY) in hosts:
+        hosts |= REGISTRY_ALIASES
+    return hosts
+
+
+# --------------------------------------------------------------------------
+# obfuscation engine (JavaScript and Python source)
+# --------------------------------------------------------------------------
+
+DECODER_RE = re.compile(
+    r"\batob\s*\("
+    r"|\bBuffer\s*\.\s*from\s*\([^;\n]{0,300}?['\"](?:base64|hex)['\"]"
+    r"|\bunescape\s*\("
+    r"|\bdecodeURIComponent\s*\(\s*(?:escape\s*\(|['\"]%)"
+    r"|\bzlib\s*\.\s*(?:gunzipSync|inflateSync|brotliDecompressSync)\s*\("
+    r"|\bbase64\s*\.\s*(?:b64decode|b32decode|b16decode|urlsafe_b64decode|"
+    r"standard_b64decode|decodebytes)\s*\("
+    r"|\bcodecs\s*\.\s*decode\s*\("
+    r"|\bbytes\s*\.\s*fromhex\s*\("
+    r"|\bmarshal\s*\.\s*loads\s*\("
+    r"|\bzlib\s*\.\s*decompress\s*\("
+    r"|\bbinascii\s*\.\s*(?:a2b_base64|unhexlify)\s*\("
+)
+
+# Sinks that turn a string into running code.  `.exec(` is included only for
+# the tainted-argument check below: a regex `.exec()` never takes a decoded
+# blob, a child_process `.exec()` that does is the whole attack.
+SINK_RE = re.compile(
+    r"\beval\s*\("
+    r"|\bnew\s+Function\s*\("
+    r"|\bvm\s*\.\s*(?:runInNewContext|runInThisContext|compileFunction)\s*\("
+    r"|(?<![.\w])exec\s*\("
+    r"|(?<![.\w])compile\s*\("
+    r"|\.\s*(?:exec|execSync|execFile|execFileSync|spawn|spawnSync)\s*\("
+    r"|\bos\s*\.\s*system\s*\("
+    r"|\bsubprocess\s*\.\s*(?:run|call|Popen|check_output)\s*\("
+)
+
+REQUIRE_RE = re.compile(r"\brequire\s*\(|(?<![.\w])import\s*\(|\bprocess\s*\.\s*binding\s*\(")
+
+FROMCHARCODE_RE = re.compile(r"String\s*\.\s*fromCharCode\s*\(([^)]{0,4000})\)")
+
+# A chain this long is an encoded string; anything shorter is a keycode or a
+# quote character.  `re.exec(String.fromCharCode(e.which))` is ordinary code
+# and used to trip the sink rule below.
+CHARCODE_CHAIN_MIN = 4
+
+
+def has_decoder(text: str) -> bool:
+    if DECODER_RE.search(text):
+        return True
+    for m in FROMCHARCODE_RE.finditer(text):
+        if len(re.findall(r"\b\d{1,7}\b", m.group(1))) >= CHARCODE_CHAIN_MIN:
+            return True
+    return False
+
+STRING_LIT_RE = re.compile(r"'([^'\\\n]*)'|\"([^\"\\\n]*)\"|`([^`\\\n]*)`")
+
+BLOB_LIT_RE = re.compile(r"""(['"])([A-Za-z0-9+/=_\-]{400,})\1""")
+HEX_LIT_RE = re.compile(r"""(['"])((?:[0-9a-fA-F]{2}){400,})\1""")
+
+# Assignment of a decoder result (or a huge literal) to a name: the two-step
+# form `const d = Buffer.from(B,'base64').toString(); new Function(d)()`.
+ASSIGN_RE = re.compile(
+    r"^\s*(?:(?:const|let|var|global|window)\s+)?"
+    r"([A-Za-z_$][\w$]*)\s*=\s*(.+)$"
+)
+
+LONG_LINE_CHARS = 5000
+
+# Paths where a huge line or a huge literal is the normal state of the world.
+MINIFIED_HINTS = (
+    ".min.js", ".min.mjs", ".min.cjs", ".map", ".bundle.js", "-min.js",
+    "/dist/", "/build/", "/umd/", "/esm/", "/bundles/", "/vendor/",
+    "/fixtures/", "/__fixtures__/", "/testdata/", "/coverage/",
+    ".snap", ".wasm", ".d.ts",
+)
+
+SOURCE_EXTS = (".js", ".cjs", ".mjs", ".jsx", ".ts", ".cts", ".mts", ".py")
+
+
+def looks_minified(path: str) -> bool:
+    low = path.replace(os.sep, "/").lower()
+    return any(h in low for h in MINIFIED_HINTS)
+
+
+def balanced_arg(text: str, open_pos: int, limit: int = 2000) -> str:
+    """Text between the '(' at open_pos and its matching ')', capped."""
+    depth = 0
+    out: list[str] = []
+    for i in range(open_pos, min(len(text), open_pos + limit)):
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+            if depth == 1:
+                continue
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        if depth >= 1:
+            out.append(ch)
+    return "".join(out)
+
+
+def decode_blob(blob: str) -> str:
+    """base64 -> text, or "" if it is not base64 or not text.
+
+    Pure decoding: nothing here executes, imports, writes or resolves
+    anything. It exists so a finding can tell the reader what the blob says
+    instead of making them run it.
+    """
+    if len(blob) < 8 or len(blob) % 4 or not re.fullmatch(r"[A-Za-z0-9+/=]+", blob):
+        return ""
+    try:
+        dec = base64.b64decode(blob, validate=True)
+        text = dec.decode("utf-8")
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return ""
+    printable = sum(1 for c in text if c.isprintable() or c in "\n\t")
+    if not text or printable / len(text) < 0.9:
+        return ""
+    return text
+
+
+def try_decode(text: str) -> str:
+    """Decode the literals inside an expression, for evidence only."""
+    out: list[str] = []
+    for m in re.finditer(r"""['"]([A-Za-z0-9+/=]{8,20000})['"]""", text):
+        got = decode_blob(m.group(1))
+        if got:
+            out.append(got)
+    for m in FROMCHARCODE_RE.finditer(text):
+        nums = re.findall(r"\b(\d{1,7})\b", m.group(1))
+        if nums:
+            try:
+                out.append("".join(chr(int(n)) for n in nums if int(n) < 0x110000))
+            except (ValueError, OverflowError):
+                pass
+    return " ".join(out)
+
+
+# Cap the taint set: propagation is O(lines x names), and a hostile file must
+# not be able to make the scan quadratic.
+MAX_TAINT = 64
+
+
+LITERAL_ASSIGN_RE = re.compile(
+    r"""^\s*(?:(?:const|let|var)\s+)?([A-Za-z_$][\w$]*)\s*=\s*['"]([^'"\n]{16,})['"]"""
+)
+
+
+def taint_names(lines: list[str]) -> tuple[dict[str, str], dict[str, str]]:
+    """-> (name -> assigning expression, name -> plain string literal).
+
+    The first is what makes `new Function(decoded)` a finding; the second is
+    what lets the finding print what `decoded` actually says.
+    """
+    tainted: dict[str, str] = {}
+    literals: dict[str, str] = {}
+    for raw in lines:
+        lm = LITERAL_ASSIGN_RE.match(raw)
+        if lm and len(literals) < MAX_TAINT * 4:
+            literals[lm.group(1)] = lm.group(2)
+        if len(tainted) >= MAX_TAINT:
+            continue
+        m = ASSIGN_RE.match(raw)
+        if not m:
+            continue
+        name, rhs = m.group(1), m.group(2)
+        if has_decoder(rhs) or BLOB_LIT_RE.search(rhs) or HEX_LIT_RE.search(rhs):
+            tainted[name] = rhs
+            continue
+        # `const d = decodeIt(BLOB)` where BLOB is already tainted.
+        for other in list(tainted):
+            if other != name and re.search(r"\b%s\b" % re.escape(other), rhs):
+                tainted[name] = rhs
+                break
+    return tainted, literals
+
+
+def arg_is_tainted(arg: str, tainted: dict[str, str]) -> str | None:
+    for name in tainted:
+        if re.search(r"\b%s\b" % re.escape(name), arg):
+            return name
+    return None
+
+
+def taint_evidence(name: str, tainted: dict[str, str], literals: dict[str, str],
+                   depth: int = 0) -> str:
+    """Follow a tainted name back to the literal it came from and decode it."""
+    rhs = tainted.get(name, "")
+    if not rhs:
+        return ""
+    got = try_decode(rhs)
+    if got.strip() or depth >= 2:
+        return got
+    for ident in re.findall(r"[A-Za-z_$][\w$]*", rhs):
+        if ident in literals:
+            got = decode_blob(literals[ident])
+            if got.strip():
+                return got
+        elif ident in tainted and ident != name:
+            got = taint_evidence(ident, tainted, literals, depth + 1)
+            if got.strip():
+                return got
+    return ""
+
+
+def line_at(text: str, pos: int) -> int:
+    return text.count("\n", 0, pos) + 1
+
+
+def scan_source(
+    sc: Scanner, text: str, display: str, pkg: str = "", *, low_rules: bool = True
+) -> None:
+    """Obfuscation heuristics over one JS or Python source text."""
+    if not text:
+        return
+    lines = text.splitlines()
+    tainted, literals = taint_names(lines)
+    # `.exec(` / `.spawn(` are only process sinks when the file actually has
+    # child_process in it; otherwise they are RegExp.prototype.exec.
+    has_cp = "child_process" in text or "subprocess" in text
+
+    # --- decoded data reaching an exec sink -------------------------------
+    for m in SINK_RE.finditer(text):
+        if m.group(0).lstrip().startswith(".") and not has_cp:
+            continue
+        paren = text.find("(", m.start())
+        if paren < 0:
+            continue
+        arg = balanced_arg(text, paren)
+        if not arg.strip():
+            continue
+        sink = clean_evidence(m.group(0))
+        hit = ""
+        if has_decoder(arg):
+            hit = "decoded inline"
+        chased = ""
+        if not hit:
+            name = arg_is_tainted(arg, tainted)
+            if name:
+                hit = "argument %s was decoded above" % name
+                chased = taint_evidence(name, tainted, literals)
+        if not hit:
+            continue
+        decoded = chased or try_decode(arg)
+        ev = "%s%s )  [%s]" % (sink, clean_evidence(arg)[:80], hit)
+        if decoded.strip():
+            ev += "  decodes to: " + clean_evidence(decoded)[:60]
+        sc.add("obf.eval-decoded", display, line_at(text, m.start()), ev, pkg=pkg)
+
+    # --- module name assembled or decoded ---------------------------------
+    for m in REQUIRE_RE.finditer(text):
+        paren = text.find("(", m.start())
+        if paren < 0:
+            continue
+        arg = balanced_arg(text, paren, limit=600).strip()
+        if not arg:
+            continue
+        # A plain literal, or a plain variable, is ordinary.
+        if re.fullmatch(r"""['"][^'"]*['"]""", arg):
+            continue
+        pieces = ["".join(g for g in mm.groups() if g) for mm in STRING_LIT_RE.finditer(arg)]
+        joined = "".join(pieces)
+        decoded = try_decode(arg)
+        concat = "+" in arg and len(pieces) >= 1
+        if not (has_decoder(arg) or concat or arg_is_tainted(arg, tainted)):
+            continue
+        # `require('./locale/' + lang)` is a path, not a hidden module name.
+        target = (decoded or joined).strip()
+        if target.startswith(".") or target.startswith("/"):
+            continue
+        if concat and not decoded and (joined.startswith(".") or joined.startswith("/")):
+            continue
+        if concat and not decoded and not joined:
+            continue
+        sev = SEV_HIGH if target in SENSITIVE_MODULES else SEV_MEDIUM
+        ev = clean_evidence(m.group(0) + arg + " )")
+        if target:
+            ev += "  -> %r" % target[:40]
+        sc.add("obf.computed-require", display, line_at(text, m.start()), ev,
+               severity=sev, pkg=pkg)
+
+    # --- fromCharCode chains ----------------------------------------------
+    for m in FROMCHARCODE_RE.finditer(text):
+        nums = re.findall(r"\b\d{1,7}\b", m.group(1))
+        if len(nums) < 8:
+            continue
+        decoded = try_decode(m.group(0))
+        ev = clean_evidence(m.group(0))
+        if decoded.strip():
+            ev += "  decodes to: " + clean_evidence(decoded)[:60]
+        sc.add("obf.charcode-chain", display, line_at(text, m.start()), ev, pkg=pkg)
+
+    if not low_rules or looks_minified(display):
+        return
+
+    # --- long encoded literals / packed lines (context only, never blocks) --
+    for m in BLOB_LIT_RE.finditer(text):
+        sc.add("obf.long-blob", display, line_at(text, m.start()),
+               "%d-char encoded literal: %s..." % (len(m.group(2)), m.group(2)[:48]),
+               pkg=pkg)
+        break
+    for m in HEX_LIT_RE.finditer(text):
+        sc.add("obf.long-blob", display, line_at(text, m.start()),
+               "%d-char hex literal: %s..." % (len(m.group(2)), m.group(2)[:48]),
+               pkg=pkg)
+        break
+    for no, raw in enumerate(lines, start=1):
+        if len(raw) > LONG_LINE_CHARS:
+            sc.add("obf.long-line", display, no,
+                   "line is %d characters: %s..." % (len(raw), raw[:60]), pkg=pkg)
+            break
+
+
+# --------------------------------------------------------------------------
+# lifecycle script content rules
+# --------------------------------------------------------------------------
+
+SHELL_PIPE_RE = re.compile(
+    r"(?:curl|wget|fetch|aria2c|http|https)\b[^|;&\n]{0,200}\|\s*"
+    r"(?:sudo\s+)?(?:/(?:usr/)?bin/)?(?:ba|z|k|da|a)?sh\b"
+    r"|(?:curl|wget)\b[^|;&\n]{0,200}\|\s*(?:python3?|perl|ruby|node)\b"
+    r"|(?:ba|z)?sh\s+-c\s+[\"']?\$\(\s*(?:curl|wget)"
+    r"|(?:ba|z)?sh\s+<\(\s*(?:curl|wget)"
+    r"|eval\s+[\"']?\$\(\s*(?:curl|wget)"
+)
+
+FETCH_VERB_RE = re.compile(
+    r"\b(?:curl|wget|aria2c|axios|node-fetch|got|superagent|request|"
+    r"downloadFile|download|urlretrieve|urlopen|requests\.(?:get|post))\b"
+    r"|\bfetch\s*\(|\bhttps?\s*\.\s*(?:get|request)\s*\("
+)
+
+# Credential material.  Each of these is a file whose only value is to be
+# stolen; a build step has no reason to read one.
+CREDENTIAL_RE = re.compile(
+    r"\.ssh\b|\bid_rsa\b|\bid_ed25519\b|\bid_ecdsa\b"
+    r"|\.npmrc\b|_authToken|\.yarnrc\.yml\b"
+    r"|\.aws\b|\.gnupg\b|\.netrc\b|\.git-credentials\b|\.pypirc\b"
+    r"|\.docker/config|\.kube/config|\.config/gcloud|\.azure\b"
+    r"|\.gem/credentials|Library/Keychains|\.local/share/keyrings"
+    r"|wallet\.dat|\.electrum\b|\.ethereum\b|keystore\b"
+    r"|GITHUB_TOKEN|NPM_TOKEN|AWS_SECRET|AWS_ACCESS_KEY",
+    re.IGNORECASE,
+)
+
+HOME_RE = re.compile(
+    r"\$HOME\b|\$\{HOME\}|\bos\.homedir\s*\(|process\.env\.HOME\b"
+    r"|process\.env\.USERPROFILE\b|\bPath\.home\s*\(|os\.path\.expanduser"
+    r"|(?<![\w/.])~/"
+)
+
+# $HOME subtrees a native build legitimately lives in.
+HOME_BENIGN_RE = re.compile(
+    r"(?:\$HOME|\$\{HOME\}|~|homedir\(\))/?\.?"
+    r"(?:cache|node-gyp|npm|nvm|pnpm-store|local/share/pnpm|bun|yarn|"
+    r"electron|electron-builder|cypress|puppeteer|playwright|cargo|rustup|"
+    r"gradle|m2|config/yarn)\b"
+)
+
+# Command heads that are the ordinary reason a package has an install script.
+# Matching one only demotes the *presence* finding - the content rules above
+# still run over the same string.
+BENIGN_SCRIPT_RE = re.compile(
+    r"^\s*(?:[A-Za-z_][\w]*=\S*\s+)*"
+    r"(?:node-gyp(?:-build)?|prebuild-install|prebuildify|node-pre-gyp|"
+    r"pkg-prebuilds|cmake-js|neon|napi|nan|node-addon-api|"
+    r"husky|patch-package|is-ci|exit|true|echo|node-gyp-build-optional-packages|"
+    r"opencollective(?:-postinstall)?|tsc|tsup|rimraf|shx|npm\s+run|pnpm\s+run|"
+    r"yarn\s+run|bun\s+run)\b"
+)
+
+
+def script_is_benign_shape(body: str) -> bool:
+    """True when every branch of the script is a recognised build idiom."""
+    parts = [p.strip() for p in re.split(r"&&|\|\||;", body) if p.strip()]
+    if not parts:
+        return True
+    return all(BENIGN_SCRIPT_RE.match(p) for p in parts)
+
+
+# Files an install script hands to an interpreter: `node install.js`,
+# `python setup.py`, `./scripts/build.sh`.  These are the ones that will
+# actually run, so they are worth reading even when the tree is huge.
+ENTRY_FILE_RE = re.compile(
+    r"(?:^|[\s;&|(])"
+    r"(?:node|nodejs|bun|deno|ts-node|tsx|python3?|python3\.\d+)\s+"
+    r"(?:-[^\s]+\s+)*"
+    r"([./A-Za-z0-9_\-][\w./\-]*\.(?:js|cjs|mjs|jsx|ts|cts|mts|py))\b"
+)
+RELATIVE_IMPORT_RE = re.compile(
+    r"""['"](\.{1,2}/[\w./\-]+\.(?:js|cjs|mjs|jsx|ts|cts|mts|py))['"]"""
+)
+MAX_ENTRY_FILES = 20
+
+
+def scan_script_entry_files(
+    sc: Scanner, body: str, pkg_dir: str, display_dir: str, pkg: str
+) -> None:
+    """Read the files an install script invokes, and what they pull in next.
+
+    Two hops, capped: the dropper is usually `postinstall: node install.js`
+    with the payload one relative import further in.
+    """
+    if not pkg_dir or not os.path.isdir(pkg_dir):
+        return
+    queue = [(m.group(1), 0) for m in ENTRY_FILE_RE.finditer(body)]
+    # `node -e "try{require('./postinstall')}catch(e){}"` is the single most
+    # common postinstall on npm (core-js, es5-ext). Read what it requires
+    # rather than guessing from the one-liner.
+    for m in re.finditer(r"""require\s*\(\s*['"](\.{1,2}/[\w./\-]*)['"]""", body):
+        rel = m.group(1)
+        queue.extend((rel + ext, 0) for ext in ("", ".js", ".cjs", ".mjs", "/index.js"))
+    seen: set[str] = set()
+    while queue and len(seen) < MAX_ENTRY_FILES:
+        rel, depth = queue.pop(0)
+        norm = os.path.normpath(rel)
+        if norm.startswith("..") or os.path.isabs(norm) or norm in seen:
+            continue
+        seen.add(norm)
+        full = os.path.join(pkg_dir, norm)
+        text = read_text(full)
+        if text is None:
+            continue
+        scan_source(sc, text, os.path.join(display_dir, norm), pkg=pkg)
+        if depth < 1:
+            for m in RELATIVE_IMPORT_RE.finditer(text):
+                queue.append((os.path.join(os.path.dirname(norm), m.group(1)), depth + 1))
+
+
+def scan_script_body(
+    sc: Scanner, body: str, display: str, line: int, pkg: str, name: str
+) -> None:
+    """Content rules for one lifecycle script string."""
+    label = "%s: %s" % (name, body)
+
+    if SHELL_PIPE_RE.search(body):
+        sc.add("npm.script-shell-pipe", display, line, label, pkg=pkg)
+
+    for m in URL_RE.finditer(body):
+        url = m.group(0)
+        reason = suspicious_reason(url)
+        host = url_host(url)
+        if reason:
+            sc.add("npm.script-net-literal", display, line, label,
+                   why="an install script contacts %s, which is a paste bin, "
+                       "tunnel, webhook or bare IP - never a build dependency" % reason,
+                   pkg=pkg, host=host)
+        elif FETCH_VERB_RE.search(body):
+            sc.add("npm.script-net-literal", display, line, label,
+                   severity=SEV_MEDIUM,
+                   why="an install script downloads from %s at install time, "
+                       "outside the lockfile's integrity checks" % (host or url),
+                   pkg=pkg, host=host)
+
+    if CREDENTIAL_RE.search(body):
+        sc.add("npm.script-credential-path", display, line, label, pkg=pkg)
+    elif HOME_RE.search(body) and not HOME_BENIGN_RE.search(body):
+        sc.add("npm.script-home-access", display, line, label, pkg=pkg)
+
+    # The same obfuscation engine, applied to the script string itself:
+    # `postinstall: node -e "eval(atob('...'))"` is the whole attack in one line.
+    scan_source(sc, body, display, pkg=pkg, low_rules=False)
+
+
+# --------------------------------------------------------------------------
+# package tree model
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Pkg:
+    name: str
+    version: str = ""
+    direct: bool = False
+    dev: bool = False
+    resolved: str = ""
+    integrity: str = ""
+    has_install_script: bool = False
+    lock_line: int = 0
+    scripts: dict[str, str] = field(default_factory=dict)
+    pkg_json: str = ""          # display path of node_modules/<...>/package.json
+    pkg_json_text: str = ""
+    dir: str = ""               # real filesystem directory, when unpacked
+    depth: int = 1              # 1 = top level in node_modules
+
+
+def read_text(path: str, cap: int = MAX_SOURCE_BYTES) -> str | None:
+    try:
+        if os.path.getsize(path) > cap:
+            return None
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    if b"\x00" in data[:4096]:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def read_json(path: str, cap: int = MAX_LOCKFILE_BYTES) -> tuple[dict | None, str]:
+    text = read_text(path, cap)
+    if text is None:
+        return None, ""
+    try:
+        obj = json.loads(text)
+    except (ValueError, RecursionError):
+        return None, text
+    return (obj if isinstance(obj, dict) else None), text
+
+
+def key_lines(text: str, pattern: str) -> dict[str, int]:
+    """Map a JSON object key to its 1-based line, by text scan."""
+    out: dict[str, int] = {}
+    for m in re.finditer(pattern, text, re.M):
+        out.setdefault(m.group(1), text.count("\n", 0, m.start()) + 1)
+    return out
+
+
+def pkg_name_from_lock_path(path: str) -> tuple[str, int]:
+    """'node_modules/a/node_modules/@s/b' -> ('@s/b', 2)."""
+    parts = path.split("node_modules/")
+    tail = parts[-1].strip("/")
+    depth = max(1, len(parts) - 1)
+    return tail, depth
+
+
+# --------------------------------------------------------------------------
+# lockfile parsers  (all offline, all tolerant: a lockfile we cannot read
+# must never stop an install)
+# --------------------------------------------------------------------------
+
+
+def parse_package_lock(path: str, display: str, direct: set[str]) -> list[Pkg]:
+    obj, text = read_json(path)
+    if not obj:
+        return []
+    out: list[Pkg] = []
+    lines = key_lines(text, r'^\s*"(node_modules/[^"]+)"\s*:')
+    packages = obj.get("packages")
+    if isinstance(packages, dict):
+        for key, meta in packages.items():
+            if not key or not isinstance(meta, dict):
+                continue
+            name, depth = pkg_name_from_lock_path(key)
+            if not name:
+                continue
+            out.append(
+                Pkg(
+                    name=meta.get("name") or name,
+                    version=str(meta.get("version") or ""),
+                    direct=depth == 1 and name in direct,
+                    dev=bool(meta.get("dev")),
+                    resolved=str(meta.get("resolved") or ""),
+                    integrity=str(meta.get("integrity") or ""),
+                    has_install_script=bool(meta.get("hasInstallScript")),
+                    lock_line=lines.get(key, 1),
+                    depth=depth,
+                )
+            )
+            if len(out) >= MAX_PACKAGES:
+                break
+        return out
+
+    # lockfileVersion 1: nested "dependencies".
+    dep_lines = key_lines(text, r'^\s*"([^"]+)"\s*:\s*\{')
+
+    def walk(node: dict, depth: int) -> None:
+        deps = node.get("dependencies")
+        if not isinstance(deps, dict) or len(out) >= MAX_PACKAGES:
+            return
+        for name, meta in deps.items():
+            if not isinstance(meta, dict):
+                continue
+            out.append(
+                Pkg(
+                    name=name,
+                    version=str(meta.get("version") or ""),
+                    direct=depth == 1 and name in direct,
+                    dev=bool(meta.get("dev")),
+                    resolved=str(meta.get("resolved") or ""),
+                    integrity=str(meta.get("integrity") or ""),
+                    lock_line=dep_lines.get(name, 1),
+                    depth=depth,
+                )
+            )
+            walk(meta, depth + 1)
+
+    walk(obj, 1)
+    return out
+
+
+YARN1_ENTRY_RE = re.compile(r'^(?!\s)(?!#)(.+):\s*$')
+
+
+def parse_yarn_lock(path: str, display: str, direct: set[str]) -> list[Pkg]:
+    text = read_text(path, MAX_LOCKFILE_BYTES)
+    if text is None:
+        return []
+    out: list[Pkg] = []
+    cur: Pkg | None = None
+    for no, raw in enumerate(text.splitlines(), start=1):
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        m = YARN1_ENTRY_RE.match(raw)
+        if m:
+            spec = m.group(1).strip().strip('"').split(",")[0].strip().strip('"')
+            if spec in ("__metadata", "__metadata:"):
+                cur = None
+                continue
+            # "foo@^1.0.0" / "@scope/foo@npm:^1.0.0"
+            at = spec.rfind("@")
+            name = spec[:at] if at > 0 else spec
+            cur = Pkg(name=name, direct=name in direct, lock_line=no)
+            out.append(cur)
+            if len(out) >= MAX_PACKAGES:
+                break
+            continue
+        if cur is None:
+            continue
+        body = raw.strip()
+        if body.startswith("version"):
+            cur.version = body.split(None, 1)[-1].strip().strip('"').lstrip(": ").strip('"')
+        elif body.startswith("resolved "):
+            cur.resolved = body.split(None, 1)[1].strip().strip('"')
+        elif body.startswith("resolution:"):
+            cur.resolved = body.split(":", 1)[1].strip().strip('"')
+        elif body.startswith("integrity ") or body.startswith("checksum:"):
+            cur.integrity = body.split(None, 1)[-1].strip().strip('"').lstrip(": ")
+    # Berry "resolution: foo@npm:1.0.0" is not a URL; it means the public
+    # registry.  Only a real URL is worth a registry check.
+    for p in out:
+        if p.resolved and "://" not in p.resolved:
+            p.resolved = ""
+            p.integrity = p.integrity or "berry"
+    return out
+
+
+PNPM_ENTRY_RE = re.compile(r"^  '?(/?[^:']+?)'?:\s*$")
+
+
+def parse_pnpm_lock(path: str, display: str, direct: set[str]) -> list[Pkg]:
+    text = read_text(path, MAX_LOCKFILE_BYTES)
+    if text is None:
+        return []
+    out: list[Pkg] = []
+    cur: Pkg | None = None
+    in_packages = False
+    for no, raw in enumerate(text.splitlines(), start=1):
+        if raw.startswith("packages:") or raw.startswith("snapshots:"):
+            in_packages = True
+            cur = None
+            continue
+        if raw and not raw.startswith(" ") and not raw.startswith("-"):
+            in_packages = raw.startswith("packages:")
+            cur = None
+            continue
+        if not in_packages:
+            continue
+        m = PNPM_ENTRY_RE.match(raw)
+        if m:
+            spec = m.group(1).strip().lstrip("/")
+            at = spec.rfind("@")
+            name = spec[:at] if at > 0 else spec
+            name = name.split("(")[0]
+            cur = Pkg(name=name, version=spec[at + 1:].split("(")[0] if at > 0 else "",
+                      direct=name in direct, lock_line=no)
+            out.append(cur)
+            if len(out) >= MAX_PACKAGES:
+                break
+            continue
+        if cur is None:
+            continue
+        body = raw.strip()
+        if body.startswith("resolution:"):
+            im = re.search(r"integrity:\s*([^,}\s]+)", body)
+            if im:
+                cur.integrity = im.group(1)
+            tm = re.search(r"tarball:\s*([^,}\s]+)", body)
+            if tm:
+                cur.resolved = tm.group(1)
+        elif body.startswith("requiresBuild:"):
+            cur.has_install_script = body.split(":", 1)[1].strip() == "true"
+        elif body.startswith("integrity:"):
+            cur.integrity = body.split(":", 1)[1].strip()
+    return out
+
+
+LOCKFILES = (
+    ("package-lock.json", parse_package_lock),
+    ("npm-shrinkwrap.json", parse_package_lock),
+    ("yarn.lock", parse_yarn_lock),
+    ("pnpm-lock.yaml", parse_pnpm_lock),
+)
+
+
+# --------------------------------------------------------------------------
+# project assembly
+# --------------------------------------------------------------------------
+
+
+def direct_dep_names(root_json: dict, root_dir: str) -> set[str]:
+    """Names the user actually wrote down, workspaces included."""
+    names: set[str] = set()
+
+    def take(obj: dict) -> None:
+        for key in ("dependencies", "devDependencies", "optionalDependencies",
+                    "peerDependencies"):
+            block = obj.get(key)
+            if isinstance(block, dict):
+                names.update(str(k) for k in block)
+
+    take(root_json)
+    ws = root_json.get("workspaces")
+    patterns: list[str] = []
+    if isinstance(ws, list):
+        patterns = [str(p) for p in ws]
+    elif isinstance(ws, dict) and isinstance(ws.get("packages"), list):
+        patterns = [str(p) for p in ws["packages"]]
+    for pat in patterns[:64]:
+        for d in glob.glob(os.path.join(root_dir, pat))[:256]:
+            sub, _ = read_json(os.path.join(d, "package.json"), cap=4 * 1024 * 1024)
+            if sub:
+                take(sub)
+                if isinstance(sub.get("name"), str):
+                    names.add(sub["name"])
+    return names
+
+
+def node_modules_package_dirs(root_dir: str, limit: int = MAX_PACKAGES) -> list[str]:
+    """Top-level (and pnpm store) package directories, without a full walk."""
+    nm = os.path.join(root_dir, "node_modules")
+    out: list[str] = []
+    if not os.path.isdir(nm):
+        return out
+    patterns = [
+        os.path.join(nm, "*", "package.json"),
+        os.path.join(nm, "@*", "*", "package.json"),
+        os.path.join(nm, ".pnpm", "*", "node_modules", "*", "package.json"),
+        os.path.join(nm, ".pnpm", "*", "node_modules", "@*", "*", "package.json"),
+    ]
+    for pat in patterns:
+        for p in glob.iglob(pat):
+            out.append(os.path.dirname(p))
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def attach_installed(pkgs: dict[str, Pkg], root_dir: str, display_root: str,
+                    direct: set[str]) -> None:
+    """Fill in real script bodies from node_modules when it is on disk."""
+    for d in node_modules_package_dirs(root_dir):
+        pj = os.path.join(d, "package.json")
+        obj, text = read_json(pj, cap=8 * 1024 * 1024)
+        if not obj:
+            continue
+        name = str(obj.get("name") or os.path.basename(d))
+        scripts = obj.get("scripts")
+        rel = os.path.relpath(pj, root_dir)
+        p = pkgs.get(name)
+        if p is None:
+            # No lockfile entry for it: classify from the tree instead, or a
+            # project without a lockfile would call every dependency
+            # transitive and warn about all of them.
+            nested = "/node_modules/" in rel[len("node_modules/"):]
+            p = Pkg(name=name, direct=name in direct, depth=2 if nested else 1)
+            pkgs[name] = p
+        p.pkg_json = os.path.join(display_root, rel) if display_root != "." else rel
+        p.pkg_json_text = text
+        p.dir = d
+        p.version = p.version or str(obj.get("version") or "")
+        if isinstance(scripts, dict):
+            p.scripts = {
+                k: str(v) for k, v in scripts.items()
+                if k in LIFECYCLE_SCRIPTS and isinstance(v, (str, int, float))
+            }
+        bins = obj.get("bin")
+        if bins is not None:
+            check_bin(p, bins, d)
+
+
+BIN_ESCAPES: list[tuple[str, str]] = []
+
+
+def check_bin(p: Pkg, bins, pkg_dir: str) -> None:
+    """Record bin targets that leave the package directory."""
+    entries: list[tuple[str, str]] = []
+    if isinstance(bins, str):
+        entries = [(p.name, bins)]
+    elif isinstance(bins, dict):
+        entries = [(str(k), str(v)) for k, v in bins.items() if isinstance(v, str)]
+    for cmd, target in entries:
+        if not target:
+            continue
+        if os.path.isabs(target) or target.startswith("~"):
+            BIN_ESCAPES.append((p.name, "%s -> %s" % (cmd, target)))
+            continue
+        norm = os.path.normpath(os.path.join("pkg", target))
+        if norm.startswith(".."):
+            BIN_ESCAPES.append((p.name, "%s -> %s" % (cmd, target)))
+
+
+# --------------------------------------------------------------------------
+# rules over the assembled model
+# --------------------------------------------------------------------------
+
+
+def lifecycle_severity(p: Pkg, bodies: dict[str, str]) -> tuple[str, str]:
+    """The ladder.  Returns (severity, why-suffix).
+
+    root project ....... handled by the caller: never reported on presence
+    direct dependency .. low     you chose it; native builds are why it exists
+    transitive ......... medium  nobody chose it - the actual npm attack shape
+    benign build idiom . low     node-gyp / prebuild-install / husky / ...
+    """
+    if p.direct:
+        return SEV_LOW, "a package you listed yourself"
+    if bodies and all(script_is_benign_shape(b) for b in bodies.values()):
+        return SEV_LOW, "a recognised native-build idiom"
+    return SEV_MEDIUM, "a transitive dependency you did not choose"
+
+
+# `prepare` is the odd one out: npm runs it for the *root* project, for a git /
+# file / link dependency, and before pack/publish - but never for a package
+# installed from a registry tarball.  Published packages routinely leave a
+# development `prepare` (tshy, tsc, husky) in their package.json, so reporting
+# it would fire ~20 times on npm's own dependency tree and never once describe
+# something that executes.  Checked against the bundled tree of npm itself.
+PREPARE_RUNS_PREFIXES = ("git+", "git:", "ssh://", "file:", "link:",
+                         "workspace:", "portal:")
+
+
+def runnable_scripts(p: Pkg) -> dict[str, str]:
+    """The lifecycle scripts that will actually run for this resolution."""
+    out: dict[str, str] = {}
+    for name, body in p.scripts.items():
+        if name == "prepare" and not p.resolved.startswith(PREPARE_RUNS_PREFIXES):
+            continue
+        if body.strip():
+            out[name] = body
+    return out
+
+
+def scan_lifecycle(sc: Scanner, pkgs: dict[str, Pkg], lock_display: str) -> None:
+    for p in sorted(pkgs.values(), key=lambda x: x.name):
+        bodies = runnable_scripts(p)
+        # We read the real package.json and nothing in it runs: say nothing,
+        # even if the lockfile's hasInstallScript disagrees.
+        if p.scripts and not bodies:
+            continue
+        if not bodies and not p.has_install_script:
+            continue
+        display = p.pkg_json or lock_display
+        # A line per script name: two scripts of one package must not collapse
+        # onto one location, or the deduper drops the worse of the two.
+        script_lines: dict[str, int] = {}
+        if p.pkg_json_text and bodies:
+            script_lines = key_lines(p.pkg_json_text, r'^\s*"([a-z]+)"\s*:')
+        line = 1
+        if bodies:
+            first = min(bodies, key=lambda k: LIFECYCLE_SCRIPTS.index(k)
+                        if k in LIFECYCLE_SCRIPTS else 9)
+            line = script_lines.get(first, 1)
+        if not p.pkg_json:
+            line = p.lock_line or 1
+
+        sev, note = lifecycle_severity(p, bodies)
+        if bodies:
+            shown = "; ".join("%s: %s" % (k, v) for k, v in bodies.items())
+        else:
+            shown = "hasInstallScript (not unpacked yet; body not on disk)"
+        label = "%s%s runs at install time - %s" % (
+            p.name, "@" + p.version if p.version else "", note,
+        )
+        sc.add("npm.lifecycle-script", display, line,
+               "%s | %s" % (label, shown), severity=sev,
+               why=None if sev == SEV_MEDIUM else
+               "this package runs a script during install; %s, so it is "
+               "expected rather than alarming - shown so you know it runs" % note,
+               pkg=p.name)
+
+        for name, body in bodies.items():
+            scan_script_body(sc, body, display, script_lines.get(name, line),
+                             p.name, name)
+            scan_script_entry_files(sc, body, p.dir,
+                                    os.path.dirname(p.pkg_json), p.name)
+
+
+def scan_lock_entries(
+    sc: Scanner, pkgs: dict[str, Pkg], lock_display: str,
+    reg_hosts: set[str], scoped: dict[str, str],
+) -> None:
+    for p in sorted(pkgs.values(), key=lambda x: x.name):
+        res = p.resolved
+        if not res:
+            continue
+        low = res.lower()
+        # Sources that legitimately carry no integrity and no registry host.
+        if low.startswith(("git+", "git:", "file:", "link:", "workspace:",
+                           "portal:", "patch:", "npm:", "ssh://")):
+            continue
+        if "://" not in res:
+            continue
+        host = url_host(res)
+        allowed = set(reg_hosts)
+        scope = p.name.split("/")[0] if p.name.startswith("@") else ""
+        if scope and scope in scoped:
+            allowed.add(url_host(scoped[scope]))
+
+        if host and host not in allowed:
+            reason = suspicious_reason(res)
+            if reason:
+                sev = SEV_HIGH
+            elif is_raw_ip(host):
+                sev = SEV_MEDIUM  # a private-IP registry is a real corporate setup
+            elif is_known_forge(host):
+                sev = SEV_LOW     # a github tarball dependency is ordinary
+            else:
+                sev = SEV_MEDIUM
+            sc.add("lock.foreign-registry", lock_display, p.lock_line or 1,
+                   "%s%s resolved from %s" % (p.name, "@" + p.version if p.version else "", res),
+                   severity=sev, pkg=p.name, host=host)
+
+        if not p.integrity and host and low.endswith((".tgz", ".tar.gz")):
+            sc.add("lock.missing-integrity", lock_display, p.lock_line or 1,
+                   "%s%s has resolved= but no integrity=" % (
+                       p.name, "@" + p.version if p.version else ""),
+                   pkg=p.name, host=host)
+
+
+# --------------------------------------------------------------------------
+# targets
+# --------------------------------------------------------------------------
+
+
+def scan_project(sc: Scanner, root_dir: str, display: str, deep: bool, warn) -> None:
+    root_json, root_text = read_json(os.path.join(root_dir, "package.json"),
+                                     cap=8 * 1024 * 1024)
+    root_json = root_json or {}
+    root_name = str(root_json.get("name") or os.path.basename(os.path.abspath(root_dir)))
+    direct = direct_dep_names(root_json, root_dir)
+
+    default_reg, scoped = load_registries(root_dir)
+    reg_hosts = registry_hosts(default_reg, scoped)
+
+    # The project's own scripts.  Presence is never reported - you wrote them -
+    # but a cloned repo whose postinstall pipes curl into sh is still an RCE,
+    # so the content rules run.
+    own = root_json.get("scripts")
+    if isinstance(own, dict):
+        pj_display = os.path.join(display, "package.json") if display != "." else "package.json"
+        lines = key_lines(root_text, r'^\s*"([A-Za-z0-9_:.\-]+)"\s*:')
+        for name in LIFECYCLE_SCRIPTS:
+            body = own.get(name)
+            if isinstance(body, str) and body.strip():
+                scan_script_body(sc, body, pj_display, lines.get(name, 1),
+                                 root_name, name)
+                scan_script_entry_files(sc, body, root_dir,
+                                        "" if display == "." else display,
+                                        root_name)
+
+    pkgs: dict[str, Pkg] = {}
+    lock_display = display
+    for fname, parser in LOCKFILES:
+        lock_path = os.path.join(root_dir, fname)
+        if not os.path.isfile(lock_path):
+            continue
+        lock_display = os.path.join(display, fname) if display != "." else fname
+        for p in parser(lock_path, lock_display, direct):
+            old = pkgs.get(p.name)
+            # Prefer the shallowest entry: that is the one the user can act on.
+            if old is None or p.depth < old.depth:
+                if old is not None:
+                    p.direct = p.direct or old.direct
+                pkgs[p.name] = p
+            elif p.has_install_script:
+                old.has_install_script = True
+        break
+
+    del BIN_ESCAPES[:]
+    attach_installed(pkgs, root_dir, display, direct)
+
+    scan_lifecycle(sc, pkgs, lock_display)
+    scan_lock_entries(sc, pkgs, lock_display, reg_hosts, scoped)
+    for name, ev in BIN_ESCAPES:
+        sc.add("npm.bin-outside-package",
+               (pkgs[name].pkg_json if name in pkgs and pkgs[name].pkg_json
+                else lock_display), 1, ev, pkg=name)
+
+    if deep:
+        deep_walk(sc, root_dir, display, warn)
+
+
+def scan_single_package(sc: Scanner, root_dir: str, display: str, warn) -> None:
+    """An unpacked package (a tarball you are about to install): read it all."""
+    obj, text = read_json(os.path.join(root_dir, "package.json"), cap=8 * 1024 * 1024)
+    obj = obj or {}
+    name = str(obj.get("name") or os.path.basename(os.path.abspath(root_dir)))
+    pj_display = os.path.join(display, "package.json") if display != "." else "package.json"
+    scripts = obj.get("scripts")
+    if isinstance(scripts, dict):
+        lines = key_lines(text, r'^\s*"([A-Za-z0-9_:.\-]+)"\s*:')
+        bodies = {k: str(v) for k, v in scripts.items() if k in LIFECYCLE_SCRIPTS}
+        if bodies:
+            first = min(bodies, key=lambda k: LIFECYCLE_SCRIPTS.index(k))
+            sev = SEV_LOW if all(script_is_benign_shape(b) for b in bodies.values()) \
+                else SEV_MEDIUM
+            sc.add("npm.lifecycle-script", pj_display, lines.get(first, 1),
+                   "%s runs at install time | %s" % (
+                       name, "; ".join("%s: %s" % kv for kv in bodies.items())),
+                   severity=sev, pkg=name)
+        for k, body in bodies.items():
+            scan_script_body(sc, body, pj_display, lines.get(k, 1), name, k)
+    del BIN_ESCAPES[:]
+    bins = obj.get("bin")
+    if bins is not None:
+        check_bin(Pkg(name=name), bins, root_dir)
+    for bname, ev in BIN_ESCAPES:
+        sc.add("npm.bin-outside-package", pj_display, 1, ev, pkg=bname)
+    deep_walk(sc, root_dir, display, warn, pkg=name)
+
+
+def deep_walk(sc: Scanner, root_dir: str, display: str, warn, pkg: str = "") -> None:
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        dirnames[:] = [d for d in dirnames if d not in (".git", ".cache")]
+        for fn in filenames:
+            if not fn.endswith(SOURCE_EXTS):
+                continue
+            seen += 1
+            if seen > MAX_DEEP_FILES:
+                warn("stopped after %d source files; re-run on a smaller path"
+                     % MAX_DEEP_FILES)
+                return
+            full = os.path.join(dirpath, fn)
+            rel = os.path.relpath(full, root_dir)
+            text = read_text(full)
+            if text is None:
+                continue
+            scan_source(sc, text,
+                        os.path.join(display, rel) if display != "." else rel,
+                        pkg=pkg)
+
+
+def looks_like_project(path: str) -> bool:
+    if os.path.isdir(os.path.join(path, "node_modules")):
+        return True
+    return any(os.path.isfile(os.path.join(path, f)) for f, _ in LOCKFILES)
+
+
+def scan_paths(paths: list[str], deep: bool = False, warn=lambda m: None) -> list[Finding]:
+    sc = Scanner()
+    for path in paths:
+        if os.path.isdir(path):
+            if os.path.isfile(os.path.join(path, "package.json")) or looks_like_project(path):
+                if looks_like_project(path):
+                    scan_project(sc, path, path.rstrip("/") or ".", deep, warn)
+                else:
+                    scan_single_package(sc, path, path.rstrip("/") or ".", warn)
+            elif deep:
+                # No package metadata, but the caller asked for a source sweep.
+                deep_walk(sc, path, path.rstrip("/") or ".", warn)
+            else:
+                warn("%s: no package.json or lockfile, nothing to scan" % path)
+            continue
+        if os.path.isfile(path):
+            text = read_text(path)
+            if text is None:
+                warn("%s: unreadable or too large" % path)
+                continue
+            scan_source(sc, text, path)
+            continue
+        warn("%s: no such file or directory" % path)
+    findings = sc.findings
+    findings.sort(key=lambda f: (-SEV_RANK[f.severity], f.file, f.line, f.id))
+    return findings
+
+
+# --------------------------------------------------------------------------
+# output
+# --------------------------------------------------------------------------
+
+COLORS = {SEV_HIGH: "\033[1;31m", SEV_MEDIUM: "\033[1;33m", SEV_LOW: "\033[36m"}
+RESET = "\033[0m"
+DIM = "\033[2m"
+
+
+def summarize(findings: list[Finding]) -> dict[str, int]:
+    counts = {SEV_HIGH: 0, SEV_MEDIUM: 0, SEV_LOW: 0}
+    for f in findings:
+        counts[f.severity] += 1
+    return counts
+
+
+def render_table(findings: list[Finding], color: bool, out, suppressed: int = 0,
+                 max_per_rule: int = 10) -> None:
+    if not findings:
+        out.write("clean: no findings\n")
+        if suppressed:
+            out.write("(%d finding(s) hidden by allow rules)\n" % suppressed)
+        return
+    width = max(len(f.severity) for f in findings)
+    idw = max(len(f.id) for f in findings)
+    shown: dict[str, int] = {}
+    elided: dict[str, int] = {}
+    for f in findings:
+        n = shown.get(f.id, 0)
+        if max_per_rule and n >= max_per_rule:
+            elided[f.id] = elided.get(f.id, 0) + 1
+            continue
+        shown[f.id] = n + 1
+        loc = "%s:%d" % (f.file, f.line)
+        sev = f.severity.upper().ljust(width)
+        if color:
+            sev = "%s%s%s" % (COLORS[f.severity], sev, RESET)
+        out.write("%s  %s  %s\n" % (sev, f.id.ljust(idw), loc))
+        pad = " " * (width + 2)
+        if color:
+            out.write("%s%s%s%s\n" % (pad, DIM, f.evidence, RESET))
+            out.write("%s%swhy:     %s%s\n" % (pad, DIM, f.why, RESET))
+            out.write("%s%sproceed: %s%s\n" % (pad, DIM, f.proceed, RESET))
+        else:
+            out.write("%s%s\n" % (pad, f.evidence))
+            out.write("%swhy:     %s\n" % (pad, f.why))
+            out.write("%sproceed: %s\n" % (pad, f.proceed))
+    for rule, n in sorted(elided.items()):
+        out.write("     ... and %d more %s finding(s) (--max-per-rule 0 for all)\n"
+                  % (n, rule))
+    counts = summarize(findings)
+    out.write(
+        "\n%d finding(s): %d high, %d medium, %d low%s\n"
+        % (
+            len(findings),
+            counts["high"],
+            counts["medium"],
+            counts["low"],
+            " (%d hidden by allow rules)" % suppressed if suppressed else "",
+        )
+    )
+    render_footer(findings, out)
+
+
+def render_footer(findings: list[Finding], out) -> None:
+    worst = max(findings, key=lambda f: SEV_RANK[f.severity])
+    pkg = worst.pkg or "<package>"
+    host = next((f.host for f in findings if f.host), "")
+    out.write("\nIf this is expected:\n")
+    if host:
+        out.write("  trust that host       echo 'host=%s' >> %s\n" % (host, ALLOW_USER))
+    out.write("  accept one rule here  echo 'pkg=%s rule=%s' >> %s\n"
+              % (pkg, worst.id, ALLOW_USER))
+    out.write("  read it first         less %s   # then re-run this scan\n" % worst.file)
+    out.write("  install anyway        MOAT_SANDBOX=0 npm install"
+              "   # skips the sandbox and this scan\n")
+    out.write("  allow-file syntax     host=<domain> | rule=<id> | pkg=<name>, "
+              "'#' comments\n")
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="moat-scan-npm",
+        description="Static review of a JavaScript package tree before its "
+                    "install scripts run.",
+    )
+    ap.add_argument("paths", metavar="PATH", nargs="*", default=None,
+                    help="project directories, package directories or source "
+                         "files (default: .)")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--min-severity", choices=(SEV_LOW, SEV_MEDIUM, SEV_HIGH),
+                    default=SEV_LOW, help="drop findings below this severity")
+    ap.add_argument("--quiet", "-q", action="store_true",
+                    help="print nothing; use the exit code (JSON still prints "
+                         "with --json)")
+    ap.add_argument("--deep", action="store_true",
+                    help="also run the obfuscation heuristics over every JS/TS/"
+                         "Python file in the tree (slow on node_modules)")
+    ap.add_argument("--max-per-rule", type=int, default=10, metavar="N",
+                    help="human output only: show at most N findings per rule "
+                         "(0 = no limit)")
+    ap.add_argument("--no-color", action="store_true", help="never colorize")
+    ap.add_argument("--allow-file", metavar="PATH", action="append", default=[],
+                    help="extra allow file (in addition to %s and %s)"
+                         % (ALLOW_SYSTEM, ALLOW_USER))
+    ap.add_argument("--no-allow", action="store_true", help="ignore all allow files")
+    ap.add_argument("--version", action="version", version="moat-scan-npm " + VERSION)
+    args = ap.parse_args(argv)
+
+    paths = args.paths or ["."]
+    warnings: list[str] = []
+    findings = scan_paths(paths, deep=args.deep, warn=warnings.append)
+
+    allow = [] if args.no_allow else load_allow(allow_file_paths(args.allow_file))
+    if allow:
+        kept = [f for f in findings if not is_allowed(f, allow)]
+        suppressed = len(findings) - len(kept)
+        findings = kept
+    else:
+        suppressed = 0
+
+    floor = SEV_RANK[args.min_severity]
+    findings = [f for f in findings if SEV_RANK[f.severity] >= floor]
+    counts = summarize(findings)
+
+    if args.json:
+        json.dump(
+            {"findings": [f.as_dict() for f in findings],
+             "summary": {"high": counts[SEV_HIGH], "medium": counts[SEV_MEDIUM],
+                         "low": counts[SEV_LOW]}},
+            sys.stdout,
+            indent=2,
+        )
+        sys.stdout.write("\n")
+    elif not args.quiet:
+        color = (not args.no_color) and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+        render_table(findings, color, sys.stdout, suppressed, args.max_per_rule)
+
+    if not args.quiet:
+        for w in warnings:
+            sys.stderr.write("moat-scan-npm: %s\n" % w)
+
+    if counts[SEV_HIGH]:
+        return 2
+    if counts[SEV_MEDIUM]:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

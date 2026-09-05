@@ -27,20 +27,27 @@
 //! | `baseline`  | the learning window, proposals, and the noise guard             |
 //! | `receipt`   | install receipts: what a package-manager subtree actually did   |
 //! | `incident`  | the pre-kill snapshot of a high/critical alert                  |
+//! | `chain`     | alerts in one process tree crossing families: one sequence      |
 //! | `bundle`    | `bundle.md`, with every process string in a `DATA` fence        |
+//! | `content`   | what is *in* a file a chain implicated: ELF, strings, entropy    |
 //! | `analysis`  | the agent preamble and how `moatctl analyze` launches it        |
 //! | `digest`    | the weekly summary and when it is due                           |
 //! | `store`     | append-only `alerts.jsonl`, updates, receipts, rotation         |
 //! | `control`   | the `/run/moat/control.sock` protocol of CONTRACT §5        |
 //! | `engine`    | the run loop that wires all of the above together               |
 //! | `feeds`     | abuse.ch feed fetch + local feed cache                          |
+//! | `telemetry` | selectable telemetry classes and `telemetry.jsonl`              |
+//! | `ship`      | `moat-ship`: NDJSON/syslog export, cursor, buffer, redaction    |
 
 pub mod alert;
 pub mod allowlist;
 pub mod analysis;
 pub mod baseline;
 pub mod bundle;
+pub mod chain;
 pub mod config;
+pub mod contain;
+pub mod content;
 pub mod context;
 pub mod control;
 pub mod digest;
@@ -59,8 +66,11 @@ pub mod render;
 pub mod rules;
 pub mod scoring;
 pub mod selectors;
+pub mod ship;
 pub mod store;
 pub mod tail;
+pub mod telemetry;
+pub mod triage;
 pub mod util;
 
 /// Version reported by `status` and written into every alert-adjacent artifact.

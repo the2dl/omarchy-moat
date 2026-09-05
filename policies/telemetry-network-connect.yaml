@@ -1,0 +1,73 @@
+# TELEMETRY, not a detection. Rendered only when `telemetry.network = true` in
+# /etc/moat/moat.toml, and routed past rule evaluation in moatd because its
+# policy name starts with `moat-telemetry-` (see moatd/src/telemetry.rs).
+#
+# Deliberately broad, and affordable because of an actual measurement: outbound
+# connects on this workstation run at 0.26/s against exec's 42/s, so recording
+# every public destination costs about 8 MB a day. That is two orders of
+# magnitude below the process class and it answers the question the alert
+# stream cannot: "what did this machine talk to on Tuesday afternoon?"
+#
+# Private, loopback, link-local and IPv6 ULA destinations are excluded in the
+# kernel. They are the bulk of the volume on a desktop (DNS to the router, the
+# display server, every container), they are the least interesting, and
+# excluding them here means they are never written to disk at all.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-telemetry-network-connect
+  annotations:
+    moat.omarchy/telemetry-class: "network"
+    moat.omarchy/severity: "low"
+    moat.omarchy/title: "Outbound connection (telemetry)"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "ignore"
+    moat.omarchy/why: >-
+      Telemetry, not a finding. Every public outbound connection with the process that
+      made it, so that a question asked after the fact - which process reached that
+      address, and what was its ancestry - has an answer. This policy never raises an
+      alert; moatd routes it past rule evaluation entirely.
+    moat.omarchy/expected: >-
+      Everything. A browser, a package manager, a language server and every sync client
+      appear here constantly. That is the point of a telemetry class: it is a record,
+      not an accusation.
+    moat.omarchy/fp-hint: "rule"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  # tcp_connect runs in the caller's context, so process.pid is the connecting
+  # process and not a softirq. It is also not error-injectable, which is exactly
+  # right here: telemetry must never be able to block a connection.
+  - call: "tcp_connect"
+    syscall: false
+    message: "Outbound connection (telemetry)"
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Family"
+        values: ["AF_INET", "AF_INET6"]
+      - index: 0
+        operator: "NotDAddr"
+        values:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+        - "127.0.0.0/8"
+        - "169.254.0.0/16"
+        - "100.64.0.0/10"
+        - "::1/128"
+        - "fc00::/7"
+        - "fe80::/10"
+      matchActions:
+      # rateLimit is keyed on the thread plus the first 40 bytes of the
+      # arguments (NOTES section 2), so this collapses a chatty connection pool
+      # to one record per process per destination per 10s without hiding a new
+      # destination for even a moment.
+      - action: Post
+        rateLimit: "10s"
+        rateLimitScope: "process"

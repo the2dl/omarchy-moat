@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
-# omarchy-moat shim: runs the real uv under moat-sandbox.
+# omarchy-moat shim for uv.
+#
+#   1. for the subcommands that resolve or build the project, scan it with
+#      moat-scan-pip before uv can execute a setup.py or a PEP 517 backend.
+#      Same contract as the npm and makepkg shims: 0 clean, 1 medium warns,
+#      2 high asks.
+#   2. run the real uv under moat-sandbox.
+#
+# `uv run` is scanned because on a fresh clone it installs the whole project
+# first; `uv venv`, `uv tool`, `uv python` and `uv cache` build nothing from
+# this directory.
+#
 # Installed as /usr/lib/moat/shims/uv; active only while
 # /etc/moat/sandbox.enabled exists (see /etc/profile.d/moat-shims.sh).
 set -euo pipefail
@@ -8,4 +19,27 @@ _shim_dir=${SHIM_SELF%/*}
 [[ $_shim_dir == "$SHIM_SELF" ]] && _shim_dir=/usr/lib/moat/shims
 # shellcheck source-path=SCRIPTDIR source=shim-common.sh
 . "$_shim_dir/shim-common.sh"
+
+uv_builds() {
+	case $1 in
+	add | sync | lock | build | run | export | install) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# `uv pip list` and `uv pip show` build nothing; `uv pip install .` does.
+uv_pip_builds() {
+	case $1 in
+	install | download | wheel | sync | compile) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+subcmd=$(shim_subcmd "$@")
+if [[ $subcmd == pip ]]; then
+	uv_pip_builds "$(shim_subcmd_n 2 "$@")" && shim_scan_python_tree uv
+elif [[ -n $subcmd ]] && uv_builds "$subcmd"; then
+	shim_scan_python_tree uv
+fi
+
 shim_exec uv "$@"

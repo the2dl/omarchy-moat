@@ -9,6 +9,7 @@
 // the alert with the matching id. moatd never rewrites in place, so the
 // file is append-only until it rotates at 20 MB.
 .pragma library
+.import "MoatCopy.js" as Copy
 
 // ------------------------------------------------------------------ severity
 
@@ -268,6 +269,81 @@ function normalizeIncident(value) {
   return { dir: dir, files: files, count: files.length }
 }
 
+// ------------------------------------------------------------------- triage
+//
+// LEARNING 2c: the unattended agent verdict. Advisory in the strongest sense —
+// it may explain, it may propose, and on `outcome: "demoted"` it moves an alert
+// from the badge to the timeline. It never changes acked, severity or
+// suppressed_by, and the panel must never let it look like it did.
+//
+// Absent on every alert until auto-triage has looked at one, and absent forever
+// when [analysis] auto_triage = "off", so null is the normal case and every
+// consumer binds `visible: !!alert.triage`.
+
+var TRIAGE_VERDICTS = ["benign", "suspicious", "malicious", "unclear"]
+var TRIAGE_CONFIDENCE = ["low", "medium", "high"]
+
+function oneOf(value, allowed, fallback) {
+  var v = String(value || "").toLowerCase()
+  return allowed.indexOf(v) >= 0 ? v : fallback
+}
+
+// An unrecognized verdict or confidence becomes "unclear" / "low" rather than
+// being rendered raw: this string came from a language model reading hostile
+// input, so the panel treats it as an enum it either knows or does not.
+function normalizeTriage(value) {
+  var v = value && typeof value === "object" && !Array.isArray(value) ? value : null
+  if (!v) return null
+  var summary = String(v.summary || "").trim()
+  var reasoning = String(v.reasoning || "").trim()
+  // A verdict with nothing said is not a verdict.
+  if (!summary && !reasoning) return null
+  var raw = Array.isArray(v.recommend) ? v.recommend : []
+  var recommend = []
+  for (var i = 0; i < raw.length && recommend.length < 6; i++) {
+    var line = String(raw[i] || "").trim()
+    if (line) recommend.push(line)
+  }
+  var outcome = String(v.outcome || "annotated").trim()
+  return {
+    agent: String(v.agent || "").trim(),
+    at: String(v.at || "").trim(),
+    verdict: oneOf(v.verdict, TRIAGE_VERDICTS, "unclear"),
+    confidence: oneOf(v.confidence, TRIAGE_CONFIDENCE, "low"),
+    summary: summary,
+    reasoning: reasoning,
+    // Kept as text and shown as text. The plugin has no verb that writes an
+    // allowlist file from a string, and this is the one string on the alert
+    // that a model wrote, so it is exactly the string that must not get one.
+    proposed_allowlist: String(v.proposed_allowlist || "").trim(),
+    recommend: recommend,
+    outcome: outcome,
+    demoted: outcome === "demoted",
+    // "withheld: <reason>" is the interesting case: a benign verdict the
+    // ceiling refused to act on. Showing the reason is what stops that reading
+    // as the panel ignoring the agent.
+    withheld: outcome.indexOf("withheld:") === 0
+              ? outcome.slice("withheld:".length).trim() : ""
+  }
+}
+
+// The chip beside an alert. Confidence rides along on the verdict because
+// "benign" and "benign, but the agent was not sure" are different claims.
+function triageChip(alert) {
+  var t = alert && alert.triage
+  if (!t) return ""
+  return t.verdict + " \u00b7 " + t.confidence
+}
+
+// What the agent's answer actually did, in words, for the detail block.
+function triageOutcomeText(alert) {
+  var t = alert && alert.triage
+  if (!t) return ""
+  if (t.demoted) return "Moved to the timeline; it is no longer in the badge count."
+  if (t.withheld) return "Left in the badge count: " + t.withheld + "."
+  return "Recorded against this alert. Nothing was changed."
+}
+
 // Human sizes for the incident file list. -1 means the daemon did not say.
 function formatBytes(bytes) {
   var n = Number(bytes)
@@ -275,6 +351,95 @@ function formatBytes(bytes) {
   if (n < 1024) return n + " B"
   if (n < 1024 * 1024) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + " KB"
   return (n / (1024 * 1024)).toFixed(n < 10485760 ? 1 : 0) + " MB"
+}
+
+// =========================================================================
+//  CONTRACT 4 -- "Chains": the sequence an alert turned out to be a step of
+// =========================================================================
+//
+// A chain is the daemon's statement that several alerts sharing one process
+// tree, crossing two or more detection families inside a window, are one
+// story. It rides on EVERY member (`alert.chain`) so a reader that opened one
+// alert can draw the whole of design 2b without joining anything -- and it
+// arrives as an `update` line, because the event that makes a sequence visible
+// happens after its earlier steps are already on disk.
+//
+// Three of the contract's reader obligations are implemented HERE, in the
+// normalizer, rather than in a view -- a view is not where a rule survives:
+//
+//   * A malformed chain is IGNORED, never merged. "A chain only ever grows",
+//     so letting a bad line through would blank a sequence already recorded.
+//   * An unrecognized `role` degrades to `trigger`. `context` is the claim
+//     that the user had already allowed this step, and inventing that claim
+//     out of a string nobody recognises shows an accusation as a permission.
+//   * The severity is only ever read back out beside its reason (see
+//     `chainSeverityLine`): the daemon never escalates silently, and the panel
+//     must not either.
+
+function normalizeChainStep(value) {
+  var s = value && typeof value === "object" && !Array.isArray(value) ? value : null
+  if (!s) return null
+  // A step is an alert id and what that alert was. Without the id there is
+  // nothing to join to, nothing to ack and nothing to point the user at.
+  var id = String(s.alert || "")
+  if (!id) return null
+  var severity = String(s.severity || "").toLowerCase()
+  return {
+    alert: id,
+    ts: String(s.ts || ""),
+    family: String(s.family || ""),
+    rule: String(s.rule || ""),
+    // Unrecognized severities become "" rather than being rendered raw; the
+    // string has been near a process like everything else on this record.
+    severity: severityRank(severity) >= 0 ? severity : "",
+    title: String(s.title || s.rule || ""),
+    pid: Number(s.pid) || 0,
+    exe: String(s.exe || ""),
+    role: s.role === "context" ? "context" : "trigger"
+  }
+}
+
+function normalizeChain(value) {
+  var c = value && typeof value === "object" && !Array.isArray(value) ? value : null
+  if (!c) return null
+  var id = String(c.id || "")
+  if (!id) return null
+
+  var raw = Array.isArray(c.steps) ? c.steps : []
+  var steps = []
+  for (var i = 0; i < raw.length; i++) {
+    var step = normalizeChainStep(raw[i])
+    if (step) steps.push(step)
+  }
+  // Two is the daemon's own floor: a chain is "two or more alerts sharing a
+  // process tree". One step is not a sequence, and drawing 2b's rail for it
+  // would put a story on the screen that never happened.
+  if (steps.length < 2) return null
+
+  var severity = String(c.severity || "").toLowerCase()
+  var base = String(c.severity_base || "").toLowerCase()
+  var ancestor = c.ancestor && typeof c.ancestor === "object" ? c.ancestor : {}
+  var total = Number(c.steps_total)
+  if (!isFinite(total) || total < steps.length) total = steps.length
+
+  return {
+    v: c.v === undefined ? 1 : c.v,
+    id: id,
+    // What every step is under. The tree root is the subject of the story:
+    // "2 things happened under node", not "node did two things".
+    ancestor: { pid: Number(ancestor.pid) || 0, exe: String(ancestor.exe || "") },
+    families: stringList(c.families),
+    severity: severityRank(severity) >= 0 ? severity : "",
+    severity_base: severityRank(base) >= 0 ? base : "",
+    severity_reason: String(c.severity_reason || ""),
+    first_ts: String(c.first_ts || ""),
+    last_ts: String(c.last_ts || ""),
+    span_secs: Number(c.span_secs) || 0,
+    steps: steps,
+    steps_total: total,
+    truncated: c.truncated === true || total > steps.length,
+    summary: String(c.summary || "")
+  }
 }
 
 // One alert with defaults filled in, so every consumer can read
@@ -335,11 +500,29 @@ function normalizeAlert(record) {
     // null when the daemon captured nothing (which is every alert below
     // [incidents] snapshot_min_severity), so the panel binds `visible: !!incident`.
     incident: normalizeIncident(r.incident),
+    // LEARNING 2c. null until an unattended agent pass has looked at this one.
+    triage: normalizeTriage(r.triage),
+    // CONTRACT 4 "Chains". null until this alert turns out to be one step of a
+    // sequence, which is almost always an `update` line rather than the alert
+    // itself -- so `UPDATABLE` carries it too, and the two must agree.
+    chain: normalizeChain(r.chain),
 
     // Filled in by decorateAlerts() once the demoted-rule list from `status` is
     // known. Defaults are what a lone alert with no status looks like.
     demoted: isDemotionMarker(r.suppressed_by),
-    surface: severityAtLeast(severity, "high") && !r.suppressed_by ? SURFACE_ALERTS : SURFACE_TIMELINE,
+    // The daemon stamps `surface` when it raises the alert (CONTRACT 4) and it
+    // is the authority: it knew the noise-guard state at that moment. Keeping
+    // its value here is what stops `decorateAlerts` re-deciding history from
+    // whatever the demotion list happens to say now. The computed value is only
+    // for a record written before the field existed.
+    surface: (r.surface === SURFACE_ALERTS || r.surface === SURFACE_TIMELINE)
+      ? r.surface
+      : (severityAtLeast(severity, "high") && !r.suppressed_by ? SURFACE_ALERTS : SURFACE_TIMELINE),
+    // Whether the value above is the DAEMON's word or this file's guess. The
+    // two are not the same authority: `alertSurface` may stand in for a
+    // missing stamp with the live demotion list, but it must never overrule a
+    // stamp the daemon made knowing everything the list says and more.
+    surfaceStamped: r.surface === SURFACE_ALERTS || r.surface === SURFACE_TIMELINE,
     visible: !r.suppressed_by || isDemotionMarker(r.suppressed_by)
   }
 }
@@ -531,6 +714,386 @@ function ignoreScopeCaution(scope) {
   }
 }
 
+// ----------------------------------------------------------------- incidents
+//
+// The redesign's central move (docs/design/README.md 1c): alerts collapse by
+// (rule, program) into ONE incident carrying a count and a first/last time.
+// The old panel showed the same detection 68 times as 68 identical rows, which
+// is what made every screen a wall of red.
+//
+// Grouped here rather than in the daemon for now. Stage 4 of docs/design/PLAN.md
+// moves it down, behind exactly this API, so the views built on it do not get
+// rewritten when it does.
+
+/// The program an incident is about, as a person would name it.
+///
+/// An interpreter running a script is the script, not the interpreter -- the
+/// daemon already worked that out for provenance, so "python3" never becomes
+/// the subject of a sentence about a package's postinstall.
+function incidentProgram(alert) {
+  if (!alert) return ""
+  var script = alert.actor && alert.actor.script ? String(alert.actor.script) : ""
+  var exe = alert.process ? String(alert.process.exe || "") : ""
+  return basename(script || exe)
+}
+
+/// What collapses into one incident.
+///
+/// Normally (rule, program): 68 records of one detection by one program are one
+/// thing to decide about, not 68 rows (1c).
+///
+/// A chain outranks that, and it is the whole premise of 3a: "four alerts in
+/// nine minutes sharing a process tree are one incident". Members of a chain
+/// key on the CHAIN, so a `.git/config` write and a credential read one second
+/// apart in one process stop being two unrelated rows the user reads in
+/// whatever order the list sorted them. `chain.id` is a member's alert id and
+/// every member carries the same one, so the key is stable as the chain grows.
+function incidentKey(alert) {
+  var chain = alert && alert.chain ? alert.chain : null
+  if (chain && chain.id) return "chain\u0000" + chain.id
+  return String(alert && alert.rule ? alert.rule : "") + "\u0000" + incidentProgram(alert)
+}
+
+/// Which of the five states an alert is in.
+///
+/// This is the redesign replacing severity, and the point is that each state
+/// says what is wanted from the USER, not how bad the thing is:
+///   expected  -- a rule covers it, nobody needs to look
+///   explained -- Moat read it and decided, you may look
+///   contained -- you already acted
+///   closed    -- you have seen it
+///   needsYou  -- everything else
+///
+/// Order matters. `contained` and `closed` are facts about what already
+/// happened and outrank any opinion; `expected` (a rule the user wrote) outranks
+/// `explained` (a verdict the model wrote), because a rule is the user's own
+/// decision and the model must never be able to overrule it.
+function alertState(alert, demotedRules) {
+  if (!alert) return "closed"
+  if (alert.acked) return "closed"
+  if (alert.action_taken && alert.action_taken !== "none") return "contained"
+  // Suppression is a per-alert fact the daemon wrote. The rule-wide demotion
+  // list is NOT consulted here: `alertSurface` below is the one place that
+  // decides what a demotion means for an alert, and it reads the daemon's
+  // stamp. (This line used to test the list too, and silenced a chain the
+  // daemon had deliberately re-surfaced.)
+  if (alert.suppressed_by) return "expected"
+  // A verdict is checked before the surface, because "Moat read this and
+  // decided" is a more informative thing to tell the user than "a rule covers
+  // it" -- and a triage demotion is what put it on the timeline in that case.
+  // ONLY a demotion the daemon actually performed counts. `verdict ===
+  // "benign"` used to be enough on its own, which let the agent's opinion
+  // silence an alert the daemon had deliberately refused to act on: the triage
+  // ceiling withholds a demotion for a chain member, a first_seen tuple, a
+  // NEVER_DEMOTE rule or anything above `demote_max`, and this line handed back
+  // exactly what the ceiling had just denied. On 2026-09-04 that turned the
+  // real C2 chain -- which the ceiling correctly declined to demote -- into
+  // "explained" and dropped it out of Now on a `benign` verdict alone.
+  //
+  // The verdict is still SHOWN either way; the agent explains, and at most
+  // demotes. Being read is not the same as being dismissed.
+  var t = alert.triage
+  if (t && t.demoted) return "explained"
+  // An alert the daemon put on the timeline is not asking the user for
+  // anything -- that is what the timeline means. Deciding "needs you" from
+  // severity here, independently of `alertSurface`, was the fourth copy of
+  // this decision in the model and the one the bar counted: on 2026-09-04 the
+  // shield read 51 while the daemon had surfaced 8, because 251 timelined
+  // alerts still came back "needsYou" from this function.
+  if (alertSurface(alert, demotedRules) !== SURFACE_ALERTS) return "expected"
+  if (t && t.verdict === "unclear") return "needsYou"
+  return "needsYou"
+}
+
+var INCIDENT_RANK = {
+  needsYou: 0, contained: 1, explained: 2, expected: 3, closed: 4
+}
+
+/// How unsure Moat is about an incident, 0 (settled) to 1 (no idea).
+///
+/// 3c orders the needs-you queue by THIS, not by severity: "a HIGH it is sure
+/// about matters less than a MEDIUM it can't place". Without a number for
+/// uncertainty the queue silently falls back to severity and the ordering rule
+/// in the design becomes decoration.
+function incidentUncertainty(alert) {
+  if (!alert) return 1
+  var t = alert.triage
+  if (!t) return 0.8                       // nobody has looked yet
+  if (t.verdict === "unclear") return 1
+  var byConfidence = { high: 0.1, medium: 0.45, low: 0.75 }
+  var base = byConfidence[t.confidence] === undefined ? 0.6 : byConfidence[t.confidence]
+  if (t.verdict === "malicious" || t.verdict === "suspicious") return Math.min(1, base + 0.2)
+  return base
+}
+
+/// Collapse alerts into incidents, newest activity first.
+///
+/// options: { demotedRules, showSuppressed, rawDetail }
+///
+/// `rawDetail` is the Advanced setting and it reaches exactly two lines of this
+/// function -- the title and the stake. It is deliberately NOT read by
+/// `alertVisible`, `alertState` or anything that decides a surface: how an
+/// incident is worded and whether it needs you are different questions, and
+/// letting a rendering flag near the second one is how a display setting turns
+/// into a security setting.
+function buildIncidents(alerts, options) {
+  var o = options || {}
+  var raw = o.rawDetail === true
+  var set = demotedSet(o.demotedRules)
+  var list = Array.isArray(alerts) ? alerts : []
+  var byKey = {}
+  var order = []
+  for (var i = 0; i < list.length; i++) {
+    var a = list[i]
+    if (!a) continue
+    if (!alertVisible(a, o.showSuppressed === true)) continue
+    var key = incidentKey(a)
+    var inc = byKey[key]
+    if (!inc) {
+      inc = {
+        key: key,
+        id: a.id,
+        rule: a.rule,
+        family: a.family,
+        program: incidentProgram(a),
+        alerts: [],
+        count: 0,
+        firstSeen: a.ts,
+        lastSeen: a.ts,
+        severity: a.severity
+      }
+      byKey[key] = inc
+      order.push(inc)
+    }
+    inc.alerts.push(a)
+    // The daemon already folds identical repeats into one record with a count,
+    // so an incident's count is the sum of those, not the number of records.
+    inc.count += (a.count === undefined ? 1 : Number(a.count)) || 1
+    if (a.ts < inc.firstSeen) inc.firstSeen = a.ts
+    if (a.ts > inc.lastSeen) { inc.lastSeen = a.ts; inc.id = a.id }
+    if (severityRank(a.severity) > severityRank(inc.severity)) inc.severity = a.severity
+  }
+  for (var j = 0; j < order.length; j++) {
+    var g = order[j]
+    // The newest member carries the incident: actions name an alert id, and the
+    // most recent one is the only member guaranteed to still have a live process.
+    g.alerts.sort(compareAlertsNewestFirst)
+    var head = g.alerts[0]
+    g.head = head
+
+    // ------------------------------------------------------------- 3a
+    //
+    // The chain, if this incident is one. Every member carries a copy and the
+    // largest is the current one ("a chain only ever grows"), so the incident
+    // is never described by whichever member happened to be folded last.
+    g.chain = null
+    for (var c = 0; c < g.alerts.length; c++) {
+      var cc = g.alerts[c].chain
+      if (!cc) continue
+      if (!g.chain || cc.steps_total > g.chain.steps_total) g.chain = cc
+    }
+
+    if (g.chain) {
+      // The verdict is written about the SEQUENCE, so the title and the stake
+      // are too, and the severity is the daemon's chain severity rather than
+      // the loudest member -- CONTRACT 4: "a reader that shows a chain must
+      // show `chain.severity`, not the maximum of its members." Nothing here
+      // computes a severity: an empty or unrecognized one falls back to what
+      // the members already said, it never invents an escalation.
+      g.title = Copy.chainTitle(g.chain, raw)
+      g.stake = Copy.chainStake(g.chain, raw)
+      if (g.chain.severity) g.severity = g.chain.severity
+      // The subject of the story is the tree root every step ran under, not
+      // whichever member sorted first.
+      g.program = basename(g.chain.ancestor.exe) || g.program
+      // 2b's rail, ready for the view, joined against the member alerts this
+      // incident already holds so a step can say what was done about it.
+      g.story = chainStory(g.chain, { alerts: g.alerts, currentId: head.id, rawDetail: raw })
+    } else {
+      g.title = Copy.titleFor(head, raw)
+      g.stake = Copy.stakeFor(head, raw)
+      g.story = []
+    }
+    // The most recent verdict among the members, NOT the verdict of the most
+    // recent member. Triage works oldest-first, so on any incident that has
+    // repeated, the newest member is exactly the one not looked at yet --
+    // taking `head.triage` meant a repeating incident showed no analysis at all
+    // while carrying several verdicts, which is how AI analysis came to look
+    // like it had never run.
+    g.verdict = null
+    for (var v = 0; v < g.alerts.length; v++) {
+      if (g.alerts[v].triage) { g.verdict = g.alerts[v].triage; break }
+    }
+    // Whether anything in the incident is still waiting, so the card can say
+    // "reading the evidence" beside a verdict it already has.
+    g.awaitingVerdict = false
+    for (var w = 0; w < g.alerts.length; w++) {
+      if (!g.alerts[w].triage) { g.awaitingVerdict = true; break }
+    }
+    // An incident needs you if ANY member does. One resolved repeat out of 68
+    // does not close the incident.
+    var state = "closed"
+    var worst = 5
+    for (var k = 0; k < g.alerts.length; k++) {
+      var st = alertState(g.alerts[k], set)
+      var rank = INCIDENT_RANK[st] === undefined ? 4 : INCIDENT_RANK[st]
+      if (rank < worst) { worst = rank; state = st }
+    }
+    g.state = state
+    g.uncertainty = incidentUncertainty(head)
+    // WHOSE decision made this quiet, for 1d's inline note. `suppressed_by`
+    // covers an allowlist entry; a demoted rule is quiet because of the noise
+    // guard and carries no marker on the alert at all, so it is resolved here
+    // against the same demoted set the state was computed from -- otherwise
+    // half the covered rows in History say "covered" and explain nothing.
+    g.coveredBy = String(head.suppressed_by || "")
+    // A label, not a decision: it explains a row the state already calls
+    // "expected", and is never written onto a row that is waiting on you.
+    if (!g.coveredBy && state === "expected" && isDemotedRule(head.rule, set))
+      g.coveredBy = "demoted:" + head.rule
+  }
+  order.sort(compareIncidentsNewestFirst)
+  return order
+}
+
+function compareIncidentsNewestFirst(a, b) {
+  if (a.lastSeen === b.lastSeen) return a.key < b.key ? 1 : -1
+  return a.lastSeen < b.lastSeen ? 1 : -1
+}
+
+/// The needs-you queue (3c): ordered by what Moat is LEAST sure about.
+function needsYouIncidents(incidents) {
+  var list = Array.isArray(incidents) ? incidents : []
+  var out = []
+  for (var i = 0; i < list.length; i++) {
+    if (list[i].state === "needsYou") out.push(list[i])
+  }
+  out.sort(function (a, b) {
+    if (b.uncertainty !== a.uncertainty) return b.uncertainty - a.uncertainty
+    return a.lastSeen < b.lastSeen ? 1 : -1
+  })
+  return out
+}
+
+// ------------------------------------------------------------- the verdict
+//
+// 3g: the top line has exactly four forms and the state is DERIVED, never set.
+
+/// `quiet | needsYou | chain | gap`.
+///
+/// The sensor gate is the important one. A blind sensor and a quiet machine
+/// look identical from the panel, so 2f's rule is that no calm claim is made
+/// unless the sensor can prove it was watching -- `gap` outranks `quiet` even
+/// with nothing waiting.
+function verdictState(incidents, status) {
+  var needs = needsYouIncidents(incidents)
+  // 3a outranks 1b/3c: a sequence is the case the product exists for, and it
+  // gets the loudest form of the line whatever else is waiting.
+  //
+  // This condition used to read `needs[i].chain.length > 1`, which was wrong
+  // twice over -- `buildIncidents` never set `chain`, and the daemon's field is
+  // an OBJECT with a `steps` array, not an array. So the state was unreachable:
+  // a correlated chain drew 1b, one row, no sequence.
+  for (var i = 0; i < needs.length; i++) {
+    var chain = needs[i].chain
+    if (chain && Number(chain.steps_total) > 1) return Copy.VERDICT_CHAIN
+  }
+  if (needs.length > 0) return Copy.VERDICT_NEEDS
+  // A blind sensor outranks a completed intervention: everything else on this
+  // page is only as trustworthy as the thing feeding it.
+  if (!sensorHealthy(status)) return Copy.VERDICT_GAP
+  // Moat acted and nobody has said they saw it. "Nothing needs you" over a
+  // card that says a process was killed is the panel contradicting itself in
+  // the space of two lines -- and the kill is the more important half.
+  if (stoppedIncidents(incidents).length > 0) return Copy.VERDICT_STOPPED
+  return Copy.VERDICT_QUIET
+}
+
+/// Incidents where Moat itself intervened and nobody has acknowledged it.
+///
+/// `contained` covers anything with an `action_taken`; this is narrower on
+/// purpose -- a quarantine the user asked for is not news, a kill or a refused
+/// connection they have not seen yet is.
+function stoppedIncidents(incidents) {
+  var list = Array.isArray(incidents) ? incidents : []
+  var out = []
+  for (var i = 0; i < list.length; i++) {
+    var members = list[i] && Array.isArray(list[i].alerts) ? list[i].alerts : []
+    // EVERY member, the way `buildIncidents` computes `state`: an incident is
+    // "contained" if any member was acted on, so an incident is "stopped" if
+    // any member was stopped and not yet acknowledged. This used to read only
+    // `head` -- the newest member -- and disagreed with the state on the row:
+    // a chain whose first step was killed and whose last step was acked by
+    // hand read "you stopped it" in History while Now said "Nothing needs
+    // you" and drew no apology for the kill nobody had seen.
+    for (var m = 0; m < members.length; m++) {
+      if (alertStopped(members[m])) { out.push(list[i]); break }
+    }
+  }
+  return out
+}
+
+/// Did Moat stop this, and has nobody said they saw it? The per-alert half of
+/// `stoppedIncidents`, kept separate so the incident-level answer is exactly
+/// "any member says yes" and nothing else.
+function alertStopped(alert) {
+  if (!alert || alert.acked) return false
+  // `mode` is the mode THIS rule was raised under, so a kill the user asked
+  // for with `moatctl kill` is not news and does not get an apology.
+  if (alert.mode !== "enforce") return false
+  return alert.action_taken === "killed" || alert.action_taken === "blocked"
+}
+
+/// Is the sensor provably watching? (2f)
+///
+/// Counted from the kernel, not from the daemon saying so: `sensor_unhealthy`
+/// and `sensors_loaded` exist because on 2026-09-03 tetragon was dead for 25
+/// minutes and every surface still read "running".
+/// Both spellings on purpose. The daemon sends snake_case (`sensor_unhealthy`,
+/// `sensors_loaded`) and `normalizeStatus` renames them to camelCase, so the
+/// raw response and the normalized object are two different shapes -- and the
+/// live panel only ever passes the normalized one. Reading just the snake_case
+/// names meant the gate never fired on a real machine while every test that
+/// hand-wrote a raw status passed.
+function sensorHealthy(status) {
+  if (!status) return false
+  if (status.sensor_unhealthy === true || status.sensorUnhealthy === true) return false
+  if (status.tetragon && status.tetragon !== "running") return false
+  var loaded = Number(status.sensors_loaded === undefined || status.sensors_loaded === null
+                      ? status.sensorsLoaded : status.sensors_loaded)
+  var total = Number(status.policies)
+  if (isFinite(loaded) && isFinite(total) && total > 0 && loaded < total) return false
+  return true
+}
+
+/// The four verdict-line inputs, ready for the view.
+///
+/// `chain` is the sequence the `chain` state is about, so the sub-line under
+/// the headline can be 3a's ("Four things happened in nine minutes and they
+/// were all the same program") rather than the generic count. null in the
+/// other three states.
+function verdict(incidents, status) {
+  var state = verdictState(incidents, status)
+  var needs = needsYouIncidents(incidents)
+  var chain = null
+  if (state === Copy.VERDICT_CHAIN) {
+    for (var i = 0; i < needs.length; i++) {
+      var c = needs[i].chain
+      if (c && Number(c.steps_total) > 1) { chain = c; break }
+    }
+  }
+  var count = state === Copy.VERDICT_STOPPED
+    ? stoppedIncidents(incidents).length
+    : needs.length
+  return {
+    state: state,
+    count: count,
+    chain: chain,
+    line: Copy.verdictLine(state, count),
+    tone: Copy.verdictTone(state)
+  }
+}
+
 // ------------------------------------------------------------------- folding
 
 // Fold an array of parsed records into alerts, newest first.
@@ -607,7 +1170,24 @@ function compareAlertsNewestFirst(a, b) {
 // reading alerts.jsonl never learned that a snapshot was taken at all -- the
 // socket's `list` carried it and the log did not, which is exactly the kind of
 // divergence the wire fixtures exist to catch.
-var UPDATABLE = ["acked", "action_taken", "count", "mode", "rotate", "actions", "ts", "incident"]
+// `chain` is on this list for the same reason, and it is the only way a chain
+// EVER reaches the panel: correlation needs the second alert, so by the time
+// moatd knows a sequence exists its first step has been on disk for a while.
+// It is written back onto every member as an update line, and a reader that
+// only honoured the fields above saw the field go past and dropped it -- which
+// is exactly how the panel came to show one lonely row for a chain the daemon
+// had correlated correctly.
+// `triage` is here for the third instance of the same story. A verdict is
+// ALWAYS an update: the pass runs on a timer, minutes to hours after the alert
+// was written, and appends `{"update":{"triage":{...}}}` onto the existing id.
+// With the field missing from this list the reader saw 161 such lines go past
+// and dropped every one, so `alert.triage` was null for every alert the log
+// reader produced and the panel showed no analysis at all -- while `moatctl
+// explain` on the same id printed the verdict, because the socket carried it
+// and the log did not. That divergence between the two readers is the same
+// fault `incident` and `chain` were added here to fix.
+var UPDATABLE = ["acked", "action_taken", "count", "mode", "rotate", "actions", "ts",
+                 "incident", "chain", "triage", "surface"]
 
 function applyUpdate(target, patch) {
   if (!target || !patch || typeof patch !== "object") return target
@@ -627,11 +1207,40 @@ function applyUpdate(target, patch) {
     case "actions":
       if (Array.isArray(value)) target[key] = value.slice()
       break
+    case "surface":
+      // The daemon restamps this when correlation concludes a chain is worth
+      // interrupting for: `surface` was decided by a rule that had seen one
+      // event, and the chain is the thing that knows better. Only the two
+      // known values are honoured -- an unrecognised string is not a licence
+      // to invent a third state.
+      if (value === SURFACE_ALERTS || value === SURFACE_TIMELINE) {
+        target.surface = value
+        target.surfaceStamped = true
+      }
+      break
+    case "triage":
+      // Never blank a verdict already recorded: a re-triage that failed to
+      // produce one is not an instruction to forget the one we have. Same
+      // reasoning as `incident` below.
+      var triage = normalizeTriage(value)
+      if (triage) target.triage = triage
+      break
     case "incident":
       var incident = normalizeIncident(value)
       // Never null out a snapshot that is already recorded: an update that
       // failed to carry one is not an instruction to forget it.
       if (incident) target.incident = incident
+      break
+    case "chain":
+      // CONTRACT 4: "a chain only ever grows, so a malformed one must be
+      // ignored rather than allowed to blank a sequence already recorded".
+      // Same reasoning covers a well-formed one that got SMALLER -- the daemon
+      // does not shrink a chain, so a shorter story is a line to disbelieve
+      // rather than a retraction to honour.
+      var chain = normalizeChain(value)
+      if (chain && (!target.chain || chain.steps_total >= target.chain.steps_total)) {
+        target.chain = chain
+      }
       break
     default:
       target[key] = String(value)
@@ -813,10 +1422,14 @@ function receiptsFromResponse(raw) {
 
 // "npm install" — what ran, as it would have been typed. Falls back to the
 // executable alone when the daemon recorded no args.
+// The command an install ran, as ONE line. `root_args` is argv: it can carry
+// newlines and it can be kilobytes long -- the triage pass invokes an agent CLI
+// with a multi-kilobyte prompt as a single argument, and moatd records that
+// invocation like any other. Rendered raw it turns a row into a page.
 function receiptCommand(receipt) {
   var r = receipt || {}
   var name = basename(r.root_exe) || String(r.root_exe || "")
-  var args = String(r.root_args || "").trim()
+  var args = Copy.oneLine(r.root_args, 90)
   if (!name) return args
   return args ? name + " " + args : name
 }
@@ -839,7 +1452,7 @@ function receiptSummary(receipt) {
   // A non-zero exit is the one thing about a receipt that is not routine, so it
   // rides the collapsed row rather than waiting inside the expansion.
   if (r.exit !== null && r.exit !== 0) bits.push("exit " + r.exit)
-  return bits.join(" · ")
+  return Copy.oneLine(bits.join(" · "), 200)
 }
 
 function listOrNone(items) {
@@ -882,9 +1495,9 @@ function receiptBlock(receipt) {
 
 // --------------------------------------------------------------------- store
 //
-// FileView hands back the whole file on every change, so the store rebuilds
-// the fold from scratch each time and its only real job is remembering which
-// ids it has already seen. Two things depend on that memory:
+// FileView hands back the whole file on every change, so the store carries the
+// running fold plus a memory of which ids it has already seen. Three things
+// depend on that memory:
 //
 //   * notifications: only ids that are new SINCE a previous ingest may notify,
 //     and the very first ingest never notifies at all (`primed`), so a login
@@ -893,13 +1506,18 @@ function receiptBlock(receipt) {
 //     starts a fresh file. The new file is shorter than what we last read, so
 //     a shrink is the rotation signal — re-fold from the new content and keep
 //     `seen`, because an id that rotated out is still not new.
-
 //   * notification cooldown: one open window per rule, plus the summaries a
 //     window still owes the user (BASELINE 5, notifyDecision below).
 
 function createStore() {
   return {
     seen: {}, seenOrder: [], lastLength: -1, primed: false,
+    // The rotated half of the log, alerts.1.jsonl, held here rather than
+    // re-supplied on every ingest: see setLogPrefix().
+    prefix: "",
+    // The running fold: see createFold(). Rebuilt from scratch whenever the
+    // file is not a strict append onto what we already folded.
+    fold: null,
     // rule -> { rule, title, windowStart, windowMs, toasted, suppressedCount }
     notifyWindows: {},
     // Summaries owed for windows that were rolled over by a new alert before
@@ -908,16 +1526,130 @@ function createStore() {
   }
 }
 
-// Cap on remembered ids. Large enough that a rotation's worth of alerts stays
-// suppressed, small enough that a long-lived shell does not grow without
-// bound. Ids age out oldest-first.
+// ---------------------------------------------------------------- the fold
+//
+// PERFORMANCE, and it is the whole reason this exists. FileView hands back the
+// WHOLE file on every change and moatd appends to it every couple of seconds.
+// Re-parsing from the top cost ~250 ms of the GUI thread per append on a 19 MB
+// / 18k-line log — several dropped frames every two seconds, which is what the
+// panel's janky scrolling actually was. Only the bytes appended since the last
+// ingest are parsed now; the folded alerts, the parked updates and the
+// receipts live here between calls.
+//
+// The incremental path is taken ONLY for a strict append: same bytes where we
+// already folded, and more of them. A shorter file (rotation, truncation) or a
+// prefix that no longer matches falls back to folding the whole body, which is
+// exactly what every ingest used to do. `guard` is the tail of the region
+// already folded and is what makes "same prefix" cheap to check without
+// comparing 19 MB.
+var FOLD_GUARD_CHARS = 64
+
+function createFold() {
+  return {
+    // id -> alert, plus the first-seen order, so the sort below is total and
+    // stable across re-reads exactly as foldRecords' was.
+    byId: {}, order: [], pending: {},
+    // LEARNING 3's install receipts, folded from the same lines.
+    receipts: [], receiptCount: 0,
+    // Characters of the body already folded, and the tail of them.
+    consumed: 0, guard: "",
+    // The folded result, newest first. Held rather than rebuilt so that a
+    // re-read that adds nothing (FileView fires more than once per append)
+    // hands back the SAME array and changes no binding downstream.
+    alerts: []
+  }
+}
+
+// The body the fold runs over is `prefix + live` -- the rotated file and then
+// the live one, the order moatd folds them in (`AlertStore::load`) -- but the
+// two are never concatenated. That concatenation used to happen on every
+// reload: 20 MB of alerts.1.jsonl copied in front of the live file so that
+// ~100 appended bytes could be folded, and the flattened 30 MB string it
+// produced was the largest single allocation the panel made, twice a second.
+// `bodySlice` reads a range out of the two halves instead.
+function bodySlice(prefix, live, start, end) {
+  var cut = prefix.length
+  if (end <= cut) return prefix.slice(start, end)
+  if (start >= cut) return live.slice(start - cut, end - cut)
+  return prefix.slice(start) + live.slice(0, end - cut)
+}
+
+/// Is `prefix + live` the body we already folded, with more appended to the end?
+function foldIsAppendOf(fold, prefix, live) {
+  if (!fold) return false
+  if (fold.consumed === 0) return true
+  if (prefix.length + live.length < fold.consumed) return false
+  return bodySlice(prefix, live, fold.consumed - fold.guard.length, fold.consumed) === fold.guard
+}
+
+// Fold one chunk of whole lines onto the running fold. The rules are
+// foldRecords': a receipt is not an alert, an update merges onto its base, and
+// an update whose base has not arrived is parked until it does.
+//
+// Returns the number of records that changed the fold, so a chunk of blank
+// lines does not churn the alerts array.
+function foldChunk(fold, chunk) {
+  var records = parseText(chunk)
+  var changed = 0
+  for (var i = 0; i < records.length; i++) {
+    var record = records[i]
+    if (isReceipt(record)) {
+      // normalizeReceipt's fallback key numbers receipts in file order, which
+      // is what a running count is; foldReceipts used `out.length` for the same
+      // thing when it saw the whole file at once.
+      fold.receipts.push(normalizeReceipt(record, fold.receiptCount))
+      fold.receiptCount++
+      changed++
+      continue
+    }
+    if (!record || !record.id) continue
+    var id = String(record.id)
+
+    if (isUpdate(record)) {
+      if (fold.byId[id]) applyUpdate(fold.byId[id], record.update)
+      else {
+        // Later updates win over earlier ones for the same key, so merging
+        // into one parked patch preserves the append-order semantics.
+        fold.pending[id] = fold.pending[id] || {}
+        applyUpdate(fold.pending[id], record.update)
+      }
+      changed++
+      continue
+    }
+
+    if (!fold.byId[id]) fold.order.push(id)
+    fold.byId[id] = normalizeAlert(record)
+    if (fold.pending[id]) {
+      applyUpdate(fold.byId[id], fold.pending[id])
+      delete fold.pending[id]
+    }
+    changed++
+  }
+  return changed
+}
+
+// Cap on remembered ids BEYOND the ones still in the fold. Every folded id is
+// always remembered -- that is the whole job -- and on top of those, this many
+// rotated-out ids stay suppressed so a re-fold cannot bring one back as new.
+// Ids age out oldest-first.
+//
+// The cap used to apply to the total. With more alerts folded than the cap
+// (4,620 once the rotated half was folded too; the cap was 4,096) the
+// oldest-first walk in ingestText evicted, on every pass, exactly the ids it
+// was about to visit: remembering the oldest id dropped the (cap+1)th, which
+// was the next one walked, which was then "new", and so on through the whole
+// list. Measured on 2026-09-05: every one of 4,620 alerts came back in
+// `newIds` on every ingest, twice a second, and the notifier's linear lookups
+// over them were ~500 ms of the GUI thread per reload -- the single largest
+// cost in the panel.
 var SEEN_LIMIT = 4096
 
-function rememberSeen(store, id) {
+function rememberSeen(store, id, folded) {
   if (store.seen[id]) return
   store.seen[id] = true
   store.seenOrder.push(id)
-  while (store.seenOrder.length > SEEN_LIMIT) {
+  var limit = SEEN_LIMIT + (folded > 0 ? folded : 0)
+  while (store.seenOrder.length > limit) {
     var dropped = store.seenOrder.shift()
     delete store.seen[dropped]
   }
@@ -934,37 +1666,105 @@ function rememberSeen(store, id) {
 //
 // options: { demotedRules: [...], showSuppressed: bool } from `status`.
 function ingestText(store, text, options) {
-  var body = String(text || "")
-  var reloaded = store.lastLength >= 0 && body.length < store.lastLength
-  store.lastLength = body.length
+  var live = String(text || "")
+  var prefix = store.prefix || ""
+  var length = prefix.length + live.length
+  var reloaded = store.lastLength >= 0 && length < store.lastLength
+  store.lastLength = length
+
+  // Anything that is not a strict append re-folds the whole body.
+  if (!store.fold || reloaded || !foldIsAppendOf(store.fold, prefix, live)) store.fold = createFold()
+  var fold = store.fold
+
+  // Only WHOLE lines are folded. moatd appends "<json>\n", so a body ending
+  // mid-line is a read that caught a write in progress: the whole-file parse
+  // dropped that line too (parseLine refuses invalid JSON) and picked it up on
+  // the next read. Leaving it unconsumed does the same thing without the risk
+  // of folding half a record. The prefix always ends in a newline (setLogPrefix
+  // sees to it), so a live half with no newline yet ends the body there.
+  var newline = live.lastIndexOf("\n")
+  var end = newline >= 0 ? prefix.length + newline + 1 : prefix.length
+  if (end < fold.consumed) end = fold.consumed
 
   // One parse, two products: the folded alerts and the install receipts that
   // share the file with them (LEARNING 3). Receipts take no part in newIds, so
-  // they cannot notify, and foldRecords drops them, so they cannot count.
-  var records = parseText(body)
-  var alerts = decorateAlerts(foldRecords(records), options)
-  var receipts = foldReceipts(records)
+  // they cannot notify, and foldChunk keeps them out of `byId`, so they cannot
+  // count.
+  if (end > fold.consumed) {
+    var changed = foldChunk(fold, bodySlice(prefix, live, fold.consumed, end))
+    fold.consumed = end
+    fold.guard = bodySlice(prefix, live, end > FOLD_GUARD_CHARS ? end - FOLD_GUARD_CHARS : 0, end)
+    if (changed > 0) {
+      fold.alerts = []
+      for (var j = 0; j < fold.order.length; j++) fold.alerts.push(fold.byId[fold.order[j]])
+      fold.alerts.sort(compareAlertsNewestFirst)
+      fold.receipts.sort(compareReceiptsNewestFirst)
+    }
+  }
+
+  var alerts = decorateAlerts(fold.alerts, options)
   var initialLoad = !store.primed
   var newIds = []
 
-  for (var i = 0; i < alerts.length; i++) {
+  // Walk OLDEST first. `alerts` is newest-first, and `rememberSeen` evicts from
+  // the front of its queue once SEEN_LIMIT is reached -- so walking forwards
+  // remembered the newest id first and then threw it away first. Past 4096
+  // folded alerts (this machine reaches ~3,500 between rotations) the most
+  // recent ids aged out of `seen` and re-notified as if they were new, which is
+  // the exact noise this set exists to prevent.
+  //
+  // Walking backwards also builds `newIds` oldest-first, which is the order the
+  // notifier wants, so the reverse afterwards is no longer needed.
+  for (var i = alerts.length - 1; i >= 0; i--) {
     var id = alerts[i].id
     if (!store.seen[id] && !initialLoad) newIds.push(id)
-    rememberSeen(store, id)
+    rememberSeen(store, id, alerts.length)
   }
   store.primed = true
 
-  // alerts is newest first; notify oldest first so a burst reads in order.
-  newIds.reverse()
-
   return {
     alerts: alerts,
-    receipts: receipts,
+    // id -> alert, the fold's own index, so a caller with an id in hand (the
+    // notifier, for every id in newIds) does not scan `alerts` for it.
+    byId: fold.byId,
+    receipts: fold.receipts,
     newIds: newIds,
     initialLoad: initialLoad,
     reloaded: reloaded,
     unacked: unackedCounts(alerts, options)
   }
+}
+
+/// Hand the store the rotated half of the log, alerts.1.jsonl, once. From then
+/// on ingestText takes the LIVE file alone and folds it as if it were appended
+/// to this text -- which is what it is: an update in the live file lands on a
+/// record that was rotated out, exactly as in `AlertStore::load`. A panel
+/// folding only the live file disagreed with `moatctl status` about what was
+/// outstanding after every rotation.
+///
+/// A prefix that differs from the one held (a rotation, or the file appearing
+/// or vanishing) drops the fold; the next ingest rebuilds it over the new
+/// body. Returns whether anything changed.
+function setLogPrefix(store, text) {
+  var prefix = String(text || "")
+  if (prefix && prefix.charAt(prefix.length - 1) !== "\n") prefix += "\n"
+  if (prefix === (store.prefix || "")) return false
+  store.prefix = prefix
+  store.fold = null
+  return true
+}
+
+/// The whole alert log, the way moatd reads it back: the rotated file first,
+/// then the live one (`AlertStore::load` folds `[rotated, path]` in that
+/// order). An update in the live file -- an ack, a chain written back onto
+/// its first step -- then lands on a record that was rotated out, exactly as
+/// it does in the daemon. A panel folding only the live file disagreed with
+/// `moatctl status` about what was outstanding after every rotation.
+function logBody(rotated, current) {
+  var a = String(rotated || "")
+  var b = String(current || "")
+  if (!a) return b
+  return (a.charAt(a.length - 1) === "\n" ? a : a + "\n") + b
 }
 
 // ------------------------------------------------------------------ surfacing
@@ -1012,9 +1812,71 @@ function isDemotedRule(rule, demotedRules) {
 // severity: BASELINE 4 keeps a demoted rule's alerts logged and grouped in the
 // timeline "regardless of severity", which is the entire point of demoting a
 // rule rather than deleting it.
+//
+// Demotion now arrives THREE ways, and the third is per-alert rather than
+// per-rule: the noise guard's live `status.demoted_rules[]`, an alert's own
+// "demoted:<rule>" marker, and LEARNING 2c's agent verdict on this one alert.
+// Deriving the tab from rule and severity alone would have silently discarded
+// the third — the daemon sets `surface: "timeline"` on a triage demotion and
+// this function never read `alert.surface`, so an auto-triaged alert would have
+// stayed in the badge and the feature would have done nothing visible.
+// =====================================================================
+// ONE DECISION, ONE FUNCTION.
+//
+// "Does this alert want something from the user?" is answered by
+// `alertSurface` and by nothing else. Everything downstream -- the badge
+// (`unackedCounts`), the tab (`surfaceAlerts`), incidents (`alertState`, and
+// through it the bar glyph and `shouldNotify`) -- calls it rather than
+// re-deriving from severity.
+//
+// This is written down because it was learned the expensive way. On
+// 2026-09-04 there were FOUR copies of that derivation in this file, each with
+// slightly different inputs. They disagreed: the shield read 51, the daemon
+// had surfaced 8, and a live supply-chain exec was buried under 251 alerts the
+// daemon had deliberately put on the timeline. Every copy was individually
+// reasonable; the bug was that there were four.
+//
+// The daemon is upstream of all of it -- it stamps `surface` when it raises an
+// alert, knowing the noise-guard state at that instant. The panel's job is to
+// read that, not to re-litigate it from whatever the global state says now.
+//
+// If you need this decision somewhere new: call `alertSurface`. Do not write
+// `severityAtLeast(..., "high")` next to a demotion check again.
+// =====================================================================
 function alertSurface(alert, demotedRules) {
   if (!alert) return SURFACE_TIMELINE
   if (alert.suppressed_by) return SURFACE_TIMELINE
+  if (alert.triage && alert.triage.demoted) return SURFACE_TIMELINE
+
+  // `status.demoted_rules` is deliberately NOT read here any more.
+  //
+  // It used to be: "a demotion in force NOW applies retroactively". But that
+  // list is the one a PERSON wants -- every rule quietened in any way, a rule
+  // with one noisy pattern included -- while the daemon's own demotion is
+  // per pattern, and the daemon re-surfaces a demoted rule's alert on purpose
+  // when a chain that reaches `high` needs it on the badge. Applying the
+  // rule-wide list here overruled both: on 2026-09-05 a 64-step chain the
+  // daemon had raised to `high` and stamped `surface: "alerts"` on read
+  // "expected" in the panel, because its rules were in that list. The same
+  // shape hid a live AUR attack the day before, from the other side.
+  //
+  // The daemon now quietens the backlog itself when the noise guard demotes
+  // (it restamps `surface` on the alerts the demotion covers, and only those),
+  // so retroactivity no longer needs a second implementation here. What is
+  // left is the rule this file already states: the daemon stamped `surface`
+  // knowing everything, and the panel reads it.
+  //
+  // The reverse stays asymmetric: an alert the daemon put on the timeline
+  // STAYS there — clearing a demotion means "watch this rule again", which is
+  // a statement about future alerts, not an instruction to resurrect a
+  // backlog. On 2026-09-04 the symmetric version re-surfaced 251 alerts,
+  // turned 8 real incidents into 51, and buried a live supply-chain exec.
+  if (alert.surfaceStamped === true) {
+    return alert.surface === SURFACE_ALERTS ? SURFACE_ALERTS : SURFACE_TIMELINE
+  }
+  // No stamp: a record from before the daemon wrote `surface`. Only here does
+  // the live list stand in for the stamp the daemon would have made, and only
+  // here does severity.
   if (isDemotedRule(alert.rule, demotedRules)) return SURFACE_TIMELINE
   return severityAtLeast(alert.severity, "high") ? SURFACE_ALERTS : SURFACE_TIMELINE
 }
@@ -1054,7 +1916,9 @@ function decorateAlerts(alerts, options) {
     // Demotion arrives two ways: status.demoted_rules[] (the live list) and the
     // alert's own "demoted:<rule>" marker (BASELINE 8), which survives in the
     // log after the demotion has cleared. Either one makes the alert demoted.
-    alert.demoted = isDemotedRule(alert.rule, set) || isDemotionMarker(alert.suppressed_by)
+    alert.demoted = isDemotedRule(alert.rule, set)
+                    || isDemotionMarker(alert.suppressed_by)
+                    || (alert.triage && alert.triage.demoted === true)
     alert.surface = alertSurface(alert, set)
     alert.visible = alertVisible(alert, show)
   }
@@ -1191,17 +2055,36 @@ function unackedCounts(alerts, options) {
   for (var i = 0; i < list.length; i++) {
     var alert = list[i]
     if (!alert || alert.acked === true) continue
-    if (alert.suppressed_by) continue
-    if (isDemotedRule(alert.rule, set)) continue
+    // ONE predicate for "is this waiting on the user": unacked, and on the
+    // Alerts surface as `alertSurface` decides it (which already covers
+    // suppression, a triage demotion and the daemon's own stamp). The
+    // per-severity counts used to be taken BEFORE that check, so `high` and
+    // `total` counted timelined alerts the badge did not -- `widgetState`
+    // went red over a badge of 0, and "N unacked" in the status line was a
+    // different N from the shield. Every number here is now the same set,
+    // split by severity; `total` and `badge` are one number.
+    if (alertSurface(alert, set) !== SURFACE_ALERTS) continue
     var severity = String(alert.severity || "").toLowerCase()
     if (counts[severity] === undefined || severity === "total" || severity === "badge") continue
     counts[severity]++
     counts.total++
+    counts.badge++
   }
-  // What the shield's number means: alerts on the Alerts surface still waiting
-  // for a decision. Precomputed here so the badge never has to re-scan.
-  counts.badge = counts.critical + counts.high
   return counts
+}
+
+/// Do two unacked-count objects say the same thing?
+///
+/// `unackedCounts` allocates a fresh object every ingest, and a `var` property
+/// assignment fires its change signal on identity, not on value — so writing an
+/// equal-but-new object re-ran the shield glyph, the badge and the status
+/// summary on every re-read of a file that had not changed. Compared by field
+/// rather than by JSON so it stays cheap and does not depend on key order.
+function sameCounts(a, b) {
+  if (a === b) return true
+  if (!a || !b) return false
+  return a.critical === b.critical && a.high === b.high && a.medium === b.medium
+    && a.low === b.low && a.total === b.total && a.badge === b.badge
 }
 
 // The number on the shield. Prefers the `badge` unackedCounts computed (which
@@ -1230,14 +2113,24 @@ function shouldNotify(alert, minSeverity, initialLoad, options) {
   if (!alert || !alert.id) return false
   if (alert.acked === true) return false
 
+  // 1f's third answer to "when should Moat interrupt you?". It is checked
+  // FIRST and it is checked here, ahead of every exception below -- including
+  // the noise guard's -- because "never" that has exceptions is not never.
+  if (options && options.notifyMuted === true) return false
+
   // A suppressed alert was written to the log purely so the timeline can show
   // it greyed out (BASELINE 8). Toasting it would defeat the suppression.
   if (alert.suppressed_by) return false
 
-  // A demoted rule "still logged, never notifies" (BASELINE 4.1). Checked
-  // before the noisy-rule exception below so that a noise-guard alert which
-  // itself started flooding can still be demoted into silence.
-  if (isDemotedRule(alert.rule, options && options.demotedRules)) return false
+  // A demoted rule "still logged, never notifies" (BASELINE 4.1). That is a
+  // fact about the alert's SURFACE, which the daemon stamped and `alertState`
+  // below reads; it is no longer re-derived from the rule-wide list here,
+  // because that list silenced a chain the daemon had deliberately raised.
+  // The one thing the list still decides is whether the noise guard's OWN
+  // announcement has been demoted into silence: that alert is medium and so
+  // always on the timeline, so the surface cannot carry that fact for it.
+  if (String(alert.rule || "") === NOISY_RULE_ALERT
+      && isDemotedRule(alert.rule, options && options.demotedRules)) return false
 
   // NOISY_RULE_NOTIFIES — the one deliberate exception to the severity table.
   //
@@ -1249,6 +2142,16 @@ function shouldNotify(alert, minSeverity, initialLoad, options) {
   // demotion still silence it, and the store's seen-set means each such alert
   // still toasts exactly once, never per repeat.
   if (String(alert.rule || "") === NOISY_RULE_ALERT) return true
+
+  // 2h: three notification shapes, and ONLY needs-you may interrupt. An alert
+  // an unattended agent pass has already read and called benign is `explained`
+  // -- Moat decided, the user may look -- and interrupting for a decision that
+  // has already been made is how someone learns to dismiss the toast that
+  // matters. It is still in the panel, still counted, still in History.
+  //
+  // Checked after the noise guard so its own announcement keeps its exception,
+  // and after the demotion checks so the cautious answers still win.
+  if (alertState(alert, options && options.demotedRules) !== "needsYou") return false
 
   return severityAtLeast(alert.severity, minSeverity)
 }
@@ -1311,7 +2214,8 @@ function _retireWindow(store, window) {
   if (!window) return
   delete store.notifyWindows[window.rule]
   if (window.suppressedCount > 0)
-    store.notifyPending.push({ rule: window.rule, title: window.title, count: window.suppressedCount })
+    store.notifyPending.push({ rule: window.rule, title: window.title,
+                               program: window.program, count: window.suppressedCount })
 }
 
 function _expired(window, nowMs) {
@@ -1362,6 +2266,9 @@ function notifyDecision(store, alert, nowMs, options) {
       window = {
         rule: rule,
         title: String(alert.title || rule || "Moat alert"),
+        // 2h's burst title names the PROGRAM, not the rule id: "Claude tripped
+        // the same detection 40 more times".
+        program: incidentProgram(alert),
         windowStart: now,
         windowMs: notifyCooldownMs(opts),
         toasted: true,
@@ -1411,7 +2318,8 @@ function flushCollapsed(store, nowMs) {
   for (var i = 0; i < due.length; i++) {
     delete store.notifyWindows[due[i].rule]
     if (due[i].suppressedCount > 0)
-      out.push({ rule: due[i].rule, title: due[i].title, count: due[i].suppressedCount })
+      out.push({ rule: due[i].rule, title: due[i].title,
+                 program: due[i].program, count: due[i].suppressedCount })
   }
   return out
 }
@@ -1604,6 +2512,102 @@ function suppressedLine(alert) {
   return "suppressed by " + by
 }
 
+// ------------------------------------------------------------ Advanced mode
+//
+// The `rawDetail` setting: the panel in the detection's own words, for a reader
+// who would rather see what the sensor recorded than what Moat made of it.
+//
+// Everything below is PRESENTATION. None of it is read by `alertSurface`,
+// `alertState`, `shouldNotify` or `unackedCounts`, and none of it changes what
+// the daemon does -- the state words still decide the surface, and Advanced
+// only decides how much of the record is printed beside them.
+
+/// The parent chain as one line per process, full paths and pids, oldest first.
+///
+/// `ancestryChain` collapses the same data to basenames joined by arrows, which
+/// is the right thing in the default voice and the wrong thing here: two
+/// different /usr/bin/python3 are the same word in that rendering.
+function ancestryLines(alert) {
+  var process = alert && alert.process ? alert.process : {}
+  var ancestry = Array.isArray(process.ancestry) ? process.ancestry : []
+  var out = []
+  // ancestry is nearest-parent-first, so walk it backwards for oldest -> newest.
+  for (var i = ancestry.length - 1; i >= 0; i--) {
+    var a = ancestry[i] || {}
+    out.push(String(a.pid === undefined ? "?" : a.pid) + "  " + String(a.exe || "?"))
+  }
+  if (process.exe || process.pid) {
+    out.push(String(process.pid === undefined ? "?" : process.pid) + "  " + String(process.exe || "?"))
+  }
+  return out
+}
+
+/// The label/value pairs Advanced adds, flattened so one Repeater fills a
+/// two-column Grid -- the same shape `EvidenceBlock.facts()` already uses.
+///
+/// Only fields the daemon actually sends (CONTRACT 4). The hook that fired and
+/// the policy name are not structured fields on the record: moatd writes them
+/// into `explain.evidence[]` as its own sentences, which is why Advanced opens
+/// the evidence rather than trying to reconstruct them.
+function rawFacts(alert) {
+  var a = alert
+  if (!a) return []
+  var out = []
+  function add(label, value) {
+    var text = String(value === undefined || value === null ? "" : value)
+    if (text) { out.push(label); out.push(text) }
+  }
+  add("id", a.id)
+  add("ts", a.ts)
+  add("rule", a.rule)
+  add("family", a.family)
+  add("severity", rawSeverityLine(a))
+  add("surface", a.surface)
+  add("mode", a.mode)
+  add("action_taken", a.action_taken)
+  add("count", a.count)
+  var p = a.process || {}
+  add("exe", p.exe)
+  add("pid", p.pid > 0 ? p.pid : "")
+  // uid 0 is root and is the single most interesting uid there is, so this
+  // tests against the -1 that normalizeAlert uses for "not recorded".
+  add("uid", p.uid >= 0 ? p.uid : "")
+  add("args", p.args)
+  add("cwd", p.cwd)
+  add("start_ts", p.start_ts)
+  add("ancestry", ancestryLines(a).join("\n"))
+  if (a.file) {
+    add("file", a.file.path)
+    add("sha256", a.file.sha256)
+  }
+  if (a.net) {
+    add("dst", String(a.net.dst_ip || "") + (a.net.dst_port ? ":" + a.net.dst_port : ""))
+    add("domain", a.net.domain)
+  }
+  add("rarity", a.rarity)
+  add("rarity_text", a.rarity_text)
+  add("actor", a.actor ? a.actor.provenance : "")
+  add("package", a.actor ? a.actor.package : "")
+  add("script", a.actor ? a.actor.script : "")
+  add("context", a.context)
+  add("suppressed_by", a.suppressed_by)
+  if (a.incident && a.incident.dir) add("incident_dir", a.incident.dir)
+  return out
+}
+
+/// "high  (base medium — <reason>)", or just the severity when nothing moved
+/// it. Advanced shows severity AS severity: `severityChangeLine` is written for
+/// the default voice and says nothing at all when base and current agree, which
+/// is the common case and exactly the case an engineer still wants printed.
+function rawSeverityLine(alert) {
+  if (!alert) return ""
+  var now = String(alert.severity || "")
+  var base = String(alert.severity_base || "")
+  var reason = String(alert.severity_reason || "")
+  if (!base || base === now) return reason ? now + "  (" + reason + ")" : now
+  return now + "  (base " + base + (reason ? " — " + reason : "") + ")"
+}
+
 // Compact relative time. `nowMs` is injectable so tests do not depend on the
 // wall clock.
 function relativeTime(iso, nowMs) {
@@ -1710,6 +2714,84 @@ function learningSummary(status, nowMs) {
   return "baseline active"
 }
 
+/// The rules that can be armed, as the daemon reports them.
+///
+/// Normalised the same way every other daemon list is: unknown shapes are
+/// dropped rather than rendered, and `enforce` is an enum the panel either
+/// knows or discards -- a row whose consequence line the panel cannot write is
+/// a switch whose effect it cannot state, and that must never be offered.
+/// What moatd is refusing on its own judgement right now.
+///
+/// A containment is the one thing moat does without being asked rule by rule,
+/// so the panel has to be able to show it and undo it. A row the panel cannot
+/// describe -- no chain to release, no destination to name -- is dropped rather
+/// than drawn as a mystery the user cannot act on.
+/// `{policy: [exe, ...]}` from the daemon, flattened into rows the panel can
+/// draw and undo one at a time.
+/// `moat-cred-etc-shadow-read` -> `cred-etc-shadow-read`. For labels that have
+/// to name a rule without spending a whole line on the prefix every rule has.
+function shortRule(rule) {
+  return String(rule || "").replace(/^moat-/, "")
+}
+
+function normalizeExclusions(raw) {
+  var out = []
+  if (!raw || typeof raw !== "object") return out
+  for (var rule in raw) {
+    var bins = raw[rule]
+    if (!Array.isArray(bins)) continue
+    for (var i = 0; i < bins.length; i++) {
+      var exe = String(bins[i] || "").trim()
+      if (rule && exe) out.push({ rule: String(rule), exe: exe })
+    }
+  }
+  return out
+}
+
+function normalizeContained(raw) {
+  var list = Array.isArray(raw) ? raw : []
+  var out = []
+  for (var i = 0; i < list.length; i++) {
+    var c = list[i]
+    if (!c || typeof c !== "object") continue
+    var chain = String(c.chain || "")
+    var dests = []
+    var raw2 = Array.isArray(c.dests) ? c.dests : []
+    for (var j = 0; j < raw2.length; j++) {
+      var d = String(raw2[j] || "").trim()
+      if (d) dests.push(d)
+    }
+    if (!chain || dests.length === 0) continue
+    out.push({
+      chain: chain,
+      exe: String(c.exe || ""),
+      dests: dests,
+      expires: Number(c.expires) || 0
+    })
+  }
+  return out
+}
+
+function normalizeEnforceable(raw) {
+  var list = Array.isArray(raw) ? raw : []
+  var out = []
+  for (var i = 0; i < list.length; i++) {
+    var r = list[i]
+    if (!r || typeof r !== "object") continue
+    var rule = String(r.rule || "")
+    var kind = String(r.enforce || "")
+    if (!rule || (kind !== "kill" && kind !== "deny")) continue
+    out.push({
+      rule: rule,
+      enforce: kind,
+      title: String(r.title || rule),
+      severity: String(r.severity || ""),
+      armed: r.armed === true
+    })
+  }
+  return out
+}
+
 function normalizeStatus(raw) {
   var value = raw
   if (typeof raw === "string") {
@@ -1739,8 +2821,33 @@ function normalizeStatus(raw) {
     mode: String(s.mode || "unknown"),
     tetragon: String(s.tetragon || "unknown"),
     policies: Number(s.policies || 0),
+    // Whitelisted like everything else here, which is why it has to be added
+    // explicitly: `normalizeStatus` builds a NEW object, so a field nobody
+    // lists is dropped in silence. That is the same fault that swallowed
+    // `chain`, `triage` and `surface` in `UPDATABLE` -- the section that reads
+    // this rendered empty and looked like a layout bug.
+    enforceable: normalizeEnforceable(s.enforceable),
+    // Whitelisted explicitly, like everything else that crosses this function.
+    containEnabled: s.contain_enabled === true,
+    // Whitelisted too -- this is the field that says whether moatd may end a
+    // process tree, and a field this function drops reads as its default
+    // everywhere downstream. An unknown value falls back to "log", which is
+    // the safe direction: it can only under-report what moatd will do.
+    containKill: (s.contain_kill === "off" || s.contain_kill === "kill")
+      ? s.contain_kill : "log",
+    contained: normalizeContained(s.contain),
+    // Whitelisted like everything else that crosses this function. A rule with
+    // a binary excluded from it has a hole in it, and a hole nobody can see is
+    // the thing to avoid: it lives inside a rendered policy in /run/moat that
+    // no one will ever open.
+    exclusions: normalizeExclusions(s.kernel_exclusions),
     // How many of those the kernel is actually running. null when moatd could
     // not read bpffs, which is "cannot tell", not "none".
+    // LEARNING 2c: `off` | `annotate` | `demote`, and how many surfaced alerts
+    // have not been looked at yet. The panel uses these to say "reading the
+    // evidence…" rather than showing an incident with a silently empty verdict.
+    autoTriage: String(s.auto_triage || "off"),
+    triagePending: Number(s.triage_pending) || 0,
     sensorsLoaded: (s.sensors_loaded === null || s.sensors_loaded === undefined)
       ? null : Number(s.sensors_loaded),
     sensorUnhealthy: s.sensor_unhealthy === true,
@@ -1753,6 +2860,10 @@ function normalizeStatus(raw) {
     },
     unacked: s.unacked && typeof s.unacked === "object" ? s.unacked : null,
     sandbox: s.sandbox === true,
+    // When moatd first ran here. It is what turns "learning ends on Thursday"
+    // into "day 2 of 9" -- the design's learning card is a progress bar, and a
+    // progress bar needs both ends of the window (1g).
+    installed_at: String(s.installed_at || ""),
     // CONTRACT 5's example status carries `group_ok`; the daemon ships
     // `socket_group` instead and argues (correctly) that "is the CALLER in the
     // group" is unanswerable from the daemon side — a client that could not
@@ -1858,6 +2969,13 @@ function normalizeAllowlistRule(value, fallbackIndex) {
     index: isFinite(index) ? index : fallbackIndex,
     comment: String(r.comment || ""),
     name: String(r.name || r.rule || ""),
+    // The matcher fields themselves, not just the rendered `detail` line. 1e
+    // groups by the PROGRAM a rule is about and 2e joins on (rule, exe), and
+    // neither can be done by parsing "exe = /usr/bin/ssh" back out of a string
+    // that was built for display.
+    exe: String(r.exe === undefined || r.exe === null ? "" : r.exe),
+    path: String(matchFile === undefined || matchFile === null ? "" : matchFile),
+    parent: String(r.parent === undefined || r.parent === null ? "" : r.parent),
     scope: isIgnoreScope(r.scope) ? String(r.scope).toLowerCase() : "",
     // The exact TOML block, shown verbatim the same way explain does it.
     line: String(r.toml || r.line || ""),
@@ -1960,14 +3078,32 @@ function normalizeAgentName(text) {
   return first
 }
 
+// The label never carries the agent's own name.
+//
+// Two reasons, and the second is the load-bearing one. It is the wrong noun:
+// `omarchy default agent` may be claude, codex, opencode or anything else, and
+// Moat has no business putting one vendor's name on its own button. And it is
+// the wrong promise: the design's "Ask Moat" (2a) is a thread INSIDE the panel,
+// which the daemon has no endpoint for -- what this actually does is hand the
+// evidence bundle to `omarchy-agent`, which opens a terminal. The label says
+// that, so nobody presses it expecting a conversation in the panel.
+//
+// The specific agent belongs in the tooltip, which is evidence, not a promise.
 function analyzeLabel(agent) {
+  return normalizeAgentName(agent) ? "Open in the Omarchy agent" : ""
+}
+
+/// The tooltip: which agent, and that it leaves the panel.
+function analyzeTooltip(agent) {
   var name = normalizeAgentName(agent)
-  return name ? "Analyze with " + name : ""
+  if (!name) return ANALYZE_HINT
+  return "Writes the evidence bundle and opens it in " + name +
+         ", in a terminal window. This panel closes."
 }
 
 // Shown in place of the button when no default agent is set. Naming the exact
 // command is the difference between a disabled control and a next step.
-var ANALYZE_HINT = "Set a default agent: omarchy default agent claude"
+var ANALYZE_HINT = "Set a default agent: omarchy default agent <name>"
 
 // LEARNING 7: {"cmd":"bundle","id":...} "writes bundle.md, returns its path".
 // The field name for that path is not fixed, so the obvious spellings are all
@@ -2024,4 +3160,908 @@ function setupSteps(needsPackage, needsGroup, group) {
     })
   }
   return steps
+}
+
+// ==========================================================================
+//  1c -- the silence choice
+// ==========================================================================
+//
+// The scopes come from the DAEMON: `explain.if_expected.options[]` is the list
+// of scopes it is prepared to write for this alert, each with the exact TOML it
+// would append. Nothing here invents one, and nothing here composes a rule --
+// an action still names an alert id and a scope the daemon offered, which is
+// the whole reason `Service._argvFor` can stay four verbs wide.
+
+/// The parent program, as a person would name it: the nearest ancestor's
+/// basename. Used for the "anything makepkg starts" chip.
+function parentProgram(alert) {
+  var ancestry = alert && alert.process && Array.isArray(alert.process.ancestry)
+    ? alert.process.ancestry : []
+  if (ancestry.length === 0) return ""
+  return basename(ancestry[0] && ancestry[0].exe)
+}
+
+/// The chips for 1c, in the order they are drawn: the recommendation first,
+/// then narrowest to broadest, and the machine-wide one ALWAYS last however the
+/// daemon ordered or recommended them. It is the one choice whose consequences
+/// the user cannot see from this screen, so it never gets the first position
+/// and it never arrives pre-selected.
+function silenceScopes(alert, count) {
+  var options = ignoreOptions(alert)
+  var program = incidentProgram(alert)
+  var parent = parentProgram(alert)
+  var out = []
+  for (var i = 0; i < options.length; i++) {
+    var o = options[i]
+    var broadest = Copy.scopeIsBroadest(o.scope)
+    out.push({
+      scope: o.scope,
+      line: o.line,
+      cmd: o.cmd,
+      recommended: o.recommended && !broadest,
+      broadest: broadest,
+      label: Copy.scopeChipLabel(o.scope, program, parent),
+      consequence: Copy.scopeConsequence(o.scope, program, parent, count)
+    })
+  }
+  out.sort(function (a, b) {
+    if (a.broadest !== b.broadest) return a.broadest ? 1 : -1
+    if (a.recommended !== b.recommended) return a.recommended ? -1 : 1
+    return IGNORE_SCOPES.indexOf(a.scope) - IGNORE_SCOPES.indexOf(b.scope)
+  })
+  return out
+}
+
+// ==========================================================================
+//  1d -- History
+// ==========================================================================
+//
+// Severity stops being a pill on every row and becomes a 3px tick plus the
+// brightness of the title, so a page of history carries at most one red mark.
+// The counts a person actually scans for move into the day header.
+
+var HISTORY_FILTERS = ["everything", "needsYou", "covered"]
+
+function historyFilterLabel(filter) {
+  switch (String(filter || "")) {
+  case "needsYou": return "Needed you"
+  case "covered": return "Silenced by a rule"
+  default: return "Everything"
+  }
+}
+
+function filterHistory(incidents, filter) {
+  var list = Array.isArray(incidents) ? incidents : []
+  var want = String(filter || "everything")
+  var out = []
+  for (var i = 0; i < list.length; i++) {
+    var state = list[i] ? list[i].state : ""
+    if (want === "needsYou") {
+      if (state === "needsYou" || state === "contained") out.push(list[i])
+    } else if (want === "covered") {
+      if (state === "expected") out.push(list[i])
+    } else {
+      out.push(list[i])
+    }
+  }
+  return out
+}
+
+/// Local calendar day of an ISO stamp, as "YYYY-MM-DD". Local, not UTC: a
+/// person's "today" ends when they go to bed, not at 00:00Z.
+function dayKeyOf(iso) {
+  var ms = Date.parse(String(iso || ""))
+  if (!isFinite(ms)) return ""
+  return dayKeyOfMs(ms)
+}
+
+function dayKeyOfMs(ms) {
+  var d = new Date(Number(ms))
+  var m = d.getMonth() + 1
+  var day = d.getDate()
+  return d.getFullYear() + "-" + (m < 10 ? "0" + m : m) + "-" + (day < 10 ? "0" + day : day)
+}
+
+var WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+/// "Today" / "Yesterday" / "Friday" / "22 Aug" -- the way a person names a day
+/// they are trying to remember: by how recent it was, then by its weekday, and
+/// only by a date once the weekday has stopped being useful.
+function dayLabelFor(iso, nowMs) {
+  var ms = Date.parse(String(iso || ""))
+  if (!isFinite(ms)) return "Earlier"
+  var now = nowMs === undefined || nowMs === null ? Date.now() : Number(nowMs)
+  var key = dayKeyOfMs(ms)
+  if (key === dayKeyOfMs(now)) return "Today"
+  if (key === dayKeyOfMs(now - 86400000)) return "Yesterday"
+  var d = new Date(ms)
+  if (now - ms < 7 * 86400000) return WEEKDAYS[d.getDay()]
+  return d.getDate() + " " + MONTHS[d.getMonth()]
+}
+
+/// The day header's counts. Incidents, never events -- the whole redesign is
+/// that a number in this panel is a number of decisions.
+function daySummary(counts) {
+  var c = counts || {}
+  var parts = []
+  if (c.needed > 0) parts.push(c.needed + " needed you")
+  else parts.push("nothing needed you")
+  if (c.contained > 0) parts.push(c.contained + " you stopped")
+  if (c.explained > 0) parts.push(c.explained + " explained")
+  if (c.covered > 0) parts.push(c.covered + (c.covered === 1 ? " covered by a rule"
+                                                             : " covered by rules"))
+  if (c.closed > 0) parts.push(c.closed + " closed")
+  return parts.join("  ·  ")
+}
+
+/// Incidents grouped into day sections, newest day first.
+function historyDays(incidents, nowMs) {
+  var list = Array.isArray(incidents) ? incidents : []
+  var byKey = {}
+  var order = []
+  for (var i = 0; i < list.length; i++) {
+    var inc = list[i]
+    if (!inc) continue
+    var key = dayKeyOf(inc.lastSeen) || "unknown"
+    var group = byKey[key]
+    if (!group) {
+      group = {
+        key: key,
+        label: dayLabelFor(inc.lastSeen, nowMs),
+        incidents: [],
+        needed: 0, explained: 0, covered: 0, contained: 0, closed: 0
+      }
+      byKey[key] = group
+      order.push(group)
+    }
+    group.incidents.push(inc)
+    // One bucket per state, and NOTHING falls through to "explained". The
+    // catch-all `else` this used to end with counted every `closed` incident
+    // -- an alert the user acked with no verdict on it -- as "explained", so
+    // the day header said "3 explained" over three rows whose state word was
+    // "closed" and whose card had never been read by anything. The header and
+    // the rows classify with the same `state`; they must bucket it the same.
+    if (inc.state === "needsYou") group.needed++
+    else if (inc.state === "contained") group.contained++
+    else if (inc.state === "expected") group.covered++
+    else if (inc.state === "explained") group.explained++
+    else group.closed++
+  }
+  for (var j = 0; j < order.length; j++) order[j].summary = daySummary(order[j])
+  order.sort(function (a, b) { return a.key < b.key ? 1 : (a.key > b.key ? -1 : 0) })
+  return order
+}
+
+/// How many events Moat looked at TODAY -- the number under the verdict line.
+///
+/// "Today" is decided by the same `dayKeyOf(lastSeen)` that files an incident
+/// under History's "Today" header, so the two screens count the same rows.
+/// The Now page used to sum `count` over every incident in the log and print
+/// it after the word "today": on a log that spans a rotation window that is
+/// several days of events under a one-day label, and at 00:01 it is all of
+/// yesterday.
+function seenToday(incidents, nowMs) {
+  var now = nowMs === undefined || nowMs === null ? Date.now() : Number(nowMs)
+  var today = dayKeyOfMs(now)
+  var list = Array.isArray(incidents) ? incidents : []
+  var seen = 0
+  for (var i = 0; i < list.length; i++) {
+    var inc = list[i]
+    if (!inc || dayKeyOf(inc.lastSeen) !== today) continue
+    seen += Number(inc.count) || 0
+  }
+  return seen
+}
+
+/// What gets appended to a history row's title in a dimmer colour: how many
+/// times, and whose decision silenced it.
+function historyNote(incident) {
+  var inc = incident || {}
+  var bits = []
+  // 3a's marker, in the place a repeat count occupies: a chain row is not "one
+  // thing that happened twice", it is several different things Moat put
+  // together, and a History row that does not say so reads as a single alert.
+  if (inc.chain) bits.push("a sequence of " + (Number(inc.chain.steps_total) || inc.chain.steps.length))
+  var repeat = Copy.repeatPhrase(inc.family, inc.count)
+  if (repeat && !inc.chain) bits.push(repeat)
+  var phrase = Copy.coveredByPhrase(inc.coveredBy)
+  if (phrase) bits.push(phrase)
+  return bits.length ? "·  " + bits.join("  ·  ") : ""
+}
+
+// ==========================================================================
+//  1e -- Rules
+// ==========================================================================
+
+/// The program a rule is about, as a person would name it.
+function ruleProgram(rule) {
+  var r = rule || {}
+  return basename(String(r.exe || "").replace(/\*+$/, ""))
+}
+
+/// The detection family a rule id belongs to: `moat-<family>-<what>`.
+function ruleFamily(name) {
+  var m = /^moat-([a-z0-9]+)-/.exec(String(name || ""))
+  return m ? m[1] : "other"
+}
+
+/// /home/dan/.config -> ~/.config. The model has no $HOME and does not need
+/// one: every path moatd reports for a user's own files is under /home/<name>.
+function shortenHome(path) {
+  return String(path || "").replace(/^\/home\/[^\/]+/, "~").replace(/^\/root/, "~")
+}
+
+/// The verb a detection family grants, split from the place it grants it over.
+///
+/// `prefix` is present only for the families whose permission is ABOUT a
+/// directory; `none` is what the family says when there is no directory to name
+/// (and, for the others, the whole sentence). Kept apart from `ruleScopeWords`
+/// so a program with eight learned directories can say the verb once and count
+/// the places, instead of printing the verb eight times -- see `scopePhrase`.
+function ruleScopeVerb(name) {
+  switch (ruleFamily(name)) {
+  case "cred": return { none: "reading your keys" }
+  case "persist": return { prefix: "writing under", none: "writing where things start at login" }
+  case "pkg": return { none: "running during package installs" }
+  case "exec": return { prefix: "running from", none: "running from unusual places" }
+  case "net": return { none: "connecting out" }
+  case "priv": return { none: "asking for more access" }
+  case "rootkit": return { none: "touching the kernel" }
+  case "shell": return { none: "opening a shell" }
+  case "ai": return { none: "running during package installs" }
+  default: return { prefix: "touching", none: "what it was flagged for" }
+  }
+}
+
+/// The deepest directory every path in `dirs` sits under, or "" when they share
+/// nothing worth naming. "/" and "~" alone are treated as nothing: "5 places
+/// under /" tells a reader less than "5 places" does, and costs them a word.
+function commonParentDir(dirs) {
+  var list = []
+  for (var i = 0; i < (dirs || []).length; i++) {
+    if (dirs[i]) list.push(String(dirs[i]))
+  }
+  if (list.length === 0) return ""
+  var parts = list[0].split("/")
+  for (var j = 1; j < list.length; j++) {
+    var other = list[j].split("/")
+    var n = 0
+    while (n < parts.length && n < other.length && parts[n] === other[n]) n++
+    parts = parts.slice(0, n)
+  }
+  var joined = parts.join("/")
+  if (joined === "" || joined === "/" || joined === "~") return ""
+  return joined
+}
+
+/// One family's permission for one program, as a sentence.
+///
+/// The tuple-per-line version printed the verb once per directory and then ran
+/// out of row: "running from /tmp/moat-sandbox-test.*/home/proj, running from
+/// /tmp/moat-sandbox-test.LKurquBA/home/proj, a…" -- three quarters of the cell
+/// spent re-reading "running from", and the paths cut off just before the part
+/// where they differed. Two or more places are counted and placed instead.
+function scopePhrase(entry) {
+  var e = entry || {}
+  var dirs = e.dirs || []
+  if (!e.prefix || dirs.length === 0) return e.none
+  if (dirs.length === 1) return e.prefix + " " + dirs[0]
+  var parent = commonParentDir(dirs)
+  return e.prefix + " " + dirs.length + " places" + (parent ? " in " + parent : "")
+}
+
+/// What a rule lets a program do, in plain words. This is the "trusted for"
+/// column in 2e and half the title in 1e, and it is derived from the detection
+/// family and the path the rule matches rather than printed as a matcher.
+function ruleScopeWords(name, path) {
+  var dir = shortenHome(String(path || "").replace(/\/?\*+$/, ""))
+  var verb = ruleScopeVerb(name)
+  return verb.prefix && dir ? verb.prefix + " " + dir : verb.none
+}
+
+/// "you added this on 2026-09-03" -- the provenance line under a rule in 1e,
+/// parsed out of the comment moatd writes into the TOML.
+///
+/// A comment it cannot parse is a HAND-WRITTEN one, so it is shown as-is: that
+/// is the user's own sentence about their own rule. A machine-written one it
+/// cannot parse is dropped rather than printed, because those are the ones that
+/// carry alert ids and file paths.
+function ruleProvenance(rule) {
+  var r = rule || {}
+  var comment = String(r.comment || "")
+  var added = /^added\s+(\d{4}-\d{2}-\d{2})/.exec(comment)
+  if (added) return "you added this on " + added[1]
+  var learned = /^learned\s+(\d{4}-\d{2}-\d{2}):\s*seen\s+(\d+)\s+times?/.exec(comment)
+  if (learned) {
+    return "Moat learned this on " + learned[1] + ", after " + learned[2] + " alerts"
+  }
+  if (/^(added|learned)\b/.test(comment)) return ""
+  return comment
+}
+
+/// Per (rule, exe) alert counts out of a baseline export, for the
+/// silenced-since column.
+function silencedCounts(tuples) {
+  var list = Array.isArray(tuples) ? tuples : []
+  var out = {}
+  for (var i = 0; i < list.length; i++) {
+    var t = list[i]
+    if (!t) continue
+    var key = String(t.rule || "") + " " + String(t.exe || "")
+    out[key] = (out[key] || 0) + (Number(t.count) || 0)
+  }
+  return out
+}
+
+/// The "Yours" section of 1e: the rules the user's own decisions wrote, each
+/// with the count of what it has actually silenced since.
+///
+/// That count is the honest measure of whether a rule was a good idea, and it is
+/// the ONLY way a user can tell. It comes from the baseline's own per-tuple
+/// counters (`moatctl baseline export`), which keep counting a tuple after an
+/// allowlist entry starts hiding it -- which is exactly what makes them the
+/// right number to put here.
+function userRuleRows(rules, tuples) {
+  var list = Array.isArray(rules) ? rules : []
+  var counts = silencedCounts(tuples)
+  var out = []
+  for (var i = 0; i < list.length; i++) {
+    var r = list[i]
+    if (!r || r.shipped) continue
+    var program = ruleProgram(r)
+    var silenced = counts[String(r.name || "") + " " + String(r.exe || "")]
+    out.push({
+      index: r.index,
+      file: r.sourceName,
+      sourceFile: r.sourceFile,
+      removable: r.removable,
+      learned: r.learned,
+      program: program,
+      label: (program || "A program") + ", " + ruleScopeWords(r.name, r.path || r.file),
+      provenance: ruleProvenance(r),
+      binary: String(r.exe || ""),
+      // -1, not 0: "the daemon is not counting this one" and "it has silenced
+      // nothing" are different answers, and the view says them differently.
+      silenced: silenced === undefined ? -1 : silenced,
+      line: r.line,
+      rule: String(r.name || "")
+    })
+  }
+  return out
+}
+
+/// The "Came with Moat" section: sixteen near-identical cards become about five
+/// lines, grouped by the programs they cover rather than by detection.
+function shippedRuleGroups(rules) {
+  var list = Array.isArray(rules) ? rules : []
+  var byKey = {}
+  var order = []
+  for (var i = 0; i < list.length; i++) {
+    var r = list[i]
+    if (!r || !r.shipped) continue
+    var group = Copy.programGroup(ruleProgram(r))
+    var g = byKey[group.key]
+    if (!g) {
+      g = { key: group.key, label: group.label, reason: group.reason, count: 0, rules: [] }
+      byKey[group.key] = g
+      order.push(g)
+    }
+    g.count++
+    g.rules.push(r)
+  }
+  order.sort(function (a, b) {
+    if (a.key === "other") return 1
+    if (b.key === "other") return -1
+    if (a.count !== b.count) return b.count - a.count
+    return a.label < b.label ? -1 : 1
+  })
+  return order
+}
+
+// ==========================================================================
+//  2e -- Programs Moat knows
+// ==========================================================================
+//
+// The positive mirror of Rules: not what has been silenced, but what is
+// considered normal. `moatctl baseline export --json` is the source -- the
+// daemon's own per-(rule, exe, parent, dir) counters, with `learned` marking the
+// ones the learning window wrote a rule for and `suppressed` the ones an
+// allowlist entry is already hiding.
+
+function normalizeBaselineTuple(value) {
+  var t = value && typeof value === "object" ? value : {}
+  return {
+    rule: String(t.rule || ""),
+    exe: String(t.exe || ""),
+    program: basename(t.exe),
+    provenance: normalizeActor({ provenance: t.provenance }).provenance,
+    pkg: String(t.package === null || t.package === undefined ? "" : t.package),
+    parent: String(t.parent === null || t.parent === undefined ? "" : t.parent),
+    dir: String(t.dir === null || t.dir === undefined ? "" : t.dir),
+    context: normalizeContext(t.context),
+    severity: String(t.severity || "low").toLowerCase(),
+    count: Number(t.count || 0),
+    days: Number(t.days || 0),
+    firstSeen: String(t.first_seen || ""),
+    lastSeen: String(t.last_seen || ""),
+    rarity: normalizeRarity(t.rarity),
+    suppressed: t.suppressed === true,
+    demoted: t.demoted === true,
+    learned: t.learned === true,
+    eligible: t.eligible === true
+  }
+}
+
+function parseBaselineExport(raw) {
+  var value = raw
+  if (typeof raw === "string") {
+    try { value = JSON.parse(String(raw || "").trim() || "{}") } catch (e) {
+      return { ok: false, error: "unparseable baseline export", tuples: [] }
+    }
+  }
+  var v = value && typeof value === "object" ? value : {}
+  var list = Array.isArray(v.tuples) ? v.tuples : (Array.isArray(v) ? v : [])
+  var tuples = []
+  for (var i = 0; i < list.length; i++) tuples.push(normalizeBaselineTuple(list[i]))
+  return {
+    ok: !v.error,
+    error: String(v.error || ""),
+    generated: String(v.generated || ""),
+    tuples: tuples
+  }
+}
+
+/// The 2e table. One row per program, with what it is trusted FOR stated as
+/// permissions in plain words, when it was last seen, and how many alerts that
+/// trust has silenced.
+///
+/// A program with an incident waiting on the user is listed too, with an empty
+/// scope and a line saying so -- the design highlights it, because "this is not
+/// trusted for anything yet" is the most useful row on the screen.
+function trustedPrograms(tuples, incidents) {
+  var list = Array.isArray(tuples) ? tuples : []
+  var byProgram = {}
+  var order = []
+
+  function rowFor(name) {
+    if (!name) return null
+    var row = byProgram[name]
+    if (!row) {
+      row = { program: name, exes: [], scopes: ({}), scopeKeys: [],
+              lastSeen: "", silenced: 0, open: false, rules: [] }
+      byProgram[name] = row
+      order.push(row)
+    }
+    return row
+  }
+
+  for (var i = 0; i < list.length; i++) {
+    var t = list[i]
+    // Trusted means a rule covers it: one the learning window wrote, or one the
+    // user's own "this was me" wrote. A tuple that has merely been observed is
+    // not trust, and listing it here would turn this screen back into a log.
+    if (!t || !(t.learned || t.suppressed)) continue
+    var row = rowFor(t.program)
+    if (!row) continue
+    if (row.exes.indexOf(t.exe) === -1) row.exes.push(t.exe)
+    if (row.rules.indexOf(t.rule) === -1) row.rules.push(t.rule)
+    // Collected by (verb, has-a-place) rather than by finished sentence, so
+    // eight learned directories under one verb stay ONE permission instead of
+    // eight near-identical ones.
+    var verb = ruleScopeVerb(t.rule)
+    var dir = shortenHome(String(t.dir || "").replace(/\/?\*+$/, ""))
+    var placed = !!(verb.prefix && dir)
+    var key = placed ? "at:" + verb.prefix : "is:" + verb.none
+    var entry = row.scopes[key]
+    if (!entry) {
+      entry = { prefix: verb.prefix, none: verb.none, dirs: [] }
+      row.scopes[key] = entry
+      row.scopeKeys.push(key)
+    }
+    if (placed && entry.dirs.indexOf(dir) === -1) entry.dirs.push(dir)
+    row.silenced += Number(t.count) || 0
+    if (t.lastSeen > row.lastSeen) row.lastSeen = t.lastSeen
+  }
+
+  // An open incident MARKS a row; it never creates one.
+  //
+  // This is the one place the handoff is wrong for this codebase. 2e draws a
+  // `flea` row reading "nothing yet — one incident waiting on you", as one line
+  // among fourteen trusted programs. On a real machine with nine things waiting
+  // that inverts the screen: eight of fifteen rows under the heading "programs
+  // Moat treats as yours" were programs it trusts for nothing, which makes the
+  // heading a lie and turns the positive mirror of Rules into a second copy of
+  // Now. A program with no trust at all is an incident, and incidents live on
+  // Now -- so it stays out, and a program that IS trusted and also has
+  // something waiting keeps the highlight and says so next to its permissions.
+  var open = Array.isArray(incidents) ? incidents : []
+  for (var j = 0; j < open.length; j++) {
+    if (!open[j] || open[j].state !== "needsYou") continue
+    var waiting = byProgram[open[j].program]
+    if (!waiting) continue
+    waiting.open = true
+    if (open[j].lastSeen > waiting.lastSeen) waiting.lastSeen = open[j].lastSeen
+  }
+
+  for (var k = 0; k < order.length; k++) {
+    var out = order[k]
+    var phrases = []
+    for (var p = 0; p < out.scopeKeys.length; p++) {
+      var phrase = scopePhrase(out.scopes[out.scopeKeys[p]])
+      if (phrase && phrases.indexOf(phrase) === -1) phrases.push(phrase)
+    }
+    out.trusted = phrases.length > 0
+    // Three permissions is as much as a row can say. Past that it is a list,
+    // and a list belongs behind the row rather than inside it.
+    var words = phrases.length > 3
+      ? phrases.slice(0, 3).join(", ") + ", and " + (phrases.length - 3) + " more"
+      : phrases.join(", ")
+    if (out.open) words += " — and one thing waiting on you"
+    out.scope = Copy.oneLine(words, 140)
+  }
+  // Open incidents first (they are the reason to look), then busiest.
+  order.sort(function (a, b) {
+    if (a.open !== b.open) return a.open ? -1 : 1
+    if (a.silenced !== b.silenced) return b.silenced - a.silenced
+    return a.program < b.program ? -1 : 1
+  })
+  return order
+}
+
+// ==========================================================================
+//  2b / 3a -- the sequence
+// ==========================================================================
+//
+// Two different things are called a chain in this file, and they are NOT the
+// same thing:
+//
+//   `chainSteps`  -- 2b's ancestry: what started what, out of one alert's own
+//                    `process.ancestry`. Present on every alert.
+//   `chainStory`  -- the daemon's correlated SEQUENCE (CONTRACT 4 "Chains"):
+//                    several alerts, in one process tree, crossing detection
+//                    families. Present only when moatd found one.
+//
+// Both are drawn with 2b's rail-and-dot layout because both are "what led
+// here" told with times. The second is what 3a is about.
+
+/// The chain an alert is a step of, or null.
+function chainOf(alert) {
+  return alert && alert.chain && alert.chain.steps ? alert.chain : null
+}
+
+/// Which step of the chain this alert is, 1-based. 0 when it is not listed --
+/// possible on a truncated chain, where the steps kept are not all of them.
+function chainPosition(alert) {
+  var c = chainOf(alert)
+  if (!c) return 0
+  var id = String(alert.id || "")
+  for (var i = 0; i < c.steps.length; i++) {
+    if (c.steps[i].alert === id) return i + 1
+  }
+  return 0
+}
+
+/// The line that tells a reader looking at ONE alert that it belongs to a
+/// sequence, and where in it (3a).
+///
+/// This is the answer to landing on the `.git/config` row and never learning
+/// that the same process read a credential a second later. It is deliberately
+/// the first thing said about such an alert, the way `moatctl explain` puts
+/// "THIS IS PART OF A SEQUENCE" above the rule's own reasoning: the rule
+/// explains one event, the chain is why that event matters.
+function chainMarker(alert) {
+  var c = chainOf(alert)
+  if (!c) return ""
+  var at = chainPosition(alert)
+  var total = Number(c.steps_total) || c.steps.length
+  if (at > 0) return "Part of a sequence — step " + at + " of " + total
+  return "Part of a sequence of " + total
+}
+
+/// A chain's severity, and NEVER without the daemon's reason for it.
+///
+/// CONTRACT 4: "Never show a chain severity without `severity_reason`." The
+/// reason is the whole guarantee that moatd's escalation is written down
+/// rather than silent, so this returns "" when there is no reason to print --
+/// showing the number alone is the one thing the obligation forbids. Every
+/// place the panel prints a chain severity goes through here.
+function chainSeverityLine(chain) {
+  var c = chain || {}
+  if (!c.severity || !c.severity_reason) return ""
+  return c.severity + " — " + c.severity_reason
+}
+
+/// The clock time of a step, "21:18:36", in the reader's own timezone.
+///
+/// Not `relativeTime`: a chain spans seconds to minutes, so every step would
+/// read the same age ("2 minutes ago") and the sequence -- the entire point of
+/// the screen -- would be invisible. 2b and 3a print clock times for exactly
+/// this reason.
+function clockTime(iso) {
+  var text = String(iso || "")
+  if (!text) return ""
+  var d = new Date(text)
+  if (isNaN(d.getTime())) return ""
+  function two(n) { return n < 10 ? "0" + n : String(n) }
+  return two(d.getHours()) + ":" + two(d.getMinutes()) + ":" + two(d.getSeconds())
+}
+
+/// The day a sequence happened, stated once.
+///
+/// Steps print clock times only, and for good reason: a chain spans seconds,
+/// so a date on every row is the same string repeated and the sequence -- the
+/// point of the screen -- gets harder to read. The cost was that the timeline
+/// carried no date at all. "20:06:10" is unreadable a day later, and a security
+/// timeline that cannot tell you WHICH 20:06:10 is not a timeline.
+///
+/// Written in full, including the year: this is a record someone may read back
+/// months later, or paste into a ticket, and an ambiguous stamp there is worse
+/// than a long one.
+function chainDay(chain) {
+  var c = chain || {}
+  var iso = c.first_ts || (c.steps && c.steps.length ? c.steps[0].ts : "")
+  return dayStamp(iso)
+}
+
+function dayStamp(iso) {
+  var text = String(iso || "")
+  if (!text) return ""
+  var d = new Date(text)
+  if (isNaN(d.getTime())) return ""
+  var days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+  var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+  return days[d.getDay()] + " " + d.getDate() + " " + months[d.getMonth()]
+         + " " + d.getFullYear()
+}
+
+/// 3a's status column: what has already happened to this step.
+///
+/// A `context` step is one the user had allowed or the noise guard had demoted
+/// (CONTRACT 4, and those two are the ONLY sources). It is shown -- that is
+/// what makes the story readable -- but it is not shown as an accusation, or
+/// the panel reverses a decision the user made.
+function chainStepStatus(step, member) {
+  var s = step || {}
+  var m = member || null
+  if (m && m.action_taken && m.action_taken !== "none") {
+    var label = "Moat stopped it"
+    if (m.action_taken === "quarantined") label = "Moat held it"
+    // A refusal is not a kill and must not read as one: the program is still
+    // running and saw its call fail. Saying "stopped it" would have the user
+    // looking for a process that never died.
+    else if (m.action_taken === "blocked") label = "Moat refused it"
+    return { label: label, tone: "accent" }
+  }
+  if (s.role === "context") return { label: "you had allowed this", tone: "calm" }
+  if (m && m.acked === true) return { label: "closed", tone: "quiet" }
+  return { label: "happened", tone: "quiet" }
+}
+
+/// The sequence, as rows for 2b's rail.
+///
+/// options: { alerts: [...the members this reader has...], currentId, rawDetail }
+///
+/// The daemon's step carries the id, the time, the family, the rule and its own
+/// title; everything else in a row is either the panel's copy for that rule or
+/// a fact joined from the member alert. A step whose alert this reader has not
+/// folded yet still renders -- the chain is the authority on what happened, and
+/// waiting for the log to catch up would show a shorter story than moatd has.
+function chainStory(chain, options) {
+  var c = chain || {}
+  var steps = Array.isArray(c.steps) ? c.steps : []
+  var o = options || {}
+  var raw = o.rawDetail === true
+  var current = String(o.currentId || "")
+
+  var byId = {}
+  var members = Array.isArray(o.alerts) ? o.alerts : []
+  for (var i = 0; i < members.length; i++) {
+    if (members[i] && members[i].id) byId[String(members[i].id)] = members[i]
+  }
+
+  var rows = []
+  for (var j = 0; j < steps.length; j++) {
+    var s = steps[j]
+    var member = byId[s.alert] || null
+    // The step's own fields are what a copy lookup needs, so a step renders in
+    // the panel's voice with no member alert present at all.
+    var asAlert = { rule: s.rule, title: s.title, summary: "", severity: s.severity }
+    rows.push({
+      alert: s.alert,
+      position: j + 1,
+      ts: s.ts,
+      time: clockTime(s.ts),
+      family: s.family,
+      rule: s.rule,
+      severity: s.severity,
+      title: Copy.titleFor(asAlert, raw),
+      // Advanced asks for the detection's own words: the rule id and the
+      // severity it fired at. The default voice gets what it costs you.
+      note: raw ? (s.rule + (s.severity ? "  ·  " + s.severity : ""))
+                : Copy.stakeFor(asAlert, false),
+      status: chainStepStatus(s, member),
+      role: s.role,
+      isContext: s.role === "context",
+      isCurrent: current !== "" && s.alert === current
+    })
+  }
+  return rows
+}
+
+// ==========================================================================
+//  2b -- what led here
+// ==========================================================================
+//
+// The old panel had this data as one line -- kernel, systemd, herdr, bash, flea
+// -- with no times and no other events, which answers a question nobody asks.
+// As a chain with what is known about each step, the interesting fact (what
+// started what, and how long before) becomes visible.
+//
+// Only what the alert actually carries. moatd records an ancestry of
+// {pid, exe} with no per-step timestamp, so the steps above the alert carry no
+// time and this does not invent one.
+function chainSteps(alert) {
+  if (!alert) return []
+  var process = alert.process || {}
+  var ancestry = Array.isArray(process.ancestry) ? process.ancestry.slice() : []
+  ancestry.reverse()                       // oldest first
+  var steps = []
+  for (var i = 0; i < ancestry.length; i++) {
+    var a = ancestry[i] || {}
+    steps.push({
+      name: basename(a.exe) || "?",
+      path: shortenHome(String(a.exe || "")),
+      note: i === 0 ? "the oldest step Moat still has a record of"
+                    : "started by the step above it",
+      ts: "",
+      isAlert: false
+    })
+  }
+  steps.push({
+    name: basename(process.exe) || "?",
+    path: shortenHome(String(process.exe || "")),
+    note: String(process.args || ""),
+    cwd: shortenHome(String(process.cwd || "")),
+    ts: String(alert.ts || ""),
+    startedAt: String(process.start_ts || ""),
+    isAlert: true
+  })
+  return steps
+}
+
+// ==========================================================================
+//  3e -- the bar glyph
+// ==========================================================================
+//
+// Exactly three states, matching the verdict line, so the bar and the panel can
+// never disagree. No event counter, no rule name, no severity palette: the old
+// widget had five colours and a count of records, which is four more colours and
+// one more number than the top of the panel has.
+function barState(verdictState, needsCount) {
+  switch (String(verdictState || "")) {
+  case Copy.VERDICT_CHAIN:
+  case Copy.VERDICT_NEEDS:
+    return { state: "needsYou", tone: "alarm",
+             label: String(Number(needsCount) || 0),
+             glyph: GLYPH_SHIELD_ALERT }
+  case Copy.VERDICT_GAP:
+    return { state: "gap", tone: "accent", label: "gap", glyph: GLYPH_SHIELD_OFF }
+  // The verdict line grew a fifth form after the bar's "exactly three states"
+  // was written, and this switch never learned it: `stopped` fell through to
+  // `default`, so the bar drew the calm shield while the headline beneath it
+  // read "Moat stopped one thing" in the accent colour. The bar takes its
+  // tone from the same table the headline does -- `Copy.verdictTone` -- so the
+  // two cannot drift apart again.
+  case Copy.VERDICT_STOPPED:
+    return { state: "stopped", tone: Copy.verdictTone(Copy.VERDICT_STOPPED), label: "",
+             glyph: GLYPH_SHIELD_CHECK }
+  default:
+    return { state: "quiet", tone: "quiet", label: "", glyph: GLYPH_SHIELD }
+  }
+}
+
+/// The tooltip, and only for the two loud states (3e). A tooltip on the quiet
+/// state is a tooltip nobody ever needed.
+function barTooltip(verdictState, incidents, nowMs) {
+  var state = String(verdictState || "")
+  if (state === Copy.VERDICT_GAP) {
+    return "Moat cannot prove it was watching the whole time · click to open"
+  }
+  if (state !== Copy.VERDICT_NEEDS && state !== Copy.VERDICT_CHAIN) return ""
+  var queue = needsYouIncidents(incidents)
+  if (queue.length === 0) return ""
+  var age = relativeTime(queue[0].lastSeen, nowMs)
+  return queue[0].title + (age ? " · " + age : "") +
+         "\nclick to open · right-click to refresh"
+}
+
+// ==========================================================================
+//  1g -- the first week
+// ==========================================================================
+//
+// Learning is a finite job with an end, and the design's point is that it says
+// so: a progress bar, a day count, and what it has learned so far. Nine silent
+// days are indistinguishable from nine broken ones.
+function learningCard(status, nowMs) {
+  var s = status && status.baseline ? status : normalizeStatus(status)
+  var b = s.baseline
+  if (!b.learning) return null
+  var now = nowMs === undefined || nowMs === null ? Date.now() : Number(nowMs)
+  var ends = Date.parse(b.learning_ends)
+  var started = Date.parse(s.installed_at)
+  if (!isFinite(ends)) return null
+  var left = Math.max(0, daysUntil(b.learning_ends, now))
+  var total = isFinite(started) ? Math.round((ends - started) / 86400000) : 0
+  if (total <= 0) total = left > 0 ? left : 1
+  var index = Math.min(total, Math.max(1, total - left + 1))
+  return {
+    dayIndex: index,
+    dayTotal: total,
+    daysLeft: left,
+    fraction: Math.max(0, Math.min(1, index / total)),
+    learned: Number(b.learned) || 0,
+    proposals: Number(b.proposals) || 0
+  }
+}
+
+/// The day-9 card: shown for the two days after the window closes, because that
+/// is the only moment the enforce question can be asked honestly.
+function learningDoneCard(status, nowMs) {
+  var s = status && status.baseline ? status : normalizeStatus(status)
+  var b = s.baseline
+  if (b.learning) return null
+  var ends = Date.parse(b.learning_ends)
+  if (!isFinite(ends)) return null
+  var now = nowMs === undefined || nowMs === null ? Date.now() : Number(nowMs)
+  var age = now - ends
+  // Two days: long enough that someone who was away for a weekend still sees
+  // it, short enough that it is not a permanent banner.
+  if (age < 0 || age > 2 * 86400000) return null
+  return {
+    learned: Number(b.learned) || 0,
+    proposals: Number(b.proposals) || 0,
+    demoted: b.demoted.length,
+    enforcing: s.mode === "enforce"
+  }
+}
+
+// ==========================================================================
+//  3d -- after Moat blocked something
+// ==========================================================================
+//
+// Enforce mode's real UI is the apology, not the switch. A kernel-level block
+// shows up in the user's terminal as a program dying for no reason, so the panel
+// owes them the explanation after the fact.
+function blockedIncidents(incidents) {
+  // The SAME question as `stoppedIncidents`, so it gets the same answer.
+  //
+  // These were two functions deciding "is this still outstanding" and they
+  // disagreed: this one never looked at `acked`, so after the user allowed a
+  // killed program the headline correctly read "Nothing needs you" while the
+  // apology card for that very program still sat underneath it. Two consumers
+  // re-deriving one decision is the bug this codebase produces most often; the
+  // fix is always to have one of them ask the other.
+  return stoppedIncidents(incidents)
+}
+
+
+/// The terminal transcript 3d shows back to the user: what they saw when the
+/// kernel killed it. Reconstructed from the recorded command line only -- Moat
+/// does not capture terminal output, and this does not pretend it does.
+function blockTranscript(alert) {
+  var process = alert && alert.process ? alert.process : {}
+  var command = String(process.args || process.exe || "")
+  // What the shell actually printed. A kill shows the shell's own "Killed";
+  // a refusal never reaches the shell at all -- the program stayed up and got
+  // EPERM from connect(), so inventing a "Killed" line here would be a lie
+  // about something the user can scroll back and check.
+  var denied = alert && alert.action_taken === "blocked"
+  return {
+    command: "$ " + (command || basename(process.exe)),
+    killed: denied ? "connect: Permission denied" : "Killed",
+    cwd: shortenHome(String(process.cwd || ""))
+  }
 }

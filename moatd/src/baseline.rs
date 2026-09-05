@@ -61,10 +61,24 @@ pub struct TupleStat {
     pub last_seen: String,
     /// The severity the last alert scored to.
     pub severity: String,
-    /// The highest severity this tuple ever produced; learning looks at this,
-    /// so one critical is enough to keep a tuple out of the baseline forever.
+    /// The highest severity this tuple ever produced, after context and
+    /// provenance adjusted it. Reported, but no longer the learning gate --
+    /// see `max_base_rank`.
     #[serde(default)]
     pub max_rank: u8,
+    /// The highest severity the *rules* ever gave this tuple, before the
+    /// context matrix escalated it. This is what learning looks at.
+    ///
+    /// Gating on the escalated value was wrong on its own terms. BASELINE §2b
+    /// escalates by context and never downgrades in `pkg-install`, so a tuple
+    /// that scores medium every ordinary day is permanently barred from the
+    /// baseline by one sighting inside a package build. On 2026-09-04 that was
+    /// 628 of 1206 tuples, 295 of them official -- the single largest reason
+    /// nothing had ever been learned. The severity a *detection* assigns is a
+    /// statement about the action; the escalation is a statement about the
+    /// circumstances, and circumstances are exactly what a baseline is for.
+    #[serde(default)]
+    pub max_base_rank: u8,
     pub provenance: String,
     pub context: String,
     #[serde(default)]
@@ -151,6 +165,10 @@ pub struct Proposal {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Demotion {
     pub rule: String,
+    /// The (rule, exe, parent, dir) tuple this demotion is scoped to. Empty
+    /// when the whole rule was demoted by the fan-out backstop.
+    #[serde(default)]
+    pub tuple: String,
     /// unix seconds
     pub since: u64,
     /// The 24 h count that tripped it.
@@ -173,6 +191,11 @@ pub struct BaselineState {
     pub proposals: Vec<Proposal>,
     #[serde(default)]
     pub demoted: BTreeMap<String, Demotion>,
+    /// Demotions scoped to one (rule, exe, parent, dir) tuple. Keyed by the
+    /// tuple, so a noisy shape goes quiet without silencing shapes of the same
+    /// rule that nobody has seen yet.
+    #[serde(default)]
+    pub demoted_tuples: BTreeMap<String, Demotion>,
     /// rule -> hour bucket (unix hours) -> alerts in that hour.
     #[serde(default)]
     pub windows: HashMap<String, BTreeMap<u64, u64>>,
@@ -213,6 +236,8 @@ pub struct Observation<'a> {
     /// Directory of the file the alert names, `""` when it names none.
     pub dir: &'a str,
     pub severity: &'a str,
+    /// What the rule itself decided, before provenance and context adjusted it.
+    pub severity_base: &'a str,
     pub provenance: &'a str,
     pub package: Option<String>,
     pub context: &'a str,
@@ -230,6 +255,10 @@ pub struct Baseline {
     pub learning_days: u64,
     pub learn_min_days: usize,
     pub noisy_rule_per_day: u64,
+    /// How many distinct tuples of one rule must each be demoted before the
+    /// rule is demoted wholesale. The backstop for a rule that is noisy in
+    /// general rather than in one shape.
+    pub noisy_rule_fanout: usize,
     dirty: bool,
     last_save: u64,
     pub save_every: u64,
@@ -275,6 +304,7 @@ impl Baseline {
             learning_days,
             learn_min_days,
             noisy_rule_per_day,
+            noisy_rule_fanout: 5,
             dirty,
             last_save: 0,
             save_every: 60,
@@ -292,15 +322,29 @@ impl Baseline {
     }
 
     /// `moatctl baseline relearn [--days N]`: restart the window, for after a
-    /// big change (new job, new toolchain).
+    /// big change (new job, new toolchain) or after a rule retune.
+    ///
+    /// The day counters and `max_rank` start over; `count`, `first_seen` and
+    /// `learned` stay, so the export keeps its history and entries already in
+    /// `baseline.toml` are untouched.
+    ///
+    /// Resetting `max_rank` is what makes this an escape hatch rather than a
+    /// no-op. It is a running maximum that never decays, so a single high — one
+    /// scored under rules that have since been retuned, or under a context
+    /// escalation that no longer applies — otherwise keeps a tuple out of the
+    /// baseline permanently, and no command could get it back. Clearing it is
+    /// safe because it is self-healing: a tuple that still scores high re-poisons
+    /// itself on its very next alert, so only tuples that have genuinely stopped
+    /// being severe stay clean.
     pub fn relearn(&mut self, days: Option<u64>, now: u64) -> u64 {
         let days = days.unwrap_or(self.learning_days);
         self.state.learning_until = now + days * DAY;
-        // Learning again means the day counters start over; the counts stay, so
-        // the export keeps its history.
         for t in self.state.tuples.values_mut() {
             t.proposed = false;
             t.dismissed = false;
+            t.days.clear();
+            t.max_rank = 0;
+            t.max_base_rank = 0;
         }
         self.state.proposals.clear();
         self.dirty = true;
@@ -327,6 +371,7 @@ impl Baseline {
         e.last_seen = o.ts.clone();
         e.severity = o.severity.to_string();
         e.max_rank = e.max_rank.max(rank);
+        e.max_base_rank = e.max_base_rank.max(crate::alert::severity_rank(o.severity_base));
         e.provenance = o.provenance.to_string();
         e.package = o.package.clone();
         e.context = o.context.to_string();
@@ -388,25 +433,61 @@ impl Baseline {
     /// BASELINE §3 + LEARNING §1: medium or low, official actor, enough
     /// distinct days, and `common` rarity.
     fn eligible(&self, t: &TupleStat) -> bool {
-        if t.learned || t.proposed || t.dismissed {
-            return false;
+        self.blocked_by(t).is_none()
+    }
+
+    /// Which gate stops this tuple being learned, in the order `eligible`
+    /// applies them, or `None` when nothing does.
+    ///
+    /// The export reports this. A reviewer reading "seen 400 times over 5 days
+    /// and still not learned" needs to know *which* condition is the one to act
+    /// on, and `max_rank` in particular is invisible in the row itself — it is
+    /// a high this tuple produced once, days ago, possibly under rules that have
+    /// since changed.
+    fn blocked_by(&self, t: &TupleStat) -> Option<String> {
+        if t.learned {
+            return Some("already learned".into());
+        }
+        if t.proposed {
+            return Some("already proposed".into());
+        }
+        if t.dismissed {
+            return Some("dismissed by the user".into());
         }
         if NEVER_LEARN.contains(&t.rule.as_str()) {
-            return false;
+            return Some(format!("{} is never learned", t.rule));
         }
-        // High and critical are never learned — and one high in this tuple's
-        // history is enough, not just the latest one.
-        if t.max_rank > crate::alert::severity_rank("medium") {
-            return false;
+        // High and critical are never learned -- judged on what the RULE said,
+        // not on what the context matrix escalated it to, and on the tuple's
+        // whole history rather than its latest sighting.
+        //
+        // A hard ceiling stays on the escalated value at `critical`: whatever
+        // the base severity, a tuple that has ever reached critical is not
+        // something to quietly learn.
+        if t.max_base_rank > crate::alert::severity_rank("medium") {
+            return Some(format!(
+                "the rule scored it {} once; learning stops at medium (`moatctl baseline relearn` clears this)",
+                crate::alert::severity_name(t.max_base_rank)
+            ));
+        }
+        if t.max_rank >= crate::alert::severity_rank("critical") {
+            return Some("reached critical once; never learned whatever the rule scored".into());
         }
         if t.provenance != "official" {
-            return false;
+            return Some(format!("actor is {}, not official", t.provenance));
         }
         if t.days.len() < self.learn_min_days {
-            return false;
+            return Some(format!(
+                "seen on {} of {} distinct days",
+                t.days.len(),
+                self.learn_min_days
+            ));
         }
         // A tuple cannot be proposed until it has been ordinary for a while.
-        t.rarity == "common"
+        if t.rarity != "common" {
+            return Some(format!("rarity is {}, not common", t.rarity));
+        }
+        None
     }
 
     // --------------------------------------------------------- the proposals
@@ -505,50 +586,146 @@ impl Baseline {
 
     /// Count one alert against its rule's rolling 24 h window. Returns the
     /// demotion when this alert is the one that crossed the threshold.
-    pub fn note_alert(&mut self, rule: &str, now: u64) -> Option<Demotion> {
+    /// Count one alert against the noise guard, and demote if it floods.
+    ///
+    /// **Counted per tuple, not per rule.** Demoting a whole rule silences every
+    /// shape it can ever match, including shapes nobody has seen yet, and on
+    /// 2026-09-04 that cost a real detection: `moat-exec-untrusted-tmpfs` had
+    /// fired 320 times from this machine's own builds (`bash` and `bwrap` out of
+    /// cargo's tempdirs, plus moat's own test binaries), so the rule was
+    /// demoted. When a package `preinstall` then downloaded a binary into /tmp
+    /// and executed it -- a tuple never seen before, and the exact thing the
+    /// rule exists for -- the alert went to the timeline instead of the badge.
+    ///
+    /// The thing that made the rule noisy had nothing in common with the thing
+    /// that tripped it except the rule id. Scoping the demotion to the tuple
+    /// keeps every noisy shape as quiet as it is today while leaving an unseen
+    /// shape loud, so this can only ever reduce what reaches the badge for
+    /// patterns already established, and never hides a new one.
+    ///
+    /// A rule-wide demotion remains as a backstop for a rule that is noisy in
+    /// *general* rather than in one shape: once `noisy_rule_fanout` distinct
+    /// tuples of it have each been demoted on their own, the rule goes quiet
+    /// wholesale. Without that, a rule firing once each from hundreds of
+    /// distinct tuples would never trip the guard at all.
+    pub fn note_alert(&mut self, rule: &str, tuple: &str, now: u64) -> Option<Demotion> {
         let hour = now / 3_600;
-        let w = self.state.windows.entry(rule.to_string()).or_default();
-        *w.entry(hour).or_insert(0) += 1;
         let cutoff = hour.saturating_sub(23);
+
+        // Rule already quiet wholesale: keep its counter fresh and say nothing.
+        if let Some(d) = self.state.demoted.get_mut(rule) {
+            d.last_seen = now;
+            return None;
+        }
+
+        let w = self.state.windows.entry(tuple.to_string()).or_default();
+        *w.entry(hour).or_insert(0) += 1;
         w.retain(|h, _| *h >= cutoff);
         let count: u64 = w.values().sum();
         self.dirty = true;
-        if let Some(d) = self.state.demoted.get_mut(rule) {
+
+        if let Some(d) = self.state.demoted_tuples.get_mut(tuple) {
             d.last_seen = now;
             d.count = count;
             return None;
         }
-        if count > self.noisy_rule_per_day {
-            let d = Demotion {
+        if count <= self.noisy_rule_per_day {
+            return None;
+        }
+
+        let d = Demotion {
+            rule: rule.to_string(),
+            tuple: tuple.to_string(),
+            since: now,
+            count,
+            last_seen: now,
+        };
+        self.state.demoted_tuples.insert(tuple.to_string(), d.clone());
+        log::warn!(
+            "noise guard: {} raised {} alerts in 24 h for one pattern; demoting that pattern \
+             to the timeline (other patterns of this rule stay on the badge)",
+            rule,
+            count
+        );
+
+        // Backstop: noisy in general, not in one shape.
+        let fanout = self
+            .state
+            .demoted_tuples
+            .values()
+            .filter(|t| t.rule == rule)
+            .count();
+        if fanout >= self.noisy_rule_fanout {
+            let whole = Demotion {
                 rule: rule.to_string(),
+                tuple: String::new(),
                 since: now,
                 count,
                 last_seen: now,
             };
-            self.state.demoted.insert(rule.to_string(), d.clone());
+            self.state.demoted.insert(rule.to_string(), whole.clone());
             log::warn!(
-                "noise guard: {} raised {} alerts in 24 h; demoting it to the timeline",
+                "noise guard: {} is noisy across {} distinct patterns; demoting the whole rule",
                 rule,
-                count
+                fanout
             );
-            return Some(d);
+            return Some(whole);
         }
-        None
+        Some(d)
+    }
+
+    /// Is this exact pattern demoted, or the whole rule?
+    pub fn is_demoted_tuple(&self, rule: &str, tuple: &str) -> bool {
+        self.state.demoted.contains_key(rule) || self.state.demoted_tuples.contains_key(tuple)
     }
 
     pub fn is_demoted(&self, rule: &str) -> bool {
         self.state.demoted.contains_key(rule)
     }
 
+    /// Every rule that has been quietened in any way — wholesale, or in one or
+    /// more of its patterns.
+    ///
+    /// `is_demoted` stays narrow ("the whole rule is quiet") because that is
+    /// what the engine and the docs mean by it. This is the list a *person*
+    /// wants: what has Moat stopped asking me about, and what can I turn back
+    /// on. `undemote` on any of these clears the rule and all its patterns.
     pub fn demoted_rules(&self) -> Vec<String> {
-        self.state.demoted.keys().cloned().collect()
+        let mut out: Vec<String> = self.state.demoted.keys().cloned().collect();
+        for d in self.state.demoted_tuples.values() {
+            if !out.contains(&d.rule) {
+                out.push(d.rule.clone());
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// How many individual patterns are quiet, for the panel's Rules tab.
+    pub fn demoted_pattern_count(&self) -> usize {
+        self.state.demoted_tuples.len()
     }
 
     /// "keep watching": clear a demotion on request.
+    /// "keep watching" a rule: clears the rule-wide demotion AND every
+    /// pattern-scoped one under it, because a user asking to be told about a
+    /// rule again means all of it, not the shapes that happen not to be quiet.
     pub fn undemote(&mut self, rule: &str) -> bool {
-        let hit = self.state.demoted.remove(rule).is_some();
-        if hit {
+        let mut hit = self.state.demoted.remove(rule).is_some();
+        let tuples: Vec<String> = self
+            .state
+            .demoted_tuples
+            .iter()
+            .filter(|(_, d)| d.rule == rule)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for t in tuples {
+            self.state.demoted_tuples.remove(&t);
             // Start the window over, or the next alert re-demotes instantly.
+            self.state.windows.remove(&t);
+            hit = true;
+        }
+        if hit {
             self.state.windows.remove(rule);
             self.dirty = true;
         }
@@ -574,6 +751,30 @@ impl Baseline {
                 self.state.demoted.remove(&rule);
                 self.dirty = true;
                 cleared.push(rule);
+            }
+        }
+        // Pattern-scoped demotions clear on the same terms. Without this a
+        // demotion scoped to a tuple would be permanent, which is a worse
+        // promise than the rule-wide one it replaced.
+        let tuples: Vec<(String, String, u64)> = self
+            .state
+            .demoted_tuples
+            .iter()
+            .map(|(k, d)| (k.clone(), d.rule.clone(), d.since))
+            .collect();
+        for (tuple, rule, since) in tuples {
+            let count: u64 = self
+                .state
+                .windows
+                .get(&tuple)
+                .map(|w| w.iter().filter(|(h, _)| **h >= cutoff).map(|(_, c)| *c).sum())
+                .unwrap_or(0);
+            if count <= self.noisy_rule_per_day && now.saturating_sub(since) >= DAY {
+                self.state.demoted_tuples.remove(&tuple);
+                self.dirty = true;
+                if !cleared.contains(&rule) {
+                    cleared.push(rule);
+                }
             }
         }
         cleared
@@ -655,7 +856,10 @@ impl Baseline {
                     "suppressed": t.suppressed,
                     "demoted": t.demoted || self.is_demoted(&t.rule),
                     "learned": t.learned,
-                    "eligible": t.provenance == "official",
+                    "max_severity": crate::alert::severity_name(t.max_rank),
+                    "max_rule_severity": crate::alert::severity_name(t.max_base_rank),
+                    "eligible": self.eligible(t),
+                    "blocked_by": self.blocked_by(t),
                     "toml": t.toml(),
                 })
             })
@@ -732,6 +936,7 @@ mod tests {
             parent: "/usr/bin/systemd",
             dir: "/home/dan/.ssh",
             severity: sev,
+            severity_base: sev,
             provenance: prov,
             package: Some("restic 0.18-1".into()),
             context: "service",
@@ -853,28 +1058,168 @@ mod tests {
         assert_eq!(until, NOW + 14 * DAY);
         assert!(b.learning(NOW));
         assert!(b.proposals().is_empty());
-        // The tuple is askable again, and now it lands in baseline.toml.
-        assert!(matches!(b.observe(&obs(4, "medium", "official", "common")), Learned::Entry { .. }));
+        // The tuple is askable again, but the day counters restarted with the
+        // window: the old three days do not carry over, so one observation is
+        // not enough and three fresh ones are.
+        assert_eq!(b.observe(&obs(4, "medium", "official", "common")), Learned::None);
+        assert_eq!(b.observe(&obs(5, "medium", "official", "common")), Learned::None);
+        assert!(matches!(b.observe(&obs(6, "medium", "official", "common")), Learned::Entry { .. }));
+    }
+
+    #[test]
+    fn context_escalation_does_not_bar_a_tuple_from_the_baseline() {
+        // BASELINE §2b escalates by context and never downgrades in
+        // pkg-install, so a tuple that scores medium every ordinary day was
+        // permanently barred by one sighting inside a package build. That was
+        // 628 of 1206 tuples on this machine on 2026-09-04 -- the largest
+        // single reason nothing had ever been learned.
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        for d in 0..2 {
+            let mut o = obs(d, "high", "official", "common");
+            o.severity_base = "medium"; // the rule said medium; context said high
+            assert_eq!(b.observe(&o), Learned::None, "day {d} is not yet three days");
+        }
+        // The third distinct day is the one that learns it.
+        let mut o = obs(2, "high", "official", "common");
+        o.severity_base = "medium";
+        assert!(matches!(b.observe(&o), Learned::Entry { .. }),
+                "the rule scored it medium; context is what a baseline is for");
+    }
+
+    #[test]
+    fn a_rule_that_really_scores_high_is_still_never_learned() {
+        // The other half: D1 relaxes what "high" means, it does not remove the
+        // gate. A detection that itself says high stays out.
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        for d in 0..5 {
+            let mut o = obs(d, "high", "official", "common");
+            o.severity_base = "high";
+            assert_eq!(b.observe(&o), Learned::None, "day {d}");
+        }
+    }
+
+    #[test]
+    fn anything_that_ever_reached_critical_stays_out_whatever_the_rule_said() {
+        // The hard ceiling. A medium-at-base tuple that context took all the
+        // way to critical is not something to quietly learn.
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        let mut first = obs(0, "critical", "official", "common");
+        first.severity_base = "medium";
+        b.observe(&first);
+        for d in 1..5 {
+            let mut o = obs(d, "medium", "official", "common");
+            o.severity_base = "medium";
+            assert_eq!(b.observe(&o), Learned::None, "day {d}");
+        }
+    }
+
+    #[test]
+    fn relearn_clears_a_max_rank_left_by_rules_that_have_since_been_retuned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        // One high, then the rule is retuned and the same tuple scores medium.
+        b.observe(&obs(0, "high", "official", "common"));
+        for d in 1..4 {
+            assert_eq!(b.observe(&obs(d, "medium", "official", "common")), Learned::None);
+        }
+        // max_rank is a running maximum, so the retune alone never frees it.
+        for d in 4..8 {
+            assert_eq!(b.observe(&obs(d, "medium", "official", "common")), Learned::None);
+        }
+        b.relearn(None, NOW + 8 * DAY);
+        for d in 8..10 {
+            assert_eq!(b.observe(&obs(d, "medium", "official", "common")), Learned::None);
+        }
+        assert!(matches!(
+            b.observe(&obs(10, "medium", "official", "common")),
+            Learned::Entry { .. }
+        ));
+    }
+
+    #[test]
+    fn relearn_does_not_rescue_a_tuple_that_is_still_severe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        b.observe(&obs(0, "high", "official", "common"));
+        b.relearn(None, NOW + DAY);
+        // Clearing max_rank is self-healing: the next high sets it straight back.
+        for d in 1..6 {
+            assert_eq!(b.observe(&obs(d, "high", "official", "common")), Learned::None);
+        }
+    }
+
+    #[test]
+    fn the_export_names_the_gate_that_is_holding_a_tuple_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        for d in 0..3 {
+            b.observe(&obs(d, "high", "official", "common"));
+        }
+        let rows = b.export(None);
+        let row = &rows[0];
+        assert_eq!(row["eligible"], serde_json::json!(false));
+        assert_eq!(row["max_severity"], serde_json::json!("high"));
+        let why = row["blocked_by"].as_str().expect("a reason");
+        assert!(why.contains("the rule scored it high once"), "{why}");
+        assert!(why.contains("relearn"), "{why}");
+        // Both severities are reported, because they now mean different things:
+        // one is what the detection said, the other what context made of it.
+        assert_eq!(row["max_rule_severity"], serde_json::json!("high"));
     }
 
     // ----------------------------------------------------------- noise guard
 
     #[test]
-    fn a_rule_over_the_threshold_is_demoted_exactly_once() {
+    fn a_noisy_pattern_is_demoted_exactly_once_and_only_that_pattern() {
         let dir = tempfile::tempdir().unwrap();
         let mut b = baseline(dir.path(), NOW);
         let rule = "moat-persist-hypr-config-write";
         for i in 0..20 {
-            assert!(b.note_alert(rule, NOW + i).is_none(), "20 is not over 20");
+            assert!(b.note_alert(rule, "t1", NOW + i).is_none(), "20 is not over 20");
         }
-        assert!(!b.is_demoted(rule));
-        let d = b.note_alert(rule, NOW + 21).expect("the 21st crosses it");
+        assert!(!b.is_demoted_tuple(rule, "t1"));
+        let d = b.note_alert(rule, "t1", NOW + 21).expect("the 21st crosses it");
         assert_eq!(d.rule, rule);
+        assert_eq!(d.tuple, "t1");
         assert_eq!(d.count, 21);
+        assert!(b.is_demoted_tuple(rule, "t1"));
+        // No second alert about the same demotion.
+        assert!(b.note_alert(rule, "t1", NOW + 22).is_none());
+
+        // The whole point: a shape of the same rule that nobody has seen is
+        // still loud. On 2026-09-04 the rule-wide version of this silenced a
+        // real supply-chain exec because the machine's own builds had made a
+        // *different* shape of the same rule noisy.
+        assert!(!b.is_demoted_tuple(rule, "t2"), "an unseen pattern stays on the badge");
+        assert!(!b.is_demoted(rule), "the rule itself is not demoted by one noisy shape");
+    }
+
+    #[test]
+    fn a_rule_noisy_across_many_patterns_still_goes_quiet_wholesale() {
+        // The backstop. Without it a rule firing a flood from many distinct
+        // tuples would never trip the guard at all.
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        let rule = "moat-x-pkg-egress";
+        let mut last = None;
+        for t in 0..5 {
+            let tuple = format!("tuple-{t}");
+            for i in 0..22 {
+                if let Some(d) = b.note_alert(rule, &tuple, NOW + t * 100 + i) {
+                    last = Some(d);
+                }
+            }
+        }
+        let d = last.expect("the fifth distinct noisy pattern demotes the rule");
+        assert_eq!(d.rule, rule);
+        assert_eq!(d.tuple, "", "a rule-wide demotion is not scoped to a tuple");
         assert!(b.is_demoted(rule));
         assert_eq!(b.demoted_rules(), vec![rule]);
-        // No second alert about the same demotion.
-        assert!(b.note_alert(rule, NOW + 22).is_none());
+        // And now every shape of it is quiet, including unseen ones.
+        assert!(b.is_demoted_tuple(rule, "never-seen"));
     }
 
     #[test]
@@ -883,24 +1228,24 @@ mod tests {
         let mut b = baseline(dir.path(), NOW);
         let rule = "moat-x-pkg-egress";
         for i in 0..25 {
-            b.note_alert(rule, NOW + i);
+            b.note_alert(rule, "t1", NOW + i);
         }
-        assert!(b.is_demoted(rule));
+        assert!(b.is_demoted_tuple(rule, "t1"));
         // Still noisy: nothing clears.
         assert!(b.clear_stale_demotions(NOW + 100).is_empty());
         // A day later with the window aged out.
         assert_eq!(b.clear_stale_demotions(NOW + DAY + 3_600), vec![rule]);
-        assert!(!b.is_demoted(rule));
+        assert!(!b.is_demoted_tuple(rule, "t1"));
 
         // "keep watching" clears it immediately and resets the window.
         for i in 0..25 {
-            b.note_alert(rule, NOW + 2 * DAY + i);
+            b.note_alert(rule, "t1", NOW + 2 * DAY + i);
         }
-        assert!(b.is_demoted(rule));
+        assert!(b.is_demoted_tuple(rule, "t1"));
         assert!(b.undemote(rule));
-        assert!(!b.is_demoted(rule));
+        assert!(!b.is_demoted_tuple(rule, "t1"));
         assert!(!b.undemote(rule), "already cleared");
-        assert!(b.note_alert(rule, NOW + 2 * DAY + 100).is_none(), "the window restarted");
+        assert!(b.note_alert(rule, "t1", NOW + 2 * DAY + 100).is_none(), "the window restarted");
     }
 
     #[test]
@@ -916,6 +1261,7 @@ mod tests {
                 parent: "/usr/bin/Hyprland",
                 dir: "/home/dan/.config/hypr",
                 severity: "low",
+                severity_base: "low",
                 provenance: "official",
                 package: None,
                 context: "service",
@@ -1005,6 +1351,7 @@ mod tests {
                     parent: "",
                     dir: "",
                     severity: "low",
+                    severity_base: "low",
                     provenance: "official",
                     package: None,
                     context: "service",

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# omarchy-moat shim: runs the real pip3 under moat-sandbox.
+# omarchy-moat shim for pip3. Identical to the pip shim; see it for the
+# reasoning about which subcommands are scanned.
+#
 # Installed as /usr/lib/moat/shims/pip3; active only while
 # /etc/moat/sandbox.enabled exists (see /etc/profile.d/moat-shims.sh).
 set -euo pipefail
@@ -8,4 +10,17 @@ _shim_dir=${SHIM_SELF%/*}
 [[ $_shim_dir == "$SHIM_SELF" ]] && _shim_dir=/usr/lib/moat/shims
 # shellcheck source-path=SCRIPTDIR source=shim-common.sh
 . "$_shim_dir/shim-common.sh"
+
+pip_installs() {
+	case $1 in
+	install | wheel | download) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+subcmd=$(shim_subcmd "$@")
+if [[ -n $subcmd ]] && pip_installs "$subcmd"; then
+	shim_scan_python_tree pip3
+fi
+
 shim_exec pip3 "$@"

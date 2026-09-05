@@ -1,0 +1,5 @@
+# ordinary pinned requirements
+--index-url https://pypi.org/simple
+requests==2.31.0
+click==8.1.7
+urllib3==2.2.1  # not a network call, just a name

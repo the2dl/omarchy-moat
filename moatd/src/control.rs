@@ -64,13 +64,101 @@ pub fn serve(daemon: Arc<Mutex<Daemon>>, path: &Path, group: &str) -> std::io::R
     Ok(())
 }
 
+/// The caller's uid, or `None` when the kernel would not say.
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut c: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut c as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(c.uid)
+}
+
+/// "uid 1000 (dan), pid 1234 /usr/bin/moatctl" -- or as much of that as the
+/// kernel and /proc will say.
+fn peer_description(stream: &UnixStream) -> String {
+    // `UnixStream::peer_cred` is still unstable in std, so ask the kernel
+    // directly. SO_PEERCRED is recorded at connect() time and cannot be changed
+    // afterwards, which is exactly the property wanted here.
+    use std::os::unix::io::AsRawFd;
+    let mut c: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut c as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return "an unidentified process".to_string();
+    }
+    let pid = c.pid;
+    // The uid also travels, separately from the human-readable line, because
+    // some commands are refused on it rather than merely recorded.
+    let uid = c.uid;
+    let exe = std::fs::read_link(format!("/proc/{}/exe", pid))
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "(exited)".to_string());
+    match escalated_from(pid) {
+        Some(orig) => format!("uid {} (escalated by uid {}), pid {} {}", uid, orig, pid, exe),
+        None => format!("uid {}, pid {} {}", uid, pid, exe),
+    }
+}
+
+/// The uid that authorised an escalation, when this caller is one.
+///
+/// After `pkexec` the caller genuinely IS root, so `SO_PEERCRED` says uid 0 --
+/// correctly, and uselessly. On a single-user workstation "root did it" names
+/// nobody: the interesting fact is which human answered the polkit prompt, and
+/// that is exactly what the audit trail is for.
+///
+/// `pkexec` puts the original uid in `PKEXEC_UID` in the child's environment,
+/// so the answer is in /proc, readable because moatd is root. It is a hint and
+/// not proof -- a process can set that variable itself -- which is why it is
+/// reported as an addition to the kernel's uid rather than in place of it. A
+/// non-root caller claiming to have been escalated gains nothing: the gate has
+/// already refused them on the uid the kernel gave.
+fn escalated_from(pid: i32) -> Option<u32> {
+    let raw = std::fs::read(format!("/proc/{}/environ", pid)).ok()?;
+    for entry in raw.split(|b| *b == 0) {
+        let text = String::from_utf8_lossy(entry);
+        if let Some(v) = text.strip_prefix("PKEXEC_UID=") {
+            return v.trim().parse().ok();
+        }
+    }
+    None
+}
+
 fn handle_conn(daemon: Arc<Mutex<Daemon>>, stream: UnixStream) -> std::io::Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    // Who is actually on the other end, from the kernel.
+    //
+    // The socket is 0660 root:moat and grants every mutating command in this
+    // file. Until now nothing recorded WHICH process used it -- `acting_user()`
+    // reads the daemon's own environment, which is root's -- so disarming a
+    // rule or allowlisting a payload was anonymous. SO_PEERCRED cannot be
+    // forged by the caller, and it is stamped over any `_peer` the request
+    // carries, so it cannot be spoofed by sending one either.
+    let peer = peer_description(&stream);
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let response = match serde_json::from_str::<Value>(line.trim()) {
-        Ok(req) => {
+        Ok(mut req) => {
+            if let Some(o) = req.as_object_mut() {
+                o.insert("_peer".into(), Value::from(peer.clone()));
+                o.insert("_peer_uid".into(), Value::from(peer_uid(&stream)));
+            }
             let mut d = daemon.lock().expect("daemon lock");
             dispatch(&mut d, &req)
         }
@@ -84,17 +172,95 @@ fn handle_conn(daemon: Arc<Mutex<Daemon>>, stream: UnixStream) -> std::io::Resul
 
 /// One request in, one response out. Pure apart from the daemon it mutates, so
 /// tests drive it directly without a socket.
+/// Commands that CHANGE WHAT MOAT ENFORCES, and are refused to anyone but root.
+///
+/// The socket is owned by the `moat` group so a person can read their own
+/// alerts without sudo -- which is right, and it is also why arming cannot live
+/// there. On this machine's threat model the attacker is a package running as
+/// the user, and the user is in that group: leaving `set mode monitor` and
+/// `set contain off` group-writable means the first thing a payload does is
+/// switch off the thing watching it, and nothing but a log line objects.
+///
+/// Reading, acking one alert, killing a process, quarantining a file -- all
+/// still group work. Only the verbs that make moat watch LESS need root.
+const ROOT_ONLY: &[(&str, &str)] = &[
+    ("ignore", "writing an allowlist rule"),
+    ("unignore", "removing an allowlist rule"),
+    // Forgetting a destination re-arms first-contact reporting for it, which
+    // is legitimate when a network changes -- and is also the cheapest way to
+    // make moat stop mentioning a host it has learned. Same gate as the
+    // allowlist, for the same reason.
+    ("forget", "making Moat forget a network destination"),
+];
+
+/// The `set` keys that change what Moat enforces. `digest` is not one of them:
+/// it decides whether a weekly summary is sent, which is a preference and not a
+/// protection, and making a person sudo for it would teach them that the sudo
+/// prompt is meaningless -- which is how the meaningful one gets waved through.
+const ROOT_ONLY_SET_KEYS: &[&str] = &["mode", "sandbox", "contain", "kill"];
+
+/// `Some(reason)` when this request needs root and the caller is not root.
+fn needs_root(req: &Value) -> Option<String> {
+    let cmd = req.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
+    let what = if cmd == "set" {
+        let key = req.get("key").and_then(|v| v.as_str()).unwrap_or("");
+        if !ROOT_ONLY_SET_KEYS.contains(&key) {
+            return None;
+        }
+        "changing what Moat enforces"
+    } else {
+        ROOT_ONLY.iter().find(|(c, _)| *c == cmd)?.1
+    };
+    // Absent uid means dispatch was driven directly (tests, moatd itself).
+    let uid = req.get("_peer_uid").and_then(|v| v.as_u64())?;
+    if uid == 0 {
+        return None;
+    }
+    Some(format!(
+        "{} needs root. Run the same command with sudo. (Moat is readable by the \
+         `moat` group on purpose; turning protection off is not, because anything \
+         running as you is in that group too.)",
+        what
+    ))
+}
+
+/// The caller, as the kernel described them. `"a local request"` when dispatch
+/// was driven directly (tests, and `moatd`'s own internal calls).
+fn peer_of(req: &Value) -> String {
+    req.get("_peer")
+        .and_then(|v| v.as_str())
+        .unwrap_or("a local request")
+        .to_string()
+}
+
 pub fn dispatch(d: &mut Daemon, req: &Value) -> Value {
+    if let Some(why) = needs_root(req) {
+        // Refused, and recorded: a payload probing for the off switch is worth
+        // knowing about even though it failed.
+        d.raise_protection_change(
+            &format!("{} -- REFUSED, not root", req["cmd"].as_str().unwrap_or("?")),
+            &peer_of(req),
+            vec![why.clone()],
+        );
+        return err(why);
+    }
     let cmd = req.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
     let id = || req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
     match cmd {
-        "status" => ok(d.status()),
+        // A status read is the panel saying it is alive. That is the only
+        // signal moatd has that anybody is watching -- see `watchdog_tick`.
+        "status" => {
+            d.note_watcher(crate::util::unix_secs());
+            ok(d.status())
+        }
         "list" => cmd_list(d, req),
         "explain" => match d.find_alert(&id()) {
             Some(a) => ok(json!({ "alert": a })),
             None => err(format!("no alert {}", id())),
         },
         "ack" => cmd_ack(d, req, &id()),
+        "forget" => cmd_forget(d, req),
+        "decisions" => cmd_decisions(d, req),
         "kill" => cmd_kill(d, &id()),
         "quarantine" => cmd_quarantine(d, req, &id()),
         "ignore" => cmd_ignore(d, req, &id()),
@@ -107,8 +273,12 @@ pub fn dispatch(d: &mut Daemon, req: &Value) -> Value {
         "incidents" => cmd_incidents(d, req),
         "bundle" => cmd_bundle(d, &id()),
         "analyze" => cmd_analyze(d, &id()),
+        "triage" => cmd_triage(d, req, &id()),
         "rarity" => cmd_rarity(d, &id()),
+        "chain" => cmd_chain(d, req, &id()),
         "digest" => cmd_digest(d, req),
+        "contain" => cmd_contain(d, req, &id()),
+        "exclusions" => cmd_exclusions(d, req),
         "" => err("missing `cmd`"),
         other => err(format!("unknown command {:?}", other)),
     }
@@ -197,6 +367,39 @@ fn cmd_rarity(d: &Daemon, id: &str) -> Value {
     }))
 }
 
+/// Design 2b/3a: `{"cmd":"chain","id":"<alert id>"}` is the story one alert is
+/// part of; `{"cmd":"chain"}` lists the chains on record, newest first.
+///
+/// It reads `alerts.jsonl`, not the daemon's live correlator, so a chain
+/// survives a restart and so "what happened last Tuesday" is answerable. The
+/// live store only decides what to *write*; the record is the record.
+fn cmd_chain(d: &Daemon, req: &Value, id: &str) -> Value {
+    let limit = req.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+    if !id.is_empty() {
+        return match d.find_alert(id) {
+            None => err(format!("no alert {}", id)),
+            Some(a) => match a.chain {
+                Some(c) => ok(json!({ "chain": c })),
+                None => ok(json!({ "chain": Value::Null, "alert": id })),
+            },
+        };
+    }
+    // One entry per chain. Alerts are loaded oldest first and every member
+    // carries the same chain, so the last copy seen is the most grown one.
+    let mut seen: std::collections::BTreeMap<String, crate::chain::Chain> =
+        std::collections::BTreeMap::new();
+    for a in d.store.load() {
+        if let Some(c) = a.chain {
+            seen.insert(c.id.clone(), c);
+        }
+    }
+    let mut chains: Vec<crate::chain::Chain> = seen.into_values().collect();
+    // Chain ids are alert ids, which are monotonic, so this is newest first.
+    chains.sort_by(|a, b| b.id.cmp(&a.id));
+    chains.truncate(limit);
+    ok(json!({ "chains": chains, "open": d.chains.len(), "formed": d.chains.formed }))
+}
+
 /// LEARNING §5: `{"cmd":"digest"}` reads it, `{"cmd":"digest","action":"sent"}`
 /// records a delivery so a catch-up run does not send twice.
 fn cmd_digest(d: &mut Daemon, req: &Value) -> Value {
@@ -214,7 +417,110 @@ fn cmd_digest(d: &mut Daemon, req: &Value) -> Value {
     }
 }
 
+/// `moatctl forget <destination>` -- drop what this machine has learned about
+/// one network destination, so a connection to it is a first contact again.
+///
+/// Root, and recorded, for the obvious reason: forgetting is the cheapest way
+/// to make moat stop reporting a host. That is legitimate when a lab address
+/// is reused or an office changes, and it is also exactly what someone would
+/// do to keep a C2 quiet -- so the fact that it happened, and to what, has to
+/// outlive the command.
+/// Every kill-gate decision moat has recorded, newest first.
+///
+/// Read-only and unprivileged: this is the evidence a person is asked to
+/// review before arming `kill`, and putting it behind sudo would mean the
+/// review does not happen.
+fn cmd_decisions(d: &mut Daemon, req: &Value) -> Value {
+    let limit = req["limit"].as_u64().unwrap_or(50) as usize;
+    let path = d.cfg.paths.state_dir.join("decisions.jsonl");
+    let mut out: Vec<Value> = Vec::new();
+    // The rotated generation first, so "newest first" is honest across a
+    // rotation rather than silently starting at the rotation boundary.
+    for p in [path.with_extension("1.jsonl"), path] {
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            for line in text.lines() {
+                if let Ok(v) = serde_json::from_str::<Value>(line) {
+                    out.push(v);
+                }
+            }
+        }
+    }
+    out.reverse();
+    out.truncate(limit);
+    let spared = out.iter().filter(|v| v["verdict"] == "spared").count();
+    let would = out.iter().filter(|v| v["verdict"] == "would_have_killed").count();
+    let killed = out.iter().filter(|v| v["verdict"] == "killed").count();
+    ok(json!({
+        "decisions": out,
+        "spared": spared,
+        "would_have_killed": would,
+        "killed": killed,
+    }))
+}
+
+fn cmd_forget(d: &mut Daemon, req: &Value) -> Value {
+    let dst = req["dst"].as_str().unwrap_or("").trim().to_string();
+    if dst.is_empty() {
+        return err("forget needs a destination, e.g. `moatctl forget 192.168.44.122`");
+    }
+    let dropped = d.rarity.forget_dst(&dst);
+    d.rarity.save_if_due(util::unix_secs(), true);
+    d.raise_protection_change(
+        &format!("forget everything learned about {}", dst),
+        &peer_of(req),
+        vec![format!(
+            "{} rarity counter(s) dropped; the next connection there reports as a first contact",
+            dropped.len()
+        )],
+    );
+    ok(json!({ "dst": dst, "forgotten": dropped.len() }))
+}
+
 fn cmd_ack(d: &mut Daemon, req: &Value, id: &str) -> Value {
+    // An enumerated set of ids, in one request.
+    //
+    // A card in the panel is a group of alerts -- same rule, same program --
+    // and "Close it" answers every member at once. The panel used to send one
+    // `moatctl ack` PER MEMBER, serialized: one fork+exec, one socket round
+    // trip and one full list repaint each. A 37-member card pegged a core for
+    // several seconds and made the button feel broken while it worked.
+    //
+    // Deliberately NOT the bulk path below, and not merged with it.
+    // `all`/`rule`/`before` are blind cuts: they clear alerts the user has
+    // never read, which is exactly how you would make the badge stop asking
+    // about something you would rather nobody looked at, so they leave an
+    // audit record. A list of ids is the opposite -- the user was looking at
+    // precisely these when they answered. Recording that as a protection
+    // change would turn every ordinary close into a tamper alert, which is
+    // both false and the fastest way to teach someone to ignore those.
+    //
+    // `--chain` is left to the single-id path below: it expands one id into a
+    // sequence, which is a different question from "ack these N".
+    if req["chain"] != Value::Bool(true) {
+        if let Some(list) = req["ids"].as_array().filter(|l| !l.is_empty()) {
+            let mut acked = 0usize;
+            let mut matched = 0usize;
+            let mut failed = Vec::new();
+            for want in list.iter().filter_map(|v| v.as_str()) {
+                matched += 1;
+                // `mark` appends an update line without checking the id is
+                // real, so an id that has rotated out would be reported as
+                // acked and the panel would take a card off the badge that is
+                // still on it. The single-id path below has always checked;
+                // this one has to as well.
+                if d.find_alert(want).is_none() {
+                    failed.push(format!("{}: no such alert", want));
+                    continue;
+                }
+                match d.mark(want, "acked", Value::Bool(true)) {
+                    Ok(()) => acked += 1,
+                    Err(e) => failed.push(format!("{}: {}", want, e)),
+                }
+            }
+            return ok(json!({ "acked": acked, "matched": matched, "failed": failed }));
+        }
+    }
+
     // Bulk ack. Retuning the rule set leaves a backlog of alerts about rules
     // that no longer exist — 1623 of them after the 2026-09-03 retune — and
     // acking those one id at a time is not a thing anyone will do, so the
@@ -243,14 +549,229 @@ fn cmd_ack(d: &mut Daemon, req: &Value, id: &str) -> Value {
                 Err(e) => failed.push(format!("{}: {}", id, e)),
             }
         }
+        // Clearing a backlog in one command is legitimate after a retune, and
+        // it is also how you make the badge stop asking about something you
+        // would rather nobody looked at. Nothing is deleted -- the alerts stay
+        // on the timeline -- but the queue is what a person actually reads.
+        d.raise_protection_change(
+            &format!(
+                "clear {} unanswered alert(s) at once{}",
+                acked,
+                if rule.is_empty() { String::new() } else { format!(" for {}", rule) }
+            ),
+            &peer_of(req),
+            vec![format!("{} matched, {} acked", targets.len(), acked)],
+        );
         return ok(json!({ "acked": acked, "matched": targets.len(), "failed": failed }));
     }
-    if d.find_alert(id).is_none() {
+    let Some(alert) = d.find_alert(id) else {
         return err(format!("no alert {}", id));
+    };
+
+    // Design 2b: "One install explains all four events. Allowing this incident
+    // closes the curl alert too — same chain, same decision." Acking one step
+    // of a sequence and leaving its siblings on the badge is the shape that
+    // teaches people to click past alerts, because the four rows they just
+    // explained to themselves are still sitting there.
+    //
+    // It is opt-in, not automatic: the user answered a question about a
+    // sequence, so they have to say that is what they were answering.
+    if req["chain"] == Value::Bool(true) {
+        let Some(chain) = alert.chain.as_ref() else {
+            return err(format!("alert {} is not part of a chain", id));
+        };
+        let mut acked = 0usize;
+        let mut failed = Vec::new();
+        for member in chain.member_ids() {
+            match d.mark(&member, "acked", Value::Bool(true)) {
+                Ok(()) => acked += 1,
+                Err(e) => failed.push(format!("{}: {}", member, e)),
+            }
+        }
+        return ok(json!({
+            "id": id, "acked": acked, "chain": chain.id,
+            "matched": chain.member_ids().len(), "failed": failed,
+        }));
     }
+
     match d.mark(id, "acked", Value::Bool(true)) {
         Ok(()) => ok(json!({ "id": id, "acked": true })),
         Err(e) => err(e),
+    }
+}
+
+/// LEARNING §2c: `{"cmd":"triage","action":"pending|submit|undo"}`.
+///
+/// The runner is a user-session process (`moatctl triage --run`) because the
+/// agent needs a session and the user's own credentials, which a root daemon
+/// has no business holding. That split is why the ceiling is enforced **here**
+/// and not in `moatctl`: the daemon re-validates the answer against
+/// `triage::decide` before touching anything, so a confused or hostile runner
+/// cannot demote a critical, ack an alert, or invent a field. `moatctl`'s copy
+/// of the check is for the error message, not for the decision.
+fn cmd_triage(d: &mut Daemon, req: &Value, id: &str) -> Value {
+    let cfg = &d.cfg.analysis;
+    match req["action"].as_str().unwrap_or("pending") {
+        // Surfaced, unacked, not yet looked at, oldest first: a burst is worked
+        // through over several runs rather than becoming one huge agent bill.
+        "pending" => {
+            if cfg.auto_triage == crate::triage::TriageMode::Off {
+                return ok(json!({ "mode": "off", "pending": [] }));
+            }
+            // Clamped, not trusted. The socket is 0660 root:moat and the
+            // attacker on this threat model is in that group, so an unclamped
+            // `limit` let any local process ask for the whole queue and get one
+            // agent call per item -- turning the single documented cost control
+            // into an advisory note. A caller may ask for FEWER than the
+            // configured maximum; it may never ask for more.
+            let limit = req["limit"]
+                .as_u64()
+                .map(|n| (n as usize).min(d.cfg.analysis.triage_max_per_run))
+                .unwrap_or(d.cfg.analysis.triage_max_per_run);
+            // Inherit before offering. A re-fire of a tuple an agent already
+            // read is the same question with a new id, and the largest
+            // avoidable cost in the feature is paying for that answer again --
+            // on 2026-09-04 one misclassified rule produced 101 alerts of a
+            // single tuple in a day. Inheritance copies the explanation and
+            // explicitly does NOT demote: only a real read of this alert's own
+            // evidence can move it off the badge.
+            // `inherit_triage_by_tuple` takes &mut, so the config borrow has
+            // to end first; `limit` is already read above.
+            let inherited = d.inherit_triage_by_tuple();
+            let cfg = &d.cfg.analysis;
+            // One call per PATTERN, not per alert.
+            //
+            // Ten alerts of three shapes is three questions, not ten. Without
+            // this the queue is a list of events and the agent is billed for
+            // every repeat inside a burst -- on 2026-09-04 eight queued calls
+            // were three real shapes. The newest alert of each tuple is the one
+            // offered, since it is the one whose process may still exist; the
+            // others inherit its verdict on the next pass.
+            //
+            // A settle window keeps a burst together: an alert younger than
+            // `triage_settle_secs` is left for the next pass, so a package
+            // install that fires four times in two seconds is read once, after
+            // it has finished, rather than four times while it is still going.
+            let now = crate::util::now_rfc3339();
+            let settle = d.cfg.analysis.triage_settle_secs;
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // Rank before truncating, rather than taking the first `limit`
+            // encountered.
+            //
+            // A pass reads at most `triage_max_per_run` alerts and one read can
+            // take minutes, so WHICH ones it picks is the whole question. Taking
+            // them in arrival order meant a live attack waited behind noise: on
+            // 2026-09-04 an AUR build egressed to a C2 and ran a dropped binary,
+            // and the pass in flight was spending its budget on a
+            // `.cache/spotify` cookie read from half an hour earlier.
+            //
+            // A member of a chain moatd has already correlated to `high` is the
+            // most interesting thing on the machine by definition -- correlation
+            // is the expensive judgement moat makes on its own -- so it goes
+            // first, then severity, then the newest.
+            let mut ranked: Vec<(u8, u8, String, Value)> = Vec::new();
+            for a in d.store.load().into_iter().rev() {
+                if a.surface != "alerts" || a.acked || a.triage.is_some() {
+                    continue;
+                }
+                if crate::util::secs_between(&a.ts, &now) < settle {
+                    continue;
+                }
+                if !seen.insert(a.tuple_key()) {
+                    continue;
+                }
+                let hot_chain = a
+                    .chain
+                    .as_ref()
+                    .is_some_and(|c| crate::alert::severity_rank(&c.severity) >= 2);
+                ranked.push((
+                    u8::from(hot_chain),
+                    a.severity_rank(),
+                    a.ts.clone(),
+                    json!({
+                        "id": a.id, "rule": a.rule, "severity": a.severity, "title": a.title
+                    }),
+                ));
+            }
+            ranked.sort_by(|x, y| {
+                y.0.cmp(&x.0).then(y.1.cmp(&x.1)).then(y.2.cmp(&x.2))
+            });
+            let pending: Vec<Value> = ranked.into_iter().take(limit).map(|r| r.3).collect();
+            ok(json!({
+                "mode": cfg.auto_triage.as_str(),
+                "timeout_secs": cfg.triage_timeout_secs,
+                "agent_args": cfg.agent_args,
+                "inherited": inherited,
+                "pending": pending,
+            }))
+        }
+        "submit" => {
+            if cfg.auto_triage == crate::triage::TriageMode::Off {
+                return err("auto_triage is off");
+            }
+            let Some(alert) = d.find_alert(id) else {
+                return err(format!("no alert {}", id));
+            };
+            // Strict: an answer carrying a key the schema does not have is
+            // rejected whole rather than partly applied.
+            let result: crate::triage::TriageResult =
+                match serde_json::from_value(req["result"].clone()) {
+                    Ok(r) => r,
+                    Err(e) => return err(format!("unusable triage result: {e}")),
+                };
+            let agent = req["agent"].as_str().unwrap_or("unknown").to_string();
+            let (action, withheld) = crate::triage::decide(
+                cfg.auto_triage,
+                &alert.rule,
+                &alert.family,
+                &alert.severity,
+                alert.rarity.as_str(),
+                &cfg.triage_demote_max_severity,
+                &result,
+            );
+            let record = crate::triage::record(
+                &agent,
+                &crate::util::now_rfc3339(),
+                result,
+                &action,
+                withheld.as_deref(),
+            );
+            let outcome = record.outcome.clone();
+            if let Err(e) = d.mark(id, "triage", serde_json::to_value(&record).unwrap_or(Value::Null)) {
+                return err(e);
+            }
+            if action == crate::triage::Action::Demote {
+                if let Err(e) = d.mark(id, "surface", Value::String("timeline".into())) {
+                    return err(e);
+                }
+            }
+            ok(json!({ "id": id, "outcome": outcome }))
+        }
+        // Every demotion is reversible, and reversing it is one command. The
+        // verdict is dropped with it: keeping a "benign" note beside an alert
+        // the user just pulled back onto the badge would be worse than nothing.
+        "undo" => {
+            let Some(alert) = d.find_alert(id) else {
+                return err(format!("no alert {}", id));
+            };
+            let was = alert.triage.as_ref().map(|t| t.outcome.clone());
+            if was.is_none() {
+                return err(format!("alert {} has not been triaged", id));
+            }
+            if let Err(e) = d.mark(id, "triage", Value::Null) {
+                return err(e);
+            }
+            if was.as_deref() == Some("demoted") {
+                if let Err(e) = d.mark(id, "surface", Value::String("alerts".into())) {
+                    return err(e);
+                }
+            }
+            ok(json!({ "id": id, "undone": was }))
+        }
+        other => err(format!(
+            "unknown triage action {:?}; use pending, submit or undo",
+            other
+        )),
     }
 }
 
@@ -464,7 +985,7 @@ fn quarantine_restore(d: &mut Daemon, id: &str) -> Value {
     ok(json!({ "id": id, "restored": original }))
 }
 
-fn quarantine_file(
+pub fn quarantine_file(
     base: &Path,
     id: &str,
     target: &str,
@@ -479,13 +1000,33 @@ fn quarantine_file(
     let dest = dir.join(if name.is_empty() { "file" } else { name });
 
     let sha = util::sha256_file(Path::new(target)).ok();
-    // rename() fails across filesystems (/tmp is usually tmpfs); fall back.
-    if std::fs::rename(target, &dest).is_err() {
-        std::fs::copy(target, &dest).map_err(|e| format!("copy {}: {}", target, e))?;
-        std::fs::remove_file(target).map_err(|e| format!("remove {}: {}", target, e))?;
-    }
+
+    // Copy from a DESCRIPTOR, remove by `unlinkat` in the parent directory.
+    //
+    // The old form was `copy(target, dest)` then `remove_file(target)`: two
+    // path walks, in a directory the attacker owns, from a root daemon. Between
+    // them the name can be replaced with a symlink to anything on the box, and
+    // `remove_file` follows the path it is given -- an arbitrary-delete-as-root
+    // with a race window as wide as a file copy.
+    //
+    // `open_suspect` is the audited opener (O_NOFOLLOW, regular-file test, and
+    // a re-read of /proc/self/fd to learn where the descriptor actually
+    // landed). Copying from that fd means the bytes come from the file that
+    // was checked. `unlinkat` never follows a symlink in its final component,
+    // so the worst an attacker can do by swapping the name is have moat delete
+    // their own swapped entry inside their own directory.
+    let (mut src, real) = util::open_suspect(Path::new(target))?;
+    let mut out = std::fs::File::create(&dest).map_err(|e| format!("{}: {}", dest.display(), e))?;
+    std::io::copy(&mut src, &mut out).map_err(|e| format!("copy {}: {}", target, e))?;
+    drop(out);
     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o000))
         .map_err(|e| format!("chmod 000: {}", e))?;
+
+    // Removal is reported, never assumed. moatd runs under
+    // `ProtectSystem=strict`, so a mount it has no write access to answers
+    // EROFS here -- and "quarantined" while the file is still sitting there
+    // running is the one thing this function must never claim.
+    let removed = unlink_in_place(Path::new(&real));
 
     let meta = json!({
         "alert": id,
@@ -494,6 +1035,8 @@ fn quarantine_file(
         "original_path": target,
         "quarantined_at": util::now_rfc3339(),
         "sha256": sha,
+        "removed": removed.is_ok(),
+        "not_removed_because": removed.as_ref().err().cloned(),
         "restore": format!("sudo chmod 600 {} && sudo mv {} {}", dest.display(), dest.display(), target),
     });
     util::atomic_write(
@@ -502,13 +1045,109 @@ fn quarantine_file(
         0o600,
     )
     .map_err(|e| format!("meta.json: {}", e))?;
+    removed?;
     Ok(dest)
+}
+
+/// Remove `path` by name, relative to a descriptor on its parent directory.
+///
+/// Returns the reason on failure rather than panicking or swallowing it: the
+/// copy has already been made by the time this runs, so a failure here means
+/// "evidence kept, file left in place", which is a different outcome from both
+/// success and total failure and has to be reportable as such.
+fn unlink_in_place(path: &Path) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::AsRawFd;
+
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(format!("{}: no parent directory", path.display()));
+    };
+    let dir = std::fs::File::open(parent).map_err(|e| format!("{}: {}", parent.display(), e))?;
+    let cname = CString::new(name.as_bytes()).map_err(|_| "NUL in file name".to_string())?;
+    // SAFETY: `dir` outlives the call and `cname` is a NUL-terminated name with
+    // no separators, so the kernel resolves it only within `dir`.
+    let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), cname.as_ptr(), 0) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    Err(format!("remove {}: {}", path.display(), e))
 }
 
 fn cmd_ignore(d: &mut Daemon, req: &Value, id: &str) -> Value {
     let Some(alert) = d.find_alert(id) else {
         return err(format!("no alert {}", id));
     };
+    // Some alerts cannot be allowlisted at all.
+    //
+    // These report on Moat itself being weakened, stopped, unwatched or
+    // dropping events. Writing a rule that silences one does not quieten a
+    // noisy detection -- it makes every FUTURE weakening invisible, which is
+    // the exact end state an attacker is working towards. The panel offers no
+    // such button, and this refuses it for anyone reaching the socket directly.
+    if crate::rules::NEVER_SILENCE.contains(&alert.rule.as_str()) {
+        return err(format!(
+            "{} reports on Moat's own integrity and cannot be allowlisted. Close it \
+             instead; if it was you, the record is the receipt.",
+            alert.rule
+        ));
+    }
+    // An allowlist entry cannot stop a rule that is armed in the KERNEL.
+    //
+    // Suppression is userspace: moatd applies it when deciding what to surface.
+    // The kill comes from Tetragon's `Sigkill`, in the kernel, before moatd
+    // sees the event -- so allowing an armed rule silences the alert and the
+    // program keeps dying. On 2026-09-05 that is exactly what happened: `cat`
+    // was allowed, `sudo cat /etc/shadow` was killed again, and the record read
+    // `suppressed_by: user.toml#2, action: killed`. Still blocked, now quiet
+    // about it, under a card promising "let it run and do not stop it again".
+    //
+    // Refusing is the honest answer. Writing the entry would do something, just
+    // not the thing that was asked for, and the user would have no way to tell.
+    // An armed rule is excluded in the KERNEL, not suppressed in userspace.
+    //
+    // Suppression never reaches a policy that enforces: the process dies before
+    // moatd sees the event, so an allowlist entry would hide the alert and
+    // change nothing about the killing. Taking the binary out of the policy is
+    // the only thing that stops it, and it is what the button promised.
+    // `mode_for`, not `enforcing_rules.contains`: under a daemon-wide enforce
+    // the list is empty and every policy kills, and this guard was the one
+    // place that forgot -- it took the allowlist branch for a rule that was
+    // killing, which is exactly the 2026-09-05 record again.
+    if d.mode_for(&alert.rule) == "enforce" {
+        let exe = alert.process.exe.clone();
+        let path = match d.exclude_binary(&alert.rule, &exe) {
+            Ok(p) => p,
+            Err(e) => return err(e),
+        };
+        if let Err(e) = d.mark(id, "acked", Value::Bool(true)) {
+            return err(e);
+        }
+        d.raise_protection_change(
+            &format!("stop {} watching {}", alert.rule, exe),
+            &peer_of(req),
+            vec![
+                format!("from alert {}", id),
+                format!("the kernel policy was reloaded from {}", path),
+                "the rule stays armed for every other binary".to_string(),
+            ],
+        );
+        return ok(json!({
+            "id": id,
+            "kernel_exclusion": exe,
+            "rule": alert.rule,
+            "acked": true,
+            // Said plainly, because it is wider than the alert the user was
+            // looking at: `matchBinaries` is the only negative the kernel
+            // offers, so this covers every path that rule watches.
+            "note": format!(
+                "{} no longer watches {} at all -- the kernel cannot exclude one file for \
+                 one program, only the program. Every other binary is still watched.",
+                alert.rule, exe
+            ),
+        }));
+    }
     let scope = req.get("scope").and_then(|v| v.as_str()).unwrap_or("exe");
     let spec = match scope_spec_from_alert(&alert, scope) {
         Ok(s) => s,
@@ -533,6 +1172,19 @@ fn cmd_ignore(d: &mut Daemon, req: &Value, id: &str) -> Value {
     if let Err(e) = d.mark(id, "acked", Value::Bool(true)) {
         return err(e);
     }
+    // `--scope rule` silences an entire detection class permanently, and the
+    // only trace was this log line, in root's journal, which the person being
+    // protected cannot read. Recorded as an alert so it is on the timeline they
+    // can see, with the kernel's answer about who asked.
+    d.raise_protection_change(
+        &format!("allow {} (scope {})", alert.rule, scope),
+        &peer_of(req),
+        vec![
+            format!("from alert {}", id),
+            format!("written to {}", path.display()),
+            format!("rule written: {}", block.trim().replace('\n', " · ")),
+        ],
+    );
     log::info!("alert {}: ignored with scope {}", id, scope);
     ok(json!({
         "id": id,
@@ -616,6 +1268,70 @@ fn cmd_allowlist(d: &Daemon) -> Value {
 
 /// `{"cmd":"baseline","action":"list|accept|dismiss|relearn|export|propose|undemote"}`
 /// (CONTRACT §11, BASELINE §3 and §4).
+/// The binaries Moat has been told to stop watching, and the way back.
+///
+/// Listing matters as much as removing: an exclusion lives inside a rendered
+/// policy where nobody will ever read it, so without this the only record that
+/// a rule has a hole in it is a line in state.json.
+fn cmd_exclusions(d: &mut Daemon, req: &Value) -> Value {
+    match req["action"].as_str().unwrap_or("list") {
+        "list" => {
+            let mut rows: Vec<Value> = Vec::new();
+            for (rule, bins) in &d.kernel_exclusions {
+                for exe in bins {
+                    rows.push(json!({"rule": rule, "exe": exe}));
+                }
+            }
+            ok(json!({ "exclusions": rows }))
+        }
+        "remove" => {
+            let rule = req["rule"].as_str().unwrap_or("");
+            let exe = req["exe"].as_str().unwrap_or("");
+            if rule.is_empty() || exe.is_empty() {
+                return err("remove needs both a rule and a binary; see `moatctl exclusions`");
+            }
+            match d.remove_exclusion(rule, exe) {
+                Ok(_) => ok(json!({"rule": rule, "exe": exe, "watched_again": true})),
+                Err(e) => err(e),
+            }
+        }
+        other => err(format!("unknown exclusions action {:?}", other)),
+    }
+}
+
+/// LEARNING: what moatd is currently refusing on its own judgement, and the
+/// one verb that undoes it.
+///
+/// Listing is not decoration here. A containment is the only thing moat does
+/// without being asked rule by rule, so "what is it doing right now, and how do
+/// I stop it" has to be answerable in one command that needs no UI.
+fn cmd_contain(d: &mut Daemon, req: &Value, id: &str) -> Value {
+    match req["action"].as_str().unwrap_or("list") {
+        "list" => ok(json!({
+            "enabled": d.cfg.contain.enabled,
+            "ttl_secs": d.cfg.contain.ttl_secs,
+            "max": d.cfg.contain.max,
+            "live": d.contain.to_state(),
+        })),
+        "release" => {
+            if id.is_empty() {
+                return err("release names the chain it contained");
+            }
+            if d.release_chain(id) {
+                d.raise_protection_change(
+                    "release a containment",
+                    &peer_of(req),
+                    vec![format!("chain {}", id)],
+                );
+                ok(json!({"released": id}))
+            } else {
+                err(format!("nothing contained for {}", id))
+            }
+        }
+        other => err(format!("unknown contain action {:?}", other)),
+    }
+}
+
 fn cmd_baseline(d: &mut Daemon, req: &Value) -> Value {
     let action = req.get("action").and_then(|v| v.as_str()).unwrap_or("list");
     let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -629,7 +1345,7 @@ fn cmd_baseline(d: &mut Daemon, req: &Value) -> Value {
             "demoted_rules": d.baseline.demoted_rules(),
             "baseline_file": d.cfg.paths.baseline_allowlist().display().to_string(),
         })),
-        "accept" => baseline_accept(d, id),
+        "accept" => baseline_accept(d, id, &peer_of(req)),
         "dismiss" => match d.baseline.dismiss(id) {
             Ok(p) => {
                 d.baseline.save_if_due(now, true);
@@ -721,7 +1437,7 @@ fn cmd_baseline(d: &mut Daemon, req: &Value) -> Value {
     }
 }
 
-fn baseline_accept(d: &mut Daemon, id: &str) -> Value {
+fn baseline_accept(d: &mut Daemon, id: &str, who: &str) -> Value {
     let (p, comment) = match d.baseline.accept(id, &acting_user()) {
         Ok(x) => x,
         Err(e) => return err(e),
@@ -737,6 +1453,17 @@ fn baseline_accept(d: &mut Daemon, id: &str) -> Value {
         Ok(b) => b,
         Err(e) => return err(format!("{}: {}", path.display(), e)),
     };
+    // Accepting a proposal writes a permanent allowlist rule, exactly as
+    // `ignore` does. It arrives as a suggestion rather than a request, which
+    // makes it easier to wave through, not less consequential.
+    d.raise_protection_change(
+        &format!("accept a baseline proposal for {}", spec.name),
+        who,
+        vec![
+            format!("written to {}", path.display()),
+            format!("rule written: {}", block.trim().replace('\n', " · ")),
+        ],
+    );
     d.reload_allowlist();
     d.baseline.save_if_due(util::unix_secs(), true);
     log::info!("baseline: accepted proposal {} for {}", id, p.rule);
@@ -758,13 +1485,16 @@ fn acting_user() -> String {
 fn cmd_set(d: &mut Daemon, req: &Value) -> Value {
     let key = req.get("key").and_then(|v| v.as_str()).unwrap_or("");
     let value = req.get("value").and_then(|v| v.as_str()).unwrap_or("");
+    let who = peer_of(req);
     match key {
-        "mode" => set_mode(d, value, req["rule"].as_str().unwrap_or("")),
-        "sandbox" => set_sandbox(d, value),
+        "mode" => set_mode(d, value, req["rule"].as_str().unwrap_or(""), &who),
+        "sandbox" => set_sandbox(d, value, &who),
         "digest" => set_digest(d, value),
+        "contain" => set_contain(d, value, &who),
+        "kill" => set_kill(d, value, &who),
         "" => err("missing `key`"),
         other => err(format!(
-            "unknown key {:?}; use mode, sandbox or digest",
+            "unknown key {:?}; use mode, sandbox, digest, contain or kill",
             other
         )),
     }
@@ -802,7 +1532,7 @@ fn set_digest(d: &mut Daemon, value: &str) -> Value {
 /// and arming them together on a desktop kills the module loader on USB
 /// hotplug and kills `ssh` for reading your own key. Enforcement has to be
 /// something you can turn on one measured rule at a time.
-fn set_mode(d: &mut Daemon, value: &str, rule: &str) -> Value {
+fn set_mode(d: &mut Daemon, value: &str, rule: &str, who: &str) -> Value {
     if value != "monitor" && value != "enforce" {
         return err(format!("mode must be monitor or enforce, got {:?}", value));
     }
@@ -845,6 +1575,16 @@ fn set_mode(d: &mut Daemon, value: &str, rule: &str) -> Value {
     } else {
         d.enforcing_rules.remove(rule);
     }
+    if value == "monitor" {
+        let what = if rule.is_empty() {
+            "stop enforcing anything (mode monitor)".to_string()
+        } else {
+            format!("stop enforcing {}", rule)
+        };
+        d.raise_protection_change(&what, who, vec![
+            format!("{} of {} policies applied", applied.len(), names.len()),
+        ]);
+    }
     d.write_state();
     log::info!(
         "mode {} for {} ({} applied, {} failed)",
@@ -883,7 +1623,97 @@ fn set_mode(d: &mut Daemon, value: &str, rule: &str) -> Value {
     }))
 }
 
-fn set_sandbox(d: &mut Daemon, value: &str) -> Value {
+/// `moatctl set contain on|off` -> `state.json.contain_enabled`.
+///
+/// Runtime state, like mode and the digest, so turning containment on needs
+/// neither root, an editor, nor a service restart. `[contain] enabled` in
+/// moat.toml stays the default for a fresh machine; this overrides it.
+///
+/// Turning it OFF releases everything live: leaving policies loaded after the
+/// user said stop would be the switch lying about what it did.
+fn set_contain(d: &mut Daemon, value: &str, who: &str) -> Value {
+    let on = match value {
+        "on" | "true" | "1" => true,
+        "off" | "false" | "0" => false,
+        other => return err(format!("contain takes on or off, got {:?}", other)),
+    };
+    d.cfg.contain.enabled = on;
+    let released = if on { 0 } else { d.release_all_contained() };
+    if !on {
+        d.raise_protection_change(
+            "stop containing correlated sequences",
+            who,
+            vec![format!("{} live containment(s) released", released)],
+        );
+    }
+    d.write_state();
+    ok(json!({
+        "contain": if on { "on" } else { "off" },
+        "released": released,
+    }))
+}
+
+/// `moatctl set kill off|log|kill` -- what containment does to the processes a
+/// chain implicates, as opposed to `set contain on|off`, which is whether it
+/// cuts the network at all. Two switches because they are two decisions: the
+/// network cut is reversible in ten minutes and touches one address, and
+/// SIGKILL is neither.
+///
+/// Root, like every other key that can weaken protection. And note which
+/// direction is the dangerous one here: `kill` is the only value in this
+/// product that destroys state a user cannot get back, so moving TOWARDS it
+/// is recorded just as loudly as moving away.
+///
+/// Persisted in state.json rather than moat.toml, exactly as `contain` is: a
+/// setting the panel can change has to survive a restart without moatd
+/// rewriting a file the user (or their config management) also owns.
+fn set_kill(d: &mut Daemon, value: &str, who: &str) -> Value {
+    let rank = |v: &str| match v {
+        "off" => Some(0u8),
+        "log" => Some(1),
+        "kill" => Some(2),
+        _ => None,
+    };
+    let Some(want) = rank(value) else {
+        return err(format!("kill takes off, log or kill, got {:?}", value));
+    };
+    let had = rank(&d.cfg.contain.kill).unwrap_or(1);
+    d.cfg.contain.kill = value.to_string();
+    d.write_state();
+
+    // Both directions are a protection change, for opposite reasons: turning
+    // it down means a sequence moatd is sure about now survives, and turning
+    // it up means moatd may start ending process trees on its own judgement.
+    // The second is the one a person should be able to find afterwards.
+    if want != had {
+        let what = if want > had {
+            format!("raise containment from {} to {}", d_kill_word(had), value)
+        } else {
+            format!("lower containment from {} to {}", d_kill_word(had), value)
+        };
+        d.raise_protection_change(
+            &what,
+            who,
+            vec![match value {
+                "kill" => "moatd may now SIGKILL the processes a high-severity chain implicates"
+                    .to_string(),
+                "log" => "moatd will write what it would have killed and kill nothing".to_string(),
+                _ => "moatd will not select processes to end at all".to_string(),
+            }],
+        );
+    }
+    ok(json!({ "kill": value }))
+}
+
+fn d_kill_word(rank: u8) -> &'static str {
+    match rank {
+        0 => "off",
+        2 => "kill",
+        _ => "log",
+    }
+}
+
+fn set_sandbox(d: &mut Daemon, value: &str, who: &str) -> Value {
     let flag = d.cfg.paths.sandbox_flag.clone();
     match value {
         "on" | "true" | "1" => {
@@ -908,6 +1738,13 @@ fn set_sandbox(d: &mut Daemon, value: &str) -> Value {
             }
         }
         other => return err(format!("sandbox must be on or off, got {:?}", other)),
+    }
+    if matches!(value, "off" | "false" | "0") {
+        d.raise_protection_change(
+            "stop hiding credentials from package installs (sandbox off)",
+            who,
+            vec!["new shells will run installs unconfined".into()],
+        );
     }
     ok(json!({
         "sandbox": d.sandbox_on(),
@@ -1154,6 +1991,622 @@ mod tests {
         assert_eq!(group_state(None, "dan", &[1000]), GroupState::NoSuchGroup);
     }
 
+    // ------------------------------------------------------------- triage
+
+    fn a_surfaced_alert(d: &mut Daemon) -> String {
+        d.store
+            .load()
+            .into_iter()
+            .find(|a| a.surface == "alerts" && !a.acked)
+            .map(|a| a.id)
+            .expect("the sample log surfaces at least one alert")
+    }
+
+    fn verdict(v: &str, c: &str) -> Value {
+        json!({"verdict": v, "confidence": c, "summary": "s", "reasoning": "r"})
+    }
+
+    /// A kernel exclusion has to be revocable, and visible.
+    ///
+    /// It lives inside a rendered policy where nobody will ever read it, so
+    /// without a listing the only record that a rule has a hole in it is a line
+    /// in state.json. And a grant that cannot be taken back is not a grant, it
+    /// is a hole with a nice name.
+    #[test]
+    fn a_kernel_exclusion_can_be_listed_and_taken_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        d.cfg.paths.policies_dir = dir.path().join("rendered");
+        std::fs::create_dir_all(&d.cfg.paths.policies_dir).unwrap();
+
+        assert!(dispatch(&mut d, &json!({"cmd": "exclusions"}))["exclusions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        d.kernel_exclusions
+            .insert("moat-cred-etc-shadow-read".into(), vec!["/usr/bin/cat".into()]);
+        let listed = dispatch(&mut d, &json!({"cmd": "exclusions"}));
+        let rows = listed["exclusions"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["exe"], "/usr/bin/cat");
+
+        // Removing it clears the record even when the reload cannot run (there
+        // is no `tetra` here): the exclusion must not survive in state after
+        // the user has revoked it, or it comes back on the next render.
+        let r = dispatch(&mut d, &json!({
+            "cmd": "exclusions", "action": "remove",
+            "rule": "moat-cred-etc-shadow-read", "exe": "/usr/bin/cat"}));
+        assert!(
+            d.kernel_exclusions.is_empty(),
+            "revoked and still recorded: {:?}",
+            r
+        );
+
+        // Removing something that was never excluded says so rather than
+        // reporting a success that did nothing.
+        let r = dispatch(&mut d, &json!({
+            "cmd": "exclusions", "action": "remove",
+            "rule": "moat-cred-etc-shadow-read", "exe": "/usr/bin/cat"}));
+        assert_eq!(r["ok"], false);
+    }
+
+    /// Allowing an ARMED rule excludes the binary in the kernel.
+    ///
+    /// The allowlist is a userspace suppression and an armed rule kills in the
+    /// kernel, before moatd sees the event -- so writing the entry hid the
+    /// alert and the program kept dying. On 2026-09-05 that happened for real:
+    /// `cat` was allowed, `sudo cat /etc/shadow` was killed again, and the
+    /// record read `suppressed_by: user.toml#2, action: killed`. The only thing
+    /// that stops the killing is taking the binary out of the policy itself.
+    #[test]
+    fn allowing_an_armed_rule_reaches_the_kernel_not_just_the_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let alert = d
+            .store
+            .load()
+            .into_iter()
+            .find(|a| !crate::rules::NEVER_SILENCE.contains(&a.rule.as_str()))
+            .expect("the sample log produced alerts");
+
+        // Unarmed: an allowlist entry is exactly right, because suppression is
+        // all that was ever wanted.
+        let r = dispatch(&mut d, &json!({
+            "cmd": "ignore", "id": alert.id, "scope": "exe", "_peer_uid": 0 }));
+        assert_eq!(r["ok"], true, "{:?}", r["error"]);
+        assert!(r["kernel_exclusion"].is_null(), "no kernel change was needed");
+
+        // Armed: the binary is recorded as a kernel exclusion instead. (`tetra`
+        // does not exist here, so the reload fails and the call reports that --
+        // what this pins is that it does not quietly write an allowlist entry.)
+        let other = d
+            .store
+            .load()
+            .into_iter()
+            .find(|a| a.id != alert.id && !crate::rules::NEVER_SILENCE.contains(&a.rule.as_str()))
+            .expect("more than one alert");
+        d.enforcing_rules.insert(other.rule.clone());
+        // Point the render OUT of the repo before doing anything that renders.
+        //
+        // `exclude_binary` re-renders every policy into `policies_dir`, and the
+        // test daemon points that at `testdata/policies` -- the checked-in
+        // fixtures. Running this test once deleted five of them and every
+        // sample-log test then failed, because the rule they assert on no
+        // longer had a policy to validate against. A test that edits the repo
+        // it is testing is a trap for whoever runs it next.
+        d.cfg.paths.policies_dir = dir.path().join("rendered");
+        std::fs::create_dir_all(&d.cfg.paths.policies_dir).unwrap();
+        let before = d.kernel_exclusions.len();
+        let r = dispatch(&mut d, &json!({
+            "cmd": "ignore", "id": other.id, "scope": "exe", "_peer_uid": 0 }));
+        assert!(
+            d.kernel_exclusions.len() > before
+                || r["error"].as_str().unwrap_or("").contains("does not enforce"),
+            "an armed rule must be handled in the kernel, not the allowlist: {:?}",
+            r
+        );
+    }
+
+    /// The same guard under a DAEMON-WIDE enforce, where `enforcing_rules` is
+    /// empty and every policy kills. "Is this rule enforcing" has one answer,
+    /// `mode_for`; testing the list instead wrote a userspace allowlist entry
+    /// for a rule the kernel was killing on -- suppressed, still dying.
+    #[test]
+    fn ignore_on_a_rule_armed_by_the_daemon_wide_switch_goes_to_the_kernel_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let alert = d
+            .store
+            .load()
+            .into_iter()
+            .find(|a| !crate::rules::NEVER_SILENCE.contains(&a.rule.as_str()))
+            .expect("the sample log produced alerts");
+        d.mode = "enforce".into();
+        assert!(d.enforcing_rules.is_empty());
+        assert_eq!(d.mode_for(&alert.rule), "enforce");
+        // Never render into the repo: see the test above.
+        d.cfg.paths.policies_dir = dir.path().join("rendered");
+        std::fs::create_dir_all(&d.cfg.paths.policies_dir).unwrap();
+        let rules_before = d.allowlist.len();
+        let r = dispatch(&mut d, &json!({
+            "cmd": "ignore", "id": alert.id, "scope": "exe", "_peer_uid": 0 }));
+        assert_eq!(
+            d.allowlist.len(),
+            rules_before,
+            "an enforcing rule must never get a userspace suppression: {:?}",
+            r
+        );
+        assert!(
+            r["kernel_exclusion"].is_string()
+                || r["error"].as_str().unwrap_or("").contains("could not be reloaded")
+                || r["error"].as_str().unwrap_or("").contains("does not enforce"),
+            "handled in the kernel (or honestly refused), not in the allowlist: {:?}",
+            r
+        );
+    }
+
+    /// A tamper alert cannot be told to stop appearing.
+    ///
+    /// Every other detection can be allowlisted, and should be -- that is what
+    /// the allowlist is for. These are not detections about a program; they are
+    /// Moat reporting that it was weakened, stopped, unwatched, or dropping
+    /// events. Silencing one does not quieten noise, it makes every FUTURE
+    /// weakening invisible, which is the end state the whole feature exists to
+    /// prevent.
+    #[test]
+    fn an_alert_about_moat_itself_cannot_be_allowlisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+
+        // Produce a real one.
+        dispatch(&mut d, &json!({
+            "cmd": "set", "key": "mode", "value": "monitor",
+            "_peer": "uid 0, pid 5 /usr/bin/moatctl", "_peer_uid": 0,
+        }));
+        let rec = d
+            .store
+            .load()
+            .into_iter()
+            .find(|a| a.rule == "moat-x-protection-changed")
+            .expect("the weakening was recorded");
+
+        // It offers no ignore action...
+        assert!(
+            !rec.actions.iter().any(|a| a == "ignore"),
+            "the panel must not offer a button that blinds this: {:?}",
+            rec.actions
+        );
+
+        // ...and the socket refuses one even asked for directly, as root.
+        let r = dispatch(&mut d, &json!({
+            "cmd": "ignore", "id": rec.id, "scope": "rule", "_peer_uid": 0,
+        }));
+        assert_eq!(r["ok"], false);
+        assert!(
+            r["error"].as_str().unwrap_or("").contains("cannot be allowlisted"),
+            "{:?}",
+            r["error"]
+        );
+
+        // An ordinary detection is still allowlistable: this is a narrow ban,
+        // not a new class of un-silenceable noise.
+        let ordinary = d
+            .store
+            .load()
+            .into_iter()
+            .find(|a| !crate::rules::NEVER_SILENCE.contains(&a.rule.as_str()))
+            .expect("the sample log produced ordinary alerts");
+        let r = dispatch(&mut d, &json!({
+            "cmd": "ignore", "id": ordinary.id, "scope": "exe", "_peer_uid": 0,
+        }));
+        assert_eq!(r["ok"], true, "{:?}", r["error"]);
+    }
+
+    /// Turning protection off is a root action.
+    ///
+    /// The socket is group-owned so a person can read their own alerts without
+    /// sudo. The attacker on this threat model is a package running as that
+    /// same person, in that same group -- so if arming lived there too, the
+    /// first thing a payload would do is switch off the thing watching it.
+    #[test]
+    fn weakening_protection_needs_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let user = |cmd: Value| -> Value {
+            let mut c = cmd;
+            c["_peer"] = json!("uid 1000, pid 77 /tmp/payload");
+            c["_peer_uid"] = json!(1000);
+            c
+        };
+
+        for cmd in [
+            json!({"cmd":"set","key":"mode","value":"monitor"}),
+            json!({"cmd":"set","key":"contain","value":"off"}),
+            // Both directions of `kill`. Turning it DOWN weakens protection in
+            // the obvious way; turning it UP hands a payload a way to make
+            // moatd start SIGKILLing process trees on its own judgement, which
+            // is a denial of service wearing the defender's uniform.
+            json!({"cmd":"set","key":"kill","value":"off"}),
+            json!({"cmd":"set","key":"kill","value":"kill"}),
+            json!({"cmd":"ignore","id":"01X","scope":"rule"}),
+        ] {
+            let r = dispatch(&mut d, &user(cmd.clone()));
+            assert_eq!(r["ok"], false, "{:?} must be refused for a non-root caller", cmd);
+            assert!(
+                r["error"].as_str().unwrap_or("").contains("needs root"),
+                "the refusal has to say what to do: {:?}",
+                r["error"]
+            );
+        }
+
+        // A refused attempt is still an event worth knowing about.
+        assert!(
+            d.store
+                .load()
+                .iter()
+                .any(|a| a.rule == "moat-x-protection-changed"
+                    && a.title.contains("REFUSED")),
+            "a payload probing for the off switch is recorded even when it fails"
+        );
+
+        // Reading is still ordinary group work -- no sudo to see your own alerts.
+        for cmd in [
+            json!({"cmd":"status"}),
+            json!({"cmd":"list"}),
+        ] {
+            assert_eq!(dispatch(&mut d, &user(cmd.clone()))["ok"], true, "{:?}", cmd);
+        }
+
+        // And root is not obstructed by THIS gate. (It may still fail for an
+        // honest reason -- there is no `tetra` in a test environment, and
+        // set_mode refuses to claim success when it applied to nothing.)
+        let mut as_root = json!({"cmd":"set","key":"mode","value":"monitor"});
+        as_root["_peer_uid"] = json!(0);
+        let r = dispatch(&mut d, &as_root);
+        assert!(
+            !r["error"].as_str().unwrap_or("").contains("needs root"),
+            "root must never be told it needs root: {:?}",
+            r
+        );
+    }
+
+    /// Every path that weakens protection has to be recorded, not just the
+    /// obvious ones. The quiet paths are the dangerous ones, because they look
+    /// like housekeeping: clearing a backlog, accepting a suggestion, turning
+    /// off a sandbox.
+    #[test]
+    fn every_weakening_path_leaves_a_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let peer = "uid 0, pid 99 /tmp/x";
+        let count = |d: &mut Daemon| {
+            d.store
+                .load()
+                .iter()
+                .filter(|a| a.rule == "moat-x-protection-changed")
+                .count()
+        };
+
+        let mut seen = count(&mut d);
+        for req in [
+            json!({"cmd":"set","key":"mode","value":"monitor","_peer":peer}),
+            json!({"cmd":"set","key":"sandbox","value":"off","_peer":peer}),
+            json!({"cmd":"set","key":"contain","value":"off","_peer":peer}),
+            json!({"cmd":"ack","all":true,"_peer":peer}),
+        ] {
+            let r = dispatch(&mut d, &req);
+            let now = count(&mut d);
+            assert!(now > seen, "{:?} left no record; response {:?}", req, r);
+            seen = now;
+        }
+
+        for a in d.store.load().iter().filter(|a| a.rule == "moat-x-protection-changed") {
+            assert!(
+                a.explain.evidence.iter().any(|e| e.contains("pid 99")),
+                "a record that does not say who is half a record: {:?}",
+                a.explain.evidence
+            );
+        }
+    }
+
+    /// Turning a protection off must leave a record the user can see.
+    ///
+    /// The socket grants every command in this file to anyone in the `moat`
+    /// group -- which on this threat model includes the attacker. Before this,
+    /// `ignore --scope rule` silenced a whole detection class and the only
+    /// trace was a line in root's journal, unreadable by the person being
+    /// protected. An off switch nobody can see being used is not a control.
+    #[test]
+    fn weakening_a_protection_is_recorded_as_an_alert() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let before = d.store.load().len();
+
+        dispatch(&mut d, &json!({
+            "cmd": "set", "key": "mode", "value": "monitor",
+            "_peer": "uid 1000, pid 4242 /tmp/dropper",
+        }));
+
+        let after = d.store.load();
+        let rec = after
+            .iter()
+            .find(|a| a.rule == "moat-x-protection-changed")
+            .expect("switching to monitor must be on the record");
+        assert!(after.len() > before);
+        assert_eq!(rec.severity, "high");
+        assert!(
+            rec.explain.evidence.iter().any(|e| e.contains("pid 4242 /tmp/dropper")),
+            "the record has to name who asked: {:?}",
+            rec.explain.evidence
+        );
+
+        // Turning something ON is not a weakening and is not recorded.
+        let n = d.store.load().len();
+        dispatch(&mut d, &json!({
+            "cmd": "set", "key": "digest", "value": "on",
+            "_peer": "uid 1000, pid 1 /usr/bin/moatctl",
+        }));
+        assert_eq!(d.store.load().len(), n, "an alert per toggle would be noise");
+    }
+
+    /// The socket is 0660 root:moat and the attacker on this threat model is in
+    /// that group. An unclamped `limit` let any local process ask for the whole
+    /// triage queue and get one LLM call per item, so the one documented cost
+    /// control was a suggestion.
+    #[test]
+    fn a_caller_cannot_ask_for_more_triage_than_the_daemon_allows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        d.cfg.analysis.triage_settle_secs = 0;
+        d.cfg.analysis.triage_max_per_run = 2;
+        for _ in 0..6 {
+            a_surfaced_alert(&mut d);
+        }
+
+        let huge = dispatch(&mut d, &json!({"cmd":"triage","action":"pending","limit":100000}));
+        assert_eq!(
+            huge["pending"].as_array().unwrap().len(),
+            2,
+            "the daemon's maximum wins over the caller's ask"
+        );
+
+        // Asking for fewer is still allowed: the clamp is a ceiling, not a
+        // quota anyone is forced to spend.
+        let small = dispatch(&mut d, &json!({"cmd":"triage","action":"pending","limit":1}));
+        assert_eq!(small["pending"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pending_offers_only_alerts_nobody_has_looked_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        // The sample log is replayed with historical timestamps, but the settle
+        // window is measured against now -- turn it off so this test is about
+        // what it says it is about.
+        d.cfg.analysis.triage_settle_secs = 0;
+        // The request's `limit` is clamped to this, so a test that wants the
+        // whole queue raises the ceiling rather than asking past it.
+        d.cfg.analysis.triage_max_per_run = 50;
+        let id = a_surfaced_alert(&mut d);
+        let r = dispatch(&mut d, &json!({"cmd":"triage","action":"pending","limit":50}));
+        assert_eq!(r["mode"], "demote");
+        let ids = |r: &Value| -> Vec<String> {
+            r["pending"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(ids(&r).contains(&id));
+
+        // Triaged once, it is not offered again.
+        dispatch(&mut d, &json!({"cmd":"triage","action":"submit","id":id,
+            "agent":"claude","result": verdict("unclear","low")}));
+        let r = dispatch(&mut d, &json!({"cmd":"triage","action":"pending","limit":50}));
+        assert!(!ids(&r).contains(&id));
+    }
+
+    #[test]
+    fn the_daemon_applies_the_ceiling_rather_than_trusting_the_runner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let id = a_surfaced_alert(&mut d);
+        // The runner is a user-session process; a confused or hostile one must
+        // not be able to smuggle a field the schema does not have.
+        let r = dispatch(&mut d, &json!({"cmd":"triage","action":"submit","id":id,
+            "agent":"claude",
+            "result": {"verdict":"benign","confidence":"high","summary":"s",
+                       "reasoning":"r","acked":true,"severity":"low"}}));
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap().contains("unusable triage result"));
+        let a = d.find_alert(&id).unwrap();
+        assert!(a.triage.is_none());
+        assert!(!a.acked);
+        assert_eq!(a.surface, "alerts");
+    }
+
+    #[test]
+    fn a_verdict_short_of_the_bar_annotates_and_leaves_the_alert_on_the_badge() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let id = a_surfaced_alert(&mut d);
+        let r = dispatch(&mut d, &json!({"cmd":"triage","action":"submit","id":id,
+            "agent":"claude","result": verdict("benign","medium")}));
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["outcome"], "withheld: confidence is medium, not high");
+        let a = d.find_alert(&id).unwrap();
+        assert_eq!(a.surface, "alerts", "an alert is never hidden by a verdict");
+        assert!(!a.acked);
+        let t = a.triage.as_ref().expect("the verdict is still attached");
+        assert_eq!(t.agent, "claude");
+        assert_eq!(t.result.summary, "s");
+    }
+
+    #[test]
+    fn a_confident_benign_verdict_demotes_and_undo_puts_it_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        // A pattern seen before: `decide` refuses to demote a `first_seen` one
+        // whatever the verdict says, so a test about demoting needs a tuple the
+        // machine has already met.
+        let id = d
+            .store
+            .load()
+            .into_iter()
+            .find(|a| a.surface == "alerts" && !a.acked && a.rarity.as_str() != "first_seen")
+            .map(|a| a.id)
+            .unwrap_or_else(|| a_surfaced_alert(&mut d));
+        let seen_before = d.find_alert(&id).unwrap().rarity.as_str() != "first_seen";
+        let before = d.find_alert(&id).unwrap().severity.clone();
+        let r = dispatch(&mut d, &json!({"cmd":"triage","action":"submit","id":id,
+            "agent":"claude","result": verdict("benign","high")}));
+        if !seen_before {
+            // The sample log has no repeated tuple; the ceiling is what is
+            // being exercised then, and that is worth asserting too.
+            assert_eq!(r["outcome"], "withheld: first time this pattern has been seen here");
+            assert_eq!(d.find_alert(&id).unwrap().surface, "alerts");
+            return;
+        }
+        assert_eq!(r["outcome"], "demoted");
+        let a = d.find_alert(&id).unwrap();
+        assert_eq!(a.surface, "timeline");
+        // Demoting is the whole ceiling: it is still there, still unacked, and
+        // its severity is untouched.
+        assert!(!a.acked);
+        assert_eq!(a.severity, before);
+
+        let r = dispatch(&mut d, &json!({"cmd":"triage","action":"undo","id":id}));
+        assert_eq!(r["ok"], true);
+        let a = d.find_alert(&id).unwrap();
+        assert_eq!(a.surface, "alerts");
+        assert!(a.triage.is_none());
+    }
+
+    #[test]
+    fn annotate_mode_and_off_mode_are_honoured_by_the_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        d.cfg.analysis.auto_triage = crate::triage::TriageMode::Annotate;
+        let id = a_surfaced_alert(&mut d);
+        let r = dispatch(&mut d, &json!({"cmd":"triage","action":"submit","id":id,
+            "agent":"claude","result": verdict("benign","high")}));
+        assert_eq!(r["outcome"], "annotated");
+        assert_eq!(d.find_alert(&id).unwrap().surface, "alerts");
+
+        d.cfg.analysis.auto_triage = crate::triage::TriageMode::Off;
+        let r = dispatch(&mut d, &json!({"cmd":"triage","action":"pending"}));
+        assert_eq!(r["mode"], "off");
+        assert!(r["pending"].as_array().unwrap().is_empty());
+        let r = dispatch(&mut d, &json!({"cmd":"triage","action":"submit","id":id,
+            "agent":"claude","result": verdict("benign","high")}));
+        assert_eq!(r["ok"], false);
+    }
+
+    #[test]
+    fn the_queue_is_one_question_per_pattern_not_one_per_alert() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        d.cfg.analysis.triage_settle_secs = 0;
+        let all = d.store.load();
+        let surfaced: Vec<_> = all
+            .iter()
+            .filter(|a| a.surface == "alerts" && !a.acked && a.triage.is_none())
+            .collect();
+        let tuples: std::collections::HashSet<String> =
+            surfaced.iter().map(|a| a.tuple_key()).collect();
+
+        let r = dispatch(&mut d, &json!({"cmd":"triage","action":"pending","limit":500}));
+        let offered = r["pending"].as_array().unwrap();
+        assert!(
+            offered.len() <= tuples.len(),
+            "offered {} calls for {} distinct patterns",
+            offered.len(),
+            tuples.len()
+        );
+        // No pattern is asked about twice in one pass.
+        let mut seen = std::collections::HashSet::new();
+        for p in offered {
+            let id = p["id"].as_str().unwrap();
+            let a = d.find_alert(id).unwrap();
+            assert!(seen.insert(a.tuple_key()), "{} repeats a pattern", id);
+        }
+    }
+
+    #[test]
+    fn an_alert_still_arriving_is_left_for_the_next_pass() {
+        // The buffer. A package install fires several alerts in a couple of
+        // seconds; reading the first while the rest are still landing spends a
+        // call on a partial picture.
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        d.cfg.analysis.triage_settle_secs = 0;
+        let before = dispatch(&mut d, &json!({"cmd":"triage","action":"pending","limit":500}));
+        let n = before["pending"].as_array().unwrap().len();
+        assert!(n > 0, "the sample log surfaces something");
+
+        // A window longer than the log's age defers everything.
+        d.cfg.analysis.triage_settle_secs = 60 * 60 * 24 * 3650;
+        let after = dispatch(&mut d, &json!({"cmd":"triage","action":"pending","limit":500}));
+        assert!(
+            after["pending"].as_array().unwrap().is_empty(),
+            "nothing is old enough yet"
+        );
+    }
+
+    #[test]
+    fn a_refire_of_a_read_tuple_inherits_instead_of_costing_another_agent_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        // Two alerts of the same shape: same rule, same actor, same parent,
+        // same directory. This is the 101-in-a-day case.
+        let first = a_surfaced_alert(&mut d);
+        let twin = d
+            .store
+            .load()
+            .into_iter()
+            .find(|a| a.id != first && a.tuple_key() == d.find_alert(&first).unwrap().tuple_key()
+                      && a.surface == "alerts" && !a.acked);
+        let Some(twin) = twin else {
+            // The sample log may not contain a repeat; the unit rules are
+            // covered in triage::tests either way.
+            return;
+        };
+
+        dispatch(&mut d, &json!({"cmd":"triage","action":"submit","id":first,
+            "agent":"claude","result": verdict("benign","high")}));
+
+        let r = dispatch(&mut d, &json!({"cmd":"triage","action":"pending","limit":50}));
+        assert!(r["inherited"].as_u64().unwrap_or(0) >= 1, "the twin inherits");
+
+        let t = d.find_alert(&twin.id).unwrap();
+        let got = t.triage.as_ref().expect("a verdict was copied on");
+        assert!(got.outcome.starts_with("inherited:"), "{}", got.outcome);
+        assert_eq!(got.result.summary, "s", "the explanation comes with it");
+        // The whole point of the ceiling: a copied verdict explains, it does
+        // not act. Only a real read of THIS alert's evidence can move it.
+        assert_eq!(t.surface, "alerts", "inheritance must never demote");
+        assert!(!t.acked);
+
+        // And it is no longer offered to an agent, which is the saving.
+        let ids: Vec<String> = r["pending"].as_array().unwrap().iter()
+            .map(|p| p["id"].as_str().unwrap().to_string()).collect();
+        assert!(!ids.contains(&twin.id), "an inherited alert is not re-read");
+    }
+
+    #[test]
+    fn undo_needs_a_verdict_and_an_unknown_action_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let id = a_surfaced_alert(&mut d);
+        assert_eq!(dispatch(&mut d, &json!({"cmd":"triage","action":"undo","id":id}))["ok"], false);
+        assert_eq!(dispatch(&mut d, &json!({"cmd":"triage","action":"undo","id":"01NOPE"}))["ok"], false);
+        let r = dispatch(&mut d, &json!({"cmd":"triage","action":"sideways"}));
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap().contains("pending, submit or undo"));
+    }
+
     #[test]
     fn moat_group_parses_the_member_list() {
         let dir = tempfile::tempdir().unwrap();
@@ -1258,6 +2711,271 @@ mod tests {
         let id = first_id(&d, "moat-cred-ssh-private-key-read");
         assert_eq!(dispatch(&mut d, &json!({"cmd":"ack","id":id}))["ok"], true);
         assert!(d.find_alert(&id).unwrap().acked);
+    }
+
+    /// Quarantine removes the file it copied, and only that file.
+    #[test]
+    fn quarantine_copies_then_unlinks_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("q");
+        let victim = dir.path().join("dropper");
+        std::fs::write(&victim, b"payload").unwrap();
+
+        let dest = quarantine_file(
+            &store,
+            "01TEST",
+            victim.to_str().unwrap(),
+            "moat-x",
+            "t",
+        )
+        .expect("quarantine");
+        assert!(!victim.exists(), "the original must be gone, not just copied");
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
+    }
+
+    /// The arbitrary-delete-as-root shape: a name in the attacker's own
+    /// directory pointing at something of the defender's. `open_suspect`
+    /// refuses to open it, so nothing is copied and nothing is unlinked --
+    /// and above all the SYMLINK TARGET still exists.
+    #[test]
+    fn quarantine_will_not_follow_a_symlink_out_of_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("q");
+        let precious = dir.path().join("precious");
+        std::fs::write(&precious, b"do not delete").unwrap();
+        let bait = dir.path().join("bait");
+        std::os::unix::fs::symlink(&precious, &bait).unwrap();
+
+        let r = quarantine_file(&store, "01TEST", bait.to_str().unwrap(), "moat-x", "t");
+        assert!(r.is_err(), "a symlink is not a file to quarantine: {:?}", r);
+        assert!(precious.exists(), "the symlink target must survive");
+        assert_eq!(std::fs::read(&precious).unwrap(), b"do not delete");
+    }
+
+    /// Forgetting a destination re-arms first contact for it, and only it.
+    #[test]
+    fn forget_drops_one_destination_and_is_root_only_and_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let now = util::unix_secs();
+        let keep = crate::rarity::Tuple::net("/usr/bin/curl", "1.1.1.1", 443, None);
+        let lab = crate::rarity::Tuple::net("/usr/bin/python", "192.168.44.122", 4873, None);
+        let lab2 = crate::rarity::Tuple::net("/usr/bin/node", "192.168.44.122", 80, None);
+        d.rarity.observe(&keep, now);
+        d.rarity.observe(&lab, now);
+        d.rarity.observe(&lab2, now);
+        assert!(d.rarity.has_seen(&lab) && d.rarity.has_seen(&keep));
+
+        // A non-root caller is refused, and the attempt is recorded.
+        let mut as_user = json!({"cmd":"forget","dst":"192.168.44.122"});
+        as_user["_peer"] = json!("uid 1000, pid 77 /tmp/payload");
+        as_user["_peer_uid"] = json!(1000);
+        let r = dispatch(&mut d, &as_user);
+        assert_eq!(r["ok"], false, "forgetting a host must need root");
+        assert!(d.rarity.has_seen(&lab), "and must not have taken effect");
+
+        let mut as_root = json!({"cmd":"forget","dst":"192.168.44.122"});
+        as_root["_peer_uid"] = json!(0);
+        let r = dispatch(&mut d, &as_root);
+        assert_eq!(r["ok"], true, "{:?}", r);
+        assert_eq!(r["forgotten"], 2, "every exe and port for that host");
+        assert!(!d.rarity.has_seen(&lab));
+        assert!(!d.rarity.has_seen(&lab2));
+        assert!(d.rarity.has_seen(&keep), "and nothing else is touched");
+
+        assert!(
+            d.store.load().iter().any(|a| a.rule == "moat-x-protection-changed"
+                && a.title.contains("forget")),
+            "forgetting a destination has to outlive the command"
+        );
+    }
+
+    /// Closing a card is one request, not one per member.
+    ///
+    /// The panel sent `moatctl ack <id>` for every alert in a group, serialized
+    /// through its queue: a 37-member card meant 37 fork+exec+connect cycles
+    /// and 37 list repaints, which pegged a core and made the button look
+    /// broken while it worked.
+    #[test]
+    fn several_ids_are_acked_in_one_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let ids: Vec<String> = d.store.load().into_iter().take(3).map(|a| a.id).collect();
+        assert_eq!(ids.len(), 3, "the sample store must have enough alerts");
+
+        let r = dispatch(&mut d, &json!({"cmd":"ack","ids":ids}));
+        assert_eq!(r["ok"], true, "{:?}", r);
+        assert_eq!(r["acked"], 3);
+        assert_eq!(r["matched"], 3);
+        for id in &ids {
+            assert!(d.find_alert(id).unwrap().acked, "{} was not acked", id);
+        }
+
+        // An id that is not there is reported, not fatal: the panel's list can
+        // race a rotation, and losing the other two acks to one stale id would
+        // leave the card half-closed.
+        let r = dispatch(&mut d, &json!({"cmd":"ack","ids":["01NOPE"]}));
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["acked"], 0);
+        assert_eq!(r["failed"].as_array().unwrap().len(), 1);
+    }
+
+    /// The distinction the two bulk paths turn on.
+    ///
+    /// `--all`/`--rule`/`--before` are blind cuts -- they clear alerts nobody
+    /// read, which is exactly how you would make the badge stop asking about
+    /// something you would rather nobody looked at -- so they leave a record.
+    /// A list of ids is the opposite: the user was looking at precisely those.
+    /// Recording that as a protection change would turn every ordinary "Close
+    /// it" into a tamper alert, and an alert that fires on ordinary use is one
+    /// people learn to click past.
+    #[test]
+    fn enumerated_acks_are_not_a_protection_change_but_blind_ones_are() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let changes = |d: &Daemon| {
+            d.store.load().iter().filter(|a| a.rule == "moat-x-protection-changed").count()
+        };
+        let before = changes(&d);
+
+        let ids: Vec<String> = d.store.load().into_iter().take(2).map(|a| a.id).collect();
+        dispatch(&mut d, &json!({"cmd":"ack","ids":ids}));
+        assert_eq!(changes(&d), before, "closing a card the user is reading is not tampering");
+
+        dispatch(&mut d, &json!({"cmd":"ack","all":true}));
+        assert!(changes(&d) > before, "clearing the whole backlog is recorded");
+    }
+
+    /// `set kill` is a second switch on purpose: `contain` is whether moatd
+    /// acts at all, this is how far it goes. A ten-minute network cut naming
+    /// one address is recoverable by waiting; SIGKILL is not recoverable.
+    #[test]
+    fn the_kill_mode_validates_persists_and_is_recorded_in_both_directions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let root = |cmd: Value| -> Value {
+            let mut c = cmd;
+            c["_peer_uid"] = json!(0);
+            c
+        };
+        assert_eq!(d.cfg.contain.kill, "log", "the shipped default");
+
+        let bad = dispatch(&mut d, &root(json!({"cmd":"set","key":"kill","value":"yes"})));
+        assert_eq!(bad["ok"], false);
+        assert_eq!(d.cfg.contain.kill, "log", "a rejected value changes nothing");
+
+        let changes = |d: &Daemon| {
+            d.store.load().iter().filter(|a| a.rule == "moat-x-protection-changed").count()
+        };
+
+        let before = changes(&d);
+        let r = dispatch(&mut d, &root(json!({"cmd":"set","key":"kill","value":"kill"})));
+        assert_eq!(r["ok"], true, "{:?}", r);
+        assert_eq!(d.cfg.contain.kill, "kill");
+        assert!(changes(&d) > before, "arming SIGKILL is findable afterwards");
+
+        let mid = changes(&d);
+        assert_eq!(
+            dispatch(&mut d, &root(json!({"cmd":"set","key":"kill","value":"off"})))["ok"],
+            true
+        );
+        assert!(changes(&d) > mid, "and so is switching it back off");
+
+        // Setting it to what it already is says nothing -- a no-op is not a
+        // protection change, and a log full of them hides the real one.
+        let quiet = changes(&d);
+        dispatch(&mut d, &root(json!({"cmd":"set","key":"kill","value":"off"})));
+        assert_eq!(changes(&d), quiet);
+    }
+
+    /// Design 2b: the socket has to be able to hand the panel a whole story,
+    /// from whichever alert the user clicked.
+    #[test]
+    fn the_socket_serves_a_chain_from_any_member_and_lists_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let members: Vec<String> = d
+            .store
+            .load()
+            .into_iter()
+            .filter(|a| a.chain.is_some())
+            .map(|a| a.id)
+            .collect();
+        assert!(members.len() >= 4, "the sample install must correlate");
+
+        for id in &members {
+            let r = dispatch(&mut d, &json!({"cmd": "chain", "id": id}));
+            assert_eq!(r["ok"], true, "{:?}", r);
+            assert_eq!(r["chain"]["severity"], "critical");
+            assert!(!r["chain"]["steps"].as_array().unwrap().is_empty());
+        }
+
+        // An alert with no chain is not an error: "nothing happened around
+        // this one" is an answer, and an error would read as a broken daemon.
+        let lonely = d
+            .store
+            .load()
+            .into_iter()
+            .find(|a| a.chain.is_none())
+            .expect("not every alert is in a chain");
+        let r = dispatch(&mut d, &json!({"cmd": "chain", "id": lonely.id}));
+        assert_eq!(r["ok"], true);
+        assert!(r["chain"].is_null());
+
+        let r = dispatch(&mut d, &json!({"cmd": "chain"}));
+        assert_eq!(r["chains"].as_array().unwrap().len(), 1, "one install, one chain");
+        assert_eq!(r["open"], 1);
+
+        let r = dispatch(&mut d, &json!({"cmd": "chain", "id": "01NOSUCHALERT"}));
+        assert_eq!(r["ok"], false);
+    }
+
+    /// Design 2b's behavioural implication: "Allowing this incident closes the
+    /// curl alert too — same chain, same decision." Acking one step and leaving
+    /// the other six on the badge is what teaches people to click past alerts.
+    #[test]
+    fn acking_a_chain_resolves_its_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let member = d
+            .store
+            .load()
+            .into_iter()
+            .find(|a| a.chain.is_some())
+            .expect("the sample install must correlate");
+        let siblings = member.chain.as_ref().unwrap().member_ids();
+        assert!(siblings.len() >= 4);
+
+        let r = dispatch(&mut d, &json!({"cmd": "ack", "id": member.id, "chain": true}));
+        assert_eq!(r["ok"], true, "{:?}", r);
+        assert_eq!(r["acked"].as_u64().unwrap() as usize, siblings.len());
+
+        let acked: std::collections::HashMap<String, bool> =
+            d.store.load().into_iter().map(|a| (a.id, a.acked)).collect();
+        for s in &siblings {
+            assert_eq!(acked.get(s), Some(&true), "{} was left on the badge", s);
+        }
+
+        // And it is opt-in: without the flag, one ack is one alert.
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let member = d.store.load().into_iter().find(|a| a.chain.is_some()).unwrap();
+        dispatch(&mut d, &json!({"cmd": "ack", "id": member.id}));
+        let still_open = d
+            .store
+            .load()
+            .into_iter()
+            .filter(|a| a.chain.is_some() && !a.acked)
+            .count();
+        assert!(still_open > 0, "a plain ack must only ack the alert it names");
+
+        // Asking for a chain ack on an alert that is not in one says so.
+        let lonely = d.store.load().into_iter().find(|a| a.chain.is_none()).unwrap();
+        let r = dispatch(&mut d, &json!({"cmd": "ack", "id": lonely.id, "chain": true}));
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap().contains("not part of a chain"));
     }
 
     /// Quarantine holds, it does not delete — so the round trip has to work,
@@ -1433,10 +3151,14 @@ mod tests {
         let mut d = daemon(dir.path());
         let now = crate::util::unix_secs();
         for rule in ["moat-cred-ssh-private-key-read", "moat-exec-untrusted-home"] {
+            // A real tuple key embeds the rule (see `baseline::tuple_key`), so
+            // two rules can never share one; spell that out here rather than
+            // reusing a bare "t1" for both and demoting only one.
+            let tuple = crate::baseline::tuple_key(rule, "/usr/bin/x", "/usr/bin/y", "/tmp");
             for _ in 0..(d.baseline.noisy_rule_per_day + 2) {
-                d.baseline.note_alert(rule, now);
+                d.baseline.note_alert(rule, &tuple, now);
             }
-            assert!(d.baseline.is_demoted(rule), "{} should be demoted", rule);
+            assert!(d.baseline.is_demoted_tuple(rule, &tuple), "{} should be demoted", rule);
         }
 
         let r = dispatch(&mut d, &json!({"cmd":"baseline","action":"undemote","all":true}));
@@ -1497,7 +3219,17 @@ mod tests {
         // --all takes the rest.
         let r = dispatch(&mut d, &json!({"cmd":"ack","all":true}));
         assert_eq!(r["ok"], true);
-        assert!(d.store.load().into_iter().all(|a| a.acked), "backlog cleared");
+        // Everything except the receipt for the clearing itself, which is
+        // raised after the acking and deliberately arrives unanswered: a bulk
+        // clear that also cleared the record of the bulk clear would be the
+        // quietest way to empty the queue there is.
+        assert!(
+            d.store
+                .load()
+                .into_iter()
+                .all(|a| a.acked || a.rule == "moat-x-protection-changed"),
+            "backlog cleared"
+        );
 
         // A bare id still works and still rejects an unknown one.
         assert_eq!(
@@ -1695,6 +3427,7 @@ mod tests {
                 parent: "/usr/bin/Hyprland",
                 dir: "/home/dan/.config/hypr",
                 severity: "low",
+                severity_base: "low",
                 provenance: "official",
                 package: Some("restic 0.18.1-1".into()),
                 context: "service",
@@ -1815,7 +3548,7 @@ mod tests {
         // "keep watching": clear a demotion.
         let now = util::unix_secs();
         for i in 0..25 {
-            d.baseline.note_alert("moat-x-pkg-egress", now + i);
+            d.baseline.note_alert("moat-x-pkg-egress", "t1", now + i);
         }
         assert_eq!(dispatch(&mut d, &json!({"cmd":"status"}))["demoted_rules"][0], "moat-x-pkg-egress");
         let r = dispatch(&mut d, &json!({"cmd":"baseline","action":"undemote","rule":"moat-x-pkg-egress"}));

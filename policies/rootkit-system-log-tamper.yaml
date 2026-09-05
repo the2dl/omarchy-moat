@@ -1,0 +1,78 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-rootkit-system-log-tamper
+  annotations:
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "Journal files deleted, or the login records emptied"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,ignore"
+    moat.omarchy/why: >-
+      The journal is the machine's account of what started, what failed and what
+      authenticated; /var/log/wtmp and btmp are the account of who logged in and who
+      tried. Deleting the first and emptying the second is anti-forensics, and it is
+      done after something worth hiding, not before.
+    moat.omarchy/expected: >-
+      journald deleting its own old files, and logrotate rotating wtmp - both excluded.
+      `journalctl --vacuum-time` and `--vacuum-size` are deliberately NOT excluded: a
+      disk clean-up and an intruder erasing an hour of evidence issue the same command,
+      so this reports it and lets you say which it was.
+    moat.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  - call: "security_path_unlink"
+    syscall: false
+    message: "A systemd journal file was deleted"
+    args:
+    - index: 0
+      type: "path"
+    - index: 1
+      type: "dentry"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/lib/systemd/systemd-journald"
+        - "/usr/lib/systemd/systemd"
+        - "/usr/bin/systemd-tmpfiles"
+      matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/var/log/journal"
+        - "/run/log/journal"
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"
+  # wtmp/btmp/lastlog are emptied rather than removed: deleting them breaks
+  # login, truncating them just erases who was here.
+  - call: "security_path_truncate"
+    syscall: false
+    message: "The login records were emptied"
+    args:
+    - index: 0
+      type: "path"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/logrotate"
+        - "/usr/sbin/logrotate"
+        - "/usr/lib/systemd/systemd"
+        - "/usr/bin/systemd-tmpfiles"
+      matchArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "/var/log/wtmp"
+        - "/var/log/btmp"
+        - "/var/log/lastlog"
+        - "/var/log/faillog"
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

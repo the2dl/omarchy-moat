@@ -18,7 +18,7 @@
 //! running this as tetragon.service's `ExecStartPre` on every boot does not
 //! churn mtimes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde_yaml::Value;
@@ -26,6 +26,18 @@ use serde_yaml::Value;
 use crate::util::{atomic_write, human_homes};
 
 pub const PLACEHOLDER: &str = "{{HOME}}";
+
+/// List placeholders: a sequence item that is exactly one of these is replaced
+/// by the whole configured list, and each entry then goes through `{{HOME}}`
+/// expansion like any other value.
+///
+/// This is how a telemetry class's *scope* comes out of `moat.toml` rather than
+/// being frozen into a shipped YAML file. It matters most for
+/// `telemetry-file-exec-shape.yaml`: an unscoped file policy is the difference
+/// between 0.3 events a second and 19, so the scope has to be something a user
+/// can see, narrow and widen without editing a policy.
+pub const FILE_SCOPE: &str = "{{FILE_SCOPE}}";
+pub const FILE_SUFFIXES: &str = "{{FILE_SUFFIXES}}";
 
 /// The two export-allowlist lines, matching `policies/export-allowlist.example`.
 ///
@@ -57,6 +69,12 @@ pub struct RenderReport {
     pub files_changed: usize,
     pub removed: Vec<PathBuf>,
     pub allowlist_changed: bool,
+    /// Telemetry templates that were deliberately not rendered, with the class
+    /// that is off. Reported rather than silent: "why is there no network
+    /// telemetry" must have an answer that is not "read the source".
+    pub skipped: Vec<(String, String)>,
+    /// Telemetry class names that are on for this render.
+    pub telemetry_classes: Vec<String>,
 }
 
 impl RenderReport {
@@ -72,6 +90,39 @@ pub struct RenderOptions<'a> {
     pub passwd: &'a Path,
     /// Overrides `passwd` discovery; used by tests and by `--home`.
     pub homes: Option<Vec<String>>,
+    /// `[telemetry]`. Decides which `telemetry-*.yaml` templates are rendered
+    /// at all, and supplies the values for the list placeholders.
+    pub telemetry: crate::config::TelemetryConfig,
+    /// Per-policy binaries the KERNEL should stop watching, as
+    /// `{policy name: [absolute exe, ...]}`.
+    ///
+    /// This is how "allow this program" is honoured for a rule that is ARMED.
+    /// An allowlist entry is a userspace suppression and cannot reach a policy
+    /// enforcing in the kernel -- the process dies before moatd sees the event
+    /// -- so allowing an armed rule used to silence the alert and change
+    /// nothing. Excluding the binary from the policy itself is the only thing
+    /// that actually stops the killing while the rule stays armed for
+    /// everything else.
+    pub exclusions: std::collections::BTreeMap<String, Vec<String>>,
+    /// `[contain] max`: how many containment policy names to reserve in the
+    /// export allowlist. See the note at the write site -- a runtime policy
+    /// whose name is not in this file is invisible to moatd.
+    pub contain_slots: usize,
+}
+
+impl Default for RenderOptions<'_> {
+    fn default() -> Self {
+        RenderOptions {
+            templates_dir: Path::new("/usr/lib/moat/policies"),
+            out_dir: Path::new("/run/moat/policies"),
+            export_allowlist: None,
+            passwd: Path::new("/etc/passwd"),
+            homes: None,
+            telemetry: crate::config::TelemetryConfig::default(),
+            exclusions: std::collections::BTreeMap::new(),
+            contain_slots: crate::config::ContainConfig::default().max,
+        }
+    }
 }
 
 pub fn render(opts: &RenderOptions) -> Result<RenderReport, String> {
@@ -79,7 +130,19 @@ pub fn render(opts: &RenderOptions) -> Result<RenderReport, String> {
         Some(h) => h.clone(),
         None => human_homes(opts.passwd),
     };
-    let mut report = RenderReport::default();
+    let mut lists: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    lists.insert(FILE_SCOPE, opts.telemetry.file_scope.clone());
+    lists.insert(FILE_SUFFIXES, opts.telemetry.file_suffixes.clone());
+
+    let mut report = RenderReport {
+        telemetry_classes: opts
+            .telemetry
+            .classes()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        ..RenderReport::default()
+    };
 
     let mut templates: Vec<PathBuf> = std::fs::read_dir(opts.templates_dir)
         .map_err(|e| format!("{}: {}", opts.templates_dir.display(), e))?
@@ -103,7 +166,20 @@ pub fn render(opts: &RenderOptions) -> Result<RenderReport, String> {
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        match render_one(tpl, &homes) {
+        // A telemetry template whose class is off is not rendered, so it is
+        // not in tracing-policy-dir, so the kernel never attaches it and not a
+        // byte is written for it. That is what "switchable" has to mean here:
+        // filtering a loaded policy in userspace would already have cost the
+        // export write and moatd's parse.
+        if let Some(class) = crate::telemetry::class_of_template(&stem) {
+            if !opts.telemetry.enabled(class) {
+                report
+                    .skipped
+                    .push((stem.clone(), format!("telemetry.{} is off", class)));
+                continue;
+            }
+        }
+        match render_one_with(tpl, &homes, &lists, &opts.exclusions) {
             Ok((name, body)) => {
                 let out = opts.out_dir.join(&stem);
                 match atomic_write(&out, body.as_bytes(), 0o644) {
@@ -138,6 +214,21 @@ pub fn render(opts: &RenderOptions) -> Result<RenderReport, String> {
     }
 
     if let Some(path) = opts.export_allowlist {
+        // The containment slots, always, whether or not any containment is
+        // live right now.
+        //
+        // `policy_names` is exact-match with no globs and this file is only
+        // read when tetragon starts, so a policy moatd writes at RUNTIME can
+        // never be added to it in time. Containment used to name its policy
+        // after the chain's ULID, which meant its events were filtered out of
+        // the export: the connection was refused in the kernel and moatd never
+        // heard about it, so the panel could not say a thing had been blocked.
+        // Fixed names, bounded by `contain.max` (the same cap that already
+        // evicts the oldest containment), are what make that visible.
+        let mut names = names.clone();
+        for slot in 0..opts.contain_slots.max(1) {
+            names.insert(crate::contain::policy_name(slot));
+        }
         report.allowlist_changed = atomic_write(path, allowlist_body(&names).as_bytes(), 0o644)
             .map_err(|e| format!("{}: {}", path.display(), e))?;
     }
@@ -146,16 +237,120 @@ pub fn render(opts: &RenderOptions) -> Result<RenderReport, String> {
 }
 
 /// Render one template. Returns `(policy name, YAML text)`.
-pub fn render_one(path: &Path, homes: &[String]) -> Result<(String, String), String> {
-    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    render_text(&text, homes)
+pub fn render_one(
+    path: &Path,
+    homes: &[String],
+    lists: &BTreeMap<&'static str, Vec<String>>,
+) -> Result<(String, String), String> {
+    render_one_with(path, homes, lists, &BTreeMap::new())
 }
 
-pub fn render_text(text: &str, homes: &[String]) -> Result<(String, String), String> {
+/// `render_one`, with the kernel exclusions the daemon has recorded.
+pub fn render_one_with(
+    path: &Path,
+    homes: &[String],
+    lists: &BTreeMap<&'static str, Vec<String>>,
+    exclusions: &BTreeMap<String, Vec<String>>,
+) -> Result<(String, String), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    render_text(&text, homes, lists, exclusions)
+}
+
+/// The list placeholders filled from the built-in `[telemetry]` defaults.
+///
+/// For callers that only want `{{HOME}}` expansion — validating a shipped
+/// template, re-reading a rendered policy — and do not have a live config in
+/// hand.
+pub fn default_lists() -> BTreeMap<&'static str, Vec<String>> {
+    let t = crate::config::TelemetryConfig::default();
+    let mut m = BTreeMap::new();
+    m.insert(FILE_SCOPE, t.file_scope);
+    m.insert(FILE_SUFFIXES, t.file_suffixes);
+    m
+}
+
+/// Stop a policy watching these binaries, in the kernel.
+///
+/// Every selector gains the binaries in its `matchBinaries` NOT-list. Two
+/// details matter and both are failure modes if missed:
+///
+/// * A selector with no `matchBinaries` at all watches every binary, so one is
+///   ADDED. Without that the exclusion would apply to some selectors of a
+///   policy and silently not others -- an exclusion that does not exclude is
+///   worse than a refusal, because the user believes the program is allowed.
+/// * Only negative operators are extended. Adding a value to an `In` or
+///   `Equal` list would WIDEN what the policy matches, turning "stop watching
+///   cat" into "also watch cat".
+fn exclude_binaries(doc: &mut Value, bins: &[String]) -> Result<(), String> {
+    if bins.is_empty() {
+        return Ok(());
+    }
+    let Some(spec) = doc.get_mut("spec").and_then(|s| s.as_mapping_mut()) else {
+        return Err("policy has no spec".into());
+    };
+    for (_, hooks) in spec.iter_mut() {
+        let Some(hooks) = hooks.as_sequence_mut() else { continue };
+        for hook in hooks.iter_mut() {
+            let Some(selectors) = hook.get_mut("selectors").and_then(|s| s.as_sequence_mut())
+            else {
+                continue;
+            };
+            for sel in selectors.iter_mut() {
+                let Some(map) = sel.as_mapping_mut() else { continue };
+                let key = Value::String("matchBinaries".into());
+                let entry = map.entry(key).or_insert_with(|| {
+                    Value::Sequence(vec![serde_yaml::from_str::<Value>(
+                        "operator: \"NotIn\"\nvalues: []",
+                    )
+                    .expect("literal parses")])
+                });
+                let Some(list) = entry.as_sequence_mut() else { continue };
+                for m in list.iter_mut() {
+                    let is_negative = m
+                        .get("operator")
+                        .and_then(|o| o.as_str())
+                        .map(|o| o.starts_with("Not"))
+                        .unwrap_or(false);
+                    if !is_negative {
+                        continue;
+                    }
+                    let Some(values) = m.get_mut("values").and_then(|v| v.as_sequence_mut())
+                    else {
+                        continue;
+                    };
+                    for b in bins {
+                        let v = Value::String(b.clone());
+                        if !values.contains(&v) {
+                            values.push(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn render_text(
+    text: &str,
+    homes: &[String],
+    lists: &BTreeMap<&'static str, Vec<String>>,
+    exclusions: &BTreeMap<String, Vec<String>>,
+) -> Result<(String, String), String> {
     if text.contains(PLACEHOLDER) && homes.is_empty() {
         return Err("template uses {{HOME}} but no human user was found in /etc/passwd".into());
     }
+    for (name, values) in lists {
+        if text.contains(*name) && values.is_empty() {
+            return Err(format!(
+                "template uses {} but the configured list is empty; an unscoped policy here \
+                 would match every file on the machine",
+                name
+            ));
+        }
+    }
     let mut doc: Value = serde_yaml::from_str(text).map_err(|e| format!("yaml: {}", e))?;
+    expand_lists(&mut doc, lists);
     expand(&mut doc, homes);
 
     let name = doc
@@ -170,6 +365,10 @@ pub fn render_text(text: &str, homes: &[String]) -> Result<(String, String), Str
             name
         ));
     }
+    if let Some(bins) = exclusions.get(&name) {
+        exclude_binaries(&mut doc, bins)?;
+    }
+
     let body = serde_yaml::to_string(&doc).map_err(|e| e.to_string())?;
     if body.contains(PLACEHOLDER) {
         return Err("placeholder survived expansion".into());
@@ -178,6 +377,45 @@ pub fn render_text(text: &str, homes: &[String]) -> Result<(String, String), Str
 }
 
 const HEADER: &str = "# rendered by `moatd render-policies` — edit the template, not this file\n";
+
+/// Replace a sequence item that is exactly `{{FILE_SCOPE}}` (or another list
+/// placeholder) with the configured list.
+///
+/// Runs before [`expand`], so every value it inserts is then `{{HOME}}`-fanned
+/// like any other. Only whole-item matches are replaced: a scalar elsewhere in
+/// the document is left alone and [`render_text`]'s "placeholder survived
+/// expansion" check turns it into a loud failure rather than a policy that
+/// matches a literal `{{FILE_SCOPE}}` path.
+fn expand_lists(v: &mut Value, lists: &BTreeMap<&'static str, Vec<String>>) {
+    match v {
+        Value::Sequence(seq) => {
+            let mut out: Vec<Value> = Vec::with_capacity(seq.len());
+            for item in seq.drain(..) {
+                match item {
+                    Value::String(ref s) if lists.contains_key(s.as_str()) => {
+                        for value in &lists[s.as_str()] {
+                            out.push(Value::String(value.clone()));
+                        }
+                    }
+                    mut other => {
+                        expand_lists(&mut other, lists);
+                        out.push(other);
+                    }
+                }
+            }
+            *seq = out;
+        }
+        Value::Mapping(map) => {
+            let keys: Vec<Value> = map.keys().cloned().collect();
+            for k in keys {
+                if let Some(val) = map.get_mut(&k) {
+                    expand_lists(val, lists);
+                }
+            }
+        }
+        _ => {}
+    }
+}
 
 /// Recursive `{{HOME}}` expansion on the parsed document.
 fn expand(v: &mut Value, homes: &[String]) {
@@ -259,7 +497,7 @@ spec:
 
     #[test]
     fn one_home_gives_one_value() {
-        let (name, out) = render_text(TPL, &["/home/dan".into()]).unwrap();
+        let (name, out) = render_text(TPL, &["/home/dan".into()], &default_lists(), &Default::default()).unwrap();
         assert_eq!(name, "moat-cred-ssh-private-key-read");
         let doc: Value = serde_yaml::from_str(&out).unwrap();
         let values = dig(&doc);
@@ -268,7 +506,7 @@ spec:
 
     #[test]
     fn two_homes_fan_the_list_item_out() {
-        let (_, out) = render_text(TPL, &["/home/dan".into(), "/var/home/ada".into()]).unwrap();
+        let (_, out) = render_text(TPL, &["/home/dan".into(), "/var/home/ada".into()], &default_lists(), &Default::default()).unwrap();
         assert!(!out.contains(PLACEHOLDER));
         let doc: Value = serde_yaml::from_str(&out).unwrap();
         assert_eq!(dig(&doc), vec!["/home/dan/.ssh/", "/var/home/ada/.ssh/"]);
@@ -276,21 +514,54 @@ spec:
 
     #[test]
     fn structure_survives_a_hostile_home() {
-        let (_, out) = render_text(TPL, &["/home/a: b\"c".into()]).unwrap();
+        let (_, out) = render_text(TPL, &["/home/a: b\"c".into()], &default_lists(), &Default::default()).unwrap();
         let doc: Value = serde_yaml::from_str(&out).expect("still valid yaml");
         assert_eq!(dig(&doc), vec!["/home/a: b\"c/.ssh/"]);
     }
 
     #[test]
     fn no_homes_is_a_failure_not_an_empty_list() {
-        let err = render_text(TPL, &[]).unwrap_err();
+        let err = render_text(TPL, &[], &default_lists(), &Default::default()).unwrap_err();
         assert!(err.contains("no human user"), "{}", err);
     }
 
     #[test]
     fn non_moat_name_is_rejected() {
         let t = TPL.replace("moat-cred-ssh-private-key-read", "some-other-policy");
-        assert!(render_text(&t, &["/home/dan".into()]).is_err());
+        assert!(render_text(&t, &["/home/dan".into()], &default_lists(), &Default::default()).is_err());
+    }
+
+    /// The gap that made a working containment silent.
+    #[test]
+    fn the_allowlist_reserves_the_containment_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let al = dir.path().join("export-allowlist");
+        let out = dir.path().join("out");
+        let tpl = dir.path().join("tpl");
+        std::fs::create_dir_all(&tpl).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let opts = RenderOptions {
+            templates_dir: &tpl,
+            out_dir: &out,
+            export_allowlist: Some(&al),
+            homes: Some(vec!["/home/x".into()]),
+            contain_slots: 4,
+            ..Default::default()
+        };
+        render(&opts).expect("render");
+        let body = std::fs::read_to_string(&al).unwrap();
+        for slot in 0..4 {
+            assert!(
+                body.contains(&crate::contain::policy_name(slot)),
+                "slot {} must be exported or a containment that fires is invisible:\n{}",
+                slot,
+                body
+            );
+        }
+        assert!(
+            !body.contains("moat-contain-4"),
+            "and no more than `contain.max` are reserved"
+        );
     }
 
     #[test]
@@ -324,6 +595,9 @@ spec:
             export_allowlist: Some(&al),
             passwd: Path::new("/etc/passwd"),
             homes: Some(vec!["/home/dan".into()]),
+            telemetry: crate::config::TelemetryConfig::default(),
+            exclusions: Default::default(),
+            contain_slots: 0,
         };
         let r1 = render(&opts).unwrap();
         assert_eq!(r1.rendered.len(), 1);
@@ -354,10 +628,182 @@ spec:
             export_allowlist: None,
             passwd: Path::new("/etc/passwd"),
             homes: Some(vec!["/home/dan".into()]),
+            telemetry: crate::config::TelemetryConfig::default(),
+            exclusions: Default::default(),
+            contain_slots: 0,
         };
         let r = render(&opts).unwrap();
         assert_eq!(r.rendered.len(), 1);
         assert_eq!(r.failed_names(), vec!["bad.yaml"]);
+    }
+
+    const TELEM: &str = r#"apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-telemetry-file-exec-shape
+  annotations:
+    moat.omarchy/telemetry-class: file
+spec:
+  kprobes:
+  - call: "security_file_post_open"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Postfix"
+        values:
+        - "{{FILE_SUFFIXES}}"
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "{{FILE_SCOPE}}"
+"#;
+
+    fn telem_lists(scope: &[&str], suffixes: &[&str]) -> BTreeMap<&'static str, Vec<String>> {
+        let mut m = BTreeMap::new();
+        m.insert(FILE_SCOPE, scope.iter().map(|s| s.to_string()).collect());
+        m.insert(
+            FILE_SUFFIXES,
+            suffixes.iter().map(|s| s.to_string()).collect(),
+        );
+        m
+    }
+
+    /// The scope has to come out of moat.toml, or "switchable" means "edit a
+    /// YAML file in /usr". It also has to fan `{{HOME}}` out afterwards, so a
+    /// scope entry can be written once and apply to every user.
+    #[test]
+    fn a_list_placeholder_becomes_the_configured_list_and_then_fans_home_out() {
+        let lists = telem_lists(&["/usr/bin/", "{{HOME}}/.local/bin/"], &[".sh", ".js"]);
+        let (name, out) =
+            render_text(TELEM, &["/home/dan".into(), "/var/home/ada".into()], &lists, &Default::default()).unwrap();
+        assert_eq!(name, "moat-telemetry-file-exec-shape");
+        let doc: Value = serde_yaml::from_str(&out).unwrap();
+        let sel = &doc["spec"]["kprobes"][0]["selectors"];
+        let suffixes: Vec<String> = sel[0]["matchArgs"][0]["values"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(suffixes, vec![".sh", ".js"]);
+        let scope: Vec<String> = sel[1]["matchArgs"][0]["values"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            scope,
+            vec!["/usr/bin/", "/home/dan/.local/bin/", "/var/home/ada/.local/bin/"]
+        );
+        assert!(!out.contains("{{"));
+    }
+
+    /// An unscoped file policy matches every write on the machine — 19 events
+    /// a second here against 0.3 with a scope. It is a failure, not a render.
+    #[test]
+    fn an_empty_scope_is_refused_rather_than_rendered_wide_open() {
+        let lists = telem_lists(&[], &[".sh"]);
+        let err = render_text(TELEM, &["/home/dan".into()], &lists, &Default::default()).unwrap_err();
+        assert!(err.contains("FILE_SCOPE"), "{}", err);
+        assert!(err.contains("every file"), "{}", err);
+    }
+
+    /// A class that is off produces no policy at all: nothing in
+    /// tracing-policy-dir, nothing in the export allowlist, nothing attached.
+    #[test]
+    fn a_telemetry_class_that_is_off_is_not_rendered_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("templates");
+        let odir = dir.path().join("out");
+        std::fs::create_dir_all(&tdir).unwrap();
+        std::fs::write(tdir.join("cred-a.yaml"), TPL).unwrap();
+        std::fs::write(tdir.join("telemetry-file-exec-shape.yaml"), TELEM).unwrap();
+        std::fs::write(
+            tdir.join("telemetry-network-connect.yaml"),
+            TELEM.replace(
+                "moat-telemetry-file-exec-shape",
+                "moat-telemetry-network-connect",
+            ),
+        )
+        .unwrap();
+        let al = dir.path().join("export-allowlist");
+
+        let mut telemetry = crate::config::TelemetryConfig::default();
+        assert!(!telemetry.file && !telemetry.network, "both ship off");
+        let opts = RenderOptions {
+            templates_dir: &tdir,
+            out_dir: &odir,
+            export_allowlist: Some(&al),
+            passwd: Path::new("/etc/passwd"),
+            homes: Some(vec!["/home/dan".into()]),
+            telemetry: telemetry.clone(),
+            exclusions: Default::default(),
+            contain_slots: 0,
+        };
+        let r = render(&opts).unwrap();
+        assert_eq!(r.rendered, vec!["moat-cred-ssh-private-key-read"]);
+        assert_eq!(r.skipped.len(), 2, "and it says which and why");
+        assert!(r.skipped.iter().all(|(_, why)| why.contains("is off")));
+        assert!(!odir.join("telemetry-file-exec-shape.yaml").exists());
+        let body = std::fs::read_to_string(&al).unwrap();
+        assert!(!body.contains("telemetry"), "not in the export allowlist either");
+
+        // Turn one on: it renders, and its name reaches the export allowlist so
+        // Tetragon will actually export what it posts.
+        telemetry.network = true;
+        let opts = RenderOptions {
+            telemetry,
+            ..opts
+        };
+        let r2 = render(&opts).unwrap();
+        assert!(r2.rendered.contains(&"moat-telemetry-network-connect".to_string()));
+        assert_eq!(r2.skipped.len(), 1);
+        assert_eq!(r2.telemetry_classes, vec!["alerts", "network"]);
+        assert!(std::fs::read_to_string(&al)
+            .unwrap()
+            .contains("moat-telemetry-network-connect"));
+
+        // …and turning it back off removes the rendered file, so a restart
+        // does not silently keep collecting.
+        let opts = RenderOptions {
+            telemetry: crate::config::TelemetryConfig::default(),
+            ..opts
+        };
+        let r3 = render(&opts).unwrap();
+        assert!(!odir.join("telemetry-network-connect.yaml").exists());
+        assert_eq!(r3.removed.len(), 1);
+    }
+
+    /// The shipped telemetry templates are real files with real placeholders;
+    /// this is the test that catches a typo in one of them at build time.
+    #[test]
+    fn the_shipped_telemetry_templates_render_with_the_shipped_scope() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("policies");
+        let lists = default_lists();
+        for t in crate::telemetry::all_templates() {
+            let p = dir.join(t);
+            if !p.exists() {
+                continue; // not laid out as a checkout
+            }
+            let (name, body) = render_one(&p, &["/home/dan".into()], &lists)
+                .unwrap_or_else(|e| panic!("{}: {}", t, e));
+            assert!(crate::telemetry::is_telemetry_policy(&name), "{} -> {}", t, name);
+            assert!(!body.contains("{{"), "{} still has a placeholder", t);
+            // A telemetry policy must never be able to act.
+            for forbidden in ["Sigkill", "Override", "NotifyEnforcer", "Signal"] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{} carries the {} action; telemetry observes and never acts",
+                    t,
+                    forbidden
+                );
+            }
+        }
     }
 
     fn dig(doc: &Value) -> Vec<String> {
@@ -367,5 +813,83 @@ spec:
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod exclusion_tests {
+    use super::*;
+
+    const ARMED: &str = r#"
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-cred-etc-shadow-read
+spec:
+  lsmhooks:
+  - hook: "file_post_open"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/passwd"
+      matchArgs:
+      - index: 0
+        operator: "Equal"
+        values: ["/etc/shadow"]
+    - matchArgs:
+      - index: 0
+        operator: "Equal"
+        values: ["/etc/gshadow"]
+"#;
+
+    /// "Allow this program" has to reach the kernel for an armed rule, and it
+    /// has to reach EVERY selector of it.
+    #[test]
+    fn an_excluded_binary_is_added_to_every_selector() {
+        let mut ex = BTreeMap::new();
+        ex.insert(
+            "moat-cred-etc-shadow-read".to_string(),
+            vec!["/usr/bin/cat".to_string()],
+        );
+        let (name, out) = render_text(ARMED, &["/home/dan".into()], &default_lists(), &ex).unwrap();
+        assert_eq!(name, "moat-cred-etc-shadow-read");
+
+        let doc: Value = serde_yaml::from_str(&out).unwrap();
+        let sels = doc["spec"]["lsmhooks"][0]["selectors"].as_sequence().unwrap();
+        assert_eq!(sels.len(), 2);
+
+        // The selector that already had a NotIn list gains the binary...
+        let first = sels[0]["matchBinaries"][0]["values"].as_sequence().unwrap();
+        assert!(first.iter().any(|v| v.as_str() == Some("/usr/bin/cat")));
+        assert!(first.iter().any(|v| v.as_str() == Some("/usr/bin/passwd")),
+                "the shipped exclusions survive");
+
+        // ...and the one with NO matchBinaries gets one. Without this the
+        // exclusion would apply to part of a policy and silently not the rest,
+        // which is worse than refusing: the user believes it is allowed.
+        let second = sels[1]["matchBinaries"][0]["values"].as_sequence().unwrap();
+        assert!(second.iter().any(|v| v.as_str() == Some("/usr/bin/cat")));
+        assert_eq!(sels[1]["matchBinaries"][0]["operator"].as_str(), Some("NotIn"));
+
+        // A positive match is never widened: adding to an `Equal` list would
+        // turn "stop watching cat" into "also watch cat".
+        assert_eq!(
+            sels[0]["matchArgs"][0]["values"].as_sequence().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_policy_with_no_exclusions_is_untouched() {
+        let plain = render_text(ARMED, &["/home/dan".into()], &default_lists(), &BTreeMap::new())
+            .unwrap()
+            .1;
+        let other = {
+            let mut ex = BTreeMap::new();
+            ex.insert("moat-some-other-rule".to_string(), vec!["/usr/bin/cat".into()]);
+            render_text(ARMED, &["/home/dan".into()], &default_lists(), &ex).unwrap().1
+        };
+        assert_eq!(plain, other, "an exclusion names one policy and touches only it");
     }
 }

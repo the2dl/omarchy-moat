@@ -8,13 +8,19 @@ Requires=tetragon.service
 After=tetragon.service
 PartOf=tetragon.service
 
+# Never give up restarting; see the same note in tetragon.service.
+StartLimitIntervalSec=0
+
 [Service]
 Type=simple
 ExecStart=/usr/bin/moatd run
 # SIGHUP re-reads moat.toml, the rendered policies' annotations and
 # allowlist.d without dropping the process table.
 ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
+# `always`, not `on-failure`. `on-failure` leaves the daemon down after a clean
+# exit(0), and "the security daemon exited successfully and stayed off" is not a
+# state anything should be able to reach on purpose.
+Restart=always
 RestartSec=5s
 KillSignal=SIGTERM
 TimeoutStopSec=15s
@@ -30,7 +36,18 @@ RuntimeDirectoryPreserve=yes
 # Only these four trees are writable; everything else, /usr included, is
 # read-only to this unit.
 ProtectSystem=strict
-ReadWritePaths=/var/lib/moat /var/log/moat /run/moat /etc/moat
+# The last four are moat's own state. The rest is the ONLY reason quarantine
+# can do anything: under ProtectSystem=strict every other path is read-only, so
+# `moatctl quarantine` copied the file and then failed with EROFS trying to
+# remove the original -- it reported a quarantine and left the implant running.
+# $HOME matters most: this threat model is a hijacked package running as the
+# user, and it drops its payload there, not in /tmp.
+#
+# This is a real widening of a root daemon's reach, so the removal path is
+# written to deserve it: control.rs copies from a descriptor opened O_NOFOLLOW
+# and removes with unlinkat() relative to the parent directory, which cannot be
+# redirected out of that directory by swapping a symlink in.
+ReadWritePaths=/var/lib/moat /var/log/moat /run/moat /etc/moat /tmp /var/tmp /dev/shm /home
 
 # Capabilities, and why each one is here:
 #   CAP_KILL             `moatctl kill` signals a process of any uid
@@ -45,6 +62,8 @@ CapabilityBoundingSet=CAP_KILL CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN CA
 AmbientCapabilities=CAP_KILL CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SYS_PTRACE
 NoNewPrivileges=yes
 
+# ReadWritePaths=/home above takes precedence over this for /home itself;
+# this still keeps /root and /run/user read-only.
 ProtectHome=read-only
 PrivateTmp=no
 PrivateDevices=yes

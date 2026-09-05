@@ -11,6 +11,21 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 /// RFC3339 with milliseconds and a `Z` suffix, as the contract's `ts` field.
+/// Seconds between two RFC3339 stamps, 0 if either is unparseable.
+///
+/// Used for the triage settle window, where "unparseable means zero" is the
+/// cautious answer: an alert whose timestamp cannot be read is treated as old
+/// enough to look at rather than being deferred forever.
+pub fn secs_between(then: &str, now: &str) -> u64 {
+    let (Ok(a), Ok(b)) = (
+        chrono::DateTime::parse_from_rfc3339(then),
+        chrono::DateTime::parse_from_rfc3339(now),
+    ) else {
+        return u64::MAX;
+    };
+    (b - a).num_seconds().max(0) as u64
+}
+
 pub fn now_rfc3339() -> String {
     chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -397,4 +412,220 @@ mod tests {
         assert_eq!(rfc3339_of(1_800_000_000), "2027-01-15T08:00:00.000Z");
         assert_eq!(rfc3339_to_nanos(&rfc3339_of(1_700_000_000)).unwrap(), 1_700_000_000i128 * 1_000_000_000);
     }
+}
+
+/// Btrfs subvolume roots, as `(exported prefix, real mountpoint)` pairs.
+///
+/// A Tetragon `dentry` argument has no `vfsmount` attached, so the kernel can
+/// only resolve it as far as its *filesystem* root -- not the mount namespace
+/// root. On the default Omarchy layout (`/` on subvol `@`, `/home` on `@home`,
+/// `/var/log` on `@log`) that means the exported path carries the subvolume
+/// name as its first component:
+///
+/// ```text
+///   /home/dan/.bash_history      is exported as  /@home/dan/.bash_history
+///   /var/tmp/x/.bash_history     is exported as  /@/var/tmp/x/.bash_history
+/// ```
+///
+/// Both were measured on this machine on 2026-09-04. A `path` argument carries
+/// the mount and needs none of this, which is why every other rule sees clean
+/// paths -- only rules matching a bare dentry are affected.
+///
+/// Pairs are returned longest-prefix-first so `/@home` is tried before `/@`.
+pub fn subvol_roots(mounts_path: &Path) -> Vec<(String, String)> {
+    match fs::read_to_string(mounts_path) {
+        Ok(text) => parse_subvol_roots(&text),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The parse, split out from the read so it can be tested without a file.
+///
+/// The tests used to write a fixture named after the process id and delete it
+/// again -- which meant the three of them shared one path and raced, because
+/// cargo runs them in parallel threads of the SAME process. That made the
+/// package's `check()` fail about one run in three: a build gate that fails at
+/// random is worse than no gate, because the first thing anyone learns is to
+/// run it again.
+pub fn parse_subvol_roots(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 4 || f[2] != "btrfs" {
+            continue;
+        }
+        let Some(sub) = f[3].split(',').find_map(|o| o.strip_prefix("subvol=")) else {
+            continue;
+        };
+        // `subvol=/@home` -> exported prefix `/@home`. A nested subvolume
+        // (`subvol=/@/var/lib/x`) exports under its own name the same way.
+        let sub = sub.trim_end_matches('/');
+        if sub.is_empty() || sub == "/" {
+            continue;
+        }
+        let mount = f[1].trim_end_matches('/');
+        let mount = if mount.is_empty() { "/" } else { mount };
+        let pair = (sub.to_string(), mount.to_string());
+        if !out.contains(&pair) {
+            out.push(pair);
+        }
+    }
+    out.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    out
+}
+
+/// Rewrite a dentry-derived path into a real absolute path.
+///
+/// A no-op for anything that does not begin with a known subvolume prefix, so
+/// it is safe to apply to every path: on ext4, and on every `path`-typed
+/// argument, the input is already absolute and comes back unchanged.
+///
+/// Paths on a filesystem with no subvolume at all (a tmpfs such as `/tmp`)
+/// cannot be recovered -- the export says `/x/.bash_history` for
+/// `/tmp/x/.bash_history` and nothing in the event names the mount. Those are
+/// returned as-is, which leaves them looking like paths at the root that do not
+/// exist. That is the honest answer, and a caller asking "is this under a real
+/// home" correctly gets `false`.
+pub fn dentry_abs(path: &str, subvols: &[(String, String)]) -> String {
+    if !path.starts_with("/@") {
+        return path.to_string();
+    }
+    for (prefix, mount) in subvols {
+        let rest = match path.strip_prefix(prefix.as_str()) {
+            // Match whole components only: `/@home` must not match `/@homely`.
+            Some(r) if r.is_empty() || r.starts_with('/') => r,
+            _ => continue,
+        };
+        let joined = format!("{}/{}", mount.trim_end_matches('/'), rest.trim_start_matches('/'));
+        let joined = joined.trim_end_matches('/').to_string();
+        return if joined.is_empty() { "/".into() } else { joined };
+    }
+    path.to_string()
+}
+
+#[cfg(test)]
+mod subvol_tests {
+    use super::*;
+
+    /// The real /proc/self/mounts from this machine, trimmed. Parsed from a
+    /// string: no shared temp file, so the tests cannot race each other.
+    fn mounts() -> Vec<(String, String)> {
+        parse_subvol_roots(
+            "/dev/nvme0n1p2 / btrfs rw,relatime,ssd,subvol=/@ 0 0\n\
+             /dev/nvme0n1p2 /home btrfs rw,relatime,ssd,subvol=/@home 0 0\n\
+             /dev/nvme0n1p2 /var/log btrfs rw,relatime,ssd,subvol=/@log 0 0\n\
+             tmpfs /tmp tmpfs rw,nosuid,nodev,usrquota 0 0\n",
+        )
+    }
+
+    #[test]
+    fn a_dentry_path_becomes_the_path_the_user_would_recognise() {
+        let s = mounts();
+        // Both measured from live events on 2026-09-04.
+        assert_eq!(
+            dentry_abs("/@home/dan/.bash_history", &s),
+            "/home/dan/.bash_history"
+        );
+        assert_eq!(
+            dentry_abs("/@/var/tmp/probe/.bash_history", &s),
+            "/var/tmp/probe/.bash_history"
+        );
+        assert_eq!(dentry_abs("/@log/journal/x", &s), "/var/log/journal/x");
+    }
+
+    #[test]
+    fn longest_prefix_wins_and_only_whole_components_match() {
+        let s = mounts();
+        // `/@` is also a prefix of `/@home/...`; taking it would give
+        // `/home/...` -> `//home/dan` and a home test that never matches.
+        assert_eq!(dentry_abs("/@home/dan/x", &s), "/home/dan/x");
+        // Not a subvolume, just a directory whose name starts the same way.
+        assert_eq!(dentry_abs("/@homely/x", &s), "/@homely/x");
+    }
+
+    #[test]
+    fn anything_already_absolute_is_returned_untouched() {
+        let s = mounts();
+        // Every `path`-typed argument, and every path on ext4. This is what
+        // makes it safe to run over all of them.
+        assert_eq!(dentry_abs("/home/dan/.bash_history", &s), "/home/dan/.bash_history");
+        assert_eq!(dentry_abs("/var/lib/moat/alerts.jsonl", &s), "/var/lib/moat/alerts.jsonl");
+        // A tmpfs dentry cannot be recovered and must not be invented.
+        assert_eq!(dentry_abs("/scratch/home/.bash_history", &s), "/scratch/home/.bash_history");
+        // No btrfs at all: the map is empty and nothing is rewritten.
+        assert_eq!(dentry_abs("/@home/dan/x", &[]), "/@home/dan/x");
+    }
+}
+
+/// Open a file that is under suspicion, for staging as evidence.
+///
+/// Returns the open descriptor **and the path the kernel says it really refers
+/// to**, so a caller can re-run its own rules against what it is actually
+/// holding rather than against the string it was given.
+///
+/// Both matter, and neither is paranoia:
+///
+/// * `O_NOFOLLOW` refuses a symlink at the final component. Without it,
+///   `std::fs::copy` follows the link, and every staging path in this daemon
+///   validated the *string* first and then followed it -- so a file the
+///   attacker named `/tmp/bait`, pointing at `/etc/shadow`, passed the
+///   credential check as `/tmp/bait` and was then read by root and written into
+///   an incident directory the `moat` group can read. That is a root file-read
+///   primitive handed to any group member, which on this threat model is the
+///   attacker.
+/// * `/proc/self/fd/<n>` closes the other half. `O_NOFOLLOW` only guards the
+///   LAST component, so a symlinked parent directory (`~/.aws` -> `/etc`) walks
+///   past it. Reading the descriptor's own path asks the kernel where it ended
+///   up, after the fact and with the file already held open -- so there is no
+///   window in which the answer can change between the check and the read.
+/// * `O_NONBLOCK` so a FIFO cannot hang the daemon at `open`; the regular-file
+///   test then rejects it, along with devices and directories.
+pub fn open_suspect(path: &Path) -> Result<(fs::File, String), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| {
+            // ELOOP is the interesting one: it means the thing we were asked to
+            // stage was a symlink, and saying so plainly is better than "could
+            // not open".
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                "refused: it is a symbolic link, and staging follows nothing".to_string()
+            } else {
+                format!("open: {}", e)
+            }
+        })?;
+
+    let meta = f.metadata().map_err(|e| format!("stat: {}", e))?;
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+
+    let real = fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd()))
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path.display().to_string());
+    Ok((f, real))
+}
+
+/// The uid a live process runs as, from `/proc/<pid>/status`.
+pub fn proc_uid(pid: u32) -> Option<u32> {
+    let text = fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            // real, effective, saved, fs — the real uid is the first.
+            return rest.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
+
+/// The cgroup path of a live process. `system.slice` is systemd's home for the
+/// machine's own services, which is how moatd, tetragon, sshd and dbus are told
+/// apart from a user's programs without matching on names.
+pub fn proc_cgroup(pid: u32) -> Option<String> {
+    let text = fs::read_to_string(format!("/proc/{}/cgroup", pid)).ok()?;
+    Some(text.lines().next()?.to_string())
 }

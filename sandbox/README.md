@@ -14,7 +14,8 @@ so that:
 - secret-looking environment variables are **unset**;
 - the network is **left alone**, because installs need it.
 
-The shims in `shims/` put that in front of `npm`, `pip`, `cargo` and friends so
+The shims in `shims/` put that in front of `npm`, `pip`, `cargo`, `go` and
+friends so
 you do not have to remember to type it.
 
 Nothing here needs root. Everything here is user-level.
@@ -25,7 +26,7 @@ Nothing here needs root. Everything here is user-level.
 |---|---|
 | `sandbox/moat-sandbox` | `/usr/bin/moat-sandbox` (0755) |
 | `sandbox/shims/shim-common.sh` | `/usr/lib/moat/shims/shim-common.sh` (0644) |
-| `sandbox/shims/{npm,npx,pnpm,yarn,bun,pip,pip3,uv,cargo,makepkg}` | `/usr/lib/moat/shims/<name>` (0755) |
+| `sandbox/shims/{npm,npx,pnpm,yarn,bun,pip,pip3,uv,cargo,go,makepkg}` | `/usr/lib/moat/shims/<name>` (0755) |
 | `sandbox/sandbox.conf` | `/etc/moat/sandbox.conf` (root:root 0644, `backup=` in the PKGBUILD) |
 | `sandbox/profile.d/moat-shims.sh` | `/etc/profile.d/moat-shims.sh` (0644) |
 | `sandbox/fish/conf.d/moat-shims.fish` | `/usr/share/fish/vendor_conf.d/moat-shims.fish` (0644) |
@@ -87,7 +88,7 @@ Check what your machine does with `sysctl dev.tty.legacy_tiocsti` and
 
 | Variable | Effect |
 |---|---|
-| `MOAT_SANDBOX=0` | `moat-sandbox` and every shim exec the real command directly. For the `makepkg` shim this also skips the `moat-scan-pkgbuild` gate — it is the single documented escape hatch, so it has to open all the way |
+| `MOAT_SANDBOX=0` | `moat-sandbox` and every shim exec the real command directly, and every shim's pre-execution scan is skipped with it — it is the single documented escape hatch, so it has to open all the way |
 | `MOAT_QUIET=1` | suppress the `[moat] …` notice and warnings on stderr |
 | `MOAT_SANDBOX_ACTIVE` | set to `1` **inside** the sandbox (`bwrap --setenv`). Do not set it yourself; it is how nested calls avoid a second, broken layer of bubblewrap. It deliberately does *not* skip the `makepkg` PKGBUILD scan: a nested `makepkg` is usually a different directory with a different PKGBUILD that the outer call never saw. **moatd cannot see it**: `/etc/tetragon/tetragon.conf.d/filter-environment-variables` is `LD_PRELOAD`, so the export carries no other environment variable, and pkg-family alerts raised inside a sandbox cannot be down-ranked on that basis. See docs/INTEGRATION.md |
 
@@ -227,10 +228,53 @@ and leading flags are skipped when looking for the subcommand.
 The trade-off is deliberate: sandboxing `cargo fmt` costs startup time, breaks
 editor integrations, and protects nothing.
 
+For the sandboxed subcommands the shim also runs `moat-scan-cargo --for cargo .`
+first, when there is a `Cargo.toml` in `$PWD` — `cargo build` on an untrusted
+crate is arbitrary code execution via `build.rs`, which is the whole reason
+that subcommand list exists, so it is exactly the list worth scanning. See
+"scans first" below for the ladder; `cargo install ripgrep` from a directory
+with no manifest reads nothing local and is not scanned.
+
+### `go` is only sandboxed for some subcommands
+
+Same split, same reasoning. Sandboxed: `build` `install` `get` `run` `test`
+`generate` `mod` `work` `vet` `bench` `fix` `tool`. Passed through: `fmt`,
+`env`, `version`, `doc`, `list`, `help`, `clean` — `go env -w` in particular
+writes the user config the sandbox deliberately makes read-only.
+
+Because `GOMODCACHE` (`$GOPATH/pkg/mod`, default `~/go/pkg/mod`) and
+`$GOPATH/bin` are outside every path `moat-sandbox` makes writable by default,
+and a read-only module cache fails every build that needs a dependency, the
+shim adds an `--allow` for each — derived from `$GOPATH`/`$GOMODCACHE`/`$GOBIN`
+rather than by running `go env`, which would be a subprocess in front of every
+command for a value we already know.
+
+`moat-scan-go --for go .` runs first for `build install get run test generate
+mod vet`, when there is a `go.mod` in `$PWD`. Go is the least exposed ecosystem
+here — `go build` compiles a dependency, it never runs one — so the scan is
+about `go generate` directives, `replace` targets outside the module and
+`//go:linkname`.
+
+### `pip`, `pip3` and `uv` scan first
+
+`pip install`, `pip wheel` and `pip download` build from whatever is in `$PWD`
+(`pip install .`, `-e .`, `-r requirements.txt`), so the shim runs
+`moat-scan-pip --for python .` first. `pip list`, `pip show` and
+`pip uninstall` execute nothing new and are not scanned; neither is
+`pip install requests` from a directory with no `setup.py`, `setup.cfg`,
+`pyproject.toml`, `pip.conf` or `requirements*.txt`.
+
+For `uv` the scanned subcommands are `add sync lock build run export install`
+and `uv pip {install,download,wheel,sync,compile}`. `uv run` is included
+because on a fresh clone it installs the whole project first; `uv venv`,
+`uv tool`, `uv python`, `uv cache` and `uv pip list` build nothing from this
+directory.
+
 ### `makepkg` scans first
 
 The `makepkg` shim runs `moat-scan-pkgbuild .` (scanner/, contract section 9)
-before doing anything:
+before doing anything. This is the ladder every shim's scan uses, via
+`shim_run_scan` in `shim-common.sh`:
 
 | Scanner exit | Shim behaviour |
 |---|---|
@@ -334,7 +378,9 @@ the `--new-session` decision for `legacy_tiocsti` 0 / 1 / missing plus
 on the test machine's kernel), shim resolution with the shim dir duplicated in
 `PATH`, the no-real-binary and
 no-recursion paths, `cargo` pass-through vs sandboxed subcommands, all three
-`makepkg` scanner outcomes, `MOAT_SANDBOX=0`, `MOAT_SANDBOX_ACTIVE=1`,
+`makepkg` scanner outcomes, the `cargo` and `go` scan gates (including the
+"no manifest here, nothing to scan" case), `MOAT_SANDBOX=0`,
+`MOAT_SANDBOX_ACTIVE=1`,
 exit-code propagation, the notice line, `MOAT_QUIET`, refusing a denied
 `$PWD`, `$PWD == $HOME`, and mise-provided `node` running inside the sandbox.
 

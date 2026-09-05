@@ -1,0 +1,8 @@
+{
+  "name": "bin-escape",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "tiny-tool": "^1.0.0"
+  }
+}

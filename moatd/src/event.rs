@@ -16,8 +16,25 @@ pub struct RawEvent {
     pub process_kprobe: Option<HookEvent>,
     pub process_lsm: Option<HookEvent>,
     pub process_tracepoint: Option<HookEvent>,
+    /// Tetragon telling us it is DROPPING events.
+    ///
+    /// `cgroup-rate` is configured at 1000 events/s per cgroup, and serde
+    /// ignores unknown fields -- so this message was parsed into nothing and
+    /// discarded. An attacker who exceeds that rate in their own cgroup gets
+    /// the sensor to drop their own events, which is the cheapest blinding
+    /// there is: unlike every other evasion it leaves no record at all,
+    /// because the record is what never gets written.
+    pub process_throttle: Option<ThrottleEvent>,
     pub node_name: Option<String>,
     pub time: Option<String>,
+}
+
+/// `{"type":"THROTTLE_START"|"THROTTLE_STOP","cgroup":"...","ticks":N}`
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ThrottleEvent {
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    pub cgroup: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -219,6 +236,14 @@ impl<'a> HookHit<'a> {
 
     /// Did the policy *configure* a kill? In monitor mode this is still
     /// reported, so it is a hint only (NOTES §7).
+    /// The kernel REFUSED the operation (`Override`) rather than killing the
+    /// process. `connect()` returned -EPERM and the program is still running,
+    /// so this is a containment that already happened -- unlike a kill, which
+    /// is only believed once `process_exit` reports SIGKILL.
+    pub fn action_is_deny(&self) -> bool {
+        matches!(self.ev.action.as_deref(), Some("KPROBE_ACTION_OVERRIDE"))
+    }
+
     pub fn action_is_kill(&self) -> bool {
         matches!(
             self.ev.action.as_deref(),

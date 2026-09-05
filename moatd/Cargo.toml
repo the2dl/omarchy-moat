@@ -22,6 +22,10 @@ path = "src/bin/moatctl.rs"
 name = "moat-feeds"
 path = "src/bin/moat_feeds.rs"
 
+[[bin]]
+name = "moat-ship"
+path = "src/bin/moat_ship.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

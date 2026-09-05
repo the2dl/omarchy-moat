@@ -69,6 +69,21 @@ fn bits_eq(a: &[u8], b: &[u8], prefix: u8) -> bool {
 
 /// Anything that never leaves the machine or the LAN. Loopback, RFC1918,
 /// link-local, CGNAT, multicast and their v6 equivalents.
+/// Addresses that are always fine to talk to from inside an install.
+///
+/// Loopback only. A local registry proxy, a devcontainer registry and a
+/// `verdaccio` on 127.0.0.1 are ordinary and are the reason `allow_private`
+/// existed at all -- but they live on loopback, not on the LAN. An install
+/// reaching an arbitrary *LAN* host is a different thing entirely, and on
+/// 2026-09-04 a simulated npm package beaconed to a WebSocket C2 on
+/// 192.168.44.122 and moat said nothing, because "private" covered both.
+pub fn is_always_local(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+    }
+}
+
 pub fn is_private(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {

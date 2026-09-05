@@ -1,0 +1,19 @@
+lockfileVersion: '6.0'
+
+dependencies:
+  esbuild:
+    specifier: ^0.20.0
+    version: 0.20.2
+
+packages:
+
+  /esbuild@0.20.2:
+    resolution: {integrity: sha512-fixturehashnotreal==}
+    hasBin: true
+    requiresBuild: true
+    dev: false
+
+  /telemetry-agent@1.0.0:
+    resolution: {integrity: sha512-fixturehashnotreal==}
+    requiresBuild: true
+    dev: false

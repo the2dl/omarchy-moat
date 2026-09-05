@@ -1,0 +1,11 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ordinary-lib"
+version = "1.2.3"
+dependencies = ["requests>=2.28", "click>=8"]
+
+[tool.uv]
+index-url = "https://pypi.org/simple"

@@ -1,0 +1,1580 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,300,0,0&display=swap" rel="stylesheet">
+<style>
+  body { margin: 0; background: #08090b; }
+  a { color: #f2a25a; text-decoration: none; }
+  a:hover { color: #f8c48f; }
+  .ms { font-family: 'Material Symbols Rounded'; font-weight: normal; font-style: normal; line-height: 1; letter-spacing: normal; text-transform: none; display: inline-block; white-space: nowrap; word-wrap: normal; direction: ltr; -webkit-font-feature-settings: 'liga'; -webkit-font-smoothing: antialiased; }
+</style>
+</helmet>
+
+<section style="width: 2100px; box-sizing: border-box; padding: 56px 56px 90px; font-family: 'JetBrains Mono', monospace; color: #eceae7; display: flex; flex-direction: column; gap: 52px;">
+
+  <div style="display: flex; flex-direction: column; gap: 11px; max-width: 1040px;">
+    <div style="font-size: 12px; letter-spacing: 0.18em; text-transform: uppercase; color: #6d6863;">Turn 3 · the bad day, the way in, the words</div>
+    <div style="font-size: 32px; font-weight: 500; letter-spacing: -0.01em;">What it looks like when it is real</div>
+    <div style="font-size: 14px; line-height: 1.65; color: #a09b95; text-wrap: pretty;">Ids: <a href="#3a">3a</a> a chain, not four alerts · <a href="#3b">3b</a> containment · <a href="#3c">3c</a> several things need you · <a href="#3d">3d</a> after Moat blocked something · <a href="#3e">3e</a> the waybar glyph · <a href="#3f">3f</a> first run · <a href="#3g">3g</a> how titles get written.</div>
+  </div>
+
+  <sc-if value="{{ showRationale }}" hint-placeholder-val="{{ true }}">
+  <div style="display: flex; gap: 24px; flex-wrap: wrap;">
+    <div style="width: 480px; padding: 18px 20px; border-radius: 13px; background: #121316; display: flex; flex-direction: column; gap: 9px;">
+      <div style="font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #f2a25a;">decision · the bad day</div>
+      <div style="font-size: 14px; color: #f6f4f2;">Correlation is the whole product on a real incident.</div>
+      <div style="font-size: 12px; line-height: 1.65; color: #a09b95; text-wrap: pretty;">Four alerts in nine minutes that share a process tree are not four problems. They become one incident with a sequence, and the verdict is written about the sequence — a key read alone is ambiguous, a key read followed by an outbound connection and a persistence write is not. This is also the only place the panel is allowed to be alarming.</div>
+    </div>
+    <div style="width: 480px; padding: 18px 20px; border-radius: 13px; background: #121316; display: flex; flex-direction: column; gap: 9px;">
+      <div style="font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #f2a25a;">decision · containment, in order</div>
+      <div style="font-size: 12px; line-height: 1.65; color: #a09b95; text-wrap: pretty;">Under pressure a non-specialist needs a numbered list, not five buttons. Moat proposes the steps in the order that matters, does the machine-side ones itself, and is explicit about the one thing it cannot do for you — rotating a key that has already left the machine.</div>
+    </div>
+    <div style="width: 480px; padding: 18px 20px; border-radius: 13px; background: #121316; display: flex; flex-direction: column; gap: 9px;">
+      <div style="font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #f2a25a;">decision · the bar is the product</div>
+      <div style="font-size: 12px; line-height: 1.65; color: #a09b95; text-wrap: pretty;">The panel gets opened weekly; the waybar glyph is seen every few seconds. So the glyph carries the same three states as the verdict line and nothing else — no count of events, no rule ids, no severity colours competing with your battery.</div>
+    </div>
+  </div>
+  </sc-if>
+
+  <!-- 3a ─────────────────────────────────────────────── -->
+  <div id="3a" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">3a</span>
+      <span style="font-size: 14px; font-weight: 500;">Now · a chain, not four alerts</span>
+      <span style="font-size: 12px; color: #837e79;">the case the tool exists for</span>
+    </div>
+
+    <div style="width: 1400px; border-radius: 16px; overflow: hidden; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); display: flex; flex-direction: column;">
+      <div style="display: flex; align-items: center; gap: 13px; height: 54px; padding: 0 22px; border-bottom: 1px solid rgba(255,255,255,0.06); background: rgba(224,82,63,0.06);">
+        <span class="ms" style="font-size: 18px; color: #e0523f;">shield</span>
+        <span style="font-size: 14px; font-weight: 500;">Moat</span>
+        <div style="margin-left: auto; display: flex; align-items: center; gap: 6px;">
+          <span style="display: flex; align-items: center; gap: 8px; font-size: 12px; color: #f2a25a; padding: 6px 13px; border-radius: 8px; background: rgba(242,162,90,0.11);">Now <span style="font-size: 10px; font-weight: 700; color: #1a1006; background: #e0523f; border-radius: 5px; padding: 2px 5px;">1</span></span>
+          <span style="font-size: 12px; color: #837e79; padding: 6px 13px;">History</span>
+          <span style="font-size: 12px; color: #837e79; padding: 6px 13px;">Rules</span>
+          <span class="ms" style="font-size: 17px; color: #55514d; margin-left: 8px;">settings</span>
+          <span class="ms" style="font-size: 17px; color: #55514d;">close</span>
+        </div>
+      </div>
+
+      <div style="padding: 40px 44px 34px; display: flex; flex-direction: column; gap: 28px;">
+        <div style="display: flex; flex-direction: column; gap: 13px; max-width: 900px;">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <span style="width: 9px; height: 9px; border-radius: 50%; background: #e0523f;"></span>
+            <span style="font-size: 26px; font-weight: 500; letter-spacing: -0.01em; color: #f6f4f2;">This one needs you now.</span>
+          </div>
+          <div style="font-size: 13px; line-height: 1.7; color: #a09b95; text-wrap: pretty; padding-left: 21px;">Four things happened in nine minutes and they were all the same program. Moat has already cut its network access while you read this.</div>
+        </div>
+
+        <div style="border-radius: 14px; background: #121316; border: 1px solid rgba(224,82,63,0.3); padding: 26px 28px 24px; display: flex; flex-direction: column; gap: 24px;">
+          <div style="display: flex; flex-direction: column; gap: 9px; max-width: 940px;">
+            <div style="font-size: 19px; font-weight: 500; line-height: 1.4; color: #f6f4f2; text-wrap: pretty;">A build script read your SSH key, sent something out, and set itself to run at every login</div>
+            <div style="display: flex; align-items: center; gap: 12px; font-size: 12px; color: #6d6863;">
+              <span style="color: #b3aea8;">node</span><span>·</span><span>started 09:14 by an npm install</span><span>·</span><span>network cut 09:23</span>
+            </div>
+          </div>
+
+          <div style="display: flex; flex-direction: column; gap: 10px; max-width: 940px; padding-left: 16px; border-left: 2px solid rgba(224,82,63,0.5);">
+            <div style="font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #e0523f;">Moat read it this way</div>
+            <div style="font-size: 14px; line-height: 1.75; color: #e8e4e0; text-wrap: pretty;">Any one of these four would be arguable. Together they are the standard shape of a stolen credential: read the key, get it off the machine, make sure you survive a reboot, then hide the evidence. The npm package that started it is <span style="color:#f6f4f2;">@ui/react-motion-lite</span>, added to your project 20 minutes ago.</div>
+            <div style="font-size: 13px; line-height: 1.7; color: #f6f4f2; text-wrap: pretty;">Assume the key that lives at ~/.ssh/id_ed25519 is no longer private.</div>
+          </div>
+
+          <div style="display: flex; flex-direction: column; gap: 0;">
+            <div style="display: grid; grid-template-columns: 74px 20px 1fr 130px; gap: 18px;">
+              <span style="font-size: 11px; color: #55514d; text-align: right; padding-top: 2px;">09:14</span>
+              <span style="display: flex; flex-direction: column; align-items: center;"><span style="width: 8px; height: 8px; border-radius: 50%; background: #3d3a37; margin-top: 4px;"></span><span style="flex: 1; width: 1px; background: rgba(255,255,255,0.08);"></span></span>
+              <div style="display: flex; flex-direction: column; gap: 4px; padding-bottom: 20px;">
+                <span style="font-size: 13px; color: #b3aea8;">npm install ran a postinstall script</span>
+                <span style="font-size: 11px; color: #6d6863;">normal on its own</span>
+              </div>
+              <span></span>
+            </div>
+            <div style="display: grid; grid-template-columns: 74px 20px 1fr 130px; gap: 18px;">
+              <span style="font-size: 11px; color: #55514d; text-align: right; padding-top: 2px;">09:16</span>
+              <span style="display: flex; flex-direction: column; align-items: center;"><span style="width: 8px; height: 8px; border-radius: 50%; background: #e0523f; margin-top: 4px;"></span><span style="flex: 1; width: 1px; background: rgba(255,255,255,0.08);"></span></span>
+              <div style="display: flex; flex-direction: column; gap: 4px; padding-bottom: 20px;">
+                <span style="font-size: 13px; color: #f6f4f2;">It read ~/.ssh/id_ed25519</span>
+                <span style="font-size: 11px; color: #837e79;">a build script has no reason to</span>
+              </div>
+              <span style="font-size: 11px; color: #6d6863;">happened</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 74px 20px 1fr 130px; gap: 18px;">
+              <span style="font-size: 11px; color: #55514d; text-align: right; padding-top: 2px;">09:17</span>
+              <span style="display: flex; flex-direction: column; align-items: center;"><span style="width: 8px; height: 8px; border-radius: 50%; background: #e0523f; margin-top: 4px;"></span><span style="flex: 1; width: 1px; background: rgba(255,255,255,0.08);"></span></span>
+              <div style="display: flex; flex-direction: column; gap: 4px; padding-bottom: 20px;">
+                <span style="font-size: 13px; color: #f6f4f2;">Sent 4 kB to 91.219.— over HTTPS</span>
+                <span style="font-size: 11px; color: #837e79;">first time this machine has talked to that host</span>
+              </div>
+              <span style="font-size: 11px; color: #6d6863;">happened</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 74px 20px 1fr 130px; gap: 18px;">
+              <span style="font-size: 11px; color: #55514d; text-align: right; padding-top: 2px;">09:21</span>
+              <span style="display: flex; flex-direction: column; align-items: center;"><span style="width: 8px; height: 8px; border-radius: 50%; background: #e0523f; margin-top: 4px;"></span><span style="flex: 1; width: 1px; background: rgba(255,255,255,0.08);"></span></span>
+              <div style="display: flex; flex-direction: column; gap: 4px; padding-bottom: 20px;">
+                <span style="font-size: 13px; color: #f6f4f2;">Added itself to your systemd user units</span>
+                <span style="font-size: 11px; color: #837e79;">would start again at next login</span>
+              </div>
+              <span style="font-size: 11px; color: #7ba37f;">reverted</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 74px 20px 1fr 130px; gap: 18px;">
+              <span style="font-size: 11px; color: #55514d; text-align: right; padding-top: 2px;">09:23</span>
+              <span style="display: flex; flex-direction: column; align-items: center;"><span style="width: 8px; height: 8px; border-radius: 50%; background: #f2a25a; margin-top: 4px;"></span></span>
+              <div style="display: flex; flex-direction: column; gap: 4px;">
+                <span style="font-size: 13px; color: #b3aea8;">Moat cut the process off the network and froze it</span>
+                <span style="font-size: 11px; color: #6d6863;">automatic — three high-confidence steps in one tree</span>
+              </div>
+              <span style="font-size: 11px; color: #f2a25a;">Moat did this</span>
+            </div>
+          </div>
+
+          <div style="display: flex; align-items: center; gap: 14px;">
+            <div style="display: flex; align-items: center; gap: 9px; padding: 11px 20px; border-radius: 10px; background: #e0523f;">
+              <span class="ms" style="font-size: 16px; color: #1a0805;">shield_lock</span>
+              <span style="font-size: 13px; font-weight: 500; color: #1a0805;">Contain it — 4 steps</span>
+            </div>
+            <span style="font-size: 12px; color: #b3aea8;">Ask Moat</span>
+            <span style="font-size: 12px; color: #837e79;">Show evidence</span>
+            <span style="font-size: 12px; color: #837e79;">This was me</span>
+            <span style="margin-left: auto; font-size: 11px; color: #3d3a37;">4 detections · one process tree</span>
+          </div>
+        </div>
+
+        <div style="display: flex; align-items: center; gap: 16px; padding: 15px 18px; border-radius: 12px; background: #121316;">
+          <span class="ms" style="font-size: 17px; color: #6d6863;">visibility_off</span>
+          <span style="font-size: 12px; line-height: 1.6; color: #837e79; text-wrap: pretty;">Nothing else today is being shown while this is open. It'll be here when you come back.</span>
+        </div>
+      </div>
+    </div>
+
+    <div style="width: 1400px; font-size: 12px; line-height: 1.7; color: #837e79; text-wrap: pretty;">Under the old design this arrives as four HIGH rows among nine identical ones, each with its own prose and its own five buttons, and the user reads them in whatever order the list sorted them. The whole point is that the fourth event changes the meaning of the first. Note the two things that shift on a real incident: Moat acts before you read, and it says the one sentence that matters — treat the key as gone.</div>
+  </div>
+
+  <!-- 3b ─────────────────────────────────────────────── -->
+  <div id="3b" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">3b</span>
+      <span style="font-size: 14px; font-weight: 500;">Containment</span>
+      <span style="font-size: 12px; color: #837e79;">a numbered list, in the order that matters</span>
+    </div>
+
+    <div style="display: flex; gap: 26px; flex-wrap: wrap;">
+      <div style="width: 860px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 32px 34px 32px; display: flex; flex-direction: column; gap: 24px;">
+        <div style="display: flex; flex-direction: column; gap: 9px;">
+          <span style="font-size: 19px; font-weight: 500; color: #f6f4f2;">Four steps. Moat can do the first three.</span>
+          <span style="font-size: 12px; color: #6d6863;">You can run them one at a time or all at once.</span>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 10px;">
+          <div style="display: grid; grid-template-columns: 26px 1fr 100px; align-items: start; gap: 16px; padding: 16px 18px; border-radius: 11px; background: #121316;">
+            <span style="font-size: 12px; color: #7ba37f; padding-top: 2px;">1</span>
+            <div style="display: flex; flex-direction: column; gap: 5px;">
+              <span style="font-size: 13px; color: #d6d2ce;">Stop the process and hold its files</span>
+              <span style="font-size: 11px; color: #6d6863;">already frozen and off the network since 09:23</span>
+            </div>
+            <span style="font-size: 11px; color: #7ba37f; justify-self: end; padding-top: 2px;">done</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 26px 1fr 100px; align-items: start; gap: 16px; padding: 16px 18px; border-radius: 11px; background: #121316;">
+            <span style="font-size: 12px; color: #7ba37f; padding-top: 2px;">2</span>
+            <div style="display: flex; flex-direction: column; gap: 5px;">
+              <span style="font-size: 13px; color: #d6d2ce;">Undo the login entry it added</span>
+              <span style="font-size: 11px; color: #6d6863;">the systemd user unit is already back to what it was</span>
+            </div>
+            <span style="font-size: 11px; color: #7ba37f; justify-self: end; padding-top: 2px;">done</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 26px 1fr 100px; align-items: start; gap: 16px; padding: 16px 18px; border-radius: 11px; background: #121316; border: 1px solid rgba(242,162,90,0.28);">
+            <span style="font-size: 12px; color: #f2a25a; padding-top: 2px;">3</span>
+            <div style="display: flex; flex-direction: column; gap: 5px;">
+              <span style="font-size: 13px; color: #f6f4f2;">Remove the package and its lockfile entry</span>
+              <span style="font-size: 11px; color: #6d6863;">@ui/react-motion-lite in ~/dev/studio · your project won't build until you replace it</span>
+            </div>
+            <span style="font-size: 11px; color: #1a1006; background: #f2a25a; border-radius: 7px; padding: 6px 11px; justify-self: end;">Do it</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 26px 1fr 100px; align-items: start; gap: 16px; padding: 16px 18px; border-radius: 11px; background: #121316; border: 1px solid rgba(224,82,63,0.28);">
+            <span style="font-size: 12px; color: #e0523f; padding-top: 2px;">4</span>
+            <div style="display: flex; flex-direction: column; gap: 5px;">
+              <span style="font-size: 13px; color: #f6f4f2;">Replace your SSH key — only you can do this</span>
+              <span style="font-size: 11px; line-height: 1.6; color: #837e79;">It left the machine at 09:17. Generate a new one, add it to GitHub and anywhere else it's authorised, then delete the old one. Moat can't reach those services and shouldn't.</span>
+            </div>
+            <span style="font-size: 11px; color: #b3aea8; background: #191a1d; border-radius: 7px; padding: 6px 11px; justify-self: end;">How</span>
+          </div>
+        </div>
+
+        <div style="display: flex; align-items: center; gap: 14px;">
+          <span style="font-size: 13px; font-weight: 500; color: #1a0805; background: #e0523f; border-radius: 10px; padding: 11px 20px;">Do steps 1–3</span>
+          <span style="font-size: 12px; color: #837e79;">Everything here is undoable except step 3</span>
+        </div>
+      </div>
+
+      <div style="width: 514px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 30px 30px 28px; display: flex; flex-direction: column; gap: 20px; box-sizing: border-box;">
+        <span style="font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: #55514d;">after · what Moat keeps</span>
+        <div style="display: flex; flex-direction: column; gap: 14px;">
+          <div style="display: flex; flex-direction: column; gap: 5px;">
+            <span style="font-size: 13px; color: #d6d2ce;">The incident stays open until step 4</span>
+            <span style="font-size: 11px; line-height: 1.6; color: #837e79;">A rotated key is the only thing that actually closes this, so the panel keeps saying so — politely, once a day.</span>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 5px;">
+            <span style="font-size: 13px; color: #d6d2ce;">A watch on the host it talked to</span>
+            <span style="font-size: 11px; line-height: 1.6; color: #837e79;">Anything else reaching 91.219.— becomes a needs-you immediately, no learning, no cooldown.</span>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 5px;">
+            <span style="font-size: 13px; color: #d6d2ce;">A written record</span>
+            <span style="font-size: 11px; line-height: 1.6; color: #837e79;">Timeline, evidence and every action taken, as one file. This is the one incident you will want to explain to someone later.</span>
+          </div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px; padding-top: 2px;">
+          <span style="font-size: 12px; color: #b3aea8; background: #191a1d; border-radius: 9px; padding: 9px 16px;">Save the record</span>
+          <span style="font-size: 12px; color: #837e79;">Remind me tomorrow</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3c ─────────────────────────────────────────────── -->
+  <div id="3c" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">3c</span>
+      <span style="font-size: 14px; font-weight: 500;">Now · several things need you</span>
+      <span style="font-size: 12px; color: #837e79;">back after a week — a queue with an order, not a list</span>
+    </div>
+
+    <div style="width: 1400px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 40px 44px 34px; display: flex; flex-direction: column; gap: 28px;">
+      <div style="display: flex; flex-direction: column; gap: 13px; max-width: 900px;">
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span style="width: 9px; height: 9px; border-radius: 50%; background: #e0523f;"></span>
+          <span style="font-size: 26px; font-weight: 500; letter-spacing: -0.01em; color: #f6f4f2;">Three things need you.</span>
+          <span style="font-size: 12px; color: #6d6863; margin-left: 4px;">about two minutes · press <span style="color:#9d9892;">j</span> to walk them</span>
+        </div>
+        <div style="font-size: 13px; line-height: 1.7; color: #a09b95; text-wrap: pretty; padding-left: 21px;">Ordered by what Moat is least sure about. The other 61 things this week are explained and closed.</div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 12px;">
+        <div style="display: grid; grid-template-columns: 26px 1fr 200px 120px; align-items: center; gap: 20px; padding: 20px 22px; border-radius: 12px; background: #121316; border: 1px solid rgba(224,82,63,0.24);">
+          <span style="font-size: 12px; color: #e0523f;">1</span>
+          <div style="display: flex; flex-direction: column; gap: 6px;">
+            <span style="font-size: 14px; color: #f6f4f2;">flea rewrote a file that runs at every login</span>
+            <span style="font-size: 11px; color: #837e79;">Moat thinks this is your own package, but it has never seen flea before</span>
+          </div>
+          <span style="font-size: 11px; color: #55514d;">Tuesday · not run yet</span>
+          <div style="display: flex; gap: 8px; justify-self: end;">
+            <span style="font-size: 11px; color: #1a1006; background: #f2a25a; border-radius: 7px; padding: 7px 12px;">Was me</span>
+            <span style="font-size: 11px; color: #b3aea8; background: #191a1d; border-radius: 7px; padding: 7px 12px;">Open</span>
+          </div>
+        </div>
+        <div style="display: grid; grid-template-columns: 26px 1fr 200px 120px; align-items: center; gap: 20px; padding: 20px 22px; border-radius: 12px; background: #121316;">
+          <span style="font-size: 12px; color: #6d6863;">2</span>
+          <div style="display: flex; flex-direction: column; gap: 6px;">
+            <span style="font-size: 14px; color: #d6d2ce;">A program you don't recognise read your GPG keyring</span>
+            <span style="font-size: 11px; color: #837e79;">once, from a terminal, while you were logged in</span>
+          </div>
+          <span style="font-size: 11px; color: #55514d;">Thursday</span>
+          <div style="display: flex; gap: 8px; justify-self: end;">
+            <span style="font-size: 11px; color: #1a1006; background: #f2a25a; border-radius: 7px; padding: 7px 12px;">Was me</span>
+            <span style="font-size: 11px; color: #b3aea8; background: #191a1d; border-radius: 7px; padding: 7px 12px;">Open</span>
+          </div>
+        </div>
+        <div style="display: grid; grid-template-columns: 26px 1fr 200px 120px; align-items: center; gap: 20px; padding: 20px 22px; border-radius: 12px; background: #121316;">
+          <span style="font-size: 12px; color: #6d6863;">3</span>
+          <div style="display: flex; flex-direction: column; gap: 6px;">
+            <span style="font-size: 14px; color: #d6d2ce;">docker got a new entry in your sudoers drop-in</span>
+            <span style="font-size: 11px; color: #837e79;">during an upgrade you ran, which is when this normally happens</span>
+          </div>
+          <span style="font-size: 11px; color: #55514d;">Saturday</span>
+          <div style="display: flex; gap: 8px; justify-self: end;">
+            <span style="font-size: 11px; color: #1a1006; background: #f2a25a; border-radius: 7px; padding: 7px 12px;">Was me</span>
+            <span style="font-size: 11px; color: #b3aea8; background: #191a1d; border-radius: 7px; padding: 7px 12px;">Open</span>
+          </div>
+        </div>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 16px; padding: 15px 18px; border-radius: 12px; background: #121316;">
+        <span class="ms" style="font-size: 17px; color: #6d6863;">done_all</span>
+        <span style="font-size: 12px; line-height: 1.6; color: #837e79; text-wrap: pretty;">All three are things Moat leans towards allowing. If you were away and nothing surprises you here, you can accept the lot — it writes three rules and lists them under Rules.</span>
+        <span style="margin-left: auto; flex: none; font-size: 12px; color: #f2a25a;">All three were me</span>
+      </div>
+    </div>
+
+    <div style="width: 1400px; font-size: 12px; line-height: 1.7; color: #837e79; text-wrap: pretty;">Order is by Moat's uncertainty, not severity — a HIGH it is sure about is less worth your attention than a MEDIUM it can't place. The bulk accept only appears when every item in the queue is one Moat would allow; with a real incident in the list it is gone, because it would be a way to click past <a href="#3a">3a</a>.</div>
+  </div>
+
+  <!-- 3d ─────────────────────────────────────────────── -->
+  <div id="3d" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">3d</span>
+      <span style="font-size: 14px; font-weight: 500;">After Moat blocked something</span>
+      <span style="font-size: 12px; color: #837e79;">enforce mode's real UI is the apology, not the switch</span>
+    </div>
+
+    <div style="width: 1400px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 32px 34px 34px; display: flex; flex-direction: column; gap: 24px;">
+      <div style="display: flex; flex-direction: column; gap: 10px; max-width: 940px;">
+        <div style="font-size: 19px; font-weight: 500; color: #f6f4f2;">Moat stopped something while you were working</div>
+        <div style="font-size: 13px; line-height: 1.7; color: #a09b95; text-wrap: pretty;">Your terminal will have shown this as a program dying for no reason. That is what a kernel-level block looks like from the outside, so this screen exists to explain it after the fact.</div>
+      </div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+        <div style="padding: 20px 22px; border-radius: 12px; background: #121316; display: flex; flex-direction: column; gap: 12px;">
+          <span style="font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #55514d;">what you saw</span>
+          <div style="padding: 14px 16px; border-radius: 9px; background: #0a0b0d; font-size: 12px; line-height: 1.9; color: #837e79;">
+            <div style="color: #9d9892;">$ ./scripts/deploy.sh</div>
+            <div>uploading…</div>
+            <div style="color: #e0523f;">Killed</div>
+            <div style="color: #55514d;">$</div>
+          </div>
+        </div>
+        <div style="padding: 20px 22px; border-radius: 12px; background: #121316; display: flex; flex-direction: column; gap: 12px;">
+          <span style="font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #55514d;">what happened</span>
+          <div style="font-size: 12px; line-height: 1.75; color: #b3aea8; text-wrap: pretty;">deploy.sh read your SSH key and then opened a connection, which is the pattern Moat is set to stop. It is also exactly what a deploy script does. Moat was wrong.</div>
+        </div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 12px; padding: 20px 22px; border-radius: 12px; background: #121316; border: 1px solid rgba(242,162,90,0.24);">
+        <span style="font-size: 13px; color: #f6f4f2;">Let it run and don't stop it again</span>
+        <span style="font-size: 12px; line-height: 1.7; color: #9d9892; text-wrap: pretty;">Adds deploy.sh to your rules for reading keys, and nothing else. Then re-run it yourself — Moat won't restart something for you.</span>
+        <div style="display: flex; align-items: center; gap: 14px; padding-top: 4px;">
+          <span style="font-size: 13px; font-weight: 500; color: #1a1006; background: #f2a25a; border-radius: 10px; padding: 11px 20px;">Allow deploy.sh</span>
+          <span style="font-size: 12px; color: #b3aea8;">Copy the command to re-run</span>
+          <span style="margin-left: auto; font-size: 12px; color: #837e79;">Go back to just telling me</span>
+        </div>
+      </div>
+
+      <div style="font-size: 12px; line-height: 1.65; color: #6d6863; text-wrap: pretty;">Two blocks in a week offers to turn enforce off, and says why: at that rate it is costing you more work than it is saving.</div>
+    </div>
+
+    <div style="width: 1400px; font-size: 12px; line-height: 1.7; color: #837e79; text-wrap: pretty;">The old Settings copy warned that <span style="color:#a09b95;">a false positive stops a real program mid-write</span> and then left the user alone with the consequence. If the product is willing to kill things, the recovery path is part of the product: show the terminal output they already saw, own the mistake, offer the narrow rule, and offer the retreat.</div>
+  </div>
+
+  <!-- 3e + 3f ────────────────────────────────────────── -->
+  <div style="display: flex; gap: 26px; flex-wrap: wrap;">
+    <div id="3e" style="display: flex; flex-direction: column; gap: 14px;">
+      <div style="display: flex; align-items: baseline; gap: 12px;">
+        <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">3e</span>
+        <span style="font-size: 14px; font-weight: 500;">The waybar glyph</span>
+        <span style="font-size: 12px; color: #837e79;">seen every few seconds</span>
+      </div>
+      <div style="width: 686px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 30px 30px 28px; display: flex; flex-direction: column; gap: 22px;">
+        <div style="display: flex; flex-direction: column; gap: 14px;">
+          <div style="display: flex; flex-direction: column; gap: 7px;">
+            <span style="font-size: 11px; color: #55514d;">quiet · the state you see all day</span>
+            <div style="display: flex; align-items: center; gap: 18px; padding: 9px 16px; border-radius: 10px; background: #121316;">
+              <span style="font-size: 12px; color: #6d6863;">1 2 3</span>
+              <span style="margin-left: auto; display: flex; align-items: center; gap: 7px;"><span class="ms" style="font-size: 14px; color: #55514d;">shield</span></span>
+              <span style="font-size: 12px; color: #6d6863;">62%</span>
+              <span style="font-size: 12px; color: #6d6863;">09:41</span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 7px;">
+            <span style="font-size: 11px; color: #55514d;">something needs you · one count, nothing else</span>
+            <div style="display: flex; align-items: center; gap: 18px; padding: 9px 16px; border-radius: 10px; background: #121316;">
+              <span style="font-size: 12px; color: #6d6863;">1 2 3</span>
+              <span style="margin-left: auto; display: flex; align-items: center; gap: 7px;"><span class="ms" style="font-size: 14px; color: #e0523f;">shield</span><span style="font-size: 12px; color: #e0523f;">1</span></span>
+              <span style="font-size: 12px; color: #6d6863;">62%</span>
+              <span style="font-size: 12px; color: #6d6863;">09:41</span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 7px;">
+            <span style="font-size: 11px; color: #55514d;">not watching properly · the state you must not miss</span>
+            <div style="display: flex; align-items: center; gap: 18px; padding: 9px 16px; border-radius: 10px; background: #121316;">
+              <span style="font-size: 12px; color: #6d6863;">1 2 3</span>
+              <span style="margin-left: auto; display: flex; align-items: center; gap: 7px;"><span class="ms" style="font-size: 14px; color: #f2a25a;">shield</span><span style="font-size: 12px; color: #f2a25a;">gap</span></span>
+              <span style="font-size: 12px; color: #6d6863;">62%</span>
+              <span style="font-size: 12px; color: #6d6863;">09:41</span>
+            </div>
+          </div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 10px; padding: 16px 18px; border-radius: 11px; background: #121316;">
+          <span style="font-size: 12px; color: #b3aea8;">Hover, and only for the two loud states</span>
+          <span style="font-size: 12px; line-height: 1.7; color: #837e79; text-wrap: pretty;">flea rewrote a file that runs at every login · 10h ago<br><span style="color: #55514d;">click to open · middle-click to say it was you</span></span>
+        </div>
+        <div style="font-size: 12px; line-height: 1.65; color: #6d6863; text-wrap: pretty;">No event counter, no rule name, no severity palette. Three states, matching the verdict line exactly, so the bar and the panel can never disagree.</div>
+      </div>
+    </div>
+
+    <div id="3f" style="display: flex; flex-direction: column; gap: 14px;">
+      <div style="display: flex; align-items: baseline; gap: 12px;">
+        <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">3f</span>
+        <span style="font-size: 14px; font-weight: 500;">First run</span>
+        <span style="font-size: 12px; color: #837e79;">before learning starts</span>
+      </div>
+      <div style="width: 686px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 30px 30px 28px; display: flex; flex-direction: column; gap: 22px;">
+        <div style="display: flex; flex-direction: column; gap: 11px;">
+          <span style="font-size: 20px; font-weight: 500; color: #f6f4f2;">Moat watches four things</span>
+          <span style="font-size: 13px; line-height: 1.7; color: #a09b95; text-wrap: pretty;">It reads what programs do, in the kernel. It never reads the contents of your files, and it never sends anything anywhere.</span>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 2px;">
+          <div style="display: grid; grid-template-columns: 1fr; gap: 5px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 13px; color: #d6d2ce;">Reads of your keys and tokens</span>
+            <span style="font-size: 11px; color: #6d6863;">~/.ssh, gpg, .npmrc, cloud credentials</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr; gap: 5px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 13px; color: #d6d2ce;">Things that make a program start at login</span>
+            <span style="font-size: 11px; color: #6d6863;">shell rc files, systemd user units, autostart, hyprland config</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr; gap: 5px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 13px; color: #d6d2ce;">Ways to become root</span>
+            <span style="font-size: 11px; color: #6d6863;">sudoers, loader paths, setuid binaries</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr; gap: 5px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05); border-bottom: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 13px; color: #d6d2ce;">What package installs and build scripts do</span>
+            <span style="font-size: 11px; color: #6d6863;">the most common way something bad gets onto a developer's machine</span>
+          </div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 12px; padding: 16px 18px; border-radius: 11px; background: #121316;">
+          <span style="font-size: 12px; color: #b3aea8;">First it spends 9 days learning what's normal here.</span>
+          <span style="font-size: 12px; line-height: 1.65; color: #837e79; text-wrap: pretty;">During that time it won't stop anything, and it'll only interrupt you for something serious. Expect it to be quiet.</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 14px;">
+          <span style="font-size: 13px; font-weight: 500; color: #1a1006; background: #f2a25a; border-radius: 10px; padding: 11px 20px;">Start watching</span>
+          <span style="font-size: 12px; color: #837e79;">See the 32 detections</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3g ─────────────────────────────────────────────── -->
+  <div id="3g" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">3g</span>
+      <span style="font-size: 14px; font-weight: 500;">How titles get written</span>
+      <span style="font-size: 12px; color: #837e79;">so detection 33 doesn't undo all of this</span>
+    </div>
+
+    <div style="width: 1400px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 32px 34px 36px; display: flex; flex-direction: column; gap: 26px;">
+      <div style="display: flex; flex-direction: column; gap: 14px; max-width: 940px;">
+        <div style="font-size: 13px; line-height: 1.75; color: #a09b95; text-wrap: pretty;">Every detection ships two strings: a <span style="color:#d6d2ce;">title</span> naming the consequence in the user's own terms, and a <span style="color:#d6d2ce;">stake</span> saying what it costs them. Rule ids stay in evidence. Three tests: no jargon a new Arch user wouldn't know, no verb the user didn't do, and it has to make sense with no other context.</div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 2px;">
+        <div style="display: grid; grid-template-columns: 280px 1fr 1fr; gap: 24px; padding: 13px 0; border-top: 1px solid rgba(255,255,255,0.05); font-size: 11px; color: #3d3a37;">
+          <span>detection</span><span>was</span><span>is</span>
+        </div>
+        <div style="display: grid; grid-template-columns: 280px 1fr 1fr; gap: 24px; padding: 15px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+          <span style="font-size: 12px; color: #55514d;">moat-persist-hypr-config-write</span>
+          <span style="font-size: 12px; color: #6d6863;">Hyprland configuration modified by a non-editor</span>
+          <span style="font-size: 13px; color: #d6d2ce;">Something added itself to your login</span>
+        </div>
+        <div style="display: grid; grid-template-columns: 280px 1fr 1fr; gap: 24px; padding: 15px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+          <span style="font-size: 12px; color: #55514d;">moat-cred-ssh-read</span>
+          <span style="font-size: 12px; color: #6d6863;">Private SSH key read by an unexpected program</span>
+          <span style="font-size: 13px; color: #d6d2ce;">A program you don't recognise read your SSH key</span>
+        </div>
+        <div style="display: grid; grid-template-columns: 280px 1fr 1fr; gap: 24px; padding: 15px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+          <span style="font-size: 12px; color: #55514d;">moat-priv-ldso-preload</span>
+          <span style="font-size: 12px; color: #6d6863;">/etc/ld.so.preload created or modified</span>
+          <span style="font-size: 13px; color: #d6d2ce;">Something is trying to load itself into every program you run</span>
+        </div>
+        <div style="display: grid; grid-template-columns: 280px 1fr 1fr; gap: 24px; padding: 15px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+          <span style="font-size: 12px; color: #55514d;">moat-pkg-downloader-exec</span>
+          <span style="font-size: 12px; color: #6d6863;">Package install ran a downloader or decoder</span>
+          <span style="font-size: 13px; color: #d6d2ce;">An install pulled something extra off the internet</span>
+        </div>
+        <div style="display: grid; grid-template-columns: 280px 1fr 1fr; gap: 24px; padding: 15px 0; border-top: 1px solid rgba(255,255,255,0.05); border-bottom: 1px solid rgba(255,255,255,0.05);">
+          <span style="font-size: 12px; color: #55514d;">moat-x-noisy-rule</span>
+          <span style="font-size: 12px; color: #6d6863;">Noise guard demoted rule after threshold</span>
+          <span style="font-size: 13px; color: #d6d2ce;">Moat stopped asking about something that kept happening</span>
+        </div>
+      </div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+        <div style="padding: 20px 22px; border-radius: 12px; background: #121316; display: flex; flex-direction: column; gap: 12px;">
+          <span style="font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #55514d;">the verdict line has four forms</span>
+          <div style="display: flex; flex-direction: column; gap: 9px; font-size: 12px; line-height: 1.6;">
+            <span style="color: #b3aea8;"><span style="color: #7ba37f;">●</span>&nbsp; Nothing needs you.</span>
+            <span style="color: #b3aea8;"><span style="color: #e0523f;">●</span>&nbsp; One thing needs you. / Three things need you.</span>
+            <span style="color: #b3aea8;"><span style="color: #e0523f;">●</span>&nbsp; This one needs you now.</span>
+            <span style="color: #b3aea8;"><span style="color: #f2a25a;">●</span>&nbsp; Watching, with one gap.</span>
+          </div>
+          <span style="font-size: 11px; line-height: 1.6; color: #6d6863;">No other sentence is allowed in that slot, and it is never a count of events.</span>
+        </div>
+        <div style="padding: 20px 22px; border-radius: 12px; background: #121316; display: flex; flex-direction: column; gap: 12px;">
+          <span style="font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #55514d;">words the panel doesn't use</span>
+          <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+            <span style="font-size: 11px; color: #6d6863; background: #191a1d; border-radius: 7px; padding: 6px 11px; text-decoration: line-through;">unacked</span>
+            <span style="font-size: 11px; color: #6d6863; background: #191a1d; border-radius: 7px; padding: 6px 11px; text-decoration: line-through;">policies</span>
+            <span style="font-size: 11px; color: #6d6863; background: #191a1d; border-radius: 7px; padding: 6px 11px; text-decoration: line-through;">tetragon</span>
+            <span style="font-size: 11px; color: #6d6863; background: #191a1d; border-radius: 7px; padding: 6px 11px; text-decoration: line-through;">allowlist</span>
+            <span style="font-size: 11px; color: #6d6863; background: #191a1d; border-radius: 7px; padding: 6px 11px; text-decoration: line-through;">suppressed</span>
+            <span style="font-size: 11px; color: #6d6863; background: #191a1d; border-radius: 7px; padding: 6px 11px; text-decoration: line-through;">demoted</span>
+            <span style="font-size: 11px; color: #6d6863; background: #191a1d; border-radius: 7px; padding: 6px 11px; text-decoration: line-through;">ancestry</span>
+            <span style="font-size: 11px; color: #6d6863; background: #191a1d; border-radius: 7px; padding: 6px 11px; text-decoration: line-through;">exe</span>
+            <span style="font-size: 11px; color: #6d6863; background: #191a1d; border-radius: 7px; padding: 6px 11px; text-decoration: line-through;">tuple</span>
+          </div>
+          <span style="font-size: 11px; line-height: 1.6; color: #6d6863;">All of them are fine in evidence, in moatctl, and in the TOML. None of them belong in a title.</span>
+        </div>
+      </div>
+    </div>
+
+    <div style="width: 1400px; font-size: 12px; line-height: 1.7; color: #837e79; text-wrap: pretty;">This is the part that decays without a written rule. A detection is contributed as a rule id and a technical description, and the panel then shows exactly what it was given — which is how the original screens ended up reading like a log. Making the two user-facing strings a required part of a detection, with the tests next to them, is what keeps the third year of Moat sounding like the first.</div>
+  </div>
+
+</section>
+
+<section style="width: 2100px; box-sizing: border-box; padding: 56px 56px 90px; font-family: 'JetBrains Mono', monospace; color: #eceae7; display: flex; flex-direction: column; gap: 52px;">
+
+  <div style="display: flex; flex-direction: column; gap: 11px; max-width: 1040px;">
+    <div style="font-size: 12px; letter-spacing: 0.18em; text-transform: uppercase; color: #6d6863;">Turn 2 · the features around the verdict</div>
+    <div style="font-size: 32px; font-weight: 500; letter-spacing: -0.01em;">Push back on it, see what led here, take it back</div>
+    <div style="font-size: 14px; line-height: 1.65; color: #a09b95; text-wrap: pretty;">Ids: <a href="#2a">2a</a> ask Moat · <a href="#2b">2b</a> what led here · <a href="#2c">2c</a> undoing a stop · <a href="#2d">2d</a> what the file used to say · <a href="#2e">2e</a> programs it knows · <a href="#2f">2f</a> is the sensor actually watching · <a href="#2g">2g</a> keyboard pass · <a href="#2h">2h</a> notifications · <a href="#2i">2i</a> when you still don't know.</div>
+  </div>
+
+  <sc-if value="{{ showRationale }}" hint-placeholder-val="{{ true }}">
+  <div style="display: flex; gap: 24px; flex-wrap: wrap;">
+    <div style="width: 480px; padding: 18px 20px; border-radius: 13px; background: #121316; display: flex; flex-direction: column; gap: 9px;">
+      <div style="font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #f2a25a;">decision · where the new surfaces live</div>
+      <div style="font-size: 14px; color: #f6f4f2;">Everything hangs off one incident. No new tabs.</div>
+      <div style="font-size: 12px; line-height: 1.65; color: #a09b95; text-wrap: pretty;">Ask, rewind, diff and undo are all the same question asked at different depths, so they expand inside the card you are already reading rather than becoming destinations. The tab bar stays at three. The only genuinely new place is <a href="#2e">2e</a>, and it is a section of Rules, not a tab.</div>
+    </div>
+    <div style="width: 480px; padding: 18px 20px; border-radius: 13px; background: #121316; display: flex; flex-direction: column; gap: 9px;">
+      <div style="font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #f2a25a;">decision · reversibility before force</div>
+      <div style="font-size: 14px; color: #f6f4f2;">Stop it earns its place as the default by being undoable.</div>
+      <div style="font-size: 12px; line-height: 1.65; color: #a09b95; text-wrap: pretty;">A destructive primary is only honest if the worst case is 30 seconds long. Quarantine keeps the file, the kill is recorded with enough state to relaunch, and both are listed for as long as they exist. The same logic covers config writes: if Moat saw the write, it can hold what was there before.</div>
+    </div>
+    <div style="width: 480px; padding: 18px 20px; border-radius: 13px; background: #121316; display: flex; flex-direction: column; gap: 9px;">
+      <div style="font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #f2a25a;">decision · the sensor is a subject too</div>
+      <div style="font-size: 12px; line-height: 1.65; color: #a09b95; text-wrap: pretty;">A blind sensor and a quiet machine look identical, and <a href="#1a">1a</a>'s calm verdict is a lie if tetragon died an hour ago. The verdict line therefore refuses to say <span style="color:#d6d2ce;">nothing needs you</span> unless Moat can prove it was watching for the whole window.</div>
+    </div>
+  </div>
+  </sc-if>
+
+  <!-- 2a ─────────────────────────────────────────────── -->
+  <div id="2a" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">2a</span>
+      <span style="font-size: 14px; font-weight: 500;">Ask Moat</span>
+      <span style="font-size: 12px; color: #837e79;">the verdict becomes arguable; suggested questions are the ones people actually have</span>
+    </div>
+
+    <div style="width: 1400px; border-radius: 16px; overflow: hidden; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6);">
+      <div style="padding: 24px 28px 20px; border-bottom: 1px solid rgba(255,255,255,0.06); display: flex; align-items: center; gap: 14px;">
+        <span style="width: 8px; height: 8px; border-radius: 50%; background: #e0523f;"></span>
+        <span style="font-size: 14px; color: #d6d2ce;">flea rewrote a file that runs at every login</span>
+        <span style="font-size: 11px; color: #55514d;">still waiting on you</span>
+        <span style="margin-left: auto; font-size: 11px; color: #3d3a37;">collapsed — the card from 1b</span>
+      </div>
+
+      <div style="padding: 28px 28px 30px; display: flex; flex-direction: column; gap: 22px;">
+        <div style="display: flex; flex-direction: column; gap: 20px; max-width: 1000px;">
+          <div style="display: flex; gap: 16px;">
+            <span style="flex: none; font-size: 11px; color: #55514d; width: 46px; padding-top: 4px;">you</span>
+            <div style="font-size: 13px; line-height: 1.7; color: #f6f4f2; padding: 12px 16px; border-radius: 11px; background: #191a1d;">what would break if I stop it?</div>
+          </div>
+          <div style="display: flex; gap: 16px;">
+            <span style="flex: none; font-size: 11px; color: #f2a25a; width: 46px; padding-top: 4px;">moat</span>
+            <div style="display: flex; flex-direction: column; gap: 10px;">
+              <div style="font-size: 13px; line-height: 1.75; color: #d6d2ce; text-wrap: pretty;">flea is a package you installed on Tuesday from the AUR — a window-tiling helper. Stopping it kills the process and moves the temp file aside. Your session keeps running; the keybindings it was trying to add simply won't exist. Nothing else on the machine depends on it.</div>
+              <div style="font-size: 12px; line-height: 1.7; color: #837e79; text-wrap: pretty;">If flea is misbehaving rather than malicious, uninstalling it is the cleaner fix — stopping it here doesn't prevent it running again at next launch.</div>
+            </div>
+          </div>
+          <div style="display: flex; gap: 16px;">
+            <span style="flex: none; font-size: 11px; color: #55514d; width: 46px; padding-top: 4px;">you</span>
+            <div style="font-size: 13px; line-height: 1.7; color: #f6f4f2; padding: 12px 16px; border-radius: 11px; background: #191a1d;">is it normal for it to write there?</div>
+          </div>
+          <div style="display: flex; gap: 16px;">
+            <span style="flex: none; font-size: 11px; color: #f2a25a; width: 46px; padding-top: 4px;">moat</span>
+            <div style="display: flex; flex-direction: column; gap: 12px;">
+              <div style="font-size: 13px; line-height: 1.75; color: #d6d2ce; text-wrap: pretty;">For a tiling helper, yes — that is where Hyprland keeps bindings and it has to write there to add any. What made this an alert is that it did it once, silently, three days after install, rather than on first run. That is unusual timing, not an unusual location.</div>
+              <div style="display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-radius: 10px; background: #121316;">
+                <span class="ms" style="font-size: 15px; color: #6d6863;">lightbulb</span>
+                <span style="font-size: 12px; color: #9d9892;">On what I can see, this is your own package doing its job late. I'd allow it.</span>
+                <span style="margin-left: auto; font-size: 12px; color: #f2a25a;">This was me</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 12px; padding-top: 6px; border-top: 1px solid rgba(255,255,255,0.05);">
+          <div style="display: flex; flex-wrap: wrap; gap: 8px; padding-top: 14px;">
+            <span style="font-size: 12px; color: #b3aea8; background: #191a1d; border-radius: 8px; padding: 8px 14px;">where did flea come from?</span>
+            <span style="font-size: 12px; color: #b3aea8; background: #191a1d; border-radius: 8px; padding: 8px 14px;">has it done anything else?</span>
+            <span style="font-size: 12px; color: #b3aea8; background: #191a1d; border-radius: 8px; padding: 8px 14px;">what should I look for next login?</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 12px; padding: 13px 16px; border-radius: 11px; border: 1px solid rgba(255,255,255,0.08);">
+            <span style="font-size: 13px; color: #55514d;">Ask about this incident…</span>
+            <span style="margin-left: auto; font-size: 11px; color: #3d3a37;">Moat can read the evidence bundle · it cannot run kill, quarantine or allow on its own</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div style="width: 1400px; font-size: 12px; line-height: 1.7; color: #837e79; text-wrap: pretty;">The old <span style="color:#a09b95;">Analyze with claude</span> button ran an analysis and produced more prose. Since the analysis already happened on arrival (<a href="#1b">1b</a>), what's left worth building is the follow-up: a thread scoped to one incident, seeded with the three questions a non-specialist actually has. The agent's boundary — reads evidence, proposes, never acts — stays visible as a single line instead of the old four-sentence disclaimer.</div>
+  </div>
+
+  <!-- 2b ─────────────────────────────────────────────── -->
+  <div id="2b" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">2b</span>
+      <span style="font-size: 14px; font-weight: 500;">What led here</span>
+      <span style="font-size: 12px; color: #837e79;">ancestry as a story with times, not an arrow chain</span>
+    </div>
+
+    <div style="width: 1400px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 32px 34px 34px; display: flex; flex-direction: column; gap: 26px;">
+      <div style="display: flex; align-items: baseline; gap: 14px;">
+        <span style="font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: #55514d;">What led here</span>
+        <span style="font-size: 11px; color: #3d3a37;">reconstructed from what Moat recorded · 41 minutes</span>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 0;">
+        <div style="display: grid; grid-template-columns: 92px 20px 1fr; gap: 20px;">
+          <span style="font-size: 11px; color: #55514d; padding-top: 2px; text-align: right;">10:41</span>
+          <span style="display: flex; flex-direction: column; align-items: center;"><span style="width: 9px; height: 9px; border-radius: 50%; background: #3d3a37; margin-top: 4px;"></span><span style="flex: 1; width: 1px; background: rgba(255,255,255,0.08);"></span></span>
+          <div style="display: flex; flex-direction: column; gap: 5px; padding-bottom: 24px;">
+            <span style="font-size: 13px; color: #b3aea8;">You ran <span style="color:#f6f4f2;">yay -S flea</span> in a terminal</span>
+            <span style="font-size: 12px; color: #6d6863;">normal, and the reason the rest of this chain exists</span>
+          </div>
+        </div>
+        <div style="display: grid; grid-template-columns: 92px 20px 1fr; gap: 20px;">
+          <span style="font-size: 11px; color: #55514d; padding-top: 2px; text-align: right;">10:43</span>
+          <span style="display: flex; flex-direction: column; align-items: center;"><span style="width: 9px; height: 9px; border-radius: 50%; background: #3d3a37; margin-top: 4px;"></span><span style="flex: 1; width: 1px; background: rgba(255,255,255,0.08);"></span></span>
+          <div style="display: flex; flex-direction: column; gap: 5px; padding-bottom: 24px;">
+            <span style="font-size: 13px; color: #b3aea8;">The build ran <span style="color:#f6f4f2;">curl</span> to fetch a release tarball</span>
+            <span style="font-size: 12px; color: #6d6863;">alerted at the time · you never opened it · covered by your package-manager rule</span>
+          </div>
+        </div>
+        <div style="display: grid; grid-template-columns: 92px 20px 1fr; gap: 20px;">
+          <span style="font-size: 11px; color: #55514d; padding-top: 2px; text-align: right;">10:44</span>
+          <span style="display: flex; flex-direction: column; align-items: center;"><span style="width: 9px; height: 9px; border-radius: 50%; background: #3d3a37; margin-top: 4px;"></span><span style="flex: 1; width: 1px; background: rgba(255,255,255,0.08);"></span></span>
+          <div style="display: flex; flex-direction: column; gap: 5px; padding-bottom: 24px;">
+            <span style="font-size: 13px; color: #b3aea8;">Installed <span style="color:#f6f4f2;">/usr/bin/flea</span> and a systemd user unit</span>
+            <span style="font-size: 12px; color: #6d6863;">the unit is why flea was running at all when it wrote the file</span>
+          </div>
+        </div>
+        <div style="display: grid; grid-template-columns: 92px 20px 1fr; gap: 20px;">
+          <span style="font-size: 11px; color: #55514d; padding-top: 2px; text-align: right;">11:22</span>
+          <span style="display: flex; flex-direction: column; align-items: center;"><span style="width: 9px; height: 9px; border-radius: 50%; background: #e0523f; margin-top: 4px;"></span></span>
+          <div style="display: flex; flex-direction: column; gap: 5px;">
+            <span style="font-size: 13px; color: #f6f4f2;">flea wrote into ~/.config/hypr <span style="color:#e0523f;">· this alert</span></span>
+            <span style="font-size: 12px; color: #6d6863;">38 minutes after install, with no terminal attached</span>
+          </div>
+        </div>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 16px; padding: 15px 18px; border-radius: 11px; background: #121316;">
+        <span class="ms" style="font-size: 17px; color: #f2a25a;">route</span>
+        <span style="font-size: 12px; line-height: 1.6; color: #9d9892; text-wrap: pretty;">One install explains all four events. Allowing this incident closes the curl alert too — same chain, same decision.</span>
+        <span style="margin-left: auto; flex: none; font-size: 12px; color: #f2a25a;">Allow the whole chain</span>
+      </div>
+      <div style="font-size: 11px; color: #3d3a37;">Anything older than 14 days is summarised rather than kept event by event.</div>
+    </div>
+
+    <div style="width: 1400px; font-size: 12px; line-height: 1.7; color: #837e79; text-wrap: pretty;">The old panel had this data — <span style="color:#a09b95;">kernel → systemd → systemd → herdr → bash → flea</span> — but as a single line with no times and no other events, which answers a question nobody asks. Laid out as a chain with timestamps, the 38-minute gap becomes the interesting fact, and the separate curl alert from the same install stops being a separate problem.</div>
+  </div>
+
+  <!-- 2c ─────────────────────────────────────────────── -->
+  <div id="2c" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">2c</span>
+      <span style="font-size: 14px; font-weight: 500;">Undoing a stop</span>
+      <span style="font-size: 12px; color: #837e79;">30 seconds of grace, then a permanent way back</span>
+    </div>
+
+    <div style="display: flex; gap: 26px; flex-wrap: wrap;">
+      <div style="width: 620px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 28px 28px 26px; display: flex; flex-direction: column; gap: 20px;">
+        <span style="font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: #55514d;">just after you clicked stop</span>
+        <div style="display: flex; flex-direction: column; gap: 14px; padding: 20px 22px; border-radius: 13px; background: #121316; border: 1px solid rgba(255,255,255,0.07);">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <span class="ms" style="font-size: 17px; color: #7ba37f;">check_circle</span>
+            <span style="font-size: 14px; color: #f6f4f2;">Stopped flea</span>
+            <span style="margin-left: auto; font-size: 11px; color: #55514d;">28s</span>
+          </div>
+          <div style="font-size: 12px; line-height: 1.7; color: #9d9892; text-wrap: pretty;">The process was killed and the file it wrote is held in quarantine. Nothing else changed.</div>
+          <div style="height: 3px; border-radius: 2px; background: #23252a; overflow: hidden;"><span style="display: block; width: 88%; height: 100%; background: #55514d;"></span></div>
+          <div style="display: flex; align-items: center; gap: 14px;">
+            <span style="font-size: 12px; font-weight: 500; color: #1a1006; background: #f2a25a; border-radius: 9px; padding: 9px 16px;">Undo</span>
+            <span style="font-size: 11px; color: #6d6863;">puts the file back and marks the incident as expected</span>
+          </div>
+        </div>
+        <div style="font-size: 12px; line-height: 1.65; color: #6d6863; text-wrap: pretty;">After 30 seconds the toast goes; the incident keeps a <span style="color:#9d9892;">Restore</span> action for as long as the quarantined file exists.</div>
+      </div>
+
+      <div style="width: 754px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 28px 28px 26px; display: flex; flex-direction: column; gap: 20px;">
+        <div style="display: flex; align-items: baseline; gap: 14px;">
+          <span style="font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: #55514d;">Rules → things Moat is holding · 2</span>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 2px;">
+          <div style="display: grid; grid-template-columns: 1fr 110px 90px; align-items: center; gap: 18px; padding: 16px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <div style="display: flex; flex-direction: column; gap: 5px;">
+              <span style="font-size: 13px; color: #d6d2ce;">bindings.lua.655644.tmp</span>
+              <span style="font-size: 11px; color: #6d6863;">taken from ~/.config/hypr · flea · 4 minutes ago</span>
+            </div>
+            <span style="font-size: 11px; color: #55514d;">2.1 kB</span>
+            <span style="font-size: 12px; color: #f2a25a; justify-self: end;">Restore</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 110px 90px; align-items: center; gap: 18px; padding: 16px 0; border-top: 1px solid rgba(255,255,255,0.05); border-bottom: 1px solid rgba(255,255,255,0.05);">
+            <div style="display: flex; flex-direction: column; gap: 5px;">
+              <span style="font-size: 13px; color: #d6d2ce;">ld.so.preload</span>
+              <span style="font-size: 11px; color: #6d6863;">taken from /etc · bash · 6 days ago</span>
+            </div>
+            <span style="font-size: 11px; color: #55514d;">64 B</span>
+            <span style="font-size: 12px; color: #f2a25a; justify-self: end;">Restore</span>
+          </div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 16px; padding: 14px 16px; border-radius: 11px; background: #121316;">
+          <span class="ms" style="font-size: 16px; color: #6d6863;">lock_clock</span>
+          <span style="font-size: 12px; line-height: 1.6; color: #9d9892;">Held files can't run from here. They are deleted after 30 days unless you keep them.</span>
+        </div>
+        <div style="font-size: 12px; line-height: 1.65; color: #6d6863; text-wrap: pretty;">A killed process that had no file to hold gets the same row, with the command line and the working directory, so relaunching it is copy-paste rather than reconstruction.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2d ─────────────────────────────────────────────── -->
+  <div id="2d" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">2d</span>
+      <span style="font-size: 14px; font-weight: 500;">What the file used to say</span>
+      <span style="font-size: 12px; color: #837e79;">for any config write — the actual question you have</span>
+    </div>
+
+    <div style="width: 1400px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 32px 34px 34px; display: flex; flex-direction: column; gap: 22px;">
+      <div style="display: flex; align-items: baseline; gap: 14px;">
+        <span style="font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: #55514d;">What changed</span>
+        <span style="font-size: 12px; color: #9d9892;">~/.config/hypr/bindings.lua</span>
+        <span style="font-size: 11px; color: #3d3a37;">one line added · nothing removed</span>
+      </div>
+
+      <div style="border-radius: 12px; overflow: hidden; background: #0a0b0d; border: 1px solid rgba(255,255,255,0.06);">
+        <div style="display: grid; grid-template-columns: 48px 1fr; font-size: 12.5px; line-height: 2;">
+          <span style="color: #3d3a37; text-align: right; padding-right: 14px;">12</span><span style="color: #6d6863; padding-left: 14px;">bind = SUPER, T, exec, kitty</span>
+          <span style="color: #3d3a37; text-align: right; padding-right: 14px;">13</span><span style="color: #6d6863; padding-left: 14px;">bind = SUPER, Q, killactive</span>
+          <span style="color: #7ba37f; text-align: right; padding-right: 14px; background: rgba(123,163,127,0.07);">14</span><span style="color: #a8c9a9; padding-left: 14px; background: rgba(123,163,127,0.07);">exec-once = /usr/bin/flea --daemon --restore-session</span>
+          <span style="color: #3d3a37; text-align: right; padding-right: 14px;">15</span><span style="color: #6d6863; padding-left: 14px;">bind = SUPER, F, fullscreen</span>
+        </div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 10px; max-width: 1000px; padding-left: 16px; border-left: 2px solid rgba(242,162,90,0.4);">
+        <div style="font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #f2a25a;">Moat read it this way</div>
+        <div style="font-size: 13px; line-height: 1.75; color: #d6d2ce; text-wrap: pretty;">One <span style="color:#f6f4f2;">exec-once</span> line, which is the line that makes something start with your desktop. It points at flea's own binary with plausible flags. If flea is yours, this is a program adding itself to startup, which it should probably have asked about.</div>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 14px;">
+        <span style="font-size: 13px; font-weight: 500; color: #1a1006; background: #f2a25a; border-radius: 10px; padding: 11px 20px;">Keep the change</span>
+        <span style="font-size: 13px; color: #b3aea8; background: #191a1d; border-radius: 10px; padding: 11px 20px;">Put the file back as it was</span>
+        <span style="margin-left: 6px; font-size: 12px; color: #837e79;">Open in editor</span>
+        <span style="margin-left: auto; font-size: 11px; color: #3d3a37;">previous version held since 11:22 · from Moat's own snapshot, not your backups</span>
+      </div>
+    </div>
+
+    <div style="width: 1400px; font-size: 12px; line-height: 1.7; color: #837e79; text-wrap: pretty;">Moat already sits on the write hook, so it can keep the bytes that were there a moment earlier. That turns the vaguest class of alert — <span style="color:#a09b95;">a file you care about was modified</span> — into four lines you can read and a revert. Snapshots are only taken for paths a detection watches, so the cost is bounded.</div>
+  </div>
+
+  <!-- 2e ─────────────────────────────────────────────── -->
+  <div id="2e" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">2e</span>
+      <span style="font-size: 14px; font-weight: 500;">Programs Moat knows</span>
+      <span style="font-size: 12px; color: #837e79;">the mirror of Rules — what's normal, stated positively</span>
+    </div>
+
+    <div style="width: 1400px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 32px 34px 36px; display: flex; flex-direction: column; gap: 24px;">
+      <div style="display: flex; flex-direction: column; gap: 10px; max-width: 900px;">
+        <div style="font-size: 19px; font-weight: 500; color: #f6f4f2;">14 programs Moat treats as yours</div>
+        <div style="font-size: 13px; line-height: 1.7; color: #a09b95; text-wrap: pretty;">Learned during the first week or added when you said <span style="color:#d6d2ce;">this was me</span>. Each one is only trusted for the things next to it.</div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 2px;">
+        <div style="display: grid; grid-template-columns: 200px 1fr 150px 110px 22px; align-items: center; gap: 18px; padding: 15px 0; border-top: 1px solid rgba(255,255,255,0.05); font-size: 12px; color: #3d3a37;">
+          <span>program</span><span>trusted for</span><span>last seen</span><span>silenced</span><span></span>
+        </div>
+        <div style="display: grid; grid-template-columns: 200px 1fr 150px 110px 22px; align-items: center; gap: 18px; padding: 15px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+          <span style="font-size: 13px; color: #d6d2ce;">claude</span>
+          <span style="font-size: 12px; color: #837e79;">running during package installs, writing under ~/dev</span>
+          <span style="font-size: 11px; color: #55514d;">3 minutes ago</span>
+          <span style="font-size: 11px; color: #6d6863;">72 alerts</span>
+          <span class="ms" style="font-size: 16px; color: #3d3a37;">chevron_right</span>
+        </div>
+        <div style="display: grid; grid-template-columns: 200px 1fr 150px 110px 22px; align-items: center; gap: 18px; padding: 15px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+          <span style="font-size: 13px; color: #d6d2ce;">nvim</span>
+          <span style="font-size: 12px; color: #837e79;">writing anything under ~/.config</span>
+          <span style="font-size: 11px; color: #55514d;">18 minutes ago</span>
+          <span style="font-size: 11px; color: #6d6863;">96 alerts</span>
+          <span class="ms" style="font-size: 16px; color: #3d3a37;">chevron_right</span>
+        </div>
+        <div style="display: grid; grid-template-columns: 200px 1fr 150px 110px 22px; align-items: center; gap: 18px; padding: 15px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+          <span style="font-size: 13px; color: #d6d2ce;">ssh · ssh-agent</span>
+          <span style="font-size: 12px; color: #837e79;">reading your keys</span>
+          <span style="font-size: 11px; color: #55514d;">12 hours ago</span>
+          <span style="font-size: 11px; color: #6d6863;">204 alerts</span>
+          <span class="ms" style="font-size: 16px; color: #3d3a37;">chevron_right</span>
+        </div>
+        <div style="display: grid; grid-template-columns: 200px 1fr 150px 110px 22px; align-items: center; gap: 18px; padding: 15px 0; border-top: 1px solid rgba(255,255,255,0.05); background: rgba(242,162,90,0.04);">
+          <span style="font-size: 13px; color: #d6d2ce;">flea</span>
+          <span style="font-size: 12px; color: #f2a25a;">nothing yet — one incident waiting on you</span>
+          <span style="font-size: 11px; color: #55514d;">10 hours ago</span>
+          <span style="font-size: 11px; color: #3d3a37;">—</span>
+          <span class="ms" style="font-size: 16px; color: #3d3a37;">chevron_right</span>
+        </div>
+        <div style="display: grid; grid-template-columns: 200px 1fr 150px 110px 22px; align-items: center; gap: 18px; padding: 15px 0; border-top: 1px solid rgba(255,255,255,0.05); border-bottom: 1px solid rgba(255,255,255,0.05);">
+          <span style="font-size: 13px; color: #55514d;">10 more</span>
+          <span style="font-size: 12px; color: #3d3a37;">pacman, makepkg, hyprctl, waybar, git, gpg, firefox, docker, systemd, omarchy-*</span>
+          <span></span><span></span>
+          <span class="ms" style="font-size: 16px; color: #3d3a37;">chevron_right</span>
+        </div>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 16px; padding: 15px 18px; border-radius: 11px; background: #121316;">
+        <span class="ms" style="font-size: 17px; color: #6d6863;">fingerprint</span>
+        <span style="font-size: 12px; line-height: 1.6; color: #9d9892; text-wrap: pretty;">Trust is pinned to the binary. If one of these is replaced by an upgrade or anything else, it comes back as a new program and you'll hear about it once.</span>
+      </div>
+    </div>
+
+    <div style="width: 1400px; font-size: 12px; line-height: 1.7; color: #837e79; text-wrap: pretty;">Rules lists what has been silenced; this lists what is considered normal, which is the thing you want to audit after a month of clicking <span style="color:#a09b95;">this was me</span>. The silenced-alerts column is the honest measure of whether a decision was right, and the hash pin is what stops the list becoming a hole.</div>
+  </div>
+
+  <!-- 2f + 2g ────────────────────────────────────────── -->
+  <div style="display: flex; gap: 26px; flex-wrap: wrap;">
+    <div id="2f" style="display: flex; flex-direction: column; gap: 14px;">
+      <div style="display: flex; align-items: baseline; gap: 12px;">
+        <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">2f</span>
+        <span style="font-size: 14px; font-weight: 500;">Is it actually watching</span>
+      </div>
+      <div style="width: 686px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 30px 30px 28px; display: flex; flex-direction: column; gap: 22px;">
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span style="width: 9px; height: 9px; border-radius: 50%; background: #f2a25a;"></span>
+          <span style="font-size: 20px; font-weight: 500; color: #f6f4f2;">Watching, with one gap</span>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 2px;">
+          <div style="display: grid; grid-template-columns: 1fr 130px 80px; align-items: center; gap: 16px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 13px; color: #b3aea8;">Kernel hooks</span>
+            <span style="font-size: 11px; color: #6d6863;">up 6 days</span>
+            <span style="font-size: 11px; color: #7ba37f; justify-self: end;">fine</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 130px 80px; align-items: center; gap: 16px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 13px; color: #b3aea8;">Detections loaded</span>
+            <span style="font-size: 11px; color: #6d6863;">32 of 32</span>
+            <span style="font-size: 11px; color: #7ba37f; justify-self: end;">fine</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 130px 80px; align-items: center; gap: 16px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <div style="display: flex; flex-direction: column; gap: 5px;">
+              <span style="font-size: 13px; color: #f6f4f2;">Known-bad list</span>
+              <span style="font-size: 11px; color: #837e79;">never downloaded — Moat is judging behaviour only, which is most of what it does anyway</span>
+            </div>
+            <span style="font-size: 11px; color: #6d6863;">never</span>
+            <span style="font-size: 12px; color: #f2a25a; justify-self: end;">Fix</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 130px 80px; align-items: center; gap: 16px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05); border-bottom: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 13px; color: #b3aea8;">Blind spells</span>
+            <span style="font-size: 11px; color: #6d6863;">1 · 4 min at boot</span>
+            <span style="font-size: 11px; color: #6d6863; justify-self: end;">logged</span>
+          </div>
+        </div>
+        <div style="font-size: 12px; line-height: 1.65; color: #6d6863; text-wrap: pretty;">If any row here is broken, <a href="#1a">1a</a> says <span style="color:#9d9892;">watching, with one gap</span> instead of <span style="color:#9d9892;">nothing needs you</span>. A calm verdict has to be earned.</div>
+      </div>
+    </div>
+
+    <div id="2g" style="display: flex; flex-direction: column; gap: 14px;">
+      <div style="display: flex; align-items: baseline; gap: 12px;">
+        <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">2g</span>
+        <span style="font-size: 14px; font-weight: 500;">The keyboard pass</span>
+      </div>
+      <div style="width: 686px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 30px 30px 28px; display: flex; flex-direction: column; gap: 22px;">
+        <div style="font-size: 13px; line-height: 1.7; color: #a09b95; text-wrap: pretty;">After a week away there may be six incidents. Clearing them should feel like reading mail in a terminal, since that is the machine this runs on.</div>
+        <div style="display: flex; flex-direction: column; gap: 2px;">
+          <div style="display: grid; grid-template-columns: 100px 1fr; align-items: center; gap: 18px; padding: 13px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 12px; color: #f2a25a;">j / k</span><span style="font-size: 12px; color: #9d9892;">next, previous incident</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 100px 1fr; align-items: center; gap: 18px; padding: 13px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 12px; color: #f2a25a;">a</span><span style="font-size: 12px; color: #9d9892;">this was me — then 1-4 to pick how wide</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 100px 1fr; align-items: center; gap: 18px; padding: 13px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 12px; color: #f2a25a;">s</span><span style="font-size: 12px; color: #9d9892;">stop it · confirms once, undoable for 30s</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 100px 1fr; align-items: center; gap: 18px; padding: 13px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 12px; color: #f2a25a;">e / ?</span><span style="font-size: 12px; color: #9d9892;">evidence · ask Moat</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 100px 1fr; align-items: center; gap: 18px; padding: 13px 0; border-top: 1px solid rgba(255,255,255,0.05); border-bottom: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 12px; color: #f2a25a;">u</span><span style="font-size: 12px; color: #9d9892;">undo the last thing you did</span>
+          </div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 14px; padding: 14px 16px; border-radius: 11px; background: #121316;">
+          <span style="font-size: 12px; color: #b3aea8;">Same verbs as the buttons.</span>
+          <span style="font-size: 12px; color: #6d6863;">moatctl does exactly these four things too.</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2h + 2i ────────────────────────────────────────── -->
+  <div style="display: flex; gap: 26px; flex-wrap: wrap;">
+    <div id="2h" style="display: flex; flex-direction: column; gap: 14px;">
+      <div style="display: flex; align-items: baseline; gap: 12px;">
+        <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">2h</span>
+        <span style="font-size: 14px; font-weight: 500;">Notifications</span>
+        <span style="font-size: 12px; color: #837e79;">the only Moat most days</span>
+      </div>
+      <div style="width: 860px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 30px 30px 28px; display: flex; flex-direction: column; gap: 16px;">
+        <div style="display: flex; gap: 16px; padding: 18px 20px; border-radius: 13px; background: #121316; border: 1px solid rgba(224,82,63,0.22);">
+          <span class="ms" style="font-size: 18px; color: #e0523f; padding-top: 1px;">shield</span>
+          <div style="display: flex; flex-direction: column; gap: 7px; flex: 1;">
+            <span style="font-size: 13px; color: #f6f4f2;">Something added itself to your login</span>
+            <span style="font-size: 12px; line-height: 1.6; color: #9d9892;">flea wrote a startup file. It hasn't run yet.</span>
+            <div style="display: flex; gap: 10px; padding-top: 4px;">
+              <span style="font-size: 11px; color: #1a1006; background: #f2a25a; border-radius: 7px; padding: 6px 12px;">This was me</span>
+              <span style="font-size: 11px; color: #b3aea8; background: #191a1d; border-radius: 7px; padding: 6px 12px;">Stop it</span>
+              <span style="font-size: 11px; color: #b3aea8; background: #191a1d; border-radius: 7px; padding: 6px 12px;">Look</span>
+            </div>
+          </div>
+        </div>
+        <div style="display: flex; gap: 16px; padding: 18px 20px; border-radius: 13px; background: #121316; border: 1px solid rgba(255,255,255,0.06);">
+          <span class="ms" style="font-size: 18px; color: #6d6863; padding-top: 1px;">shield</span>
+          <div style="display: flex; flex-direction: column; gap: 6px; flex: 1;">
+            <span style="font-size: 13px; color: #d6d2ce;">Quiet week</span>
+            <span style="font-size: 12px; line-height: 1.6; color: #837e79;">Nothing needed you. 3 things explained, 1 rule added. Moat has been watching the whole time.</span>
+          </div>
+        </div>
+        <div style="display: flex; gap: 16px; padding: 18px 20px; border-radius: 13px; background: #121316; border: 1px solid rgba(255,255,255,0.06);">
+          <span class="ms" style="font-size: 18px; color: #6d6863; padding-top: 1px;">shield</span>
+          <div style="display: flex; flex-direction: column; gap: 6px; flex: 1;">
+            <span style="font-size: 13px; color: #d6d2ce;">Claude tripped the same detection 40 more times</span>
+            <span style="font-size: 12px; line-height: 1.6; color: #837e79;">Counted, not shown one by one. Want it silenced?</span>
+          </div>
+        </div>
+        <div style="font-size: 12px; line-height: 1.65; color: #6d6863; text-wrap: pretty;">Three shapes, and only the first can interrupt: something needs you, the weekly note, and a burst that has been counted. Titles are consequences — <span style="color:#9d9892;">something added itself to your login</span>, not <span style="color:#9d9892;">HIGH: moat-persist-hypr-config-write</span>.</div>
+      </div>
+    </div>
+
+    <div id="2i" style="display: flex; flex-direction: column; gap: 14px;">
+      <div style="display: flex; align-items: baseline; gap: 12px;">
+        <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">2i</span>
+        <span style="font-size: 14px; font-weight: 500;">When you still don't know</span>
+      </div>
+      <div style="width: 514px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 30px 30px 28px; display: flex; flex-direction: column; gap: 20px; box-sizing: border-box;">
+        <div style="font-size: 13px; line-height: 1.7; color: #a09b95; text-wrap: pretty;">There is a third answer besides yes and no, and the current panel has no room for it.</div>
+        <div style="display: flex; flex-direction: column; gap: 12px; padding: 20px 22px; border-radius: 13px; background: #121316;">
+          <span style="font-size: 14px; color: #f6f4f2;">I don't know</span>
+          <span style="font-size: 12px; line-height: 1.7; color: #9d9892; text-wrap: pretty;">Leaves the incident open, mutes it until something new happens, and packages the evidence as one file you can hand to someone who does know.</span>
+          <div style="display: flex; flex-direction: column; gap: 7px; padding: 12px 14px; border-radius: 9px; background: #0a0b0d;">
+            <span style="font-size: 11px; color: #9d9892;">moat-incident-4f2a.txt · 14 kB</span>
+            <span style="font-size: 11px; color: #55514d;">plain text · paths under your home redacted · nothing sent anywhere</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 12px; padding-top: 2px;">
+            <span style="font-size: 12px; font-weight: 500; color: #1a1006; background: #f2a25a; border-radius: 9px; padding: 9px 16px;">Save the bundle</span>
+            <span style="font-size: 12px; color: #837e79;">Copy as text</span>
+          </div>
+        </div>
+        <div style="font-size: 12px; line-height: 1.65; color: #6d6863; text-wrap: pretty;">It also stops the honest non-answer from being a permanent red dot, which is what pushes people to click allow on things they don't understand.</div>
+      </div>
+    </div>
+  </div>
+
+</section>
+
+<section style="width: 2100px; box-sizing: border-box; padding: 56px 56px 90px; font-family: 'JetBrains Mono', monospace; color: #eceae7; display: flex; flex-direction: column; gap: 52px;">
+
+  <div style="display: flex; flex-direction: column; gap: 11px; max-width: 1040px;">
+    <div style="font-size: 12px; letter-spacing: 0.18em; text-transform: uppercase; color: #6d6863;">Turn 1 · moat, decluttered</div>
+    <div style="font-size: 32px; font-weight: 500; letter-spacing: -0.01em;">Answer first, evidence on request</div>
+    <div style="font-size: 14px; line-height: 1.65; color: #a09b95; text-wrap: pretty;">One direction across all four tabs, for someone who runs Omarchy and has no security background. Ids: <a href="#1a">1a</a> quiet day · <a href="#1b">1b</a> something needs you · <a href="#1c">1c</a> the ×68 problem · <a href="#1d">1d</a> history · <a href="#1e">1e</a> rules · <a href="#1f">1f</a> settings · <a href="#1g">1g</a> first week.</div>
+  </div>
+
+  <sc-if value="{{ showRationale }}" hint-placeholder-val="{{ true }}">
+  <div style="display: flex; gap: 24px; flex-wrap: wrap;">
+    <div style="width: 480px; padding: 18px 20px; border-radius: 13px; background: #121316; display: flex; flex-direction: column; gap: 9px;">
+      <div style="font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #f2a25a;">decision · severity</div>
+      <div style="font-size: 14px; color: #f6f4f2;">Three states, not five severities.</div>
+      <div style="font-size: 12px; line-height: 1.65; color: #a09b95; text-wrap: pretty;">HIGH on every row is the same as no label at all. Rows now say what they want from you: <b style="color:#e0523f;">needs you</b> (act), <b style="color:#a09b95;">explained</b> (Moat decided, you can look), <b style="color:#6d6863;">expected</b> (a rule covers it). Raw severity survives only in the evidence block, where it is a fact rather than a shout.</div>
+    </div>
+    <div style="width: 480px; padding: 18px 20px; border-radius: 13px; background: #121316; display: flex; flex-direction: column; gap: 9px;">
+      <div style="font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #f2a25a;">decision · the AI verdict</div>
+      <div style="font-size: 14px; color: #f6f4f2;">The analysis replaces the four prose blocks.</div>
+      <div style="font-size: 12px; line-height: 1.65; color: #a09b95; text-wrap: pretty;">What happened, why it was flagged and what to do were three sections saying one thing. Moat now runs analysis on arrival and writes a single paragraph in plain words. Process, path, args, cwd, ancestry, hooks and the rule id all move behind <span style="color:#b3aea8;">Show evidence</span> — present, one click away, never in the reading path.</div>
+    </div>
+    <div style="width: 480px; padding: 18px 20px; border-radius: 13px; background: #121316; display: flex; flex-direction: column; gap: 9px;">
+      <div style="font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #f2a25a;">decision · one incident, not 68 alerts</div>
+      <div style="font-size: 12px; line-height: 1.65; color: #a09b95; text-wrap: pretty;">Alerts collapse by rule + program into an incident with a count and a time range. A repeat is not new information, so it never re-sorts the list or re-notifies; it increments. The nine-identical-rows list disappears by construction.</div>
+    </div>
+    <div style="width: 480px; padding: 18px 20px; border-radius: 13px; background: #121316; display: flex; flex-direction: column; gap: 9px;">
+      <div style="font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #f2a25a;">decision · actions</div>
+      <div style="font-size: 12px; line-height: 1.65; color: #a09b95; text-wrap: pretty;">Kill / Quarantine / Ack / Ignore (exe) / Ignore (rule) are five verbs for two questions: was this you, and if not, stop it. Two buttons ask exactly that. Scope for “was me” is a follow-up choice, not a fifth button. Ack disappears — reading a resolved incident acknowledges it.</div>
+    </div>
+  </div>
+  </sc-if>
+
+  <!-- 1a ─────────────────────────────────────────────── -->
+  <div id="1a" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">1a</span>
+      <span style="font-size: 14px; font-weight: 500;">Now · a quiet day</span>
+      <span style="font-size: 12px; color: #837e79;">the state the panel is in 95% of the time; it should read like a sentence, not a console</span>
+    </div>
+
+    <div style="width: 1400px; border-radius: 16px; overflow: hidden; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); display: flex; flex-direction: column;">
+      <div style="display: flex; align-items: center; gap: 13px; height: 54px; padding: 0 22px; border-bottom: 1px solid rgba(255,255,255,0.06);">
+        <span class="ms" style="font-size: 18px; color: #7ba37f;">shield</span>
+        <span style="font-size: 14px; font-weight: 500; letter-spacing: 0.01em;">Moat</span>
+        <div style="margin-left: auto; display: flex; align-items: center; gap: 6px;">
+          <span style="font-size: 12px; color: #f2a25a; padding: 6px 13px; border-radius: 8px; background: rgba(242,162,90,0.11);">Now</span>
+          <span style="font-size: 12px; color: #837e79; padding: 6px 13px;">History</span>
+          <span style="font-size: 12px; color: #837e79; padding: 6px 13px;">Rules</span>
+          <span class="ms" style="font-size: 17px; color: #55514d; margin-left: 8px;">settings</span>
+          <span class="ms" style="font-size: 17px; color: #55514d;">close</span>
+        </div>
+      </div>
+
+      <div style="padding: 46px 44px 30px; display: flex; flex-direction: column; gap: 40px;">
+        <div style="display: flex; flex-direction: column; gap: 13px; max-width: 800px;">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <span style="width: 9px; height: 9px; border-radius: 50%; background: #7ba37f;"></span>
+            <span style="font-size: 26px; font-weight: 500; letter-spacing: -0.01em; color: #f6f4f2;">Nothing needs you.</span>
+          </div>
+          <div style="font-size: 13px; line-height: 1.7; color: #a09b95; text-wrap: pretty; padding-left: 21px;">Moat looked at 1,204 things today. Three were worth a second look; it read all three and closed them. Nothing has been blocked, because you are still in monitor mode.</div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 4px;">
+          <div style="font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: #55514d; padding-bottom: 10px;">What it watched today</div>
+
+          <div style="display: grid; grid-template-columns: 250px 1fr 130px 22px; align-items: center; gap: 16px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 13px; color: #d6d2ce;">Package installs</span>
+            <span style="font-size: 12px; color: #837e79;">14 runs, all started by pacman or your AUR helper</span>
+            <span style="font-size: 11px; color: #6d6863;">expected</span>
+            <span class="ms" style="font-size: 16px; color: #3d3a37;">chevron_right</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 250px 1fr 130px 22px; align-items: center; gap: 16px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 13px; color: #d6d2ce;">Writes to your config</span>
+            <span style="font-size: 12px; color: #837e79;">6 files under ~/.config, by your editor and hyprctl</span>
+            <span style="font-size: 11px; color: #6d6863;">expected</span>
+            <span class="ms" style="font-size: 16px; color: #3d3a37;">chevron_right</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 250px 1fr 130px 22px; align-items: center; gap: 16px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 13px; color: #d6d2ce;">Reads of your SSH keys</span>
+            <span style="font-size: 12px; color: #837e79;">22, all by ssh, ssh-agent and git</span>
+            <span style="font-size: 11px; color: #6d6863;">expected</span>
+            <span class="ms" style="font-size: 16px; color: #3d3a37;">chevron_right</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 250px 1fr 130px 22px; align-items: center; gap: 16px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05); border-bottom: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 13px; color: #d6d2ce;">Claude, during installs</span>
+            <span style="font-size: 12px; color: #837e79;">68 times — Moat read it as your own workflow</span>
+            <span style="font-size: 11px; color: #a09b95;">explained</span>
+            <span class="ms" style="font-size: 16px; color: #3d3a37;">chevron_right</span>
+          </div>
+        </div>
+
+        <div style="display: flex; align-items: center; gap: 14px; padding: 16px 18px; border-radius: 12px; background: #121316;">
+          <span class="ms" style="font-size: 17px; color: #6d6863;">history</span>
+          <div style="display: flex; flex-direction: column; gap: 3px;">
+            <span style="font-size: 12px; color: #b3aea8;">The last thing that needed you was 6 days ago.</span>
+            <span style="font-size: 12px; color: #6d6863;">A shell wrote to /etc/ld.so.preload. You stopped it.</span>
+          </div>
+          <span style="margin-left: auto; font-size: 12px; color: #f2a25a;">Open it</span>
+        </div>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 20px; padding: 14px 44px; border-top: 1px solid rgba(255,255,255,0.06); background: #0a0b0d;">
+        <span style="font-size: 11px; color: #6d6863;">Watching, not blocking</span>
+        <span style="width: 1px; height: 11px; background: rgba(255,255,255,0.09);"></span>
+        <span style="font-size: 11px; color: #6d6863;">Still learning your machine — 7 days left</span>
+        <span style="width: 1px; height: 11px; background: rgba(255,255,255,0.09);"></span>
+        <span style="font-size: 11px; color: #6d6863;">Threat feeds have never updated</span>
+        <span style="font-size: 11px; color: #f2a25a;">Fix</span>
+        <span style="margin-left: auto; font-size: 11px; color: #3d3a37;">32 detections · tetragon running</span>
+      </div>
+    </div>
+
+    <div style="width: 1400px; font-size: 12px; line-height: 1.7; color: #837e79; text-wrap: pretty;">The old status strip put <span style="color:#a09b95;">mode monitor · tetragon running · policies 32 · feeds never · sandbox off · learning, 7 days left · unacked 24</span> above everything, in one weight, at the same volume. Here the two facts that change what Moat does — it is not blocking, it is still learning — are sentences in the footer, the one broken thing gets the only accent on screen, and the machine-shaped counters sit at the far right where you can ignore them. <span style="color:#a09b95;">unacked 24</span> is gone: a backlog counter is a to-do list you never asked for.</div>
+  </div>
+
+  <!-- 1b ─────────────────────────────────────────────── -->
+  <div id="1b" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">1b</span>
+      <span style="font-size: 14px; font-weight: 500;">Now · one thing needs you</span>
+      <span style="font-size: 12px; color: #837e79;">no split pane — the thing that needs you is the page</span>
+    </div>
+
+    <div style="width: 1400px; border-radius: 16px; overflow: hidden; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); display: flex; flex-direction: column;">
+      <div style="display: flex; align-items: center; gap: 13px; height: 54px; padding: 0 22px; border-bottom: 1px solid rgba(255,255,255,0.06);">
+        <span class="ms" style="font-size: 18px; color: #e0523f;">shield</span>
+        <span style="font-size: 14px; font-weight: 500;">Moat</span>
+        <div style="margin-left: auto; display: flex; align-items: center; gap: 6px;">
+          <span style="display: flex; align-items: center; gap: 8px; font-size: 12px; color: #f2a25a; padding: 6px 13px; border-radius: 8px; background: rgba(242,162,90,0.11);">Now <span style="font-size: 10px; font-weight: 700; color: #1a1006; background: #e0523f; border-radius: 5px; padding: 2px 5px;">1</span></span>
+          <span style="font-size: 12px; color: #837e79; padding: 6px 13px;">History</span>
+          <span style="font-size: 12px; color: #837e79; padding: 6px 13px;">Rules</span>
+          <span class="ms" style="font-size: 17px; color: #55514d; margin-left: 8px;">settings</span>
+          <span class="ms" style="font-size: 17px; color: #55514d;">close</span>
+        </div>
+      </div>
+
+      <div style="padding: 40px 44px 34px; display: flex; flex-direction: column; gap: 30px;">
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span style="width: 9px; height: 9px; border-radius: 50%; background: #e0523f;"></span>
+          <span style="font-size: 26px; font-weight: 500; letter-spacing: -0.01em; color: #f6f4f2;">One thing needs you.</span>
+          <span style="font-size: 12px; color: #6d6863; margin-left: 4px;">everything else today is explained</span>
+        </div>
+
+        <div style="border-radius: 14px; background: #121316; border: 1px solid rgba(224,82,63,0.22); overflow: hidden;">
+          <div style="padding: 26px 28px 24px; display: flex; flex-direction: column; gap: 22px;">
+            <div style="display: flex; flex-direction: column; gap: 9px; max-width: 900px;">
+              <div style="font-size: 19px; font-weight: 500; line-height: 1.4; color: #f6f4f2; text-wrap: pretty;">A program you don't edit with rewrote a file that runs at every login</div>
+              <div style="display: flex; align-items: center; gap: 12px; font-size: 12px; color: #6d6863;">
+                <span style="color: #b3aea8;">flea</span><span>·</span><span>10 hours ago</span><span>·</span><span>first time on this machine</span><span>·</span><span>nothing has run yet</span>
+              </div>
+            </div>
+
+            <div style="display: flex; flex-direction: column; gap: 10px; max-width: 900px; padding-left: 16px; border-left: 2px solid rgba(242,162,90,0.4);">
+              <div style="font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #f2a25a;">Moat read it this way</div>
+              <div style="font-size: 14px; line-height: 1.75; color: #d6d2ce; text-wrap: pretty;">A program called <span style="color:#f6f4f2;">flea</span> wrote into your Hyprland config folder. Anything there runs automatically the next time you log in, with your whole session. flea has never touched that folder before and it isn't an editor, which is the pattern something uses to survive a reboot without touching anything root owns. It hasn't run yet — you have until your next login.</div>
+              <div style="font-size: 12px; line-height: 1.7; color: #837e79; text-wrap: pretty;">If you installed or ran flea yourself in the last day, this is almost certainly it setting up its own keybindings.</div>
+            </div>
+
+            <div style="display: grid; grid-template-columns: 120px 1fr; gap: 9px 20px; font-size: 12px; max-width: 900px;">
+              <span style="color: #55514d;">The file</span><span style="color: #b3aea8;">~/.config/hypr/bindings.lua</span>
+              <span style="color: #55514d;">The program</span><span style="color: #b3aea8;">/usr/bin/flea, launched from your own shell</span>
+            </div>
+
+            <div style="display: flex; align-items: center; gap: 12px; padding-top: 4px;">
+              <div style="display: flex; align-items: center; gap: 9px; padding: 11px 20px; border-radius: 10px; background: #f2a25a;">
+                <span class="ms" style="font-size: 16px; color: #1a1006;">check</span>
+                <span style="font-size: 13px; font-weight: 500; color: #1a1006;">This was me</span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 9px; padding: 11px 20px; border-radius: 10px; background: rgba(224,82,63,0.13); border: 1px solid rgba(224,82,63,0.3);">
+                <span class="ms" style="font-size: 16px; color: #e0523f;">block</span>
+                <span style="font-size: 13px; color: #e0523f;">Stop it</span>
+              </div>
+              <span style="margin-left: 10px; font-size: 12px; color: #837e79;">Show evidence</span>
+              <span style="font-size: 12px; color: #837e79;">Ask Moat a question</span>
+              <span style="margin-left: auto; font-size: 11px; color: #3d3a37;">moat-persist-hypr-config-write</span>
+            </div>
+          </div>
+
+          <sc-if value="{{ showEvidence }}" hint-placeholder-val="{{ true }}">
+          <div style="padding: 20px 28px 24px; border-top: 1px solid rgba(255,255,255,0.06); background: #0e0f12; display: flex; flex-direction: column; gap: 14px;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span class="ms" style="font-size: 15px; color: #55514d;">expand_less</span>
+              <span style="font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #55514d;">Evidence</span>
+              <span style="margin-left: auto; font-size: 11px; color: #55514d;">Copy bundle</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 110px 1fr; gap: 7px 20px; font-size: 12px;">
+              <span style="color: #55514d;">process</span><span style="color: #9d9892;">flea · pid 655644 · uid 1000 · args --default</span>
+              <span style="color: #55514d;">cwd</span><span style="color: #9d9892;">/home/dan</span>
+              <span style="color: #55514d;">ancestry</span><span style="color: #9d9892;">kernel → systemd → systemd → herdr → bash → flea</span>
+              <span style="color: #55514d;">wrote</span><span style="color: #9d9892;">/home/dan/.config/hypr/bindings.lua.655644.tmp</span>
+              <span style="color: #55514d;">hook</span><span style="color: #9d9892;">security_file_post_open (write)</span>
+              <span style="color: #55514d;">severity</span><span style="color: #9d9892;">medium → high, raised because the write landed in an autostart path</span>
+            </div>
+          </div>
+          </sc-if>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 4px;">
+          <div style="font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: #55514d; padding-bottom: 10px;">Also today</div>
+          <div style="display: grid; grid-template-columns: 1fr 90px 130px 22px; align-items: center; gap: 16px; padding: 13px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 13px; color: #b3aea8;">Claude ran inside package installs</span>
+            <span style="font-size: 11px; color: #55514d;">68 times</span>
+            <span style="font-size: 11px; color: #a09b95;">explained</span>
+            <span class="ms" style="font-size: 16px; color: #3d3a37;">chevron_right</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 90px 130px 22px; align-items: center; gap: 16px; padding: 13px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 13px; color: #b3aea8;">git and ssh read your keys</span>
+            <span style="font-size: 11px; color: #55514d;">22 times</span>
+            <span style="font-size: 11px; color: #6d6863;">expected</span>
+            <span class="ms" style="font-size: 16px; color: #3d3a37;">chevron_right</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 90px 130px 22px; align-items: center; gap: 16px; padding: 13px 0; border-top: 1px solid rgba(255,255,255,0.05); border-bottom: 1px solid rgba(255,255,255,0.05);">
+            <span style="font-size: 13px; color: #b3aea8;">curl ran during a package build</span>
+            <span style="font-size: 11px; color: #55514d;">1 time</span>
+            <span style="font-size: 11px; color: #a09b95;">explained</span>
+            <span class="ms" style="font-size: 16px; color: #3d3a37;">chevron_right</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div style="width: 1400px; font-size: 12px; line-height: 1.7; color: #837e79; text-wrap: pretty;">The list-plus-detail split spent half the width on nine rows of the same sentence. When one thing needs you, showing a list is a way of not answering. <span style="color:#a09b95;">This was me</span> is the honest primary — it is the true answer nine times out of ten, and it is the click that teaches Moat. <span style="color:#a09b95;">Stop it</span> folds kill and quarantine into one act, because a user with no security background cannot choose between them and shouldn't have to.</div>
+  </div>
+
+  <!-- 1c ─────────────────────────────────────────────── -->
+  <div id="1c" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">1c</span>
+      <span style="font-size: 14px; font-weight: 500;">One incident, 68 times · and the silence choice</span>
+      <span style="font-size: 12px; color: #837e79;">what replaces four TOML blocks and a wall of repeats</span>
+    </div>
+
+    <div style="width: 1400px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 34px 44px 38px; display: flex; flex-direction: column; gap: 26px;">
+      <div style="display: flex; flex-direction: column; gap: 9px; max-width: 900px;">
+        <div style="font-size: 19px; font-weight: 500; color: #f6f4f2;">Claude ran inside package installs</div>
+        <div style="display: flex; align-items: center; gap: 12px; font-size: 12px; color: #6d6863;">
+          <span style="color: #b3aea8;">68 times</span><span>·</span><span>Tuesday to 3 minutes ago</span><span>·</span><span>always the same program and rule</span>
+        </div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 10px; max-width: 900px; padding-left: 16px; border-left: 2px solid rgba(242,162,90,0.4);">
+        <div style="font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #f2a25a;">Moat read it this way</div>
+        <div style="font-size: 14px; line-height: 1.75; color: #d6d2ce; text-wrap: pretty;">This is your own setup. Every one of the 68 is your editor, hyprctl writing keywords, omarchy-shell saving its own settings, or pacman dropping in a default config. The detection exists because a real install script that pulls a coding agent mid-build is worth knowing about — on your machine it only ever catches you working.</div>
+      </div>
+
+      <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px 26px; padding: 18px 20px; border-radius: 12px; background: #121316;">
+        <div style="display: flex; flex-direction: column; gap: 5px; padding: 6px 0;"><span style="font-size: 11px; color: #55514d;">every time by</span><span style="font-size: 13px; color: #b3aea8;">/usr/bin/claude</span></div>
+        <div style="display: flex; flex-direction: column; gap: 5px; padding: 6px 0;"><span style="font-size: 11px; color: #55514d;">every time under</span><span style="font-size: 13px; color: #b3aea8;">makepkg → bash</span></div>
+        <div style="display: flex; flex-direction: column; gap: 5px; padding: 6px 0;"><span style="font-size: 11px; color: #55514d;">busiest hour</span><span style="font-size: 13px; color: #b3aea8;">14:00, 19 runs</span></div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 16px; max-width: 1000px;">
+        <div style="font-size: 13px; color: #d6d2ce;">This keeps firing. Stop asking about it?</div>
+        <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+          <span style="font-size: 12px; color: #1a1006; background: #f2a25a; border-radius: 9px; padding: 9px 16px;">when claude does it</span>
+          <span style="font-size: 12px; color: #b3aea8; background: #191a1d; border-radius: 9px; padding: 9px 16px;">only claude, only this folder</span>
+          <span style="font-size: 12px; color: #b3aea8; background: #191a1d; border-radius: 9px; padding: 9px 16px;">anything a package build starts</span>
+          <span style="font-size: 12px; color: #837e79; background: #141518; border-radius: 9px; padding: 9px 16px;">this detection, everywhere</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 16px; padding: 15px 18px; border-radius: 11px; background: #121316;">
+          <span class="ms" style="font-size: 17px; color: #7ba37f;">check_circle</span>
+          <div style="display: flex; flex-direction: column; gap: 4px;">
+            <span style="font-size: 12px; color: #d6d2ce;">Silences all 68 and anything like them, as long as it is claude doing it.</span>
+            <span style="font-size: 11px; color: #6d6863;">Claude doing something in the credential or persistence families still reaches you. One line into your own rules file — remove it any time under Rules.</span>
+          </div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 14px;">
+          <span style="font-size: 13px; font-weight: 500; color: #1a1006; background: #f2a25a; border-radius: 10px; padding: 11px 20px;">Stop asking</span>
+          <span style="font-size: 12px; color: #837e79;">Keep asking</span>
+          <span style="margin-left: auto; font-size: 11px; color: #3d3a37;">Show the rule it writes</span>
+        </div>
+      </div>
+    </div>
+
+    <div style="width: 1400px; font-size: 12px; line-height: 1.7; color: #837e79; text-wrap: pretty;">The four scopes were four headings, four sentences of explanation and four <span style="color:#a09b95;">Show TOML</span> links, all live at once. As chips, only the chosen one has to be explained — and the consequence sentence is where the caveat belongs, not in a paragraph about file paths. The TOML is still one click away for the people who want it.</div>
+  </div>
+
+  <!-- 1d ─────────────────────────────────────────────── -->
+  <div id="1d" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">1d</span>
+      <span style="font-size: 14px; font-weight: 500;">History</span>
+      <span style="font-size: 12px; color: #837e79;">grouped by day, one row per incident, weight carries severity</span>
+    </div>
+
+    <div style="width: 1400px; border-radius: 16px; overflow: hidden; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); display: flex; flex-direction: column;">
+      <div style="display: flex; align-items: center; gap: 13px; height: 54px; padding: 0 22px; border-bottom: 1px solid rgba(255,255,255,0.06);">
+        <span class="ms" style="font-size: 18px; color: #7ba37f;">shield</span>
+        <span style="font-size: 14px; font-weight: 500;">Moat</span>
+        <div style="margin-left: auto; display: flex; align-items: center; gap: 6px;">
+          <span style="font-size: 12px; color: #837e79; padding: 6px 13px;">Now</span>
+          <span style="font-size: 12px; color: #f2a25a; padding: 6px 13px; border-radius: 8px; background: rgba(242,162,90,0.11);">History</span>
+          <span style="font-size: 12px; color: #837e79; padding: 6px 13px;">Rules</span>
+          <span class="ms" style="font-size: 17px; color: #55514d; margin-left: 8px;">settings</span>
+          <span class="ms" style="font-size: 17px; color: #55514d;">close</span>
+        </div>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 10px; padding: 16px 44px; border-bottom: 1px solid rgba(255,255,255,0.05);">
+        <span style="font-size: 12px; color: #1a1006; background: #f2a25a; border-radius: 8px; padding: 7px 14px;">Everything</span>
+        <span style="font-size: 12px; color: #b3aea8; background: #191a1d; border-radius: 8px; padding: 7px 14px;">Needed you</span>
+        <span style="font-size: 12px; color: #b3aea8; background: #191a1d; border-radius: 8px; padding: 7px 14px;">Silenced by a rule</span>
+        <span style="margin-left: auto; font-size: 12px; color: #55514d;">last 7 days</span>
+      </div>
+
+      <div style="padding: 30px 44px 36px; display: flex; flex-direction: column; gap: 30px;">
+        <div style="display: flex; flex-direction: column; gap: 0;">
+          <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 12px;">
+            <span style="font-size: 13px; color: #f6f4f2;">Today</span>
+            <span style="font-size: 11px; color: #55514d;">1 needed you · 3 explained · 41 covered by a rule</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 3px 1fr 110px 120px; align-items: center; gap: 20px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="height: 22px; background: #e0523f; border-radius: 2px;"></span>
+            <span style="font-size: 13px; color: #f6f4f2;">flea rewrote a file that runs at every login</span>
+            <span style="font-size: 11px; color: #55514d;">10h ago</span>
+            <span style="font-size: 11px; color: #e0523f;">waiting on you</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 3px 1fr 110px 120px; align-items: center; gap: 20px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="height: 22px; background: #3d3a37; border-radius: 2px;"></span>
+            <span style="font-size: 13px; color: #b3aea8;">Claude ran inside package installs <span style="color:#55514d;">· 68 times</span></span>
+            <span style="font-size: 11px; color: #55514d;">3m ago</span>
+            <span style="font-size: 11px; color: #6d6863;">explained</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 3px 1fr 110px 120px; align-items: center; gap: 20px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="height: 22px; background: #3d3a37; border-radius: 2px;"></span>
+            <span style="font-size: 13px; color: #b3aea8;">curl ran during a package build <span style="color:#55514d;">· 1 time</span></span>
+            <span style="font-size: 11px; color: #55514d;">10h ago</span>
+            <span style="font-size: 11px; color: #6d6863;">explained</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 3px 1fr 110px 120px; align-items: center; gap: 20px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05); border-bottom: 1px solid rgba(255,255,255,0.05);">
+            <span style="height: 22px; background: #26241f; border-radius: 2px;"></span>
+            <span style="font-size: 13px; color: #6d6863;">ssh and git read your keys <span style="color:#3d3a37;">· 22 times · rule: your SSH tools</span></span>
+            <span style="font-size: 11px; color: #3d3a37;">12h ago</span>
+            <span style="font-size: 11px; color: #3d3a37;">covered</span>
+          </div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 0;">
+          <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 12px;">
+            <span style="font-size: 13px; color: #f6f4f2;">Yesterday</span>
+            <span style="font-size: 11px; color: #55514d;">nothing needed you</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 3px 1fr 110px 120px; align-items: center; gap: 20px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+            <span style="height: 22px; background: #3d3a37; border-radius: 2px;"></span>
+            <span style="font-size: 13px; color: #b3aea8;">bsdtar unpacked an AI agent task file <span style="color:#55514d;">· 4 times</span></span>
+            <span style="font-size: 11px; color: #55514d;">1d ago</span>
+            <span style="font-size: 11px; color: #6d6863;">explained</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 3px 1fr 110px 120px; align-items: center; gap: 20px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05); border-bottom: 1px solid rgba(255,255,255,0.05);">
+            <span style="height: 22px; background: #26241f; border-radius: 2px;"></span>
+            <span style="font-size: 13px; color: #6d6863;">Writes under ~/.config <span style="color:#3d3a37;">· 31 times · rule: your editor</span></span>
+            <span style="font-size: 11px; color: #3d3a37;">1d ago</span>
+            <span style="font-size: 11px; color: #3d3a37;">covered</span>
+          </div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 0;">
+          <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 12px;">
+            <span style="font-size: 13px; color: #f6f4f2;">Friday</span>
+            <span style="font-size: 11px; color: #55514d;">1 needed you, you stopped it</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 3px 1fr 110px 120px; align-items: center; gap: 20px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05); border-bottom: 1px solid rgba(255,255,255,0.05);">
+            <span style="height: 22px; background: #e0523f; border-radius: 2px;"></span>
+            <span style="font-size: 13px; color: #b3aea8;">A shell wrote to /etc/ld.so.preload</span>
+            <span style="font-size: 11px; color: #55514d;">6d ago</span>
+            <span style="font-size: 11px; color: #7ba37f;">you stopped it</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div style="width: 1400px; font-size: 12px; line-height: 1.7; color: #837e79; text-wrap: pretty;">Severity moves from a coloured pill on every row to a 3px tick and the brightness of the text, so a page of history has one red mark on it instead of nine. Day headers carry the count summary, which is the thing you actually scan for. Rule-covered rows stay visible but recede — you asked for them to be silent, not invisible.</div>
+  </div>
+
+  <!-- 1e ─────────────────────────────────────────────── -->
+  <div id="1e" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">1e</span>
+      <span style="font-size: 14px; font-weight: 500;">Rules</span>
+      <span style="font-size: 12px; color: #837e79;">16 near-identical cards become 5 grouped lines</span>
+    </div>
+
+    <div style="width: 1400px; border-radius: 16px; overflow: hidden; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); display: flex; flex-direction: column;">
+      <div style="display: flex; align-items: center; gap: 13px; height: 54px; padding: 0 22px; border-bottom: 1px solid rgba(255,255,255,0.06);">
+        <span class="ms" style="font-size: 18px; color: #7ba37f;">shield</span>
+        <span style="font-size: 14px; font-weight: 500;">Moat</span>
+        <div style="margin-left: auto; display: flex; align-items: center; gap: 6px;">
+          <span style="font-size: 12px; color: #837e79; padding: 6px 13px;">Now</span>
+          <span style="font-size: 12px; color: #837e79; padding: 6px 13px;">History</span>
+          <span style="font-size: 12px; color: #f2a25a; padding: 6px 13px; border-radius: 8px; background: rgba(242,162,90,0.11);">Rules</span>
+          <span class="ms" style="font-size: 17px; color: #55514d; margin-left: 8px;">settings</span>
+          <span class="ms" style="font-size: 17px; color: #55514d;">close</span>
+        </div>
+      </div>
+
+      <div style="padding: 34px 44px 38px; display: flex; flex-direction: column; gap: 34px;">
+        <div style="display: flex; flex-direction: column; gap: 14px; max-width: 900px;">
+          <div style="font-size: 19px; font-weight: 500; color: #f6f4f2;">What Moat has been told to ignore</div>
+          <div style="font-size: 13px; line-height: 1.7; color: #a09b95; text-wrap: pretty;">Every time you say <span style="color:#d6d2ce;">this was me</span>, a line lands here. You can take any of them back.</div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div style="font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: #55514d;">Yours · 2</div>
+          <div style="display: grid; grid-template-columns: 1fr 150px 130px 80px; align-items: center; gap: 20px; padding: 16px 20px; border-radius: 12px; background: #121316;">
+            <div style="display: flex; flex-direction: column; gap: 5px;">
+              <span style="font-size: 13px; color: #f6f4f2;">Claude, during package installs</span>
+              <span style="font-size: 11px; color: #6d6863;">you added this 3 minutes ago, after 68 alerts</span>
+            </div>
+            <span style="font-size: 11px; color: #55514d;">/usr/bin/claude</span>
+            <span style="font-size: 11px; color: #6d6863;">silenced 4 since</span>
+            <span style="font-size: 12px; color: #f2a25a; justify-self: end;">Undo</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 150px 130px 80px; align-items: center; gap: 20px; padding: 16px 20px; border-radius: 12px; background: #121316;">
+            <div style="display: flex; flex-direction: column; gap: 5px;">
+              <span style="font-size: 13px; color: #f6f4f2;">hyprctl writing your keybindings</span>
+              <span style="font-size: 11px; color: #6d6863;">you added this on Tuesday</span>
+            </div>
+            <span style="font-size: 11px; color: #55514d;">/usr/bin/hyprctl</span>
+            <span style="font-size: 11px; color: #6d6863;">silenced 31 since</span>
+            <span style="font-size: 12px; color: #f2a25a; justify-self: end;">Undo</span>
+          </div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div style="display: flex; align-items: baseline; gap: 14px;">
+            <span style="font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: #55514d;">Came with Moat · 16</span>
+            <span style="font-size: 11px; color: #3d3a37;">grouped by what they cover · replaced on upgrade</span>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 2px;">
+            <div style="display: grid; grid-template-columns: 260px 1fr 90px 22px; align-items: center; gap: 20px; padding: 15px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+              <span style="font-size: 13px; color: #d6d2ce;">Your SSH tools</span>
+              <span style="font-size: 12px; color: #837e79;">reading ~/.ssh is the entire point of ssh, ssh-agent, ssh-add and ssh-keygen</span>
+              <span style="font-size: 11px; color: #55514d;">4 rules</span>
+              <span class="ms" style="font-size: 16px; color: #3d3a37;">chevron_right</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 260px 1fr 90px 22px; align-items: center; gap: 20px; padding: 15px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+              <span style="font-size: 13px; color: #d6d2ce;">git</span>
+              <span style="font-size: 12px; color: #837e79;">reads ~/.ssh/config and ~/.git-credentials constantly — credential reads only, nothing else</span>
+              <span style="font-size: 11px; color: #55514d;">1 rule</span>
+              <span class="ms" style="font-size: 16px; color: #3d3a37;">chevron_right</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 260px 1fr 90px 22px; align-items: center; gap: 20px; padding: 15px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+              <span style="font-size: 13px; color: #d6d2ce;">Your package manager</span>
+              <span style="font-size: 12px; color: #837e79;">pacman and makepkg write everywhere by design</span>
+              <span style="font-size: 11px; color: #55514d;">5 rules</span>
+              <span class="ms" style="font-size: 16px; color: #3d3a37;">chevron_right</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 260px 1fr 90px 22px; align-items: center; gap: 20px; padding: 15px 0; border-top: 1px solid rgba(255,255,255,0.05);">
+              <span style="font-size: 13px; color: #d6d2ce;">Your desktop</span>
+              <span style="font-size: 12px; color: #837e79;">omarchy scripts and hyprland rewriting their own config</span>
+              <span style="font-size: 11px; color: #55514d;">4 rules</span>
+              <span class="ms" style="font-size: 16px; color: #3d3a37;">chevron_right</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 260px 1fr 90px 22px; align-items: center; gap: 20px; padding: 15px 0; border-top: 1px solid rgba(255,255,255,0.05); border-bottom: 1px solid rgba(255,255,255,0.05);">
+              <span style="font-size: 13px; color: #d6d2ce;">Browsers</span>
+              <span style="font-size: 12px; color: #837e79;">their own profile directories</span>
+              <span style="font-size: 11px; color: #55514d;">2 rules</span>
+              <span class="ms" style="font-size: 16px; color: #3d3a37;">chevron_right</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div style="width: 1400px; font-size: 12px; line-height: 1.7; color: #837e79; text-wrap: pretty;">Four cards titled <span style="color:#a09b95;">moat-cred-*</span> that differed only in a binary path, each repeating the same 22-word sentence about upgrades, is a list of rows pretending to be cards. Grouping by what they protect names them in a way a user recognises. The upgrade caveat belongs once, in the section header. <span style="color:#a09b95;">Yours</span> goes first and carries a count of what it has actually silenced — the only way to know a rule was a good idea.</div>
+  </div>
+
+  <!-- 1f ─────────────────────────────────────────────── -->
+  <div id="1f" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">1f</span>
+      <span style="font-size: 14px; font-weight: 500;">Settings</span>
+      <span style="font-size: 12px; color: #837e79;">question, control, one line of consequence — the rest is Advanced</span>
+    </div>
+
+    <div style="width: 1400px; border-radius: 16px; overflow: hidden; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); display: flex; flex-direction: column;">
+      <div style="display: flex; align-items: center; gap: 13px; height: 54px; padding: 0 22px; border-bottom: 1px solid rgba(255,255,255,0.06);">
+        <span class="ms" style="font-size: 18px; color: #7ba37f;">shield</span>
+        <span style="font-size: 14px; font-weight: 500;">Moat</span>
+        <span style="font-size: 12px; color: #55514d;">/ Settings</span>
+        <div style="margin-left: auto; display: flex; align-items: center; gap: 12px;">
+          <span class="ms" style="font-size: 17px; color: #55514d;">close</span>
+        </div>
+      </div>
+
+      <div style="padding: 34px 44px 38px; display: flex; flex-direction: column; gap: 0;">
+        <div style="display: grid; grid-template-columns: 1fr 320px; align-items: start; gap: 40px; padding: 24px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
+          <div style="display: flex; flex-direction: column; gap: 7px;">
+            <span style="font-size: 14px; color: #f6f4f2;">Should Moat stop things, or just tell you?</span>
+            <span style="font-size: 12px; line-height: 1.65; color: #837e79; text-wrap: pretty;">Stopping happens in the kernel, before this panel sees it — a wrong guess kills a real program mid-write. Stay on telling you until Rules has been quiet for a week.</span>
+          </div>
+          <div style="display: flex; gap: 8px; justify-self: end;">
+            <span style="font-size: 12px; color: #1a1006; background: #f2a25a; border-radius: 9px; padding: 9px 16px;">Just tell me</span>
+            <span style="font-size: 12px; color: #b3aea8; background: #191a1d; border-radius: 9px; padding: 9px 16px;">Stop things</span>
+          </div>
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 320px; align-items: start; gap: 40px; padding: 24px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
+          <div style="display: flex; flex-direction: column; gap: 7px;">
+            <span style="font-size: 14px; color: #f6f4f2;">When should Moat interrupt you?</span>
+            <span style="font-size: 12px; line-height: 1.65; color: #837e79; text-wrap: pretty;">Everything still lands in the panel either way. Repeats of the same thing are counted up and arrive as one notification, so a noisy detection costs you two interruptions instead of two hundred.</span>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 8px; justify-self: end; align-items: flex-end;">
+            <div style="display: flex; gap: 8px;">
+              <span style="font-size: 12px; color: #b3aea8; background: #191a1d; border-radius: 9px; padding: 9px 16px;">Anything odd</span>
+              <span style="font-size: 12px; color: #1a1006; background: #f2a25a; border-radius: 9px; padding: 9px 16px;">Only if it needs me</span>
+              <span style="font-size: 12px; color: #b3aea8; background: #191a1d; border-radius: 9px; padding: 9px 16px;">Never</span>
+            </div>
+            <span style="font-size: 11px; color: #55514d;">at most one every 10 minutes</span>
+          </div>
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 320px; align-items: start; gap: 40px; padding: 24px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
+          <div style="display: flex; flex-direction: column; gap: 7px;">
+            <span style="font-size: 14px; color: #f6f4f2;">Hide your keys from package installs</span>
+            <span style="font-size: 12px; line-height: 1.65; color: #837e79; text-wrap: pretty;">Runs npm, pip, cargo and makepkg in a box where ~/.ssh and your tokens don't exist. Takes effect in new shells.</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 12px; justify-self: end;">
+            <span style="font-size: 12px; color: #6d6863;">off</span>
+            <span style="width: 42px; height: 23px; border-radius: 12px; background: #23252a; display: flex; align-items: center; padding: 0 3px;"><span style="width: 17px; height: 17px; border-radius: 50%; background: #6d6863;"></span></span>
+          </div>
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 320px; align-items: start; gap: 40px; padding: 24px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
+          <div style="display: flex; flex-direction: column; gap: 7px;">
+            <span style="font-size: 14px; color: #f6f4f2;">A weekly note on what happened</span>
+            <span style="font-size: 12px; line-height: 1.65; color: #837e79; text-wrap: pretty;">The only thing Moat sends on a schedule.</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 12px; justify-self: end;">
+            <span style="font-size: 12px; color: #b3aea8;">on, Mondays</span>
+            <span style="width: 42px; height: 23px; border-radius: 12px; background: #f2a25a; display: flex; align-items: center; justify-content: flex-end; padding: 0 3px;"><span style="width: 17px; height: 17px; border-radius: 50%; background: #1a1006;"></span></span>
+          </div>
+        </div>
+
+        <div style="display: flex; align-items: center; gap: 12px; padding: 26px 0 8px;">
+          <span class="ms" style="font-size: 16px; color: #55514d;">chevron_right</span>
+          <span style="font-size: 13px; color: #837e79;">Advanced</span>
+          <span style="font-size: 11px; color: #3d3a37;">show rule-covered events · notification threshold by severity · cooldown window · policy paths</span>
+        </div>
+      </div>
+    </div>
+
+    <div style="width: 1400px; font-size: 12px; line-height: 1.7; color: #837e79; text-wrap: pretty;">Monitor/Enforce, notify-at, notify-cooldown and show-suppressed were four controls in the vocabulary of the daemon, each carrying a paragraph the user has to decode before they can touch the switch. Rewritten as questions, two of them merge and one turns out to be an implementation detail. <span style="color:#a09b95;">10 min</span> stays as a fact under the choice rather than a row of its own.</div>
+  </div>
+
+  <!-- 1g ─────────────────────────────────────────────── -->
+  <div id="1g" style="display: flex; flex-direction: column; gap: 14px;">
+    <div style="display: flex; align-items: baseline; gap: 12px;">
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; padding: 4px 8px; border-radius: 6px; background: #191a1d; color: #f2a25a;">1g</span>
+      <span style="font-size: 14px; font-weight: 500;">The first week</span>
+      <span style="font-size: 12px; color: #837e79;">learning mode as a visible, finite job with an end</span>
+    </div>
+
+    <div style="display: flex; gap: 26px; flex-wrap: wrap;">
+      <div style="width: 686px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 34px 34px 30px; display: flex; flex-direction: column; gap: 24px;">
+        <div style="display: flex; flex-direction: column; gap: 11px;">
+          <div style="font-size: 20px; font-weight: 500; color: #f6f4f2;">Moat is learning your machine</div>
+          <div style="font-size: 13px; line-height: 1.7; color: #a09b95; text-wrap: pretty;">For the next 7 days it watches without judging much. Anything that looks like your normal work gets written down as normal. You'll see fewer, better alerts at the end of it.</div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 10px;">
+          <div style="height: 5px; border-radius: 3px; background: #191a1d; overflow: hidden;"><span style="display: block; width: 22%; height: 100%; background: #f2a25a;"></span></div>
+          <div style="display: flex; justify-content: space-between; font-size: 11px; color: #55514d;"><span>day 2 of 9</span><span>412 things learned</span></div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 12px; padding: 18px 20px; border-radius: 12px; background: #121316;">
+          <span style="font-size: 12px; color: #b3aea8;">It already knows</span>
+          <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+            <span style="font-size: 11px; color: #9d9892; background: #191a1d; border-radius: 7px; padding: 6px 11px;">your editor</span>
+            <span style="font-size: 11px; color: #9d9892; background: #191a1d; border-radius: 7px; padding: 6px 11px;">pacman</span>
+            <span style="font-size: 11px; color: #9d9892; background: #191a1d; border-radius: 7px; padding: 6px 11px;">hyprctl</span>
+            <span style="font-size: 11px; color: #9d9892; background: #191a1d; border-radius: 7px; padding: 6px 11px;">claude</span>
+            <span style="font-size: 11px; color: #9d9892; background: #191a1d; border-radius: 7px; padding: 6px 11px;">ssh-agent</span>
+            <span style="font-size: 11px; color: #9d9892; background: #191a1d; border-radius: 7px; padding: 6px 11px;">+ 9 more</span>
+          </div>
+        </div>
+        <div style="font-size: 12px; line-height: 1.65; color: #6d6863; text-wrap: pretty;">Serious things still reach you today — a write to a loader path or a key read by something unknown doesn't wait for learning to finish.</div>
+      </div>
+
+      <div style="width: 686px; border-radius: 16px; background: #0d0e10; box-shadow: 0 30px 80px rgba(0,0,0,0.6); padding: 34px 34px 30px; display: flex; flex-direction: column; gap: 22px;">
+        <div style="font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: #55514d;">day 9 · one notification</div>
+        <div style="display: flex; flex-direction: column; gap: 11px;">
+          <div style="font-size: 20px; font-weight: 500; color: #f6f4f2;">Done learning. Here's what changed.</div>
+          <div style="font-size: 13px; line-height: 1.7; color: #a09b95; text-wrap: pretty;">14 programs are now known as yours, and 3 detections that only ever caught your own work have gone quiet. Alerts from here will be about things Moat hasn't seen before.</div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 2px;">
+          <div style="display: flex; justify-content: space-between; padding: 12px 0; border-top: 1px solid rgba(255,255,255,0.05); font-size: 12px;"><span style="color: #b3aea8;">Alerts in week one</span><span style="color: #6d6863;">312</span></div>
+          <div style="display: flex; justify-content: space-between; padding: 12px 0; border-top: 1px solid rgba(255,255,255,0.05); font-size: 12px;"><span style="color: #b3aea8;">Expected from here</span><span style="color: #6d6863;">about 4 a week</span></div>
+          <div style="display: flex; justify-content: space-between; padding: 12px 0; border-top: 1px solid rgba(255,255,255,0.05); border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 12px;"><span style="color: #b3aea8;">Rules written for you</span><span style="color: #6d6863;">11 · review them</span></div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 14px; padding-top: 2px;">
+          <span style="font-size: 13px; font-weight: 500; color: #1a1006; background: #f2a25a; border-radius: 10px; padding: 11px 20px;">Let Moat stop things now</span>
+          <span style="font-size: 12px; color: #837e79;">Keep just telling me</span>
+        </div>
+        <div style="font-size: 12px; line-height: 1.65; color: #6d6863; text-wrap: pretty;">The end of learning is the one moment the enforce question can be asked honestly, so it is asked here and nowhere else.</div>
+      </div>
+    </div>
+  </div>
+
+</section>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;showEvidence&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Doc&quot;},&quot;showRationale&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Doc&quot;}}">
+class Component extends DCLogic {
+  renderVals() {
+    return {
+      showEvidence: this.props.showEvidence ?? true,
+      showRationale: this.props.showRationale ?? true,
+    };
+  }
+}
+</script>
+</body>
+</html>

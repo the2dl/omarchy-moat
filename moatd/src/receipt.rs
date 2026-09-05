@@ -422,6 +422,7 @@ mod tests {
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            sid: None,
         }
     }
 

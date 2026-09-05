@@ -50,6 +50,30 @@ pub fn is_version_manager_shim(exe: &str) -> bool {
 
 pub const ID: &str = "moat-x-ai-cli-headless";
 
+/// Argv that belongs to a bundled search/utility tool rather than to an agent
+/// launch.
+///
+/// Deliberately conservative, and deliberately about **flags an agent launch
+/// does not take** rather than a list of tool names -- a multi-call binary can
+/// grow another applet tomorrow, and this must not need updating when it does.
+/// A real agent launch is `claude -p "..."`, `claude --resume <id>`, or bare;
+/// none of them pass `--glob`, `--hidden`, `-e <pattern>` or `--no-config`.
+fn looks_like_a_tool_invocation(args: &str) -> bool {
+    const TOOL_FLAGS: &[&str] = &[
+        "--glob",
+        "--hidden",
+        "--no-config",
+        "--no-ignore",
+        "--files-with-matches",
+        "--line-number",
+        "--max-count",
+        "--type-add",
+        "--binary-files",
+        "--json-lines",
+    ];
+    args.split_whitespace().any(|t| TOOL_FLAGS.contains(&t))
+}
+
 #[derive(Default)]
 pub struct AiCliHeadless;
 
@@ -86,6 +110,25 @@ impl UserRule for AiCliHeadless {
         };
         let comm = basename(&proc.exe);
         if !AI_CLIS.contains(&comm) {
+            return Vec::new();
+        }
+        // The binary's NAME is not the invocation. Modern agent CLIs ship as
+        // multi-call binaries: `claude` re-execs itself as its own bundled
+        // `rg`, `ugrep` and friends, so a plain file search inside an editing
+        // session arrives here as "/…/installs/claude/2.1.258/claude" with
+        // ripgrep's argv. On 2026-09-04 that fired this rule roughly once a
+        // minute on a machine where an agent was working -- a permanent false
+        // positive on a detection whose whole job is to notice the *rare* case
+        // of an agent running with nobody watching.
+        //
+        // Two dead allowlist entries were written before the cause was found,
+        // which is the argument for fixing the discriminator rather than adding
+        // a third: `parent = "*/moat-sandbox"` can never match (the script ends
+        // in `exec bwrap`, so the process becomes bwrap and never appears as an
+        // ancestor), and a path glob missed `/usr/bin/moatctl (deleted)` after
+        // pacman replaced the binary mid-run.
+        if looks_like_a_tool_invocation(&proc.args) {
+            log::debug!("{}: {} is running as a bundled tool, not as an agent", ID, proc.exe);
             return Vec::new();
         }
         // The shim is about to exec the real binary; let that one speak.
@@ -190,6 +233,7 @@ mod tests {
         let feeds = Feeds::default();
         let homes = vec!["/home/dan".to_string()];
         let ctx = RuleCtx {
+            rarity: &crate::rarity::RarityStore::default(),
             cfg,
             table,
             feeds: &feeds,
@@ -335,6 +379,40 @@ mod tests {
         assert!(f[0].proc.exe.contains("/installs/"), "the alert names the real binary");
         assert!(is_version_manager_shim("/home/dan/.local/share/mise/shims/claude"));
         assert!(!is_version_manager_shim("/usr/bin/claude"));
+    }
+
+    #[test]
+    fn a_bundled_search_tool_is_not_an_agent_launch() {
+        // `claude` ships as a multi-call binary and re-execs itself as its own
+        // `rg`, so on 2026-09-04 every file search inside an editing session
+        // arrived here as a headless agent launch -- about once a minute, on a
+        // rule whose whole job is to notice the rare case.
+        let rg = "--no-config --hidden --glob !.git --glob !.svn -e pattern .";
+        assert!(looks_like_a_tool_invocation(rg));
+        assert!(looks_like_a_tool_invocation("--files-with-matches --line-number foo"));
+
+        // Real agent launches, which must still fire.
+        assert!(!looks_like_a_tool_invocation(""));
+        assert!(!looks_like_a_tool_invocation("-p \"read the bundle\""));
+        assert!(!looks_like_a_tool_invocation("--resume 09cac212-f91a-424d"));
+        assert!(!looks_like_a_tool_invocation("--permission-mode plan -- prompt"));
+        assert!(!looks_like_a_tool_invocation("--dangerously-skip-permissions"));
+
+        // Keyed on flags an agent launch does not take, not on a list of applet
+        // names -- a multi-call binary can grow another tool tomorrow and this
+        // must not need updating when it does.
+        assert!(!looks_like_a_tool_invocation("--hiddenish"),
+                "a substring is not a flag");
+        assert!(!looks_like_a_tool_invocation("--glob=x"),
+                "and neither is an --opt=value spelling");
+
+        // The honest limit: an argument that IS the bare token counts, whatever
+        // it meant. `claude` handed a file literally named `--glob` would be
+        // read as a tool invocation and skipped. That direction is a missed
+        // detection rather than a false positive, and the alternative -- knowing
+        // each applet's real argv grammar -- costs far more than the case is
+        // worth.
+        assert!(looks_like_a_tool_invocation("a file called --glob"));
     }
 
     #[test]

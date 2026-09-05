@@ -1,0 +1,193 @@
+# /etc/moat/ship.toml — moat-ship configuration.
+#
+# Mode 0644 as shipped, which is fine because it holds NO SECRET. If you put an
+# inline token in the [https] section, moat-ship refuses to run until this file
+# is 0600 — but prefer `token_file` and leave this readable and diffable.
+#
+#   moat-ship check      validate this file and the destination; sends nothing
+#   moat-ship once --dry-run
+#                        print the exact bytes a collector would receive
+#   moat-ship status     how far the cursor has got, what was dropped
+#   systemctl enable --now moat-ship
+#
+# WHY THIS IS A SEPARATE UNIT. moatd runs as root with the kernel sensor
+# attached to it. An outbound HTTPS client there would put a TLS stack, a retry
+# loop and a response parser inside the one process that owns detection, and
+# would hand a remote endpoint a way to make it block. alerts.jsonl is
+# 0640 root:moat, so a shipper needs no privilege at all: moat-ship runs as
+# `moat-ship` in supplementary group `moat`, with an empty capability set.
+
+# Master switch. Off: shipping is a decision, not a default.
+enabled = false
+
+# none | https | syslog
+#
+#   https   NDJSON batches with your own headers. This is how Splunk HEC,
+#           Elastic, Loki and Datadog all take data.
+#   syslog  RFC5424 to /dev/log or tcp://host:port, as a SUMMARY — see [syslog].
+transport = "none"
+
+# Which telemetry classes to ship: alerts, process, network, file.
+#
+# A class moatd is not collecting produces nothing whatever is listed here, so
+# this is a second, independent switch: `[telemetry]` in moat.toml decides what
+# is RECORDED, and this decides what LEAVES. Recording `file` locally and
+# shipping only `alerts` is a perfectly reasonable configuration.
+classes = ["alerts"]
+
+# Value of the `host` field on every record. Empty reads the hostname.
+host = ""
+
+# Seconds between polls of alerts.jsonl and telemetry.jsonl.
+poll_secs = 10
+
+# THE HEARTBEAT. A shipper that has gone quiet is indistinguishable at the
+# collector from a machine that has nothing to say — which is the same failure
+# mode as the blind sensor of 2026-09-03, where every surface read "running" for
+# 25 minutes with nothing loaded. Every heartbeat_secs, moat-ship emits
+#
+#   {"kind":"heartbeat","shipped":N,"dropped":M,"backlog":B,"last_error":"..."}
+#
+# whether or not anything happened. Alert on its ABSENCE at the collector: that
+# is the only way "moat is watching this machine" is a fact rather than a hope.
+# 0 disables it and is refused while `enabled = true`.
+heartbeat_secs = 300
+
+[https]
+# The collector endpoint.
+#
+# TLS VERIFICATION IS ALWAYS ON AND THERE IS NO FLAG FOR IT. A security product
+# with a MITM switch is not one. `http://` is accepted only for a loopback
+# address, where there is no network segment for anyone to sit on and a local
+# vector/fluent-bit/rsyslog sidecar is the normal shape.
+#
+#   Splunk HEC   https://splunk.example:8088/services/collector/raw
+#   Elastic      https://es.example:9200/_bulk        (see content_type below)
+#   Loki         http://127.0.0.1:3100/loki/api/v1/push
+#   Datadog      https://http-intake.logs.datadoghq.com/api/v2/logs
+url = ""
+
+# WHERE THE SECRET COMES FROM. Exactly one of these, in this order of
+# preference:
+#
+#   token_file  a file containing the token and nothing else. MUST BE 0600 —
+#               moat-ship refuses to start otherwise. Preferred: a secret in its
+#               own file can be rotated, backed up and permissioned separately
+#               from the configuration around it, and it keeps this file clean.
+#   token_env   an environment variable. Second choice: a unit's environment is
+#               visible in `systemctl show` unless it came from a credential.
+#   token       inline. Last resort, and only accepted when THIS FILE is 0600.
+token_file = ""
+token_env = ""
+token = ""
+
+# Elastic's _bulk wants "application/x-ndjson"; Splunk HEC raw and Datadog are
+# happy with it too. Loki wants "application/json" and a JSON body, so point it
+# at a local promtail/vector instead of at Loki directly.
+content_type = "application/x-ndjson"
+
+# One request carries at most this many records or this many bytes, whichever
+# comes first. A batch is all-or-nothing: the cursor moves only once the
+# collector has acknowledged the whole thing.
+batch_max_records = 200
+batch_max_bytes = 1048576
+timeout_secs = 20
+
+# Sent verbatim, EXCEPT that `${token}` in any value is replaced with the
+# resolved secret at send time. That indirection is the point: this map can be
+# printed by `moat-ship check`, pasted into a bug report and committed to a
+# config repo; the token cannot. moat-ship also scrubs the resolved value out of
+# every log line, error and response body before anything is written.
+#
+#   Splunk HEC   Authorization = "Splunk ${token}"
+#   Elastic      Authorization = "ApiKey ${token}"
+#   Datadog      "DD-API-KEY"  = "${token}"
+#   Loki         "X-Scope-OrgID" = "moat"        (no token at all)
+[https.headers]
+Authorization = "Bearer ${token}"
+
+[syslog]
+# "/dev/log" (unix, datagram with a stream fallback) or "tcp://host:port"
+# (RFC6587 octet-counted framing).
+target = "/dev/log"
+# RFC5424 facility. 13 is "log audit", which is what this is.
+facility = 13
+app_name = "moat"
+
+# SYSLOG SHIPS A SUMMARY, NOT THE RECORD, AND THAT IS DELIBERATE.
+#
+# A moat alert carries full ancestry and an explain block with evidence,
+# expected cases and next steps — several kilobytes. RFC5424 guarantees 480
+# bytes and most receivers stop near 2048. Sending the whole record over syslog
+# would not deliver a moat alert; it would deliver the first third of one,
+# silently, with the explain block that makes it actionable cut off mid-word.
+#
+# So the syslog transport projects each record down to who / what / where / how
+# bad / the alert id:
+#
+#   <107>1 2026-09-03T16:21:07.123Z mars moat 4711 alert - \
+#     id=01J8ZK... severity=high rule=moat-cred-ssh-private-key-read family=cred \
+#     pid=41233 exe="~/.local/bin/node" file="~/.ssh/<redacted>" action=none \
+#     title="Private SSH key read by an unexpected program"
+#
+# The id is there so the full record is one `moatctl explain <id>` away. If a
+# line still does not fit it is cut with a visible `…[truncated]` marker rather
+# than just stopping. If you want the whole record, use the https transport.
+max_len = 2048
+
+[buffer]
+# BOUNDED, DROP-OLDEST, COUNTED. If the collector is down the shipper holds
+# records in memory up to these limits and then drops the OLDEST, incrementing a
+# counter that the heartbeat and `moat-ship status` both report. It never grows
+# without limit and it never blocks the daemon — moatd does not know this
+# process exists.
+#
+# Dropping the oldest rather than the newest is deliberate: the newest records
+# describe whatever is happening right now, which is exactly what an outage
+# during an incident would otherwise cost you.
+max_records = 20000
+max_bytes = 33554432
+
+# Exponential backoff with jitter, so a fleet coming back from an outage does
+# not arrive at the collector in lockstep.
+retry_min_secs = 5
+retry_max_secs = 300
+
+# Records read from the source files in one poll. Bounds the work a burst can
+# create; it matters when `process` is one of the classes.
+read_max_records = 5000
+
+[redact]
+# ON BY DEFAULT.
+#
+# Rewrite every human home to `~`. The username is the one identifier in a moat
+# record that is about the person rather than the machine, and it appears in
+# paths, arguments, cwd and prose alike.
+home = true
+
+# Replace the last component of a path that looks like key material with
+# `<redacted>`, keeping the directory: `~/.ssh/id_ed25519` becomes
+# `~/.ssh/<redacted>`. You keep "something read a private key out of ~/.ssh",
+# which is the whole content of the alert, and lose which key. Uses the same
+# `is_secret_path` list that stops evidence.rs staging a credential for an AI,
+# and it applies inside sentences too, not only to whole-path fields.
+#
+# Turn it off if your collector is where you do that triage.
+secret_paths = true
+
+# Extra literal strings scrubbed from every record before it is sent. Also added
+# to the log scrubber, so anything listed here can never appear in a journal
+# line either.
+extra = []
+
+# WHAT IS NEVER SHIPPED, WITH NO SWITCH AT ALL:
+#
+#   /var/lib/moat/incidents/**   staged evidence: a copy of the accused file
+#   *.suspect                    the same, by name
+#   /var/lib/moat/quarantine/**  files moat moved out of the way
+#
+# These are the accused artefacts and they may be the user's credentials.
+# evidence.rs already refuses to hand them to an AI API; moat-ship refuses to
+# hand them to a collector. The check is on path shape rather than on which
+# field the path appeared in, so a record shape invented later cannot route
+# around it, and a hit is counted and reported in the heartbeat as `withheld`.

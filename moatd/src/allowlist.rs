@@ -189,7 +189,32 @@ pub fn render_block(spec: &RuleSpec) -> String {
 }
 
 fn toml_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    // Control characters too, not just `\` and `"`.
+    //
+    // A TOML basic string may not contain a raw newline, and a path may: a
+    // filename with a `\n` in it produced a `user.toml` that failed to parse,
+    // and `Allowlist::load` drops EVERY rule in a file it cannot read -- so one
+    // crafted filename, run past the user once and clicked "This was me",
+    // silently emptied their whole allowlist. It fails noisy rather than blind,
+    // but the user's next reflex is to allow more things, which is the wrong
+    // direction to be pushed in by an attacker.
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("\\u{:04X}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// A `[[rule]]` block together with the comment lines above it.
@@ -625,8 +650,9 @@ exe = "/usr/bin/gnome-keyring-daemon"
             al.len(),
             7,
             "two test-suite rules x two exe globs, the omarchy-shell plugin exec \
-             entry, the agent-usage credential read, and the sandbox suite's \
-             fake toolchain — nothing else"
+             entry, the agent-usage credential read, the sandbox suite's \
+             fake toolchain — nothing else. Moat's own triage pass has NO entry: \
+             see the note at the end of omarchy-default.toml"
         );
 
         // omarchy-shell running its own plugins' helper scripts. Scoped to that
@@ -746,3 +772,4 @@ exe = "/usr/bin/gnome-keyring-daemon"
         }
     }
 }
+

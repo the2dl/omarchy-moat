@@ -33,9 +33,45 @@ use crate::proctable::{ProcInfo, ProcTable};
 use crate::util::basename;
 
 /// A process whose binary is one of these *is* a package-manager root.
+///
+/// Being on this list is what gives a process tree `pkg-install` context, and
+/// that context is load-bearing: BASELINE §2b escalates on it and never
+/// downgrades inside it, `moat-x-pkg-egress` only fires inside it, and every
+/// `moat-pkg-subtree-*` rule requires it. An ecosystem missing from here is not
+/// detected weakly — its postinstall scripts get no install context at all, so
+/// those rules structurally cannot fire.
+///
+/// Only tools whose *every* invocation fetches or builds third-party code
+/// belong here unconditionally. Anything used routinely for non-install work
+/// (`go run`, `dotnet build`) is verb-gated in `VERB_MARKERS` instead, so a
+/// developer compiling their own code is not permanently inside an install.
 pub const PKG_ROOT_BINARIES: &[&str] = &[
-    "npm", "npx", "pnpm", "yarn", "bun", "corepack", "pip", "pip3", "uv", "poetry", "pipx",
-    "cargo", "makepkg", "yay", "paru",
+    // JavaScript / TypeScript
+    "npm", "npx", "pnpm", "yarn", "bun", "corepack",
+    // Python
+    "pip", "pip3", "uv", "poetry", "pipx",
+    // Rust
+    "cargo",
+    // Arch / AUR
+    "makepkg", "yay", "paru",
+    // Perl: cpanm and cpan only ever install, and both run the distribution's
+    // own Makefile.PL/Build.PL as root of the build.
+    "cpanm", "cpan",
+    // JVM: a Maven or Gradle build downloads plugins and executes them as part
+    // of the build itself -- there is no "just compile" mode that does not run
+    // third-party code, which is why the ecosystem's supply-chain incidents are
+    // build-plugin incidents.
+    "mvn", "mvnw", "gradle", "gradlew",
+    // Ruby: a native-extension gem runs extconf.rb at install time.
+    "gem", "bundle", "bundler",
+    // PHP
+    "composer",
+    // Homebrew formulas are Ruby that executes during install.
+    "brew",
+    // Elixir / Erlang
+    "mix", "rebar3",
+    // Haskell
+    "cabal", "stack",
 ];
 
 /// Script names that mean "this interpreter is running a package manager".
@@ -44,7 +80,23 @@ const SCRIPT_MARKERS: &[&str] = &["npm-cli.js", "npx-cli.js", "yarn.js"];
 
 /// Tool names that mean a package manager even when they are an argument
 /// (`bash /usr/bin/makepkg`, `node …/pnpm/bin/pnpm.cjs`). Matched against the
-/// argument's basename with a script extension stripped.
+/// argument's basename with a script extension stripped, **and only when the
+/// process itself is an interpreter**.
+///
+/// The interpreter gate is what the marker actually means: "this interpreter is
+/// running a package manager". Without it the basename test fires on any
+/// argument that merely ends in the name, which is how `moat-sandbox` came to
+/// be classified as a package install on 2026-09-04 — it binds
+/// `~/.local/share/pnpm` into the sandbox, so `bwrap --bind …/pnpm …/pnpm`
+/// contained a token whose basename is `pnpm`.
+///
+/// That misclassification was not cosmetic. `pkg-install` context escalates an
+/// AI CLI launch to high (BASELINE §2b), so every unattended triage pass raised
+/// new high alerts about itself, which the next pass then triaged: 101 alerts of
+/// one rule in a day, stopped only by the noise guard. The file's own header
+/// already states the principle — markers match per path segment, never as a
+/// bare substring — and a directory path ending in the name is the same error
+/// as `pnpm-lock.yaml`.
 const BARE_MARKERS: &[&str] = &["pnpm", "makepkg"];
 
 /// `tool subcommand` markers: the tool must appear (as the binary or as an
@@ -75,6 +127,67 @@ const VERB_MARKERS: &[Verb] = &[
         tool: "cargo",
         subs: &["build", "install", "run", "test", "add", "fetch", "update"],
     },
+    // Go has no postinstall hook, but `go generate` runs arbitrary commands,
+    // cgo compiles and links C from the module, and `go test` runs the module's
+    // own code. `go build`/`go run` on a module with cgo do the same. What is
+    // deliberately absent is a bare `go` -- `go fmt`, `go vet`, `go doc` and
+    // `go env` are not installs and a developer runs them constantly.
+    Verb {
+        tool: "go",
+        subs: &["get", "install", "build", "run", "test", "generate", "mod", "work"],
+    },
+    // NuGet package scripts and MSBuild targets both execute during restore and
+    // build. `dotnet new`, `dotnet --info` and friends do not.
+    Verb {
+        tool: "dotnet",
+        subs: &["restore", "build", "run", "test", "tool", "add", "publish", "pack"],
+    },
+    // Deno fetches and executes remote modules directly; `deno run <url>` is
+    // the install and the execution in one step.
+    Verb {
+        tool: "deno",
+        subs: &["run", "install", "cache", "add", "task", "test", "compile"],
+    },
+    // A Nix build runs the derivation's builder, which is arbitrary code.
+    Verb {
+        tool: "nix",
+        subs: &["build", "run", "shell", "develop", "profile", "env"],
+    },
+    Verb {
+        tool: "nix-env",
+        subs: &["-i", "--install", "-iA"],
+    },
+    Verb {
+        tool: "nix-shell",
+        subs: &["-p", "--packages", "--run"],
+    },
+    // conda/mamba packages carry post-link scripts.
+    Verb {
+        tool: "conda",
+        subs: &["install", "create", "env", "update"],
+    },
+    Verb {
+        tool: "mamba",
+        subs: &["install", "create", "env", "update"],
+    },
+    Verb {
+        tool: "micromamba",
+        subs: &["install", "create", "env", "update"],
+    },
+    // No Verb for pip: it is already an unconditional root above, so every
+    // invocation counts -- including `pip list` and `pip freeze`, which are not
+    // installs. That is deliberate and predates this list: narrowing pip to a
+    // verb set risks missing an install form nobody enumerated (`pip download`
+    // and `pip wheel` both execute setup.py from the sdist), and the cost is
+    // that a few read-only pip commands carry install context. Worth revisiting
+    // with real false-positive data rather than by guesswork.
+    // The oldest arbitrary-code-execution install in Python. Spelled without
+    // the extension because `tool_name` strips `.py` before comparing, the same
+    // normalisation that lets `node …/pnpm.cjs` match `pnpm`.
+    Verb {
+        tool: "setup",
+        subs: &["install", "develop", "build", "bdist_wheel", "sdist"],
+    },
 ];
 
 /// `…/node_modules/pnpm/bin/pnpm.cjs` -> `pnpm`; `/usr/bin/npm` -> `npm`.
@@ -97,15 +210,27 @@ pub fn root_reason(exe: &str, args: &str) -> Option<String> {
         return Some(format!("binary basename `{}`", comm));
     }
 
+    // A shell handed a string of code is not the tools its code mentions.
+    // `bash -c "cargo test 2>&1 | grep -E ..."` was marking the whole pipeline
+    // as a cargo subtree, so `grep` -- an unrelated sibling -- inherited
+    // pkg-install context and got scored as a package install running an AI CLI.
+    // Whatever the code actually starts shows up as its own process and is
+    // classified there; nothing is lost by declining to read the string.
+    if crate::provenance::runs_inline_code(exe, args) {
+        return None;
+    }
+
     let toks: Vec<&str> = args.split_whitespace().collect();
     for m in SCRIPT_MARKERS {
         if toks.iter().any(|t| basename(t) == *m) {
             return Some(format!("argument `{}`", m));
         }
     }
-    for m in BARE_MARKERS {
-        if toks.iter().any(|t| tool_name(t) == *m) {
-            return Some(format!("argument `{}`", m));
+    if crate::provenance::is_interpreter(comm) {
+        for m in BARE_MARKERS {
+            if toks.iter().any(|t| tool_name(t) == *m) {
+                return Some(format!("argument `{}`", m));
+            }
         }
     }
     for v in VERB_MARKERS {
@@ -282,6 +407,92 @@ mod tests {
         for id in ["e-bash", "e-bash2", "e-make", "e-cc"] {
             assert!(pkg_root_for(&t, id).is_none(), "{} must not be in a pkg subtree", id);
         }
+    }
+
+    #[test]
+    fn a_bound_directory_that_ends_in_a_tool_name_is_not_that_tool() {
+        // The 2026-09-04 self-loop: moat-sandbox binds ~/.local/share/pnpm into
+        // the sandbox, so bwrap's argv carried a token whose basename is `pnpm`
+        // and the whole triage subtree was classified as a package install.
+        // pkg-install escalates an AI CLI launch to high, so every triage pass
+        // raised alerts about itself for the next pass to triage: 101 alerts of
+        // one rule in a day.
+        let bwrap = "--ro-bind / / --bind /home/dan/.local/share/pnpm                      /home/dan/.local/share/pnpm -- claude -p";
+        assert!(root_reason("/usr/bin/bwrap", bwrap).is_none(),
+            "a bind mount is not an invocation");
+        assert!(root_reason("/usr/bin/moat-sandbox", bwrap).is_none());
+
+        // The interpreter cases the marker exists for still work.
+        assert!(root_reason("/usr/bin/bash", "/usr/bin/makepkg -si").is_some());
+        assert!(root_reason("/usr/bin/node", "/home/d/.local/share/pnpm/bin/pnpm.cjs add x").is_some());
+        // ...and a non-interpreter naming makepkg in a path does not.
+        assert!(root_reason("/usr/bin/rsync", "-a /src/makepkg /dst/makepkg").is_none());
+    }
+
+    #[test]
+    fn a_shell_running_inline_code_is_not_the_tools_its_code_mentions() {
+        // `cargo test 2>&1 | grep -E ...` marked the whole pipeline as a cargo
+        // subtree, so `grep` -- an unrelated sibling -- inherited pkg-install
+        // and was scored as a package install running an AI CLI. The real cargo
+        // arrives as its own process and is classified there.
+        assert!(root_reason("/usr/bin/bash", "-c cargo test 2>&1 | grep -E foo").is_none());
+        assert!(root_reason("/usr/bin/sh", "-c 'pnpm add lodash'").is_none());
+        assert!(root_reason("/usr/bin/bash", "-c echo makepkg").is_none());
+
+        // But a module name is a tool identity, not code: `-m pip install` is a
+        // pip invocation and has to stay one.
+        assert!(root_reason("/usr/bin/python3", "-m pip install requests").is_some());
+        // And a shell actually handed a script still counts.
+        assert!(root_reason("/usr/bin/bash", "/usr/bin/makepkg").is_some());
+    }
+
+    #[test]
+    fn the_ecosystems_a_developer_machine_actually_installs_from() {
+        // Being unrecognised is not "weaker detection": with no pkg-install
+        // context, BASELINE 2b never escalates, moat-x-pkg-egress cannot fire
+        // (it requires an install subtree), and every moat-pkg-subtree-* rule
+        // is structurally unable to match. A malicious RubyGem or Go module was
+        // invisible to all of it.
+        for exe in [
+            "/usr/bin/gem", "/usr/bin/bundle", "/usr/bin/composer", "/usr/bin/brew",
+            "/usr/bin/mvn", "/usr/bin/gradle", "/usr/bin/cpanm", "/usr/bin/mix",
+            "/usr/bin/cabal", "/usr/bin/stack",
+        ] {
+            assert!(root_reason(exe, "install").is_some(), "{exe} should be an install root");
+        }
+    }
+
+    #[test]
+    fn a_compiler_is_only_an_install_when_it_is_fetching_or_running_code() {
+        // `go` and `dotnet` are verb-gated rather than unconditional: a
+        // developer runs `go fmt` and `go vet` all day and is not installing
+        // anything. What IS an install is anything that fetches a module or
+        // executes its code -- cgo compiles C from the module, `go generate`
+        // runs arbitrary commands, `go test` runs the module's own tests.
+        assert!(root_reason("/usr/bin/go", "build ./...").is_some());
+        assert!(root_reason("/usr/bin/go", "generate ./...").is_some());
+        assert!(root_reason("/usr/bin/go", "get example.com/x").is_some());
+        assert!(root_reason("/usr/bin/go", "fmt ./...").is_none(), "fmt is not an install");
+        assert!(root_reason("/usr/bin/go", "vet ./...").is_none());
+        assert!(root_reason("/usr/bin/go", "env").is_none());
+
+        assert!(root_reason("/usr/bin/dotnet", "restore").is_some());
+        assert!(root_reason("/usr/bin/dotnet", "--info").is_none());
+
+        // Deno fetches and executes remote code in one step.
+        assert!(root_reason("/usr/bin/deno", "run https://example.com/x.ts").is_some());
+
+        // pip is an unconditional root, so even `pip list` counts. See the
+        // note in VERB_MARKERS: narrowing it risks missing an install form
+        // nobody enumerated, and the cost is install context on a few read-only
+        // commands.
+        assert!(root_reason("/usr/bin/pip", "download requests").is_some());
+        assert!(root_reason("/usr/bin/pip", "list").is_some(),
+                "pip is unconditional; this documents the tradeoff rather than endorsing it");
+
+        // The oldest arbitrary-code install in Python, run through an
+        // interpreter rather than as a binary.
+        assert!(root_reason("/usr/bin/python3", "setup.py install").is_some());
     }
 
     #[test]

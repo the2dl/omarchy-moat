@@ -141,6 +141,7 @@ mod tests {
     fn run(rule: &mut NewExecIoc, t: &ProcTable, feeds: &Feeds, homes: &[String], id: &str) -> Vec<Finding> {
         let cfg = cfg();
         let ctx = RuleCtx {
+            rarity: &crate::rarity::RarityStore::default(),
             cfg: &cfg,
             table: t,
             feeds,

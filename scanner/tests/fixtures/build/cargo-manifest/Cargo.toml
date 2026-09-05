@@ -1,0 +1,15 @@
+[package]
+name = "sneaky"
+version = "0.1.0"
+build = "../outside/build.rs"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+serde = "1.0"
+local = { path = "../../elsewhere/local" }
+
+[build-dependencies]
+gen = { git = "https://pastebin.com/raw/abcd" }
+helper = { git = "https://git.example.org/helper.git" }

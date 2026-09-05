@@ -12,7 +12,7 @@ so in your final report. Do not commit to git; the coordinator commits.
 | `policies/`  | Tetragon TracingPolicy YAML                  | yaml     | kernel  |
 | `moatd/` | `moatd`, `moatctl`, `moat-feeds` | Rust     | root / user |
 | `sandbox/`   | `moat-sandbox`, PATH shims               | bash     | user    |
-| `scanner/`   | `moat-scan-pkgbuild`                     | python3  | user    |
+| `scanner/`   | `moat-scan-pkgbuild`, `moat-scan-npm`, `moat-scan-build` | python3  | user    |
 | `shell/` + `manifest.json` | omarchy-shell plugin           | QML/JS   | user (inside omarchy-shell) |
 
 Tetragon itself is **upstream, unmodified**, v1.7.1, from
@@ -51,23 +51,39 @@ Tetragon itself is **upstream, unmodified**, v1.7.1, from
 /etc/moat/allowlist.d/*.toml           user-editable allowlists, merged
 /etc/moat/feeds.toml                   feed URLs, optional abuse.ch auth key
 /etc/moat/sandbox.conf                 sandbox deny/allow paths
-/etc/moat/scanner-allow.conf           PKGBUILD scanner allow file (host=/rule=/pkg=),
+/etc/moat/scanner-allow.conf           scanner allow file, shared by all three
+                                           scanners (host=/rule=/pkg=),
                                            root:root 0644, commented example; the user
                                            copy is ~/.config/moat/scanner-allow.conf
-/usr/bin/moatd  /usr/bin/moatctl  /usr/bin/moat-feeds
-/usr/bin/moat-sandbox  /usr/bin/moat-scan-pkgbuild
-/usr/lib/moat/shims/{npm,npx,pnpm,yarn,bun,pip,pip3,uv,cargo,makepkg}
+/usr/bin/moatd  /usr/bin/moatctl  /usr/bin/moat-feeds  /usr/bin/moat-ship
+/usr/bin/moat-sandbox  /usr/bin/moat-scan-pkgbuild  /usr/bin/moat-scan-npm
+/usr/bin/moat-scan-build   (+ symlinks moat-scan-cargo, moat-scan-pip,
+                            moat-scan-go: argv[0] picks the ecosystem)
+/usr/lib/moat/check.py                     the policy validator, re-run by
+                                           `moatd telemetry --apply` before it
+                                           will restart the sensor
+/usr/lib/moat/shims/{npm,npx,pnpm,yarn,bun,pip,pip3,uv,cargo,go,makepkg}
+/etc/moat/ship.toml                    0644 (holds no secret; an inline token
+                                           forces 0600). moat-ship destination,
+                                           classes and redaction.
 /etc/profile.d/moat-shims.sh           prepends shim dir to PATH iff
                                            /etc/moat/sandbox.enabled exists
 /usr/lib/systemd/system/tetragon.service   hardened, After=local-fs
 /usr/lib/systemd/system/moatd.service  Requires+After tetragon
 /usr/lib/systemd/system/moat-feeds.{service,timer}   hourly, RandomizedDelaySec=10min
-/usr/lib/sysusers.d/moat.conf          creates group `moat`
+/usr/lib/systemd/system/moat-ship.service  User=moat-ship, group `moat`, NO
+                                           capabilities; not enabled by default
+/usr/lib/sysusers.d/moat.conf          creates group `moat` and user `moat-ship`
 /usr/lib/tmpfiles.d/moat.conf          /var/lib/moat 0750 root:moat
                                            /var/log/moat 0750 root:moat
                                            /run/moat     0750 root:moat
                                            /var/lib/moat/quarantine 0700 root:root
 /var/lib/moat/alerts.jsonl             0640 root:moat, append-only
+/var/lib/moat/telemetry.jsonl          0640 root:moat, append-only; written
+                                           only while a telemetry class beyond
+                                           `alerts` is on (docs/SHIPPING.md)
+/var/lib/moat/ship/cursor.json         0640, owned by moat-ship: how far the
+                                           shipper has got, and what it dropped
 /var/lib/moat/state.json               0640 root:moat, daemon status
 /var/lib/moat/feeds/{hashes.txt,domains.txt,urls.txt,meta.json}
 /run/moat/control.sock                 0660 root:moat
@@ -188,13 +204,181 @@ One JSON object per line, UTF-8, no pretty printing. Fields:
   "action_taken": "none",                      // none|killed|quarantined
   "actions": ["kill", "quarantine", "ignore"],
   "acked": false,
-  "mode": "monitor"                            // mode at time of alert
+  "mode": "monitor",                           // mode at time of alert
+
+  // Absent until auto-triage has looked at this alert, and absent forever when
+  // [analysis] auto_triage = "off" (LEARNING §2c).
+  "triage": {
+    "agent": "claude",
+    "at": "2026-09-04T12:04:11.220Z",
+    "verdict": "benign",                       // benign|suspicious|malicious|unclear
+    "confidence": "high",                      // low|medium|high
+    "summary": "Your own AUR install of flea; makepkg is in the ancestry.",
+    "reasoning": "...",
+    "proposed_allowlist": "[[rule]]\nname = ...",   // or null; NEVER auto-applied
+    "recommend": ["moatctl ack 01J8ZK..."],
+    "outcome": "demoted"                       // annotated|demoted|withheld: <reason>
+  },
+
+  // Absent unless this alert turned out to be one step of a sequence
+  // (design 2b "What led here", 3a "a chain not four alerts"). Appended as an
+  // `update` line, because the event that makes a sequence visible happens
+  // after its earlier steps are already on disk.
+  "chain": {
+    "v": 1,
+    "id": "01J8ZK6B4Q3M7N9P2R5S8T1V4W",       // the first step's alert id
+    "ancestor": {"pid": 41201, "exe": "/usr/bin/npm"},  // what every step is under
+    "families": ["cred", "net", "priv"],       // crossed by the trigger steps
+    "severity": "critical",                    // MAY be higher than any member
+    "severity_base": "high",                   // the highest any member reached alone
+    "severity_reason": "high -> critical: a credential was read and the same process tree then connected out",
+    "first_ts": "2026-09-03T16:21:07.100Z",
+    "last_ts":  "2026-09-03T16:21:08.400Z",
+    "span_secs": 1,
+    "steps": [                                 // time order, oldest first
+      {"alert": "01J8ZK...", "ts": "2026-09-03T16:21:07.100Z", "family": "cred",
+       "rule": "moat-cred-ssh-private-key-read", "severity": "high",
+       "title": "Private SSH key read by an unexpected program",
+       "pid": 41233, "exe": "/usr/bin/node", "role": "trigger"}   // trigger|context
+    ],
+    "steps_total": 7,                          // > steps.len() once truncated
+    "truncated": false,
+    "summary": "7 things happened in 1 second under npm (pid 41201), crossing cred, net and priv."
+  },
+
+  // Absent unless a chain reached `high` and moat then looked INSIDE the files
+  // this alert implicated (`content.rs`). Appended as an `update` line. One
+  // entry per file; `role` is `actor` (what ran) or `target` (what it touched).
+  // Purely descriptive — nothing in here moves a severity.
+  "content": [
+    {
+      "path": "/tmp/.fontconfig-helper",       // attacker-chosen; render as data
+      "real_path": "/tmp/other",               // only when the descriptor disagreed
+      "role": "actor",
+      "ts": "2026-09-04T12:04:11.220Z",
+      "sha256": "…",                           // absent on a refused file
+      "bytes": 82344,
+      "kind": "elf",                           // elf|script|archive|pe|macho|text|data|empty|unread
+      "skipped": null,                         // set => nothing below was read
+      "entropy": 7.81,                         // Shannon, bits/byte, whole file
+      "elf": {
+        "class": "elf64", "kind": "dyn", "machine": "x86-64",
+        "linkage": "static", "interp": null, "stripped": true,
+        "needed": [], "runpath": [], "imports": ["socket", "connect", "execve"],
+        "sections": [{"name": ".text", "size": 40960, "entropy": 7.9}],
+        "notes": ["UPX magic in the header: the file is packed"]
+      },
+      "script": null,                          // shebang/interpreter/lines when kind=script
+      "urls": ["http://45.9.148.99/stage2"],
+      "hosts": [{"value": "45.9.148.99", "scope": "public"}],  // public|loopback|private|
+                                               // link-local|cgnat|multicast|domain|…
+      "markers": [{"name": "exec:curl-pipe-shell", "sample": "curl -sL http://… | sh"}],
+      "strings": ["…"],                        // sanitised to printable ASCII, capped
+      "truncated": false
+    }
+  ]
 }
 ```
 
+Reader obligations for `content`:
+
+- **Every string, URL, host, marker sample, symbol, section name and path in
+  the block came out of the bytes of a file believed to be hostile.** It has no
+  length limit and no syntax to respect, and it is the most attacker-controlled
+  text moat produces. Render it as data — never as markup, never as a link,
+  never into a shell. `bundle.md` puts all of it inside `DATA` fences.
+- **The classifications did not.** `kind`, `entropy`, `linkage`, `scope` and
+  the counts were computed by moatd from a closed vocabulary and are safe to
+  format.
+- **`skipped` is not "clean".** It means moat did not look — the file was over
+  the size cap, was a credential path, was inside moat's own store, or the
+  hourly budget was spent. Say which; do not present it as an absence of
+  findings.
+- **Nothing here changes severity.** Content analysis annotates a decision the
+  chain correlator already made.
+
+`triage` is advisory. A verdict never changes `acked`, `severity`,
+`action_taken` or `suppressed_by`; the only field it may move is `surface`,
+`alerts` → `timeline`, and only on `verdict: benign` + `confidence: high` in
+`demote` mode.
+
+Reader obligations:
+
+- **Honour `outcome: "demoted"` when deciding the tab.** A reader that derives
+  the surface itself from rule and severity — as the plugin does, because
+  demotion also arrives from `status.demoted_rules[]` and from a
+  `demoted:<rule>` marker — must add this third, per-alert source or a triage
+  demotion changes nothing the user can see.
+- **Render every string in the block as plain text.** They were written by a
+  language model that had just read attacker-controlled input.
+- **Treat an unrecognized `verdict` or `confidence` as `unclear` / `low`.**
+  Degrade towards "nobody knows", never towards "benign".
+- **`proposed_allowlist` is displayed, never applied.** No reader may grow a
+  verb that writes an allowlist file from a daemon-supplied string; the
+  existing `ignore` scopes, which name an alert id and a scope the daemon
+  itself offered, stay the only way an entry gets written.
+- **Show `outcome` when it starts with `withheld:`**, so a benign verdict the
+  ceiling refused to act on explains itself rather than reading as the reader
+  ignoring the agent.
+
+### Chains (design 2b, 3a)
+
+A chain is recognised when, inside one ten-minute window, two or more alerts
+**share a process tree** and **cross two or more detection families** (`cred`,
+`net`, `persist`, `exec`, `priv`, `rootkit`, `pkg`, `shell`), at least one of
+them is `medium` or worse, and at least one of them is new on this machine
+(`rarity` of `first_seen` or `rare`). The tree is rooted at the outermost
+process below the session boundary — pid 1, a terminal, a multiplexer, an
+editor, `sshd`, or a login shell a terminal started — so two commands typed into
+one terminal window are two trees and one `npm install` is one tree however many
+processes it forks. `ai` and `x` alerts are excluded: `x` is moat's own
+housekeeping, and an AI CLI is too busy on a developer machine to be one of the
+two families that create a story.
+
+Reader obligations:
+
+- **`chain.severity` may exceed every member's `severity`.** That is the point:
+  a sequence means more than its steps. The member alerts are **not** rewritten —
+  each one's own `severity`, `surface` and `suppressed_by` still describe the
+  single event it is about — so a reader that shows a chain must show
+  `chain.severity`, not the maximum of its members.
+- **Never show a chain severity without `severity_reason`.** It is always
+  present and always explains the number: `"high -> critical: <the pattern that
+  raised it>"` when a sequence moved it, `"stays critical: <the pattern> —
+  already at the highest severity"` when the pattern matched but a member was
+  already at the ceiling, and `"stays high: cred and pkg in one process tree, no
+  escalating sequence"` when nothing matched. Same shape as the alert-level
+  field of the same name.
+- **A `role: "context"` step is an alert the user had already allowed
+  (`suppressed_by`), or one the noise guard had demoted for firing all day.**
+  It is shown in the story — that is what makes 2b readable — but it did not
+  create the chain and never contributed to the escalation. Render it as such;
+  showing it as an accusation reverses a decision the user made.
+
+  Those two are the *only* sources of `context`. In particular `surface:
+  "timeline"` is **not** one: `surface` is a pure function of severity, so every
+  `medium` and `low` alert carries it, and a rule that is weak on its own is the
+  prime candidate for a sequence rather than a thing to discount. Treating it as
+  silence is what made moat miss a `persist` write and a `cred` read one second
+  apart in one pid on 2026-09-04 — it turned the documented "at least one member
+  at medium or worse" into an undocumented "at least two members at high or
+  worse".
+- **Every member carries the whole chain**, so a reader that opened one alert
+  can draw 2b without joining anything. When a chain grows, every member gets a
+  new `update` line with the larger chain; fold by id as usual and the last one
+  wins.
+- **`chain.id` is a member's alert id**, so `moatctl explain <chain.id>` and
+  `moatctl chain <chain.id>` both work, and chains sort newest-first by id.
+- **Allowing a chain resolves its siblings.** `{"cmd":"ack","id":...,"chain":true}`
+  acks every id in `steps[]`. It is opt-in: a plain `ack` still acks one alert.
+
 moatd rewrites nothing in place. State changes (ack, action results) are
 appended as `{"v":1,"id":"<same id>","update":{"acked":true,"action_taken":"killed"}}`
-lines. Readers fold updates by id. The file is rotated by moatd at 20 MB
+lines. Readers fold updates by id. `update.triage` carries the object above, or
+`null` for `moatctl triage --undo`; a malformed one must be ignored rather than
+allowed to blank a verdict already recorded. `update.chain` follows the same
+rule: a chain only ever grows, so a malformed one must be ignored rather than
+allowed to blank a sequence already recorded. The file is rotated by moatd at 20 MB
 (rename to `alerts.1.jsonl`); readers must handle truncation/rotation (re-open
 on inode change).
 
@@ -212,6 +396,13 @@ Requests:
                                           /var/lib/moat/quarantine/<id>/ with a
                                           meta.json, chmod 000
 {"cmd":"ack","id":"<alert id>"}
+{"cmd":"ack","id":"<alert id>","chain":true} acks every alert in that alert's chain
+                                          ("same chain, same decision", design 2b).
+                                          Errors if the alert is not in one.
+{"cmd":"chain","id":"<alert id>"}         the chain that alert is a step of, or
+                                          {"chain":null} when it is not in one
+{"cmd":"chain","limit":20}                the chains on record, newest first, plus
+                                          "open" (live now) and "formed" (since start)
 {"cmd":"ignore","id":"<alert id>","scope":"exe|exe+file|parent|rule","comment":"..."}
                                           appends a [[rule]] block to allowlist.d/user.toml
                                           with a `# added <date> from alert <id>: <title>`
@@ -237,8 +428,19 @@ use moatd to kill or move something the sensor did not already flag.
  "sensors_loaded":32,"sensor_unhealthy":false,"enforcing_rules":[],
  "policies_failed":[],"feeds":{"updated":"...","hashes":123456,"domains":5432},
  "unacked":{"critical":0,"high":2,"medium":5,"low":11},"sandbox":false,
+ "chains_open":0,"chains_formed":0,
+ "telemetry":{"classes":["alerts"],"written":0,"filtered":0,"file":null},
  "socket_group":"moat"}
 ```
+
+`telemetry.classes` is which record streams moatd is keeping (section 12), and
+it belongs beside `sensor_unhealthy` for the same reason: a reader that sees a
+healthy sensor and `["alerts"]` knows exactly how much of this machine's
+history exists. `written` counts records appended to `telemetry.jsonl` since
+start; `filtered` counts file-class events dropped by the create/modify ladder
+before anything was written, so the two together say what the scope is costing.
+`file` is `null` when no class beyond `alerts` is on, which is the default and
+means the file does not exist.
 
 `tetragon` is one of `running`, `degraded <n>/<m>`, `down`, `stale`, `stopped`
 or `unverified`, and `sensor_unhealthy` is true for every value except
@@ -268,7 +470,13 @@ plugin answers that one itself with `id -nG` and uses `socket_group` to print
 adds more fields to this response; they are listed in docs/BASELINE.md section 8
 and docs/LEARNING-AND-ANALYSIS.md section 9.
 
-`moatctl` is a thin CLI over this socket: `moatctl status|kill|quarantine|ack|ignore|unignore|allowlist|explain|set|list|feeds`.
+`chains_open` is how many sequences the daemon is currently correlating; a
+reader showing 3a ("a chain, not four alerts") instead of 1b keys on it.
+`chains_formed` counts them since start.
+
+`moatctl` is a thin CLI over this socket: `moatctl status|kill|quarantine|ack|ignore|unignore|allowlist|explain|set|list|feeds|chain`.
+`moatctl chain <id>` prints design 2b in a terminal: the sequence with times,
+which step was already allowed, and the one command that closes all of it.
 `moatctl explain <id>` prints the human-readable version: WHAT HAPPENED, WHY IT WAS
 FLAGGED, EVIDENCE, IF THIS IS EXPECTED (the options with the exact command and the
 exact TOML that would be written), WHAT TO DO IF NOT
@@ -318,6 +526,18 @@ sudoers rule.
    not policies: Tetragon's follow-children parent matching misfired on unrelated
    processes. `moat-x-sensor-mismatch` (low) is raised when a kernel event contradicts
    its own policy's selectors (selectors.rs re-validation).
+4b. Sequence correlation (`moatd/src/chain.rs`, design 2b and 3a). Every rule
+   above fires on one syscall in isolation, which is what let a simulated npm
+   supply-chain attack read a credential, open a socket to a host on the LAN and
+   rewrite its own installed source on 2026-09-04 without moat saying anything:
+   each event was weak, ambiguous, or deliberately allowlisted. Alerts sharing a
+   process tree inside a window and crossing two or more detection families are
+   grouped into one chain whose verdict is written about the sequence, and whose
+   severity may be higher than any member — see "Chains" in section 4 for the
+   exact conditions, the record and the reader obligations. The chain is written
+   back onto every member as an `update` line. The correlator holds a fixed
+   amount of memory: 128 candidate alerts, 32 live chains, 12 steps each, all
+   aged out at the window.
 5. Enforcement: in `enforce` mode Tetragon kills; the one userland exception is
    `moat-pkg-subtree-netcat-exec`, where moatd itself SIGKILLs after verifying pid start
    time and exe. moatd records
@@ -397,9 +617,14 @@ bubblewrap with:
 
 Shims: `/usr/lib/moat/shims/<name>` finds the real binary by searching
 `$PATH` with the shim dir removed (mise shims must keep working), and execs
-`moat-sandbox -- <real> "$@"`. `makepkg` shim first runs
-`moat-scan-pkgbuild .` and, on high findings, prompts (gum confirm if
-interactive, refuse if not) before continuing. `MOAT_SANDBOX=0` bypasses.
+`moat-sandbox -- <real> "$@"`. Before handing over, a shim runs the scanner
+for its ecosystem -- `makepkg` runs `moat-scan-pkgbuild .`, the four JS shims
+run `moat-scan-npm .`, `cargo` runs `moat-scan-cargo`, `pip`/`pip3`/`uv` run
+`moat-scan-pip` and `go` runs `moat-scan-go` -- and on high findings prompts
+(gum confirm if interactive, refuse if not) before continuing. A scanner that
+is missing or that exits with anything other than 0/1/2 warns and continues:
+it must never be able to stop a build by breaking. `MOAT_SANDBOX=0` bypasses
+the shim, the scan included.
 
 ## 9. Scanner (scanner/)
 
@@ -415,6 +640,29 @@ discord-webhook/telegram-bot hosts; `systemctl enable`, writes to `~/.bashrc`,
 network at all; `sha256sums=('SKIP')` on remote non-VCS sources. Exit 0 no
 findings, 1 medium, 2 high. `--json` output. Fixtures under `scanner/tests/`
 include a synthetic reproduction of the AUR incidents.
+
+`moat-scan-npm [PATH ...]` scans a JavaScript package tree before its install
+scripts run: lifecycle scripts in transitive dependencies, what those scripts
+do (shell pipes, credential paths, bare IPs, decoded blobs reaching eval),
+`bin` entries escaping the package, and lockfile entries resolved off the
+configured registry or pinned without an integrity hash.
+
+`moat-scan-build [PATH ...]` scans the three ecosystems that also execute code
+before the user has run anything, and is installed under three names so each
+shim calls the tool for its own -- `moat-scan-cargo`, `moat-scan-pip`,
+`moat-scan-go` (argv[0] selects, `--for` overrides). cargo: `build.rs` and
+`build = ` overrides, `.cargo/config.toml` registry replacement, runners,
+compiler wrappers and linker overrides, path/git dependencies leaving the tree,
+proc-macro crates, and `Cargo.lock` sources and checksums. python: `setup.py`,
+PEP 517 `backend-path`, `*.pth` `import` lines (which run on every interpreter
+start), `setup_requires`, and index overrides in requirements/pip.conf/uv.
+go: `go:generate` directives, `replace` targets outside the module, and
+`//go:linkname`.
+
+All three share one finding shape, one allow file, one exit-code contract and
+one detection vocabulary (`net.*`, `cred.*`, `obf.*`, `uni.*`, `lock.*` mean
+the same thing in each, so `rule=obf.*` in the allow file covers all of them).
+None of them ever executes, imports or subprocesses what it reads.
 
 ## 10. Versioning and naming
 
@@ -433,3 +681,58 @@ keys; `moatctl baseline list|accept|dismiss|relearn` and the socket commands
 `{"cmd":"baseline","action":"list|accept|dismiss|relearn",...}` are part of
 section 5. The plugin gets an Alerts tab (high/critical), a Timeline tab
 (everything else, grouped), and proposals in the Allowlist tab.
+
+## 12. Telemetry and shipping records
+
+Full detail in docs/SHIPPING.md, including the measured volume of each class
+and why the `file` class is scoped the way it is. The contract-level shapes,
+which any reader of these files must honour, are here.
+
+**`/var/lib/moat/telemetry.jsonl`** — one JSON object per line, 0640 root:moat,
+rotated by rename to `telemetry.1.jsonl` at 16 MiB. Written only while a class
+beyond `alerts` is on. Every line carries `v`, `class`, `kind`, `ts`:
+
+```json
+{"v":1,"class":"process","kind":"exec","ts":"...","exec_id":"...","parent_exec_id":"...",
+ "pid":41233,"uid":1000,"auid":1000,"exe":"...","args":"...","cwd":"...","start_time":"..."}
+{"v":1,"class":"process","kind":"exit","ts":"...","exec_id":"...","pid":41233,"status":0,"signal":null}
+{"v":1,"class":"network","kind":"connect","ts":"...","dst_ip":"1.2.3.4","dst_port":443,
+ "hook":"tcp_connect","exec_id":"...","parent_exec_id":"...","pid":...,"uid":...,
+ "exe":"...","args":"...","cwd":"...","pkg_root":"/usr/bin/npm"}
+{"v":1,"class":"file","kind":"file_write","ts":"...","path":"...","verdict":"modify",
+ "shape":"script","bytes":1234,"sha256":"...","exec_id":"...","pid":...,"pkg_root":null}
+```
+
+Reader obligations:
+
+- **A telemetry record is not an alert.** It has no severity, no `explain`, no
+  `id` and no actions. It never appears in `alerts.jsonl`, never reaches rule
+  evaluation, and must never be rendered as a finding.
+- **`verdict` is `create` | `modify` | `chmod_x`.** `modify` means the file
+  existed before this write, which is the higher-value case; a reader that
+  collapses the two loses the distinction the class exists for.
+- **`pkg_root` is ancestry the kernel cannot see.** Non-null means the actor was
+  inside a package-manager subtree.
+- **`parent_exec_id` is a join, not a copy.** Reconstruct the tree from
+  `exec_id`; the parent block is only inlined when `inline_parent = true`.
+
+**The shipped envelope** (`moat-ship` → collector), one NDJSON line per record:
+
+```json
+{"v":1,"event_id":"01J8ZK6B4Q3M7N9P2R5S8T1V4W","host":"mars","class":"alerts",
+ "kind":"alert","severity":"high","@timestamp":"2026-09-03T16:21:07.123Z",
+ "moat":{ …the source line, redacted… }}
+```
+
+- `event_id` is the alert's **ULID** for a full alert and
+  `<id>.<12 hex of sha256(line)>` for anything else. It is stable across
+  re-sends: the contract is at-least-once with **receiver-side dedupe on
+  `event_id`**.
+- `kind` is `alert` | `update` | `receipt` | `heartbeat` | a telemetry `kind`.
+- A `heartbeat` has `class: "moat"` and carries
+  `{shipped, dropped, withheld, backlog, backlog_bytes, classes, last_ok,
+  last_error}`. **Alert on its absence**: a dead shipper and a quiet machine
+  look identical without it.
+- Paths inside `moat` are redacted by default (`$HOME` → `~`, credential leaf →
+  `<redacted>`), and staged evidence is replaced with
+  `<withheld: staged evidence>` with no switch to disable it.

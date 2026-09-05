@@ -101,12 +101,25 @@ would have done to the same read from an install script.
 `state.json` records `installed_at`. For `learning_days` (default 7) after that,
 moat is in **learning** mode. During learning:
 
-- A (rule, actor exe, parent exe, file dir) tuple that produces alerts of
-  severity **medium or low** from an **official** actor on **3 distinct days**
+- A (rule, actor exe, parent exe, file dir) tuple whose **rule** scores it
+  **medium or low** — `severity_base`, before the §2b context matrix escalates
+  it — from an **official** actor on **3 distinct days**
   is written to `/etc/moat/allowlist.d/baseline.toml` as a learned rule, with a
   comment recording the counts and dates. It suppresses further alerts for that
   tuple. High and critical are never learned. Foreign and user actors are never
   learned.
+
+  **The gate reads `severity_base`, not the escalated severity.** §2b escalates
+  by context and never downgrades inside `pkg-install`, so gating on the final
+  value meant one sighting inside a package build barred a tuple from the
+  baseline permanently — even one that scores medium every ordinary day. On
+  2026-09-04 that blocked 628 of 1206 tuples, 295 of them from official actors,
+  and was the single largest reason nothing had ever been learned. The severity
+  a detection assigns is a statement about the action; the escalation is a
+  statement about the circumstances, and circumstances are exactly what a
+  baseline is for. A hard ceiling remains on the escalated value: a tuple that
+  has ever reached `critical` is never learned, whatever its rule scored.
+  `baseline export` reports both, as `max_rule_severity` and `max_severity`.
 - The panel's Allowlist tab shows learned entries with a "learned" tag and a
   Remove button, same as user entries.
 
@@ -118,24 +131,55 @@ does the same from the CLI. Accepting writes to `baseline.toml` with a comment
 saying who accepted and when.
 
 `moatctl baseline relearn [--days N]` restarts the window, for after a big
-change (new job, new toolchain).
+change (new job, new toolchain) or after a rule retune. It clears each tuple's
+distinct-day counter and its `max_rank`, so the three days have to be earned
+again inside the new window; `count`, `first_seen` and anything already written
+to `baseline.toml` are left alone.
 
-## 4. Noise guard: a rule that floods gets demoted, not deleted
+Clearing `max_rank` is the point of the command. It is a running maximum that
+never decays, so one high — scored under rules that have since been retuned, or
+under a context escalation that no longer applies — otherwise keeps a tuple out
+of the baseline permanently with no way back. The reset is safe because it is
+self-healing: a tuple that still scores high re-poisons itself on its next
+alert, so only tuples that have genuinely stopped being severe stay clean.
 
-If one rule raises more than `noisy_rule_per_day` (default 20) alerts in a
-rolling 24 h, moat:
+`moatctl baseline export` reports both, as `max_severity` and `blocked_by` —
+the gate actually holding each tuple back, in the order the checks apply. A row
+that has been seen hundreds of times over a week and still is not learned is
+otherwise unexplainable from the row itself.
 
-1. marks the rule `demoted` in `state.json` (still logged to alerts.jsonl,
-   never notifies, not counted in the badge),
-2. raises one `moat-x-noisy-rule` alert at medium with the top five
-   (actor, file) tuples and their counts, an `if_expected` option that
-   proposes baseline entries for exactly those tuples, and a "keep watching"
-   option that clears the demotion,
-3. clears the demotion automatically after 24 h below the threshold.
+## 4. Noise guard: a pattern that floods gets demoted, not deleted
 
-This protects the user from a bad rule or a new workload without anyone
-touching the rule set, and it makes the noise itself visible as one item
-instead of hundreds.
+If one **(rule, actor, parent, file dir) tuple** raises more than
+`noisy_rule_per_day` (default 20) alerts in a rolling 24 h, moat demotes **that
+tuple** to the timeline: still logged, still grouped, no notification and no
+badge count. It clears itself after 24 h under the threshold, and
+`moatctl baseline undemote <rule>` clears the rule and every pattern under it at
+once.
+
+**Scoped to the tuple, not the rule.** Demoting a whole rule silences every
+shape it can ever match, including shapes nobody has seen yet, and on 2026-09-04
+that cost a real detection. `moat-exec-untrusted-tmpfs` had fired 320 times from
+this machine's own builds — `bash` and `bwrap` out of cargo's temp directories,
+plus moat's own test binaries — so the guard demoted the rule. When a package
+`preinstall` then downloaded a binary into `/tmp` and executed it, which is the
+precise thing that rule exists to catch, the alert went to the timeline instead
+of the badge. The activity that made the rule noisy had nothing in common with
+the activity that tripped it except the rule id.
+
+Tuple scoping can only reduce what reaches the badge for patterns already
+established, and never hides a new one: every shape that is quiet today stays
+quiet, and a shape nobody has seen is heard.
+
+**The fan-out backstop.** A rule that is noisy in *general* rather than in one
+shape would never trip a per-tuple threshold — a flood spread across hundreds of
+distinct tuples would leave every one of them under 20. So once
+`noisy_rule_fanout` (default 5) distinct tuples of one rule have each been
+demoted on their own, the rule is demoted wholesale.
+
+`status.demoted_rules` lists every rule quietened either way, so "what has Moat
+stopped asking me about" has one answer; `is_demoted` stays narrow and means the
+whole rule.
 
 ## 5. Surfacing policy
 

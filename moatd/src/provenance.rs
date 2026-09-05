@@ -161,7 +161,29 @@ pub const USER_ROOTS: &[&str] = &["/tmp", "/var/tmp", "/dev/shm", "/opt", "/usr/
 const SHELL_INTERPRETERS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh", "fish"];
 
 /// Flags after which the rest of the command line is code, not a script path.
-const CODE_FLAGS: &[&str] = &["-c", "-e", "-m", "--eval", "--command", "-E"];
+pub const CODE_FLAGS: &[&str] = &["-c", "-e", "-m", "--eval", "--command", "-E"];
+
+/// Flags whose value is a string of CODE, not a name of anything.
+///
+/// Deliberately narrower than [`CODE_FLAGS`], which also carries `-m`. For
+/// finding a script path, `python3 -m pip` has no script and `-m` belongs
+/// there. For deciding what a process *is*, `-m pip` names a module -- it is
+/// a pip invocation and must stay one -- while `-c "…"` is arbitrary text that
+/// may mention any tool on the machine.
+const INLINE_CODE_FLAGS: &[&str] = &["-c", "-e", "--eval", "--command", "-E"];
+
+/// Is this an interpreter handed a string of code rather than something named?
+///
+/// `bash -c "cargo test | grep foo"` is a shell running arbitrary text. The text
+/// may name any tool on the machine without the process being that tool, so
+/// nothing may be concluded from scanning it -- the real `cargo`, if one runs,
+/// arrives as its own process and is classified on its own merits.
+pub fn runs_inline_code(exe: &str, args: &str) -> bool {
+    if !is_interpreter(basename(exe)) {
+        return false;
+    }
+    args.split_whitespace().any(|t| INLINE_CODE_FLAGS.contains(&t))
+}
 
 pub fn is_interpreter(comm: &str) -> bool {
     SHELL_INTERPRETERS.contains(&comm)

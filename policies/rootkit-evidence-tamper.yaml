@@ -1,0 +1,119 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-rootkit-evidence-tamper
+  annotations:
+    moat.omarchy/severity: "critical"
+    moat.omarchy/title: "Moat's own alert record deleted, emptied or moved"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,ignore"
+    moat.omarchy/why: >-
+      /var/lib/moat holds the alert record and the incident snapshots, and /var/log/moat
+      holds the raw sensor export they are built from. Destroying them is what an
+      intruder does after acting: the machine looks quiet afterwards because there is
+      nothing left to read, not because nothing happened.
+    moat.omarchy/expected: >-
+      Nothing but Moat itself. Only moatd, moatctl, moat-feeds and the sensor write in
+      these two directories, and they are all excluded here, so a match means some other
+      program removed, emptied or renamed evidence.
+    moat.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  # `rm`. Argument 0 is the parent directory; argument 1 is the file itself and
+  # is carried for evidence only. Only index 0 is filtered: two path filters in
+  # one selector would be compared against the same reported path downstream.
+  - call: "security_path_unlink"
+    syscall: false
+    message: "A file was deleted from Moat's own evidence directories"
+    args:
+    - index: 0
+      type: "path"
+    - index: 1
+      type: "dentry"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/moatd"
+        - "/usr/bin/moatctl"
+        - "/usr/bin/moat-feeds"
+        - "/usr/bin/tetragon"
+        - "/usr/bin/systemd-tmpfiles"
+        - "/usr/lib/systemd/systemd"
+        - "/usr/bin/logrotate"
+      matchArgs:
+      # No trailing slash: the parent of /var/lib/moat/alerts.jsonl is
+      # /var/lib/moat itself, and Prefix is the only operator paths have.
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/var/lib/moat"
+        - "/var/log/moat"
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"
+  # `truncate -s0`, `: > file`, and any O_TRUNC open: fs/open.c runs
+  # handle_truncate() -> do_truncate() -> security_path_truncate for all three.
+  - call: "security_path_truncate"
+    syscall: false
+    message: "A file in Moat's own evidence directories was emptied"
+    args:
+    - index: 0
+      type: "path"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/moatd"
+        - "/usr/bin/moatctl"
+        - "/usr/bin/moat-feeds"
+        - "/usr/bin/tetragon"
+        - "/usr/bin/systemd-tmpfiles"
+        - "/usr/lib/systemd/systemd"
+        - "/usr/bin/logrotate"
+      matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/var/lib/moat/"
+        - "/var/log/moat/"
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"
+  # `mv alerts.jsonl /tmp` evades both of the above. Argument 0 is the old
+  # parent directory. moatd's own atomic writes rename into these directories
+  # constantly, which is why it and the sensor are excluded.
+  - call: "security_path_rename"
+    syscall: false
+    message: "A file was renamed out of Moat's own evidence directories"
+    args:
+    - index: 0
+      type: "path"
+    - index: 1
+      type: "dentry"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/moatd"
+        - "/usr/bin/moatctl"
+        - "/usr/bin/moat-feeds"
+        - "/usr/bin/tetragon"
+        - "/usr/bin/systemd-tmpfiles"
+        - "/usr/lib/systemd/systemd"
+        - "/usr/bin/logrotate"
+      matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/var/lib/moat"
+        - "/var/log/moat"
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

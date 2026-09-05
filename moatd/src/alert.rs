@@ -130,11 +130,37 @@ pub struct Alert {
     /// The plain sentence behind `rarity`.
     #[serde(default)]
     pub rarity_text: String,
+    /// The unattended agent verdict, once one has been recorded
+    /// (LEARNING §2c). Absent until auto-triage has run on this alert, and
+    /// absent forever when `[analysis] auto_triage = "off"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage: Option<crate::triage::Triage>,
     /// LEARNING §4 and §9: the snapshot taken before any kill. Absent until the
     /// capture finishes, then appended as an `update` line — the alert must not
     /// wait on a filesystem walk to be written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incident: Option<crate::incident::Incident>,
+    /// CONTRACT §4 "Chain", design 2b/3a: the sequence this alert turned out to
+    /// be one step of. Absent on the overwhelming majority of alerts — a chain
+    /// is by design a rare thing — and appended as an `update` line when one is
+    /// recognised, because the fourth event is what changes the meaning of the
+    /// first and the first was written three seconds earlier.
+    ///
+    /// Every member of a chain carries the whole chain, so a reader that opened
+    /// one alert can draw the story without joining anything. The chain's
+    /// `severity` may be higher than this alert's own; the alert's own severity
+    /// is never rewritten, because it is still the right answer about a single
+    /// event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<crate::chain::Chain>,
+    /// What is actually *in* the files this alert implicated (`content.rs`).
+    ///
+    /// Empty on almost every alert: content analysis only runs when a chain
+    /// reaches `high`, and it is appended as an `update` line for the same
+    /// reason `incident` is — the alert must not wait on a file read to be
+    /// written. Purely descriptive: nothing in here changes `severity`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<crate::content::FileAnalysis>,
     /// Not serialised: only the live daemon uses it, to tie a later
     /// `process_exit` back to the alert that predicted the kill.
     #[serde(skip)]
@@ -157,6 +183,31 @@ impl Alert {
         self.suppressed_by.is_some()
     }
 
+    /// The baseline's tuple for this alert: (rule, actor exe, parent exe, file
+    /// dir). Built from the stored record, so it agrees with what
+    /// `engine::note_baseline` fed the baseline when the alert was raised.
+    ///
+    /// Used to decide whether an unattended triage pass has already read this
+    /// exact shape (LEARNING §2c). A re-fire of a tuple an agent has already
+    /// explained is the same question with a new id, and paying for the answer
+    /// again is the single largest avoidable cost in the feature.
+    pub fn tuple_key(&self) -> String {
+        let dir = self
+            .file
+            .as_ref()
+            .map(|f| crate::rarity::dir_of(&f.path))
+            .unwrap_or_default();
+        // `Finding::parent_exe` is `ancestry.first()`, and the stored record
+        // keeps that same ordering.
+        let parent = self
+            .process
+            .ancestry
+            .first()
+            .map(|a| a.exe.clone())
+            .unwrap_or_default();
+        crate::baseline::tuple_key(&self.rule, &self.process.exe, &parent, &dir)
+    }
+
     /// BASELINE §8 "Resolved shapes": timeline rows group on the script an
     /// interpreter was running when there is one, otherwise on the binary.
     pub fn group_key(&self) -> &str {
@@ -173,6 +224,16 @@ pub fn severity_rank(s: &str) -> u8 {
         "high" => 2,
         "medium" => 1,
         _ => 0,
+    }
+}
+
+/// The inverse of `severity_rank`, for reporting a stored rank back to a human.
+pub fn severity_name(rank: u8) -> &'static str {
+    match rank {
+        3 => "critical",
+        2 => "high",
+        1 => "medium",
+        _ => "low",
     }
 }
 
@@ -212,6 +273,41 @@ pub fn fold(alert: &mut Alert, update: &Map<String, Value>) {
             ("suppressed_by", Value::Null) => alert.suppressed_by = None,
             ("incident", v) => {
                 alert.incident = serde_json::from_value(v.clone()).ok();
+            }
+            // A chain only ever grows, and a malformed one must not blank a
+            // sequence already recorded — same rule as `triage`, for the same
+            // reason: losing the story is worse than showing a stale one.
+            ("chain", Value::Null) => alert.chain = None,
+            ("chain", v) => {
+                if let Ok(c) = serde_json::from_value(v.clone()) {
+                    alert.chain = Some(c);
+                }
+            }
+            // Content analysis arrives after the fact, like `incident`. Folding
+            // it also folds its one-line summaries into `explain.evidence`,
+            // which is what every reader — the panel, `moatctl show`, the
+            // bundle — already renders. Deriving them here rather than storing
+            // them twice means the sanitising in `FileAnalysis::evidence`
+            // cannot be bypassed by a reader that builds its own line, and the
+            // dedupe below keeps a re-fold from stuttering.
+            ("content", v) => {
+                if let Ok(c) = serde_json::from_value::<Vec<crate::content::FileAnalysis>>(v.clone())
+                {
+                    for line in c.iter().flat_map(|f| f.evidence()) {
+                        if !alert.explain.evidence.contains(&line) {
+                            alert.explain.evidence.push(line);
+                        }
+                    }
+                    alert.content = c;
+                }
+            }
+            // A malformed verdict must not silently blank an existing one, so
+            // this folds only what parses; `triage: null` is the explicit undo.
+            ("triage", Value::Null) => alert.triage = None,
+            ("triage", v) => {
+                if let Ok(t) = serde_json::from_value(v.clone()) {
+                    alert.triage = Some(t);
+                }
             }
             _ => {}
         }
@@ -302,7 +398,10 @@ pub mod tests_support {
             suppressed_by: None,
             rarity: crate::rarity::Rarity::FirstSeen,
             rarity_text: "first time /usr/bin/node has read /home/dan/.ssh on this machine".into(),
+            triage: None,
             incident: None,
+            chain: None,
+            content: Vec::new(),
             exec_id: "abc".into(),
         }
     }
@@ -407,6 +506,58 @@ mod tests {
             Record::Full(b) => assert_eq!(b.incident, a.incident),
             _ => panic!("should parse as a full alert"),
         }
+    }
+
+    /// CONTRACT §4: a chain is recognised after its members are already on
+    /// disk, so it can only ever reach a reader as an update line — and it has
+    /// to survive being re-sent as the chain grows.
+    #[test]
+    fn a_chain_folds_in_and_keeps_growing() {
+        let mut a = demo();
+        assert!(a.chain.is_none());
+        assert!(!serde_json::to_string(&a).unwrap().contains("chain"));
+        let two = serde_json::json!({
+            "v": 1, "id": "01A",
+            "ancestor": {"pid": 41201, "exe": "/usr/bin/npm"},
+            "families": ["cred", "net"],
+            "severity": "critical", "severity_base": "high",
+            "severity_reason": "high -> critical: a credential was read and the \
+                                same process tree then connected out",
+            "first_ts": "2026-09-04T16:41:02.100Z",
+            "last_ts": "2026-09-04T16:41:02.600Z",
+            "span_secs": 1,
+            "steps": [
+                {"alert":"01A","ts":"2026-09-04T16:41:02.100Z","family":"cred",
+                 "rule":"moat-cred-registry-token-read","severity":"high",
+                 "title":"t","pid":41233,"exe":"/usr/bin/node","role":"trigger"},
+                {"alert":"01B","ts":"2026-09-04T16:41:02.600Z","family":"net",
+                 "rule":"moat-net-suspicious-port-egress","severity":"medium",
+                 "title":"t","pid":41233,"exe":"/usr/bin/node","role":"trigger"}
+            ],
+            "steps_total": 2, "truncated": false, "summary": "s",
+        });
+        let id = a.id.clone();
+        fold(&mut a, &UpdateLine::new(&id).set("chain", two.clone()).update);
+        let c = a.chain.as_ref().unwrap();
+        assert_eq!(c.severity, "critical");
+        assert_eq!(c.steps.len(), 2);
+
+        // It round-trips on the full record.
+        let line = serde_json::to_string(&a).unwrap();
+        match parse_record(&line).unwrap() {
+            Record::Full(b) => assert_eq!(b.chain, a.chain),
+            _ => panic!("should parse as a full alert"),
+        }
+
+        // A third step arrives as another update on the same id.
+        let mut three = two;
+        three["steps_total"] = serde_json::json!(3);
+        fold(&mut a, &UpdateLine::new(&id).set("chain", three).update);
+        assert_eq!(a.chain.as_ref().unwrap().steps_total, 3);
+
+        // Garbage must not blank a story already recorded.
+        fold(&mut a, &UpdateLine::new(&id).set("chain", Value::from(7)).update);
+        assert!(a.chain.is_some(), "a malformed chain must be ignored, not applied");
     }
 
     #[test]

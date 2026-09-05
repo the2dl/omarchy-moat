@@ -24,12 +24,9 @@ Item {
 
   signal recheckRequested()
 
-  Flickable {
+  MoatScroll {
     anchors.fill: parent
-    contentWidth: width
     contentHeight: column.implicitHeight
-    clip: true
-    boundsBehavior: Flickable.StopAtBounds
 
     Column {
       id: column

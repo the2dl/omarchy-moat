@@ -1,0 +1,31 @@
+[Unit]
+Description=Moat unattended alert triage
+Documentation=file:///usr/share/doc/omarchy-moat/README.md
+# A *user* unit, for the same reason as moat-digest and for one more: the agent
+# needs a session and the user's own credentials, which a root daemon has no
+# business holding. The daemon says what is waiting and decides what the answer
+# is allowed to do; this side does the asking
+# (docs/LEARNING-AND-ANALYSIS.md §2c).
+
+[Service]
+Type=oneshot
+# Prints and exits 0 when auto_triage is off or nothing is waiting, so a machine
+# with the feature switched off never turns this into a failed unit.
+ExecStart=/usr/bin/moatctl triage --run
+# The socket is 0660 root:moat: without the group there is nothing to read.
+ExecCondition=/usr/bin/test -r /run/moat/control.sock
+# One pass is bounded by triage_max_per_run x triage_timeout_secs (3 x 600s =
+# 30min with the shipped defaults); this is the backstop for an agent that hangs
+# in a way the per-call timeout misses, so it has to stay ABOVE that product or
+# systemd kills a pass that was working normally.
+TimeoutStartSec=40min
+# A pass is a long agent call, so stopping one mid-flight is a normal thing to
+# do — and interrupting it changes nothing: the alert is left exactly as it was,
+# the same as a timeout or a crash. Without this, `systemctl --user stop` leaves
+# a red unit until the next scheduled run, which reads as "auto-triage is
+# broken" when it means "you cancelled a pass".
+SuccessExitStatus=SIGTERM
+# The agent is confined by moat-sandbox, which needs to set up its own mounts,
+# so this unit adds no sandboxing of its own that would conflict with it.
+Nice=10
+IOSchedulingClass=idle

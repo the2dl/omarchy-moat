@@ -30,6 +30,35 @@ pub struct ProcInfo {
     /// Set when `exe` is not what the kernel reported: a `/proc/self/fd/<n>`
     /// binary we resolved (or failed to). Shown as evidence on every alert.
     pub exe_note: Option<String>,
+    /// POSIX session id, read from /proc at exec time. `None` when the process
+    /// was already gone.
+    ///
+    /// Tetragon does not carry it: its `Process` message has `exec_id`, `pid`,
+    /// `uid`, `auid`, `cwd`, `binary`, `arguments`, `flags`, `start_time` and
+    /// `parent_exec_id`, and none of those separate two panes of one login.
+    /// `auid` is the *login* uid and is identical across them; the systemd
+    /// cgroup is identical too, because every pane of a terminal shares one
+    /// `app-*.scope`. Measured on this machine on 2026-09-04.
+    ///
+    /// The session id is the thing that does separate them, and the kernel has
+    /// had it all along: `herdr` was `sid == pid` (a session leader), and a
+    /// Claude pane under it was session 11314. Reading it is what lets
+    /// `chain.rs` ask what a process IS instead of what it is CALLED.
+    pub sid: Option<u32>,
+}
+
+/// Field 6 of /proc/<pid>/stat, the session id.
+///
+/// The comm field can contain spaces and parentheses, so the fields after it
+/// are found from the LAST ')' rather than by splitting the whole line.
+pub fn read_sid(pid: u32) -> Option<u32> {
+    if pid == 0 {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // After ')': state, ppid, pgrp, session -> the 4th field.
+    rest.split_whitespace().nth(3)?.parse().ok()
 }
 
 impl ProcInfo {
@@ -78,6 +107,7 @@ impl ProcTable {
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            sid: read_sid(p.pid.unwrap_or(0)),
         };
         match self.map.get_mut(&exec_id) {
             Some(existing) => {

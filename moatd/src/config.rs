@@ -43,6 +43,13 @@ pub struct Paths {
     pub tetra: PathBuf,
     /// `moat-feeds` binary, spawned by `feeds refresh`.
     pub feeds_bin: PathBuf,
+    /// `policies/check.py`, re-run by `moatd telemetry apply` before any
+    /// profile switch. On 2026-09-03 a bad policy load left the sensor dead for
+    /// 25 minutes while every surface still read "running"; a profile switch is
+    /// the same operation, so it validates first and verifies afterwards.
+    pub policy_check: PathBuf,
+    /// `python3`, the only interpreter `check.py` needs.
+    pub python: PathBuf,
     /// Where human users are discovered for `{{HOME}}` expansion.
     pub passwd: PathBuf,
     /// The local pacman database, parsed for provenance (BASELINE §1). Its
@@ -68,6 +75,8 @@ impl Default for Paths {
             tetragon_bpf_dir: d("/sys/fs/bpf/tetragon"),
             tetra: d("/usr/bin/tetra"),
             feeds_bin: d("/usr/bin/moat-feeds"),
+            policy_check: d("/usr/lib/moat/check.py"),
+            python: d("/usr/bin/python3"),
             passwd: d("/etc/passwd"),
             pacman_local: d("/var/lib/pacman/local"),
             pacman: d("/usr/bin/pacman"),
@@ -101,6 +110,15 @@ impl Paths {
     pub fn rarity_file(&self) -> PathBuf {
         self.state_dir.join("rarity.json")
     }
+    /// The telemetry stream. Deliberately not `alerts.jsonl`: telemetry is high
+    /// volume and disposable, alerts are small and permanent, and one file
+    /// would push a week of alerts out of the store in an afternoon.
+    pub fn telemetry(&self) -> PathBuf {
+        self.state_dir.join("telemetry.jsonl")
+    }
+    pub fn telemetry_rotated(&self) -> PathBuf {
+        self.state_dir.join("telemetry.1.jsonl")
+    }
 }
 
 /// Severity names in the order the incident threshold compares them.
@@ -117,6 +135,10 @@ pub fn severity_at_least(sev: &str, min: &str) -> bool {
 pub struct RuleToggles {
     pub ai_cli_headless: bool,
     pub pkg_egress: bool,
+    /// `moat-net-first-contact`: an outbound connection to a destination this
+    /// machine has never talked to. Low, timeline-only, and meaningful mainly
+    /// as a chain step beside a credential read.
+    pub net_first_contact: bool,
     pub new_exec_ioc: bool,
     pub mass_read: bool,
     /// The four rules that replaced the deleted `pkg` kernel policies.
@@ -131,6 +153,7 @@ impl Default for RuleToggles {
         Self {
             ai_cli_headless: true,
             pkg_egress: true,
+            net_first_contact: true,
             new_exec_ioc: true,
             mass_read: true,
             pkg_subtree_interpreter_spawn: true,
@@ -193,7 +216,9 @@ impl Default for Thresholds {
             mass_read_window_secs: 10,
             process_prune_secs: 60,
             ancestry_max: 8,
-            alerts_max_bytes: 20 * 1024 * 1024,
+            // 4 MiB, not 20: this bounds what the PANEL re-reads on every
+            // append, not what the disk holds. See the note in moat.toml.
+            alerts_max_bytes: 4 * 1024 * 1024,
             state_interval_secs: 5,
             feeds_poll_secs: 60,
         }
@@ -206,7 +231,18 @@ pub struct NetConfig {
     /// Destinations a package-manager subtree may talk to without an alert.
     /// DNS is not available to us (CONTRACT/NOTES gap 4), so this is CIDRs only.
     pub registry_cidrs: Vec<String>,
-    /// Everything private is allowed implicitly; set false to alert on LAN too.
+    /// Allow RFC1918 egress from inside a package install without alerting.
+    ///
+    /// Stays **true**, and should: an internal Artifactory, Nexus, Verdaccio or
+    /// PyPI mirror is how a great many real installs work, and alerting on all
+    /// LAN traffic would make moat useless in exactly the environments that
+    /// most need it.
+    ///
+    /// It is not a blanket pass, though. A LAN address this machine has *never
+    /// talked to before* is not the registry you use every day, so a
+    /// `first_seen` destination is still reported once (see `pkg_egress`). Your
+    /// registry becomes ordinary within a few installs and goes quiet; a
+    /// beacon to a host that has never been seen does not.
     pub allow_private: bool,
     /// Severity for an egress hit.
     pub egress_severity: String,
@@ -306,6 +342,49 @@ pub struct AnalysisConfig {
     pub agent_args: BTreeMap<String, Vec<String>>,
     /// Bundles and incident snapshots: `<bundle_dir>/<alert id>/`.
     pub bundle_dir: PathBuf,
+
+    // --- auto-triage -------------------------------------------------------
+    /// `off` | `annotate` | `demote` (default `demote`).
+    ///
+    /// What an unattended agent run may do with an alert. The ceiling is
+    /// enforced in `triage::decide`, not here: `annotate` attaches the verdict
+    /// and nothing else; `demote` additionally lets a **benign** verdict at
+    /// **high** confidence move an alert from the notification badge to the
+    /// panel timeline. Neither can hide, ack, delete, re-severity or allowlist
+    /// anything — the alert stays in the store and stays visible either way.
+    ///
+    /// The tradeoff to know about: the alerts worth triaging are the ones most
+    /// likely to contain attacker-controlled text, so `demote` is the one mode
+    /// where a successful prompt injection buys something — a move off the
+    /// badge. It buys nothing more than that, it is recorded on the alert as
+    /// `triage.outcome`, and `moatctl triage --undo <id>` puts it back.
+    pub auto_triage: crate::triage::TriageMode,
+    /// The highest severity a triage demotion may touch. Default `high`, which
+    /// leaves `critical` on the badge no matter what the agent concludes.
+    pub triage_demote_max_severity: String,
+    /// Alerts triaged per run, so a burst cannot turn into an unbounded queue
+    /// of agent calls.
+    pub triage_max_per_run: usize,
+    /// How long an alert must have existed before it is offered to an agent.
+    ///
+    /// The buffer half of "buffer, dedupe, then react". A package install
+    /// fires several alerts in a couple of seconds; reading the first one
+    /// while the rest are still arriving spends a call on a partial picture.
+    /// Waiting a few seconds lets the burst settle so one read covers it.
+    pub triage_settle_secs: u64,
+    /// Wall-clock ceiling for one agent call.
+    ///
+    /// Measured, not guessed: on this machine an agent in plan mode reading one
+    /// bundle plus its staged evidence takes about three minutes, and the first
+    /// live run landed at 172s. A ceiling near that turns a normal answer into a
+    /// killed child and a wasted call, so the default stays clear of it.
+    ///
+    /// Lowered from 600 to 300 on 2026-09-04. A pass reads up to
+    /// `triage_max_per_run` alerts and the service is `Type=oneshot`, so the
+    /// old ceiling let one pass hold the queue for thirty minutes while no
+    /// other alert -- including a live attack -- could be looked at. 300 is
+    /// still well over the measured normal; the queue is what it protects.
+    pub triage_timeout_secs: u64,
 }
 
 impl Default for AnalysisConfig {
@@ -318,6 +397,11 @@ impl Default for AnalysisConfig {
         Self {
             agent_args,
             bundle_dir: d("/var/lib/moat/incidents"),
+            auto_triage: crate::triage::TriageMode::Demote,
+            triage_demote_max_severity: "high".into(),
+            triage_settle_secs: 20,
+            triage_max_per_run: 3,
+            triage_timeout_secs: 300,
         }
     }
 }
@@ -339,6 +423,41 @@ impl Default for IncidentsConfig {
             snapshot_min_severity: "high".into(),
             retain_days: 30,
             retain_max: 200,
+        }
+    }
+}
+
+/// `[content]` — analysing what is *inside* a file a chain implicated.
+///
+/// The limits are the feature. moat is not an anti-virus: nothing here scans on
+/// write, on exec, or on a timer, and the only trigger is a chain that already
+/// reached `high` (`content.rs`). These two numbers are what stop a bounded
+/// after-the-fact look from turning into an ambient scanner that a hostile
+/// package can aim at the machine's own disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContentConfig {
+    /// Off switch. On by default: the analysis is the difference between "a
+    /// binary in /tmp phoned home" and "a binary in /tmp containing this C2
+    /// string phoned home".
+    pub enabled: bool,
+    /// Files larger than this are listed as skipped, with the reason, and never
+    /// read. 16 MiB covers every dropper anyone has shipped and refuses the
+    /// 8 GB video file an attacker would love moat to hash on its event thread.
+    pub max_bytes: u64,
+    /// Analyses per rolling hour, counted from first use and persisted through
+    /// `state.json`. A high chain is a rare event by design; if this cap is
+    /// ever reached, something is wrong and the right answer is to stop
+    /// reading files, not to keep up.
+    pub per_hour: u32,
+}
+
+impl Default for ContentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_bytes: crate::content::DEFAULT_MAX_BYTES,
+            per_hour: crate::content::DEFAULT_PER_HOUR,
         }
     }
 }
@@ -365,6 +484,199 @@ impl Default for DigestConfig {
     }
 }
 
+/// `[telemetry]` — which classes of record moatd keeps, and how the expensive
+/// one is scoped. See `telemetry.rs` for what each class contains and
+/// docs/SHIPPING.md for the measured volume of each.
+///
+/// Every class except `alerts` is **off by default**. This is a developer
+/// workstation, not a fleet endpoint: the numbers below are real, they were
+/// measured on this machine, and a user who turns one on should have seen them
+/// first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// `alerts.jsonl` as it is today. Low volume, high value; on.
+    pub alerts: bool,
+    /// exec/exit with parent mapping. **Already exported** — Tetragon cannot
+    /// filter exec in-kernel (NOTES §10) — so this is a shipping decision, not
+    /// a sensor one. Measured here: 42 events/s, ~3.1 KB each, 127 KB/s.
+    pub process: bool,
+    /// Outbound connects. Measured here at 0.26/s against exec's 42/s, which
+    /// is what makes a deliberately broad policy affordable.
+    pub network: bool,
+    /// Executable-shaped file writes and `chmod +x`. Scoped by `file_scope`
+    /// and `file_suffixes`; see `telemetry.rs` for why it is keyed on the file
+    /// rather than on the operation.
+    pub file: bool,
+
+    /// `process`: repeat the whole parent block on every child, as the raw
+    /// export does. Off, because `parent_exec_id` plus a join at the collector
+    /// is the same graph for roughly half the bytes.
+    pub inline_parent: bool,
+
+    /// `file`: locations where *anything* written is worth a record,
+    /// regardless of what it is. Rendered into the kernel policy as a `Prefix`
+    /// list, so the filtering happens before a byte is written to disk.
+    /// `{{HOME}}` fans out over every human home.
+    pub file_scope: Vec<String>,
+    /// `file`: suffixes that make a file executable-shaped anywhere on the
+    /// system. Rendered as a `Postfix` list. Magic-byte ELF detection is not
+    /// expressible in a selector, so it happens in userspace on the paths
+    /// these already caught.
+    pub file_suffixes: Vec<String>,
+    /// `file`: path fragments under which a **create** is not recorded. Build
+    /// and cache trees are almost all of the volume and almost none of the
+    /// value. Never applied to a modify — a rewrite of an installed script is
+    /// the case the class exists for.
+    pub quiet_creates_under: Vec<String>,
+    /// `file`: a file born within this many seconds counts as a create.
+    pub create_window_secs: u64,
+    /// `file`: attach the body of a small script to its record.
+    ///
+    /// Off. This is the one switch that puts file *contents* on the wire, and
+    /// it is worth having — the body of a freshly written dropper is the
+    /// evidence — but it inherits `evidence::is_secret_path` wholesale: a path
+    /// that looks like key material is never read, whatever this says.
+    pub capture_body: bool,
+    /// Ceiling for `capture_body`. A model cannot usefully read more, and a
+    /// collector should not have to store more.
+    pub capture_body_max_bytes: u64,
+
+    /// `telemetry.jsonl` rotation size (16 MiB).
+    pub max_bytes: u64,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            alerts: true,
+            process: false,
+            network: false,
+            file: false,
+            inline_parent: false,
+            file_scope: vec![
+                "/usr/bin/".into(),
+                "/usr/local/bin/".into(),
+                "/usr/lib/systemd/system/".into(),
+                "/etc/systemd/system/".into(),
+                "/etc/cron.d/".into(),
+                "/etc/profile.d/".into(),
+                "{{HOME}}/.local/bin/".into(),
+                "{{HOME}}/.config/systemd/user/".into(),
+                "{{HOME}}/.config/autostart/".into(),
+                "{{HOME}}/.local/share/applications/".into(),
+            ],
+            file_suffixes: vec![
+                ".sh".into(),
+                ".bash".into(),
+                ".zsh".into(),
+                ".py".into(),
+                ".pl".into(),
+                ".rb".into(),
+                ".js".into(),
+                ".mjs".into(),
+                ".cjs".into(),
+                ".ts".into(),
+                ".php".into(),
+                ".lua".into(),
+            ],
+            quiet_creates_under: vec![
+                "/node_modules/".into(),
+                "/.cache/".into(),
+                "/.npm/".into(),
+                "/target/".into(),
+                "/.git/".into(),
+                "/__pycache__/".into(),
+                "/.venv/".into(),
+                "/site-packages/".into(),
+                "/.local/share/mise/".into(),
+                "/.cargo/registry/".into(),
+            ],
+            create_window_secs: 5,
+            capture_body: false,
+            capture_body_max_bytes: 65536,
+            max_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+impl TelemetryConfig {
+    /// Is this class on?
+    pub fn enabled(&self, class: &str) -> bool {
+        match class {
+            "alerts" => self.alerts,
+            "process" => self.process,
+            "network" => self.network,
+            "file" => self.file,
+            _ => false,
+        }
+    }
+
+    /// Class names that are on, in `CLASSES` order.
+    pub fn classes(&self) -> Vec<&'static str> {
+        crate::telemetry::CLASSES
+            .iter()
+            .copied()
+            .filter(|c| self.enabled(c))
+            .collect()
+    }
+
+    /// Reasons this configuration cannot be applied.
+    ///
+    /// The one that matters: `file = true` with no scope at all would render a
+    /// policy that matches every write on the machine. That is the volume trap
+    /// the class exists to avoid, so it is refused rather than rendered.
+    pub fn problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.file && self.file_scope.is_empty() && self.file_suffixes.is_empty() {
+            out.push(
+                "telemetry.file is on but file_scope and file_suffixes are both empty: that \
+                 would watch every write on the machine (measured here: 24.5/s under $HOME, \
+                 2769 events from one npm install). Give it a scope or turn it off."
+                    .into(),
+            );
+        }
+        for s in &self.file_suffixes {
+            if !s.starts_with('.') {
+                out.push(format!(
+                    "telemetry.file_suffixes entry {:?} does not start with a dot",
+                    s
+                ));
+            }
+            // Tetragon's Postfix values are capped at 127 bytes (NOTES §2).
+            if s.len() > 127 {
+                out.push(format!("telemetry.file_suffixes entry {:?} exceeds 127 bytes", s));
+            }
+        }
+        for p in &self.file_scope {
+            if !p.starts_with('/') && !p.starts_with("{{HOME}}") {
+                out.push(format!(
+                    "telemetry.file_scope entry {:?} is neither absolute nor {{{{HOME}}}}-relative",
+                    p
+                ));
+            }
+            if !p.ends_with('/') {
+                out.push(format!(
+                    "telemetry.file_scope entry {:?} does not end in '/': a Prefix without a \
+                     trailing slash also matches sibling paths that merely start with it",
+                    p
+                ));
+            }
+            if p.len() > 256 {
+                out.push(format!("telemetry.file_scope entry {:?} exceeds the 256-byte Prefix cap", p));
+            }
+        }
+        if self.capture_body && self.capture_body_max_bytes > 1024 * 1024 {
+            out.push(
+                "telemetry.capture_body_max_bytes above 1 MiB: evidence.rs stages at most 1 MiB \
+                 for the same reason, and this body may leave the machine"
+                    .into(),
+            );
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -381,7 +693,52 @@ pub struct Config {
     pub learning: LearningConfig,
     pub analysis: AnalysisConfig,
     pub incidents: IncidentsConfig,
+    pub content: ContentConfig,
     pub digest: DigestConfig,
+    pub telemetry: TelemetryConfig,
+    pub contain: ContainConfig,
+}
+
+/// Correlation-driven containment (`contain.rs`). Off by default: it is the one
+/// thing moat does that acts on its own judgement rather than on a single rule
+/// the user armed, so it is opt-in even when rules are armed.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContainConfig {
+    pub enabled: bool,
+    /// `off` | `log` | `kill`. Ending processes a chain implicates.
+    ///
+    /// **`log` by default, and that is the point.** A design review on
+    /// 2026-09-05 ran the first version of the rules against this machine's own
+    /// records and found they would have SIGKILLed the developer's build four
+    /// times that day, thirteen processes at a time -- while failing to kill
+    /// the lab payload they were written for. Rules for a destructive action
+    /// have to be judged against real traffic before they are allowed to act,
+    /// which is how the industry ships this too: detect first, promote to
+    /// prevent after a tuning period.
+    ///
+    /// `log` runs the whole decision and writes what it WOULD have killed.
+    /// A week of that with nothing wrong in it is the argument for `kill`.
+    pub kill: String,
+    /// How long a containment lasts before moatd deletes it. Minutes, not
+    /// hours: long enough to stop an exfil in progress, short enough that a
+    /// wrong call costs one failed connection and fixes itself.
+    pub ttl_secs: u64,
+    /// How many may be live at once. These share the `socket_connect` LSM hook
+    /// with the detection policies and the kernel caps that hook, so this is a
+    /// coverage guard, not a preference.
+    pub max: usize,
+}
+
+impl Default for ContainConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            kill: "log".into(),
+            ttl_secs: 600,
+            max: 4,
+        }
+    }
 }
 
 impl Default for Config {
@@ -398,7 +755,10 @@ impl Default for Config {
             learning: LearningConfig::default(),
             analysis: AnalysisConfig::default(),
             incidents: IncidentsConfig::default(),
+            content: ContentConfig::default(),
             digest: DigestConfig::default(),
+            telemetry: TelemetryConfig::default(),
+            contain: ContainConfig::default(),
         }
     }
 }
@@ -478,7 +838,7 @@ mod tests {
 
         for section in [
             "rules", "ai", "thresholds", "net", "baseline", "learning", "analysis", "incidents",
-            "digest",
+            "content", "digest", "telemetry",
         ] {
             let want = defaults.get(section).unwrap().as_table().unwrap();
             let got = shipped
@@ -510,7 +870,13 @@ mod tests {
         assert_eq!(c.learning, LearningConfig::default(), "a shipped learning key drifted");
         assert_eq!(c.analysis, AnalysisConfig::default(), "a shipped analysis key drifted");
         assert_eq!(c.incidents, IncidentsConfig::default(), "a shipped incidents key drifted");
+        assert_eq!(c.content, ContentConfig::default(), "a shipped content key drifted");
         assert_eq!(c.digest, DigestConfig::default(), "a shipped digest key drifted");
+        assert_eq!(
+            c.telemetry,
+            TelemetryConfig::default(),
+            "a shipped telemetry key drifted"
+        );
     }
 
     /// LEARNING §6 publishes these values; the plugin and the docs quote them.

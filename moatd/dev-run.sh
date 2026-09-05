@@ -103,8 +103,29 @@ ALERT_ID="$(ctl --json list --limit 50 | grep -o '"id": "[0-9A-Z]*"' | head -1 |
 hr "moatctl explain $ALERT_ID"
 ctl explain "$ALERT_ID"
 
-hr "moatctl ignore $ALERT_ID --scope exe"
-ctl ignore "$ALERT_ID" --scope exe --comment "dev-run demo"
+# Writing an allowlist rule needs root (control.rs ROOT_ONLY): the socket is
+# group-owned so a person can READ their alerts without sudo, and the attacker
+# in this threat model is in that group too, so the verbs that make moat watch
+# less are refused there. This dev run is unprivileged, so the refusal IS the
+# expected result and the script checks for it rather than failing on it.
+hr "moatctl ignore $ALERT_ID --scope exe  (expected: refused, needs root)"
+if ctl ignore "$ALERT_ID" --scope exe --comment "dev-run demo"; then
+	echo "UNEXPECTED: an unprivileged ignore succeeded; the root gate is not working" >&2
+	exit 1
+fi
+
+# The rest of the demo needs a rule to exist, and this run cannot ask the daemon
+# for one. Write it straight into the scratch allowlist -- which is what root
+# would have done on the user's behalf -- so the reload, listing and matching
+# below still show what they are meant to show.
+hr "writing the same rule directly (what root would have done)"
+mkdir -p "$DEV_DIR/allowlist.d"
+cat >"$DEV_DIR/allowlist.d/user.toml" <<'TOML'
+# added by dev-run.sh: the daemon refuses this unprivileged, by design.
+[[rule]]
+name = "moat-x-pkg-egress"
+exe = "/usr/bin/sh"
+TOML
 
 hr "moatctl allowlist"
 ctl allowlist

@@ -5,7 +5,7 @@ metadata:
   annotations:
     moat.omarchy/severity: "critical"
     moat.omarchy/title: "Binary running from /tmp or /dev/shm connected to the internet"
-    moat.omarchy/enforce: "kill"
+    moat.omarchy/enforce: "deny"
     moat.omarchy/actions: "kill,quarantine,ignore"
     moat.omarchy/why: >-
       A program that lives in a world-writable directory and then talks to a public
@@ -13,19 +13,38 @@ metadata:
       dropped in /tmp.
     moat.omarchy/expected: >-
       Rare. A downloaded installer you unpacked into /tmp and ran on purpose, or a build
-      tool executing a temporary binary that fetches something.
+      tool executing a temporary binary that fetches something. In enforce mode that
+      program's connection fails with "permission denied" and the program keeps running,
+      so an expected one reports a network error rather than disappearing.
     moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"
     value: "monitor"
-  kprobes:
-  - call: "tcp_connect"
-    syscall: false
+  # An LSM hook, not the `tcp_connect` kprobe this rule used until 2026-09-04.
+  #
+  # The kprobe could only ever be armed with `Sigkill`: `tcp_connect` is not an
+  # error-injectable function, so there was no way to refuse the connection --
+  # the only enforcement available was ending the process. On a developer's
+  # machine that is a bad trade. The thing you want stopped is the *connection*,
+  # and killing the process to stop it takes a build, an editor or a shell with
+  # it, and destroys the process tree you would want to look at afterwards.
+  #
+  # `security_socket_connect` is a real LSM hook (`bpf_lsm_socket_connect` is
+  # present on this kernel), so `Override` can return -EPERM from it: connect()
+  # fails, errno is EPERM, and the process carries on and reports a network
+  # error. That is the difference between a workstation you can run this on and
+  # one you cannot.
+  lsmhooks:
+  - hook: "socket_connect"
     message: "Temporary-directory binary connected to a non-private address"
     args:
+    # security_socket_connect(struct socket *sock, struct sockaddr *address,
+    #                         int addrlen) -- arg 1 is where it is going.
     - index: 0
-      type: "sock"
+      type: "socket"
+    - index: 1
+      type: "sockaddr"
     selectors:
     - matchBinaries:
       - operator: "Prefix"
@@ -34,11 +53,16 @@ spec:
         - "/var/tmp/"
         - "/dev/shm/"
       matchArgs:
-      - index: 0
+      - index: 1
         operator: "Family"
         values: ["AF_INET", "AF_INET6"]
-      - index: 0
-        operator: "NotDAddr"
+      # Unchanged from the kprobe version, deliberately. A workstation talks to
+      # its LAN all day, and on this machine the developer's own package
+      # registry lives on it -- refusing those connections would break ordinary
+      # installs. A LAN C2 is caught by correlation instead, where moatd knows
+      # the destination has never been seen before and the kernel cannot.
+      - index: 1
+        operator: "NotSAddr"
         values:
         - "10.0.0.0/8"
         - "172.16.0.0/12"
@@ -49,4 +73,6 @@ spec:
         - "fc00::/7"
         - "fe80::/10"
       matchActions:
-      - action: Sigkill
+      # -1 is -EPERM: the connect fails, the process lives.
+      - action: Override
+        argError: -1

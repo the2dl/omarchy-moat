@@ -1,0 +1,74 @@
+[Unit]
+Description=Ship Moat alerts and telemetry to a collector
+Documentation=file:///usr/share/doc/omarchy-moat/SHIPPING.md
+# Wants=, not Requires=. A collector that is unreachable, or a moatd that is
+# restarting, must not stop the shipper: it holds a bounded buffer, backs off,
+# and picks the cursor up where it left it. The one thing it must never do is
+# hold the daemon up, which is the whole reason it is a separate unit.
+After=network-online.target moatd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/moat-ship run
+Restart=on-failure
+RestartSec=15s
+# A bad ship.toml exits 1 and stays exited rather than crash-looping against a
+# collector: `moat-ship check` is the way to find out why.
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# NO PRIVILEGE AT ALL. This is the point of the separate binary: alerts.jsonl
+# and telemetry.jsonl are 0640 root:moat, so group membership is the entire
+# permission set, and moatd keeps its capabilities and its root to itself.
+User=moat-ship
+Group=moat-ship
+# Group membership is the entire permission set: `moat` reads the two logs,
+# `moat-ship` owns the cursor directory. A dedicated user rather than `nobody`
+# so that "what can the shipper touch" is answerable from /etc/passwd.
+SupplementaryGroups=moat
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+ProtectSystem=strict
+# The cursor is the only thing it writes. Created by tmpfiles.d as
+# 0750 moat-ship:moat-ship.
+ReadWritePaths=/var/lib/moat/ship
+# /etc/moat holds ship.toml and, if you use one, the token file. Read-only.
+ReadOnlyPaths=/etc/moat /var/lib/moat
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# AF_UNIX for a /dev/log syslog target; AF_INET/AF_INET6 for HTTPS and TCP
+# syslog. Nothing else — no raw sockets, no netlink.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+# A backlog against a dead collector is bounded in the shipper (buffer.max_bytes,
+# 32 MiB by default). This is the belt to that braces: if the bound is ever wrong,
+# systemd kills it rather than the machine swapping.
+MemoryMax=256M
+MemoryHigh=192M
+# Shipping must never compete with the sensor for CPU.
+Nice=10
+CPUWeight=20
+IOWeight=20
+
+[Install]
+WantedBy=multi-user.target

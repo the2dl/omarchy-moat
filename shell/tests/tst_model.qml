@@ -1,6 +1,7 @@
 import QtQuick
 import QtTest
 import "../MoatModel.js" as Model
+import "../MoatCopy.js" as Copy
 
 // Unit tests for MoatModel.js. No shell, no daemon, no /var/lib/moat:
 // the model is pure functions over plain values precisely so the folding,
@@ -16,6 +17,12 @@ TestCase {
 
   property string fixtureText: ""
   property string statusText: ""
+  /// The real chain off this machine: two alerts moatd correlated on
+  /// 2026-09-04, copied verbatim out of /var/lib/moat/alerts.jsonl. Six lines
+  /// -- two alert records, an `incident` snapshot update, the two `chain`
+  /// updates moatd wrote back onto both members, and a `triage` update -- in
+  /// the order they were appended.
+  property string chainText: ""
 
   // The rule the fixture's status.json reports as demoted (BASELINE 4), and the
   // options object every surfacing call takes.
@@ -34,6 +41,18 @@ TestCase {
     verify(suite.fixtureText.length > 0, "fixture alerts.jsonl is empty or unreadable")
     suite.statusText = readFixture("status.json")
     verify(suite.statusText.length > 0, "fixture status.json is empty or unreadable")
+    suite.chainText = readFixture("chain.jsonl")
+    verify(suite.chainText.length > 0, "fixture chain.jsonl is empty or unreadable")
+  }
+
+  /// The two members of the real chain, folded the way the panel folds them.
+  function chainAlerts() {
+    return Model.foldText(suite.chainText)
+  }
+
+  function chainIncident(options) {
+    var inc = Model.buildIncidents(suite.chainAlerts(), options || {})
+    return inc.length > 0 ? inc[0] : null
   }
 
   function alertsFromFixture() {
@@ -203,11 +222,17 @@ TestCase {
     // update lines. V42 is acked and then un-acked, so it counts. V4F is
     // suppressed and is never counted, with or without the demoted list. The
     // two receipt lines are not alerts and never reach these counts at all.
+    // Every number here is the SAME set -- unacked alerts on the Alerts
+    // surface -- split by severity. The medium and low ones are on the
+    // timeline, so they are not "unacked" in any sense the shield shows:
+    // counting them in `total` while `badge` did not is what put a red
+    // widget state over a badge of 0.
     compare(counts.critical, 3)   // V46, V49, V4E; V45 is acked
     compare(counts.high, 9)       // V42, V43, V47, V48, V4A, V4G, V4H, V4J, V4M
-    compare(counts.medium, 5)     // V41, V44, V4B, V4D, V4K
-    compare(counts.low, 1)        // V4C; V40 is acked, V4F is suppressed
-    compare(counts.total, 18)
+    compare(counts.medium, 0)     // V41, V44, V4B, V4D, V4K are on the timeline
+    compare(counts.low, 0)        // V4C too; V40 is acked, V4F is suppressed
+    compare(counts.total, 12)
+    compare(counts.badge, 12, "total and badge are one number")
     compare(Model.badgeCount(counts), 12)
   }
 
@@ -218,9 +243,9 @@ TestCase {
     var counts = Model.unackedCounts(alertsFromFixture(), suite.demoted)
     compare(counts.critical, 3)
     compare(counts.high, 6, "the demoted rule's three high alerts stop counting")
-    compare(counts.medium, 5)
-    compare(counts.low, 1)
-    compare(counts.total, 15)
+    compare(counts.medium, 0)
+    compare(counts.low, 0)
+    compare(counts.total, 9)
     compare(counts.badge, 9)
     compare(Model.badgeCount(counts), 9)
   }
@@ -348,6 +373,116 @@ TestCase {
     compare(result.newIds.length, 0)
   }
 
+  // ------------------------------------------------- the incremental fold
+  //
+  // FileView hands back the whole file on every change and moatd appends to it
+  // every couple of seconds; re-parsing 19 MB of JSONL per append cost ~250 ms
+  // of the GUI thread and was what made the panel's scrolling stutter. The fold
+  // is now incremental, so what these pin is that it still produces EXACTLY
+  // what a from-scratch fold of the same bytes produces.
+
+  function stampAlerts(list) {
+    var out = []
+    for (var i = 0; i < list.length; i++) out.push(JSON.stringify(list[i]))
+    return out.join("\n")
+  }
+
+  function test_incremental_fold_matches_a_full_refold_at_every_prefix() {
+    var lines = suite.fixtureText.split("\n")
+    var store = Model.createStore()
+    for (var cut = 0; cut <= lines.length; cut++) {
+      var body = lines.slice(0, cut).join("\n")
+      if (cut > 0) body += "\n"
+      var got = Model.ingestText(store, body, suite.demoted)
+      var want = Model.decorateAlerts(Model.foldText(body), suite.demoted)
+      compare(got.alerts.length, want.length, "alert count after " + cut + " lines")
+      compare(suite.stampAlerts(got.alerts), suite.stampAlerts(want),
+        "the incremental fold must equal a full refold after " + cut + " lines")
+      compare(JSON.stringify(got.unacked), JSON.stringify(Model.unackedCounts(want, suite.demoted)),
+        "counts after " + cut + " lines")
+    }
+  }
+
+  function test_a_half_written_line_is_not_folded_until_it_is_complete() {
+    var lines = suite.fixtureText.split("\n")
+    var whole = lines.slice(0, 3).join("\n") + "\n"
+    var store = Model.createStore()
+
+    // A read that caught moatd mid-write: three whole lines plus the first
+    // 30 characters of the fourth.
+    var torn = whole + String(lines[3]).slice(0, 30)
+    var first = Model.ingestText(store, torn)
+    compare(first.alerts.length, Model.foldText(whole).length,
+      "half a record is not an alert")
+
+    // The rest of that line lands, and only then does the alert appear.
+    var complete = lines.slice(0, 4).join("\n") + "\n"
+    var second = Model.ingestText(store, complete)
+    compare(suite.stampAlerts(second.alerts),
+      suite.stampAlerts(Model.decorateAlerts(Model.foldText(complete), {})),
+      "the completed line folds exactly once, with nothing lost or doubled")
+  }
+
+  function test_a_file_replaced_by_one_the_same_length_is_refolded_not_appended() {
+    function line(id, day, title) {
+      return JSON.stringify({ v: 1, id: id, ts: "2026-01-0" + day + "T00:00:00.000Z",
+        severity: "high", rule: "r", title: title }) + "\n"
+    }
+    var first = line("AAA", 1, "a") + line("BBB", 2, "b")
+    // Same byte count, entirely different alerts. A length check alone would
+    // call this an append, find no new bytes, and hand back the old fold.
+    var replaced = line("CCC", 3, "c") + line("DDD", 4, "d")
+    compare(replaced.length, first.length, "the fixture must actually be the same length")
+
+    var store = Model.createStore()
+    compare(Model.ingestText(store, first).alerts.length, 2)
+
+    var result = Model.ingestText(store, replaced)
+    compare(result.alerts.length, 2, "a replaced file is refolded, not appended to")
+    compare(result.alerts[0].id, "DDD")
+    compare(result.alerts[1].id, "CCC")
+    compare(suite.stampAlerts(result.alerts),
+      suite.stampAlerts(Model.decorateAlerts(Model.foldText(replaced), {})))
+  }
+
+  function test_an_update_parked_in_one_ingest_still_applies_in_the_next() {
+    // Rotation truncates the head of the file, so an update can legitimately
+    // arrive before the alert it patches -- and across two reads, not one.
+    var store = Model.createStore()
+    var update = JSON.stringify({ v: 1, id: "ZZZ", update: { count: 9 } }) + "\n"
+    var base = JSON.stringify({ v: 1, id: "ZZZ", ts: "2026-01-01T00:00:00.000Z",
+      severity: "high", rule: "r", title: "z" }) + "\n"
+
+    compare(Model.ingestText(store, update).alerts.length, 0,
+      "an update with no base is not an alert")
+    var result = Model.ingestText(store, update + base)
+    compare(result.alerts.length, 1)
+    compare(result.alerts[0].count, 9, "the parked patch survived the ingest boundary")
+  }
+
+  function test_a_reread_that_folded_nothing_returns_the_very_same_arrays() {
+    // Service.qml's identity guard depends on this: FileView fires more than
+    // once per append, and re-assigning an equal-but-new array would rebuild
+    // every incident and every delegate on the panel for a file that did not
+    // change.
+    var store = Model.createStore()
+    var first = Model.ingestText(store, suite.fixtureText, suite.demoted)
+    var second = Model.ingestText(store, suite.fixtureText, suite.demoted)
+    verify(first.alerts === second.alerts, "alerts array identity is stable")
+    verify(first.receipts === second.receipts, "receipts array identity is stable")
+    verify(Model.sameCounts(first.unacked, second.unacked))
+  }
+
+  function test_same_counts_compares_by_value() {
+    var a = Model.unackedCounts(suite.alertsFromFixture(), suite.demoted)
+    var b = Model.unackedCounts(suite.alertsFromFixture(), suite.demoted)
+    verify(a !== b, "two calls really are two objects")
+    verify(Model.sameCounts(a, b))
+    b.high = a.high + 1
+    verify(!Model.sameCounts(a, b))
+    verify(!Model.sameCounts(a, null))
+  }
+
   function test_should_notify_respects_threshold_and_ack() {
     var alerts = alertsFromFixture()
     var medium = findAlert(alerts, "01J8ZK6B4Q3M7N9P2R5S8T1V41")
@@ -355,7 +490,13 @@ TestCase {
     var ackedCritical = findAlert(alerts, "01J8ZK6B4Q3M7N9P2R5S8T1V45")
 
     verify(!Model.shouldNotify(medium, "high", false))
-    verify(Model.shouldNotify(medium, "medium", false))
+    // A medium lives on the timeline (BASELINE 5), so it is never `needsYou`
+    // and 2h's "only needs-you may interrupt" stops it whatever the severity
+    // floor says. Lowering minNotifySeverity below high therefore changes
+    // nothing -- which is why 1f replaced that setting with three
+    // consequence-based choices rather than a severity dial.
+    verify(!Model.shouldNotify(medium, "medium", false),
+           "a timeline alert does not interrupt, whatever the floor is set to")
     verify(Model.shouldNotify(high, "high", false))
     verify(!Model.shouldNotify(ackedCritical, "low", false), "an acked alert is already handled")
     verify(!Model.shouldNotify(null, "low", false))
@@ -489,6 +630,787 @@ TestCase {
     compare(groups.length, 1)
     compare(groups[0].suppressed, false, "a demoted row is not greyed out as suppressed")
     compare(groups[0].demoted, true)
+  }
+
+  function test_status_carries_what_the_panel_needs_to_explain_a_missing_verdict() {
+    // `IncidentCard` binds `service.autoTriageOn` to decide whether an incident
+    // with no verdict is *waiting* for one or will never get one. That property
+    // was referenced before it existed, so it read undefined, the "reading the
+    // evidence..." state never rendered, and AI analysis was invisible in the
+    // panel until a verdict happened to land. QML does not error on an unknown
+    // property, so nothing caught it -- this does.
+    var s = Model.normalizeStatus({
+      auto_triage: "demote", triage_pending: 3,
+      tetragon: "running", policies: 32, sensors_loaded: 32
+    })
+    compare(s.autoTriage, "demote")
+    compare(s.triagePending, 3)
+
+    // Off is the honest default for a daemon that does not send the field, so
+    // an older daemon shows no pending state rather than a permanent spinner.
+    var old = Model.normalizeStatus({ tetragon: "running", policies: 32 })
+    compare(old.autoTriage, "off")
+    compare(old.triagePending, 0)
+  }
+
+  function test_the_seen_set_ages_out_the_oldest_ids_not_the_newest() {
+    // `alerts` is newest-first and rememberSeen evicts from the front of its
+    // queue, so walking forwards remembered the newest id first and threw it
+    // away first. Past SEEN_LIMIT the most recent alerts aged out of `seen` and
+    // re-notified as new -- the exact noise the set exists to prevent.
+    var store = Model.createStore()
+    var text = ""
+    var n = 4200   // over SEEN_LIMIT (4096)
+    for (var i = 0; i < n; i++) {
+      text += JSON.stringify({
+        v: 1, id: "01" + String(100000 + i), severity: "high", rule: "r",
+        title: "t", ts: "2026-09-04T10:00:00Z", surface: "alerts",
+        process: { exe: "/usr/bin/p" }
+      }) + "\n"
+    }
+    Model.ingestText(store, text, {})            // primes the store
+    // The newest id must still be remembered; the oldest is the one allowed to
+    // fall out of the window.
+    var newest = "01" + String(100000 + n - 1)
+    var oldest = "01100000"
+    verify(store.seen[newest] === true, "the newest id must survive eviction")
+    // The cap is on ids BEYOND the fold, so with nothing rotated out yet the
+    // oldest is remembered too; what ages out is shown in the tests below.
+    verify(store.seen[oldest] === true, "a folded id is always remembered")
+    compare(store.seenOrder[0], oldest, "oldest first in the queue, so it is the first to age out")
+  }
+
+  function test_more_folded_alerts_than_the_cap_do_not_all_come_back_as_new() {
+    // With more alerts in the fold than SEEN_LIMIT (4,620 once the rotated
+    // half was folded too, against a cap of 4,096) the oldest-first walk
+    // evicted, on every ingest, exactly the ids it was about to visit:
+    // remembering the oldest dropped the (cap+1)th, which was walked next, was
+    // "new", and pushed the next one out in turn. Every alert came back in
+    // newIds on every ingest -- 4,620 lookups and notification decisions per
+    // reload, twice a second, on 2026-09-05.
+    var store = Model.createStore()
+    var text = ""
+    var n = 4600
+    for (var i = 0; i < n; i++) {
+      text += JSON.stringify({
+        v: 1, id: "01" + String(100000 + i), severity: "high", rule: "r",
+        title: "t", ts: "2026-09-04T10:00:00Z", surface: "alerts",
+        process: { exe: "/usr/bin/p" }
+      }) + "\n"
+    }
+    Model.ingestText(store, text, {})
+    verify(store.seen["01100000"] === true, "every folded id is remembered, cap or no cap")
+    var again = Model.ingestText(store, text, {})
+    compare(again.newIds.length, 0, "nothing already folded is new")
+    text += JSON.stringify({
+      v: 1, id: "01999999", severity: "high", rule: "r", title: "t",
+      ts: "2026-09-04T10:00:00Z", surface: "alerts", process: { exe: "/usr/bin/p" }
+    }) + "\n"
+    var more = Model.ingestText(store, text, {})
+    compare(more.newIds.length, 1, "only the appended alert is new")
+    compare(more.newIds[0], "01999999")
+    compare(store.seenOrder.length, n + 1, "the fold itself never ages out")
+  }
+
+  function test_the_seen_set_still_ages_out_ids_that_left_the_fold() {
+    var store = Model.createStore()
+    var first = ""
+    for (var i = 0; i < 10; i++) {
+      first += JSON.stringify({ v: 1, id: "01A" + i, severity: "high", rule: "r", title: "t",
+        ts: "2026-09-04T10:00:00Z", surface: "alerts", process: { exe: "/usr/bin/p" } }) + "\n"
+    }
+    Model.ingestText(store, first, {})
+    // A truncation to a body of SEEN_LIMIT + 5 fresh ids: the fold is those,
+    // and only 4096 rotated-out ids may stay on top of them.
+    // A different exe, so no 64-char tail of `second` matches the guard and
+    // it cannot pass for an append onto `first`.
+    var second = ""
+    for (var j = 0; j < 4096 + 5; j++) {
+      second += JSON.stringify({ v: 1, id: "01B" + j, severity: "high", rule: "r", title: "t",
+        ts: "2026-09-04T10:00:00Z", surface: "alerts", process: { exe: "/usr/bin/second-body" } }) + "\n"
+    }
+    var result = Model.ingestText(store, second, {})
+    verify(!result.byId["01A0"], "a non-append body is re-folded from scratch")
+    compare(result.alerts.length, 4096 + 5)
+    compare(store.seenOrder.length, 10 + 4096 + 5, "ten rotated-out ids fit under the cap")
+    verify(store.seen["01A0"] === true)
+  }
+
+  function test_nothing_already_seen_notifies_twice_within_the_cap() {
+    var store = Model.createStore()
+    var text = ""
+    for (var i = 0; i < 50; i++) {
+      text += JSON.stringify({
+        v: 1, id: "01" + String(200000 + i), severity: "high", rule: "r",
+        title: "t", ts: "2026-09-04T10:00:00Z", surface: "alerts",
+        process: { exe: "/usr/bin/p" }
+      }) + "\n"
+    }
+    Model.ingestText(store, text, {})
+    var again = Model.ingestText(store, text, {})
+    compare(again.newIds.length, 0, "nothing already seen may notify again")
+  }
+
+  // ------------------------------------------------- the daemon's decision
+
+  function test_the_daemons_recorded_surface_is_not_second_guessed() {
+    // On 2026-09-04 clearing the noise-guard demotions made 251 alerts the
+    // daemon had put on the timeline re-surface in the panel, turning 8 real
+    // incidents into 51 and burying a live supply-chain exec. The daemon knew
+    // the demotion state when it raised each alert; the panel only knows the
+    // state now, so it must not re-decide history.
+    var demotedThen = Model.decorateAlerts(Model.foldText(JSON.stringify({
+      v: 1, id: "A", severity: "high", rule: "moat-exec-untrusted-tmpfs",
+      title: "t", ts: "2026-09-03T10:00:00Z", surface: "timeline"
+    })), { demotedRules: [] })[0]
+    compare(demotedThen.surface, "timeline",
+            "an alert the daemon put on the timeline stays there")
+
+    // And the other way round: an alert the daemon stamped `alerts` stays
+    // there even when its rule is on the live demoted list. This used to be
+    // the asymmetric exception ("a demotion in force NOW quietens the backlog
+    // too"), and on 2026-09-05 it silenced a 64-step chain the daemon had
+    // raised to high and re-surfaced on purpose, because the chain's rules
+    // were in `demoted_rules`. The daemon quietens the backlog itself now,
+    // per pattern, when the guard demotes -- so the list is no longer a
+    // second implementation of that in the panel.
+    var demotedNow = Model.decorateAlerts(Model.foldText(JSON.stringify({
+      v: 1, id: "B", severity: "high", rule: "moat-exec-untrusted-tmpfs",
+      title: "t", ts: "2026-09-04T10:00:00Z", surface: "alerts"
+    })), { demotedRules: ["moat-exec-untrusted-tmpfs"] })[0]
+    compare(demotedNow.surface, "alerts", "the daemon's stamp is not overruled by the list")
+
+    // The list still stands in for a record that carries NO stamp at all -- a
+    // log written by a daemon from before the field existed.
+    var unstamped = Model.decorateAlerts(Model.foldText(JSON.stringify({
+      v: 1, id: "B1", severity: "high", rule: "moat-exec-untrusted-tmpfs",
+      title: "t", ts: "2026-09-04T10:00:00Z"
+    })), { demotedRules: ["moat-exec-untrusted-tmpfs"] })[0]
+    compare(unstamped.surface, "timeline", "no stamp: the live list is the best guess")
+
+    // Clearing a demotion is a statement about future alerts and must not
+    // resurrect a backlog.
+    var clearedSince = Model.decorateAlerts(Model.foldText(JSON.stringify({
+      v: 1, id: "B2", severity: "high", rule: "moat-exec-untrusted-tmpfs",
+      title: "t", ts: "2026-09-04T10:00:00Z", surface: "timeline"
+    })), { demotedRules: [] })[0]
+    compare(clearedSince.surface, "timeline", "undemoting does not unbury history")
+
+    // A record written before the daemon stamped the field still gets a sane
+    // answer from severity.
+    var legacy = Model.decorateAlerts(Model.foldText(JSON.stringify({
+      v: 1, id: "C", severity: "high", rule: "r", title: "t",
+      ts: "2026-09-04T10:00:00Z"
+    })), {})[0]
+    compare(legacy.surface, "alerts")
+    var legacyLow = Model.decorateAlerts(Model.foldText(JSON.stringify({
+      v: 1, id: "D", severity: "low", rule: "r", title: "t",
+      ts: "2026-09-04T10:00:00Z"
+    })), {})[0]
+    compare(legacyLow.surface, "timeline")
+
+    // Suppression and a triage demotion still win: those are per-alert facts,
+    // not a global list being applied retroactively.
+    var supp = Model.decorateAlerts(Model.foldText(JSON.stringify({
+      v: 1, id: "E", severity: "high", rule: "r", title: "t",
+      ts: "2026-09-04T10:00:00Z", surface: "alerts", suppressed_by: "user.toml#1"
+    })), { showSuppressed: true })[0]
+    compare(supp.surface, "timeline")
+  }
+
+  function test_an_alert_on_the_timeline_never_becomes_an_incident_needing_you() {
+    // The bar counts needs-you INCIDENTS, so alertState is a fourth place the
+    // "where does this belong" decision could disagree -- and did.
+    var text = ""
+    for (var i = 0; i < 4; i++) {
+      text += JSON.stringify({
+        v: 1, id: "S" + i, severity: "high", rule: "r" + i, title: "t",
+        ts: "2026-09-04T10:0" + i + ":00Z",
+        surface: i === 0 ? "alerts" : "timeline",
+        process: { exe: "/usr/bin/x" }
+      }) + "\n"
+    }
+    var inc = Model.buildIncidents(Model.foldText(text), {})
+    compare(inc.length, 4, "all four are still incidents in the timeline")
+    compare(Model.needsYouIncidents(inc).length, 1,
+            "but only the one the daemon surfaced is waiting on the user")
+    compare(Model.verdict(inc, { tetragon: "running", policies: 1,
+                                 sensorsLoaded: 1, sensorUnhealthy: false }).count, 1)
+  }
+
+  function test_every_surface_consumer_agrees_with_alertSurface() {
+    // The consistency test. Four copies of "does this need the user?" is what
+    // made the shield say 51 while the daemon had surfaced 8, so this asserts
+    // the badge, the tab, incidents and the verdict all land on the same
+    // answer -- over a mix that would separate them if any one drifted back to
+    // deriving it from severity.
+    var rows = [
+      { id: "X1", severity: "critical", surface: "alerts" },
+      { id: "X2", severity: "high", surface: "alerts" },
+      { id: "X3", severity: "high", surface: "timeline" },   // daemon demoted it
+      { id: "X4", severity: "critical", surface: "timeline" },
+      { id: "X5", severity: "medium", surface: "timeline" },
+      { id: "X6", severity: "low", surface: "timeline" }
+    ]
+    var text = ""
+    for (var i = 0; i < rows.length; i++) {
+      text += JSON.stringify({
+        v: 1, id: rows[i].id, severity: rows[i].severity, rule: "rule-" + rows[i].id,
+        title: "t", ts: "2026-09-04T10:0" + i + ":00Z", surface: rows[i].surface,
+        process: { exe: "/usr/bin/p" + i }
+      }) + "\n"
+    }
+    var alerts = Model.foldText(text)
+    var opts = {}
+
+    var expected = 2   // X1 and X2, the only two the daemon surfaced
+    compare(Model.surfaceAlerts(alerts, "alerts", opts).length, expected, "the tab")
+    compare(Model.unackedCounts(alerts, opts).badge, expected, "the badge")
+
+    var inc = Model.buildIncidents(alerts, opts)
+    compare(Model.needsYouIncidents(inc).length, expected, "incidents")
+
+    var healthy = { tetragon: "running", policies: 1, sensorsLoaded: 1, sensorUnhealthy: false }
+    compare(Model.verdict(inc, healthy).count, expected, "the verdict line and the bar")
+    compare(Model.barState(Model.verdict(inc, healthy).state, expected).label,
+            String(expected), "the bar glyph")
+
+    // And nothing that was timelined can interrupt.
+    for (var j = 2; j < rows.length; j++) {
+      var a = null
+      for (var k = 0; k < alerts.length; k++) if (alerts[k].id === rows[j].id) a = alerts[k]
+      verify(!Model.shouldNotify(a, "low", false, opts),
+             rows[j].id + " is on the timeline and must not notify")
+    }
+  }
+
+  function test_the_badge_asks_the_same_function_the_tab_does() {
+    // Two copies of "where does this alert belong" is how the shield came to
+    // say 51 while the daemon said 8.
+    var text = ""
+    for (var i = 0; i < 5; i++) {
+      text += JSON.stringify({
+        v: 1, id: "T" + i, severity: "high", rule: "r", title: "t",
+        ts: "2026-09-04T10:0" + i + ":00Z",
+        surface: i < 2 ? "alerts" : "timeline"
+      }) + "\n"
+    }
+    var alerts = Model.foldText(text)
+    var counts = Model.unackedCounts(alerts, {})
+    compare(counts.badge, 2, "only what the daemon surfaced is counted")
+    compare(Model.surfaceAlerts(alerts, "alerts", {}).length, 2,
+            "and the tab agrees with it")
+  }
+
+  function test_an_incident_shows_the_newest_verdict_it_has_not_its_newest_members() {
+    // Triage works oldest-first, so on a repeating incident the newest member
+    // is the one NOT looked at yet. Reading the verdict off the head meant a
+    // repeating incident displayed no analysis while carrying several
+    // verdicts -- which made AI analysis look like it had never run.
+    var text = ""
+    var v = { verdict: "benign", confidence: "high", summary: "read it",
+              reasoning: "r", outcome: "annotated" }
+    text += JSON.stringify({ v: 1, id: "M1", severity: "high", rule: "r",
+      title: "t", ts: "2026-09-04T10:00:00Z", surface: "alerts",
+      process: { exe: "/usr/bin/p" }, triage: v }) + "\n"
+    text += JSON.stringify({ v: 1, id: "M2", severity: "high", rule: "r",
+      title: "t", ts: "2026-09-04T10:05:00Z", surface: "alerts",
+      process: { exe: "/usr/bin/p" } }) + "\n"
+
+    var inc = Model.buildIncidents(Model.foldText(text), {})
+    compare(inc.length, 1)
+    compare(inc[0].id, "M2", "the newest member still carries the incident")
+    verify(!!inc[0].verdict, "but the verdict comes from whichever member has one")
+    compare(inc[0].verdict.summary, "read it")
+    compare(inc[0].awaitingVerdict, true, "and it still says one is outstanding")
+  }
+
+  // --------------------------------------------------------------- incidents
+
+  function incAlert(over) {
+    var base = {
+      v: 1, id: "01A", severity: "high", rule: "moat-exec-untrusted-home",
+      family: "exec", title: "Binary executed from a cache or download directory",
+      ts: "2026-09-04T10:00:00Z", acked: false, action_taken: "none",
+      process: { exe: "/usr/bin/quickshell" }
+    }
+    for (var k in over) base[k] = over[k]
+    return base
+  }
+
+  function incidentsOf(list, options) {
+    var text = ""
+    for (var i = 0; i < list.length; i++) text += JSON.stringify(list[i]) + "\n"
+    return Model.buildIncidents(Model.foldText(text), options || {})
+  }
+
+  function test_the_same_rule_and_program_collapse_into_one_incident() {
+    // The wall of identical rows this redesign exists to remove: 3 records of
+    // the same detection by the same program are ONE incident, not three.
+    var inc = incidentsOf([
+      incAlert({ id: "01A", ts: "2026-09-04T10:00:00Z" }),
+      incAlert({ id: "01B", ts: "2026-09-04T10:05:00Z" }),
+      incAlert({ id: "01C", ts: "2026-09-04T10:09:00Z" })
+    ])
+    compare(inc.length, 1)
+    compare(inc[0].count, 3)
+    compare(inc[0].firstSeen, "2026-09-04T10:00:00Z")
+    compare(inc[0].lastSeen, "2026-09-04T10:09:00Z")
+    // Actions name an alert id, and it has to be the newest -- the only member
+    // whose process might still exist.
+    compare(inc[0].id, "01C")
+  }
+
+  function test_a_different_program_is_a_different_incident() {
+    var inc = incidentsOf([
+      incAlert({ id: "01A", process: { exe: "/usr/bin/curl" } }),
+      incAlert({ id: "01B", process: { exe: "/usr/bin/bsdtar" } })
+    ])
+    compare(inc.length, 2)
+  }
+
+  function test_an_interpreter_is_named_by_its_script_not_itself() {
+    // Otherwise every postinstall in the product is an incident about "python3".
+    var inc = incidentsOf([
+      incAlert({ id: "01A", process: { exe: "/usr/bin/python3" },
+                 actor: { provenance: "user", script: "/tmp/x/setup.py" } })
+    ])
+    compare(inc[0].program, "setup.py")
+  }
+
+  function test_the_daemons_own_repeat_count_is_carried_not_recounted() {
+    // The daemon already folds identical repeats into one record with `count`.
+    var inc = incidentsOf([incAlert({ id: "01A", count: 68 })])
+    compare(inc[0].count, 68, "68 repeats is one incident of 68, not one of 1")
+  }
+
+  // --- the three states -----------------------------------------------------
+
+  function test_state_says_what_is_wanted_from_the_user() {
+    var quiet = incidentsOf([incAlert({ id: "01A", suppressed_by: "user.toml#1" })],
+                            { showSuppressed: true })
+    compare(quiet[0].state, "expected", "a rule covers it")
+
+    var read = incidentsOf([incAlert({ id: "01A", triage: {
+      verdict: "benign", confidence: "high", summary: "s", reasoning: "r",
+      outcome: "demoted" } })])
+    compare(read[0].state, "explained", "Moat read it and decided")
+
+    var acted = incidentsOf([incAlert({ id: "01A", action_taken: "killed" })])
+    compare(acted[0].state, "contained")
+
+    compare(incidentsOf([incAlert({ id: "01A", acked: true })])[0].state, "closed")
+    compare(incidentsOf([incAlert({ id: "01A" })])[0].state, "needsYou")
+  }
+
+  function test_a_user_rule_outranks_a_model_verdict() {
+    // The model must never be able to overrule a decision the user made. An
+    // allowlisted alert reads "expected" even when triage called it malicious.
+    var inc = incidentsOf([incAlert({
+      id: "01A", suppressed_by: "user.toml#1",
+      triage: { verdict: "malicious", confidence: "high", summary: "s",
+                reasoning: "r", outcome: "annotated" }
+    })], { showSuppressed: true })
+    compare(inc[0].state, "expected")
+  }
+
+  function test_one_resolved_repeat_does_not_close_the_incident() {
+    // 67 acked and one still open is an incident that needs you.
+    var inc = incidentsOf([
+      incAlert({ id: "01A", acked: true }),
+      incAlert({ id: "01B", acked: true }),
+      incAlert({ id: "01C", acked: false })
+    ])
+    compare(inc.length, 1)
+    compare(inc[0].state, "needsYou")
+  }
+
+  // --- the queue ordering ---------------------------------------------------
+
+  function test_the_queue_is_ordered_by_uncertainty_not_severity() {
+    // 3c: "a HIGH it is sure about matters less than a MEDIUM it can't place".
+    var inc = incidentsOf([
+      incAlert({ id: "01A", severity: "critical", rule: "moat-cred-ssh-private-key-read",
+                 triage: { verdict: "suspicious", confidence: "high", summary: "s",
+                           reasoning: "r", outcome: "annotated" } }),
+      incAlert({ id: "01B", severity: "high", rule: "moat-exec-untrusted-tmpfs",
+                 triage: { verdict: "unclear", confidence: "low", summary: "s",
+                           reasoning: "r", outcome: "annotated" } })
+    ])
+    var q = Model.needsYouIncidents(inc)
+    compare(q.length, 2)
+    compare(q[0].rule, "moat-exec-untrusted-tmpfs",
+            "the one nobody can place outranks the critical Moat is sure about")
+    verify(q[0].uncertainty > q[1].uncertainty)
+  }
+
+  function test_a_confident_benign_verdict_leaves_the_queue_entirely() {
+    // The other half of the same rule: once Moat has read something and is sure,
+    // it stops being a thing the user is asked about. This is what makes the
+    // needs-you count fall rather than just re-order.
+    var inc = incidentsOf([incAlert({ id: "01A", severity: "critical",
+      triage: { verdict: "benign", confidence: "high", summary: "s",
+                reasoning: "r", outcome: "demoted" } })])
+    compare(inc[0].state, "explained")
+    compare(Model.needsYouIncidents(inc).length, 0)
+    compare(Model.verdict(inc, healthy()).line, "Nothing needs you.")
+  }
+
+  // --- the verdict line -----------------------------------------------------
+
+  function healthy() {
+    return { tetragon: "running", policies: 32, sensors_loaded: 32, sensor_unhealthy: false }
+  }
+
+  function test_the_verdict_line_has_exactly_four_forms() {
+    var none = Model.verdict([], healthy())
+    compare(none.line, "Nothing needs you.")
+    compare(none.tone, "calm")
+
+    var one = Model.verdict(incidentsOf([incAlert({ id: "01A" })]), healthy())
+    compare(one.line, "One thing needs you.")
+    compare(one.tone, "alarm")
+
+    var three = Model.verdict(incidentsOf([
+      incAlert({ id: "01A", rule: "r1" }),
+      incAlert({ id: "01B", rule: "r2" }),
+      incAlert({ id: "01C", rule: "r3" })
+    ]), healthy())
+    compare(three.line, "Three things need you.")
+
+    // Never a count of events: 68 repeats of one thing is still "One thing".
+    var many = Model.verdict(incidentsOf([incAlert({ id: "01A", count: 68 })]), healthy())
+    compare(many.line, "One thing needs you.")
+  }
+
+  function test_the_panel_will_not_claim_calm_it_cannot_prove() {
+    // 2f: a blind sensor and a quiet machine look identical from here. On
+    // 2026-09-03 tetragon was dead for 25 minutes and every surface said
+    // "running", which is the whole reason this gate exists.
+    var dead = { tetragon: "running", policies: 32, sensors_loaded: 11, sensor_unhealthy: true }
+    var v = Model.verdict([], dead)
+    compare(v.line, "Watching, with one gap.")
+    compare(v.tone, "accent")
+    verify(!Model.sensorHealthy(dead))
+    verify(!Model.sensorHealthy({ tetragon: "running", policies: 32, sensors_loaded: 11 }),
+           "fewer sensors loaded than policies is a gap even without the flag")
+    verify(Model.sensorHealthy(healthy()))
+
+    // Something needing you still outranks the gap -- the gap is what you say
+    // when there is nothing else to say.
+    var both = Model.verdict(incidentsOf([incAlert({ id: "01A" })]), dead)
+    compare(both.line, "One thing needs you.")
+  }
+
+  // --- the copy contract ----------------------------------------------------
+
+  function test_titles_name_a_consequence_not_a_detection() {
+    compare(Copy.titleFor({ rule: "moat-persist-hypr-config-write" }),
+            "Something added itself to your login")
+    compare(Copy.titleFor({ rule: "moat-cred-ssh-private-key-read" }),
+            "A program you don't recognise read your SSH key")
+    // An unknown detection degrades to its own old wording, never to blank.
+    compare(Copy.titleFor({ rule: "moat-not-written-yet", title: "Old string" }),
+            "Old string")
+    compare(Copy.stakeFor({ rule: "moat-not-written-yet" }), "")
+  }
+
+  // --- Advanced (`rawDetail`) -----------------------------------------------
+  //
+  // A rendering choice and nothing else. These pin both halves of that: that it
+  // really does swap the voice, and that it reaches nothing which decides what
+  // is surfaced, counted or notified.
+
+  function rawAlert() {
+    return {
+      id: "01RAW", ts: "2026-09-03T10:00:00.000Z",
+      rule: "moat-persist-hypr-config-write",
+      title: "Hyprland configuration modified by a non-editor",
+      summary: "sed (pid 4242) wrote /home/dan/.config/hypr/hyprland.conf.",
+      severity: "high", severity_base: "medium",
+      severity_reason: "actor is unpackaged",
+      family: "persist", surface: "alerts", mode: "monitor", action_taken: "none",
+      count: 3,
+      process: { pid: 4242, uid: 1000, exe: "/usr/bin/sed", args: "-i s/a/b/ hyprland.conf",
+                 cwd: "/home/dan/.config/hypr", start_ts: "2026-09-03T09:59:59.000Z",
+                 ancestry: [{ pid: 40, exe: "/bin/bash" }, { pid: 1, exe: "/usr/lib/systemd/systemd" }] },
+      actions: ["ignore"]
+    }
+  }
+
+  function test_advanced_prints_the_detections_own_title_and_summary() {
+    var alert = suite.rawAlert()
+
+    // Off: the copy table wins, exactly as before.
+    compare(Copy.titleFor(alert), "Something added itself to your login")
+    compare(Copy.titleFor(alert, false), "Something added itself to your login")
+
+    // On: the daemon's own words, table skipped even though copy exists.
+    compare(Copy.titleFor(alert, true), "Hyprland configuration modified by a non-editor")
+    compare(Copy.stakeFor(alert, true), alert.summary)
+    verify(Copy.stakeFor(alert, false) !== alert.summary,
+           "the default voice must not be the daemon's summary")
+
+    // And it still degrades rather than blanking when the daemon sent nothing.
+    compare(Copy.titleFor({ rule: "moat-nope" }, true), "moat-nope")
+    compare(Copy.stakeFor({ rule: "moat-nope" }, true), "")
+  }
+
+  function test_advanced_reaches_the_title_and_the_stake_and_nothing_else() {
+    var alerts = [suite.rawAlert()]
+    var plain = Model.buildIncidents(alerts, {})
+    var raw = Model.buildIncidents(alerts, { rawDetail: true })
+
+    compare(plain.length, 1)
+    compare(raw.length, 1)
+    verify(plain[0].title !== raw[0].title, "the title is what the setting changes")
+    compare(raw[0].title, "Hyprland configuration modified by a non-editor")
+
+    // Everything that decides what happens to this incident is identical.
+    compare(raw[0].key, plain[0].key)
+    compare(raw[0].state, plain[0].state)
+    compare(raw[0].severity, plain[0].severity)
+    compare(raw[0].count, plain[0].count)
+    compare(raw[0].coveredBy, plain[0].coveredBy)
+    compare(raw[0].uncertainty, plain[0].uncertainty)
+    compare(Model.needsYouIncidents(raw).length, Model.needsYouIncidents(plain).length)
+
+    // Over the whole fixture, not one hand-made alert: every incident's key,
+    // state, severity and covering rule is the same in both modes, and so is
+    // the badge. Only the wording moves.
+    var log = suite.alertsFromFixture()
+    var a = Model.buildIncidents(log, suite.demoted)
+    var b = Model.buildIncidents(log, { demotedRules: [suite.demotedRule], rawDetail: true })
+    compare(b.length, a.length)
+    var moved = 0
+    for (var i = 0; i < a.length; i++) {
+      compare(b[i].key, a[i].key)
+      compare(b[i].state, a[i].state)
+      compare(b[i].severity, a[i].severity)
+      compare(b[i].coveredBy, a[i].coveredBy)
+      compare(b[i].count, a[i].count)
+      if (b[i].title !== a[i].title) moved++
+    }
+    verify(moved > 0, "the fixture must actually exercise a rule that has copy")
+    compare(JSON.stringify(Model.unackedCounts(log, { demotedRules: [suite.demotedRule], rawDetail: true })),
+            JSON.stringify(Model.unackedCounts(log, suite.demoted)),
+            "the badge cannot notice a rendering setting")
+  }
+
+  function test_advanced_facts_are_the_recorded_fields() {
+    var facts = Model.rawFacts(suite.rawAlert())
+    function valueOf(label) {
+      for (var i = 0; i < facts.length; i += 2) if (facts[i] === label) return facts[i + 1]
+      return null
+    }
+    compare(valueOf("rule"), "moat-persist-hypr-config-write")
+    compare(valueOf("exe"), "/usr/bin/sed")
+    compare(valueOf("pid"), "4242")
+    compare(valueOf("uid"), "1000")
+    compare(valueOf("args"), "-i s/a/b/ hyprland.conf")
+    compare(valueOf("cwd"), "/home/dan/.config/hypr")
+    compare(valueOf("surface"), "alerts")
+    // Severity as severity, with the base and the reason beside it.
+    compare(valueOf("severity"), "high  (base medium — actor is unpackaged)")
+    // uid 0 is a value, not an absence.
+    var asRoot = suite.rawAlert()
+    asRoot.process.uid = 0
+    compare(Model.rawFacts(asRoot)[Model.rawFacts(asRoot).indexOf("uid") + 1], "0")
+
+    // The chain, oldest first, with pids and full paths -- not the arrow line.
+    var chain = Model.ancestryLines(suite.rawAlert())
+    compare(chain.length, 3)
+    compare(chain[0], "1  /usr/lib/systemd/systemd")
+    compare(chain[2], "4242  /usr/bin/sed")
+
+    compare(Model.rawFacts(null).length, 0)
+  }
+
+  function test_advanced_severity_line_says_the_severity_even_when_nothing_moved_it() {
+    // severityChangeLine is the default voice's version and is silent here;
+    // Advanced exists to print it anyway.
+    var steady = { severity: "medium", severity_base: "medium" }
+    compare(Model.severityChangeLine(steady), "")
+    compare(Model.rawSeverityLine(steady), "medium")
+    compare(Model.rawSeverityLine({ severity: "low", severity_base: "high",
+                                    severity_reason: "actor is official" }),
+            "low  (base high — actor is official)")
+  }
+
+  function test_no_title_or_stake_uses_a_word_the_panel_has_banned() {
+    // 3g's list is only real if it fails a build. Every shipped string, checked.
+    var rules = Object.keys(Copy.COPY)
+    verify(rules.length >= 32, "every shipped detection needs copy, got " + rules.length)
+    for (var i = 0; i < rules.length; i++) {
+      var c = Copy.COPY[rules[i]]
+      var badTitle = Copy.bannedWordsIn(c.title)
+      var badStake = Copy.bannedWordsIn(c.stake)
+      compare(badTitle.length, 0, rules[i] + " title says: " + badTitle.join(", "))
+      compare(badStake.length, 0, rules[i] + " stake says: " + badStake.join(", "))
+      verify(c.title.length > 0 && c.title.length < 80, rules[i] + " title length")
+      verify(c.stake.length > 0, rules[i] + " needs a stake")
+      // No rule id ever leaks into a title.
+      verify(c.title.indexOf("moat-") === -1, rules[i] + " title carries a rule id")
+    }
+  }
+
+  function test_advanced_is_an_escape_hatch_not_a_loophole_in_the_banned_words() {
+    // The point of the list is that detection 33 cannot reintroduce log-speak
+    // into the DEFAULT voice. Advanced must not become the way to do that.
+    //
+    // 1. The rule still binds every shipped string, whatever mode the panel is
+    //    in -- Copy.COPY is one table and bannedWordsIn does not take a mode.
+    var rules = Object.keys(Copy.COPY)
+    for (var i = 0; i < rules.length; i++) {
+      compare(Copy.bannedWordsIn(Copy.COPY[rules[i]].title).length, 0)
+      compare(Copy.bannedWordsIn(Copy.COPY[rules[i]].stake).length, 0)
+    }
+
+    // 2. An alert whose daemon title is full of banned words renders clean in
+    //    the default voice, and verbatim in Advanced. Both halves matter: the
+    //    first is the rule holding, the second is Advanced actually working.
+    var logSpeak = {
+      rule: "moat-persist-hypr-config-write",
+      title: "kprobe lsm hook: uid 1000 pid 42 exe /usr/bin/sed, severity high, allowlist miss",
+      summary: "tetragon policy fired"
+    }
+    compare(Copy.bannedWordsIn(Copy.titleFor(logSpeak)).length, 0,
+            "the default voice never prints the daemon's vocabulary")
+    verify(Copy.bannedWordsIn(Copy.titleFor(logSpeak, true)).length > 0,
+            "Advanced is where those words are allowed, and it is the only place")
+
+    // 3. A detection with NO copy has always fallen back to the daemon's own
+    //    string, in both modes. That is the pre-existing floor, not something
+    //    Advanced introduced, and it is why the list is enforced over the table
+    //    rather than over titleFor's output.
+    var uncovered = { rule: "moat-not-written-yet", title: "severity high on pid 42" }
+    verify(!Copy.hasCopy("moat-not-written-yet"))
+    compare(Copy.titleFor(uncovered), Copy.titleFor(uncovered, true))
+  }
+
+  function test_every_detection_the_daemon_ships_has_copy() {
+    // The 42 policies in policies/*.yaml. A new detection added without copy
+    // fails here rather than shipping as log-speak.
+    var shipped = [
+      "moat-cred-registry-token-read", "moat-cred-etc-shadow-read",
+      "moat-cred-browser-secrets-read", "moat-cred-ssh-private-key-read",
+      "moat-cred-ai-credentials-read", "moat-persist-hypr-config-write",
+      "moat-cred-gnupg-keyring-read", "moat-persist-omarchy-hooks-write",
+      "moat-persist-desktop-entry-write", "moat-cred-vcs-token-read",
+      "moat-persist-authorized-keys-write", "moat-cred-cloud-credentials-read",
+      "moat-rootkit-kernel-module-load", "moat-persist-agent-config-write",
+      "moat-exec-untrusted-home", "moat-rootkit-ldso-preload-write",
+      "moat-persist-git-hook-write", "moat-priv-setcap-xattr",
+      "moat-rootkit-bpffs-write", "moat-persist-autostart-write",
+      "moat-priv-ptrace-attach", "moat-exec-untrusted-tmpfs",
+      "moat-rootkit-bpf-prog-load", "moat-persist-omarchy-menu-extension-write",
+      "moat-persist-omarchy-plugin-write", "moat-priv-setuid-chmod",
+      "moat-net-suspicious-port-egress", "moat-net-tmpfs-binary-egress",
+      "moat-shell-reverse-shell-connect", "moat-persist-shell-rc-write",
+      "moat-persist-system-unit-write", "moat-priv-proc-mem-access",
+      // self-protection, covering-tracks and project-local credentials
+      "moat-rootkit-evidence-tamper", "moat-rootkit-sensor-tamper",
+      "moat-rootkit-history-tamper", "moat-rootkit-system-log-tamper",
+      "moat-rootkit-trust-store-write", "moat-cred-project-token-read",
+      "moat-cred-ssh-agent-socket", "moat-cred-ssh-recon-read",
+      "moat-priv-container-socket-connect", "moat-persist-git-config-write"
+    ]
+    var cov = Copy.coverage(shipped)
+    compare(cov.missing.length, 0, "no copy for: " + cov.missing.join(", "))
+    compare(cov.have, 42)
+  }
+
+  // ------------------------------------------------------------------ triage
+  //
+  // LEARNING 2c. The verdict is a model's opinion attached to kernel evidence,
+  // so what is tested here is mostly what it is NOT allowed to look like.
+
+  function triagedAlert(triage, severity) {
+    return Model.decorateAlerts(Model.foldText(JSON.stringify({
+      v: 1, id: "A", severity: severity || "high", rule: "moat-exec-untrusted-home",
+      title: "t", ts: "2026-09-03T10:00:00Z", triage: triage
+    })), {})[0]
+  }
+
+  function test_no_triage_is_the_normal_case() {
+    var alert = triagedAlert(undefined)
+    compare(alert.triage, null, "auto_triage off means every alert has none")
+    compare(alert.surface, "alerts")
+    compare(Model.triageChip(alert), "")
+    compare(Model.triageOutcomeText(alert), "")
+  }
+
+  function test_a_demoting_verdict_moves_the_alert_to_the_timeline() {
+    var alert = triagedAlert({
+      agent: "claude", at: "2026-09-03T10:01:00Z", verdict: "benign",
+      confidence: "high", summary: "your own AUR install", reasoning: "makepkg",
+      outcome: "demoted"
+    })
+    compare(alert.triage.demoted, true)
+    compare(alert.demoted, true)
+    // The daemon sets surface on the alert, but the panel derives its own from
+    // rule and severity — so without alertSurface reading the verdict, a triage
+    // demotion would change nothing the user could see.
+    compare(alert.surface, "timeline", "a triage demotion has to reach the tab")
+    compare(alert.visible, true, "demoted is quiet, never hidden")
+    // The ceiling: everything else about the alert is untouched.
+    compare(alert.acked, false)
+    compare(alert.severity, "high")
+    compare(alert.suppressed_by, "")
+  }
+
+  function test_a_withheld_verdict_stays_in_the_badge_and_says_why() {
+    var alert = triagedAlert({
+      verdict: "benign", confidence: "high", summary: "s", reasoning: "r",
+      outcome: "withheld: critical is above the high demote ceiling"
+    }, "critical")
+    compare(alert.triage.demoted, false)
+    compare(alert.triage.withheld, "critical is above the high demote ceiling")
+    compare(alert.surface, "alerts", "withheld means it stays where it was")
+    verify(Model.triageOutcomeText(alert).indexOf("Left in the badge count") === 0)
+    verify(Model.triageOutcomeText(alert).indexOf("above the high demote ceiling") > 0)
+  }
+
+  function test_an_annotating_verdict_changes_nothing_about_the_tab() {
+    var alert = triagedAlert({
+      verdict: "malicious", confidence: "high", summary: "s", reasoning: "r",
+      outcome: "annotated"
+    })
+    compare(alert.surface, "alerts")
+    compare(alert.demoted, false)
+    compare(Model.triageChip(alert), "malicious · high")
+    compare(Model.triageOutcomeText(alert), "Recorded against this alert. Nothing was changed.")
+  }
+
+  // The verdict came from a language model that had just read hostile input,
+  // so an unrecognized value must land somewhere harmless rather than being
+  // rendered raw or believed.
+  function test_an_unrecognized_verdict_degrades_to_unclear_not_to_benign() {
+    var alert = triagedAlert({
+      verdict: "definitely-fine", confidence: "absolute", summary: "s",
+      reasoning: "r", outcome: "demoted"
+    })
+    compare(alert.triage.verdict, "unclear")
+    compare(alert.triage.confidence, "low")
+  }
+
+  function test_a_verdict_with_nothing_said_is_not_a_verdict() {
+    compare(Model.normalizeTriage(null), null)
+    compare(Model.normalizeTriage({ verdict: "benign", confidence: "high" }), null)
+    compare(Model.normalizeTriage({ verdict: "benign", summary: "   " }), null)
+    // Reasoning alone is enough to be worth showing.
+    verify(Model.normalizeTriage({ verdict: "benign", reasoning: "r" }) !== null)
+  }
+
+  function test_the_proposed_allowlist_is_carried_as_text_and_capped() {
+    var t = Model.normalizeTriage({
+      verdict: "benign", confidence: "high", summary: "s", reasoning: "r",
+      proposed_allowlist: "  [[rule]]\nname = \"x\"  ",
+      recommend: ["a", "b", "c", "d", "e", "f", "g", "h", "", "  "]
+    })
+    compare(t.proposed_allowlist, "[[rule]]\nname = \"x\"")
+    compare(t.recommend.length, 6, "a model does not get an unbounded list")
+    compare(t.outcome, "annotated", "a missing outcome is the harmless one")
   }
 
   function test_alerts_surface_puts_unacked_first_then_newest() {
@@ -1331,8 +2253,16 @@ TestCase {
   }
 
   function test_analyze_label_and_hint() {
-    compare(Model.analyzeLabel("claude"), "Analyze with claude")
+    // The button never carries a vendor name: `omarchy default agent` may be
+    // any of them, and the label has to describe what the button DOES rather
+    // than which model happens to be configured. The name is a tooltip, which
+    // is evidence and not a promise.
+    compare(Model.analyzeLabel("claude"), "Open in the Omarchy agent")
+    compare(Model.analyzeLabel("codex"), "Open in the Omarchy agent")
     compare(Model.analyzeLabel(""), "", "no default agent means no button")
+    verify(Model.analyzeTooltip("codex").indexOf("codex") >= 0)
+    verify(Model.analyzeTooltip("codex").indexOf("terminal") >= 0,
+           "the tooltip says it leaves the panel, because it does")
     verify(Model.ANALYZE_HINT.indexOf("omarchy default agent") >= 0)
   }
 
@@ -1486,5 +2416,1455 @@ TestCase {
     compare(Model.quarantineView({ quarantine: [] }).length, 0)
     compare(Model.quarantineView({}).length, 0)
     compare(Model.quarantineView(null).length, 0)
+  }
+
+  // ==========================================================================
+  //  Stages 2, 3, 5 and 6 of docs/design/PLAN.md
+  // ==========================================================================
+
+  // --- the sensor gate, against the shape the panel actually passes ---------
+
+  function test_the_sensor_gate_reads_the_shape_the_panel_hands_it() {
+    // The live panel never passes a raw status: Service.status is the output of
+    // normalizeStatus, which renames sensor_unhealthy -> sensorUnhealthy and
+    // sensors_loaded -> sensorsLoaded. Reading only the snake_case names meant
+    // the gate never fired on a real machine while every test that hand-wrote a
+    // raw status passed, which is exactly the failure 2f exists to prevent.
+    var raw = { ok: true, tetragon: "running", policies: 32,
+                sensors_loaded: 11, sensor_unhealthy: true }
+    verify(!Model.sensorHealthy(raw), "raw daemon shape")
+    verify(!Model.sensorHealthy(Model.normalizeStatus(raw)), "normalized shape")
+    compare(Model.verdict([], Model.normalizeStatus(raw)).line, "Watching, with one gap.")
+
+    var loadedShort = Model.normalizeStatus({ ok: true, tetragon: "running",
+                                              policies: 32, sensors_loaded: 11 })
+    verify(!Model.sensorHealthy(loadedShort),
+           "fewer sensors loaded than policies is a gap even without the flag")
+    verify(Model.sensorHealthy(Model.normalizeStatus(
+      { ok: true, tetragon: "running", policies: 32, sensors_loaded: 32 })))
+  }
+
+  // --- 1c, the silence choice ----------------------------------------------
+
+  function scopedAlert(hint) {
+    return incAlert({
+      id: "01S",
+      process: { exe: "/usr/bin/claude", ancestry: [{ pid: 2, exe: "/usr/bin/makepkg" }] },
+      explain: {
+        if_expected: {
+          hint: hint,
+          options: [
+            { scope: "rule", line: "[[rule]]\nname = \"r\"\n" },
+            { scope: "exe", line: "[[rule]]\nexe = \"/usr/bin/claude\"\n" },
+            { scope: "parent", line: "[[rule]]\nparent = \"/usr/bin/makepkg\"\n" }
+          ]
+        }
+      }
+    })
+  }
+
+  function test_the_broadest_silence_is_never_first_and_never_recommended() {
+    // 1c draws the machine-wide scope duller and last. It is the one choice
+    // whose consequences cannot be seen from the screen, so even a daemon that
+    // recommends it must not get it into the first (pre-selected) position.
+    var alerts = Model.foldText(JSON.stringify(scopedAlert("rule")) + "\n")
+    var scopes = Model.silenceScopes(alerts[0], 68)
+    compare(scopes.length, 3)
+    compare(scopes[scopes.length - 1].scope, "rule")
+    verify(scopes[scopes.length - 1].broadest)
+    for (var i = 0; i < scopes.length; i++) {
+      if (scopes[i].scope === "rule") verify(!scopes[i].recommended,
+        "the machine-wide scope must never arrive recommended")
+    }
+  }
+
+  function test_scope_chips_are_consequences_and_the_toml_is_the_daemons() {
+    var alerts = Model.foldText(JSON.stringify(scopedAlert("exe")) + "\n")
+    var scopes = Model.silenceScopes(alerts[0], 68)
+    compare(scopes[0].scope, "exe")
+    compare(scopes[0].label, "when claude does it")
+    // The parent chip names the parent the alert actually recorded.
+    var parent = null
+    for (var i = 0; i < scopes.length; i++) if (scopes[i].scope === "parent") parent = scopes[i]
+    compare(parent.label, "anything makepkg starts")
+    // Both halves of the consequence, always: what goes quiet AND what still
+    // reaches you. A silence explained only by what it silences is how somebody
+    // agrees to a rule they would not have written.
+    verify(scopes[0].consequence.silences.indexOf("68") !== -1)
+    verify(scopes[0].consequence.through.length > 0)
+    // The TOML is the daemon's own string, carried through untouched. Nothing
+    // in the panel composes one.
+    compare(scopes[0].line, "[[rule]]\nexe = \"/usr/bin/claude\"\n")
+  }
+
+  function test_an_alert_with_no_offered_scope_offers_no_chip() {
+    // No invented scopes. An alert the daemon has no rule for gets an empty
+    // list, and the view says so instead of sending a scope nobody offered.
+    compare(Model.silenceScopes(incAlert({}), 1).length, 0)
+    compare(Model.silenceScopes(null, 1).length, 0)
+  }
+
+  // --- 1d, History ----------------------------------------------------------
+
+  function test_history_groups_by_local_day_newest_first() {
+    var now = Date.parse("2026-09-04T12:00:00Z")
+    var inc = incidentsOf([
+      incAlert({ id: "01A", rule: "r1", ts: "2026-09-04T10:00:00Z" }),
+      incAlert({ id: "01B", rule: "r2", ts: "2026-09-03T10:00:00Z" }),
+      incAlert({ id: "01C", rule: "r3", ts: "2026-08-20T10:00:00Z" })
+    ])
+    var days = Model.historyDays(inc, now)
+    compare(days.length, 3)
+    // Newest first, and named the way a person names a day they are trying to
+    // remember: by how recent, then by weekday, then by date.
+    compare(days[0].label, "Today")
+    compare(days[1].label, "Yesterday")
+    compare(days[2].label, "20 Aug")
+    compare(days[0].incidents.length, 1)
+  }
+
+  function test_the_day_header_counts_decisions_not_events() {
+    var now = Date.parse("2026-09-04T12:00:00Z")
+    // One needing a decision, one covered by a rule, one already acted on --
+    // and the covered one carrying 41 events, which must NOT become "41" in the
+    // header. A number in this panel is a number of decisions.
+    var inc = incidentsOf([
+      incAlert({ id: "01A", rule: "r1", ts: "2026-09-04T10:00:00Z" }),
+      incAlert({ id: "01B", rule: "r2", ts: "2026-09-04T10:01:00Z",
+                 count: 41, suppressed_by: "user.toml#1" }),
+      incAlert({ id: "01C", rule: "r3", ts: "2026-09-04T10:02:00Z", action_taken: "killed" })
+    ], { showSuppressed: true })
+    var days = Model.historyDays(inc, now)
+    compare(days.length, 1)
+    compare(days[0].needed, 1)
+    compare(days[0].covered, 1)
+    compare(days[0].contained, 1)
+    verify(days[0].summary.indexOf("1 needed you") === 0)
+    compare(days[0].summary.indexOf("41"), -1, "the header must not count events")
+
+    // A day with nothing waiting says so first.
+    var quiet = Model.daySummary({ needed: 0, explained: 3, covered: 41, contained: 0 })
+    verify(quiet.indexOf("nothing needed you") === 0)
+  }
+
+  function test_history_filters_split_decisions_from_silence() {
+    var inc = incidentsOf([
+      incAlert({ id: "01A", rule: "r1" }),
+      incAlert({ id: "01B", rule: "r2", suppressed_by: "baseline.toml#3" }),
+      incAlert({ id: "01C", rule: "r3", action_taken: "killed" })
+    ], { showSuppressed: true })
+    compare(Model.filterHistory(inc, "everything").length, 3)
+    // "Needed you" is the decisions column: still open, or already acted on.
+    compare(Model.filterHistory(inc, "needsYou").length, 2)
+    compare(Model.filterHistory(inc, "covered").length, 1)
+  }
+
+  function test_a_covered_row_names_whose_decision_silenced_it() {
+    // 1d appends the covering rule to the title in a dimmer colour. The daemon
+    // names it as a fragment and an index, which is a file path and an ordinal
+    // -- the two things a title is not allowed to carry. What the user needs is
+    // WHOSE decision it was.
+    var mine = incidentsOf([incAlert({ id: "01A", count: 68, suppressed_by: "user.toml#1" })],
+                           { showSuppressed: true })
+    compare(Model.historyNote(mine[0]), "·  68 times  ·  a rule you added")
+    var learned = incidentsOf([incAlert({ id: "01B", suppressed_by: "baseline.toml#3" })],
+                              { showSuppressed: true })
+    compare(Model.historyNote(learned[0]), "·  a rule Moat learned")
+    var demoted = incidentsOf([incAlert({ id: "01C", suppressed_by: "demoted:moat-x" })],
+                              { showSuppressed: true })
+    compare(Model.historyNote(demoted[0]), "·  Moat stopped asking")
+
+    // A rule the noise guard demoted carries NO marker on the alert -- it is
+    // quiet because of `status.demoted_rules[]` -- so the phrase is resolved
+    // against the same demoted set the state was. Without that, half the
+    // covered rows in History said "covered" and explained nothing.
+    var byGuard = incidentsOf([incAlert({ id: "01E", rule: "moat-x-quiet" })],
+                              { demotedRules: ["moat-x-quiet"] })
+    compare(byGuard[0].state, "expected")
+    compare(Model.historyNote(byGuard[0]), "·  Moat stopped asking")
+    // Nothing to qualify: no suffix at all rather than an empty separator.
+    compare(Model.historyNote(incidentsOf([incAlert({ id: "01D" })])[0]), "")
+  }
+
+  // --- 1e, Rules ------------------------------------------------------------
+
+  function shippedRule(over) {
+    var base = { name: "moat-cred-ssh-private-key-read", exe: "/usr/bin/ssh",
+                 source: "shipped", removable: false, index: 1, path: null,
+                 file: "/etc/moat/allowlist.d/omarchy-default.toml" }
+    for (var k in over) base[k] = over[k]
+    return base
+  }
+
+  function test_sixteen_shipped_rules_become_about_five_lines() {
+    var parsed = Model.parseAllowlist({ ok: true, rules: [
+      shippedRule({ exe: "/usr/bin/ssh" }),
+      shippedRule({ exe: "/usr/bin/ssh-agent" }),
+      shippedRule({ exe: "/usr/bin/ssh-add" }),
+      shippedRule({ exe: "/usr/bin/git", name: "moat-cred-vcs-token-read" }),
+      shippedRule({ exe: "/usr/bin/pacman", name: "moat-pkg-downloader-exec" }),
+      shippedRule({ exe: "/usr/bin/makepkg", name: "moat-pkg-downloader-exec" }),
+      shippedRule({ exe: "/usr/bin/hyprctl", name: "moat-persist-hypr-config-write" }),
+      shippedRule({ exe: "/usr/bin/firefox", name: "moat-cred-browser-secrets-read" })
+    ] })
+    var groups = Model.shippedRuleGroups(parsed.rules)
+    // Five groups, named for what they cover rather than for a detection.
+    var labels = groups.map(function (g) { return g.label })
+    compare(groups.length, 5)
+    verify(labels.indexOf("Your SSH tools") !== -1)
+    verify(labels.indexOf("git") !== -1)
+    verify(labels.indexOf("Your package manager") !== -1)
+    verify(labels.indexOf("Your desktop") !== -1)
+    verify(labels.indexOf("Browsers") !== -1)
+    // Biggest group first, and every group carries the entries it collapsed.
+    compare(groups[0].label, "Your SSH tools")
+    compare(groups[0].count, 3)
+    compare(groups[0].rules.length, 3)
+    // No rule id anywhere in a group name or its reason.
+    for (var i = 0; i < groups.length; i++) {
+      compare(groups[i].label.indexOf("moat-"), -1)
+      compare(groups[i].reason.indexOf("moat-"), -1)
+    }
+  }
+
+  function test_everything_unrecognised_lands_in_one_group_and_lands_last() {
+    var parsed = Model.parseAllowlist({ ok: true, rules: [
+      shippedRule({ exe: "/opt/vendor/thing", name: "moat-exec-untrusted-home" }),
+      shippedRule({ exe: "/opt/vendor/other", name: "moat-exec-untrusted-home" }),
+      shippedRule({ exe: "/usr/bin/ssh" })
+    ] })
+    var groups = Model.shippedRuleGroups(parsed.rules)
+    compare(groups.length, 2)
+    // A group of one is a card again, so unmatched programs share one line --
+    // and it sorts last however many entries it holds.
+    compare(groups[groups.length - 1].key, "other")
+    compare(groups[groups.length - 1].count, 2)
+  }
+
+  function test_a_rule_you_added_carries_what_it_has_silenced_since() {
+    // The silenced-count column is the ONLY way a user can tell whether a rule
+    // they wrote was a good idea. It comes from the daemon's own per-tuple
+    // counters, which keep counting after an allowlist entry starts hiding the
+    // tuple -- which is exactly what makes them the right number.
+    var parsed = Model.parseAllowlist({ ok: true, rules: [{
+      index: 1, file: "/etc/moat/allowlist.d/user.toml", source: "user",
+      removable: true, name: "moat-ai-cli-in-pkg-subtree", exe: "/usr/bin/claude",
+      // `path: null` the way moatd sends it: the key is always present, and
+      // that is what tells normalizeAllowlistRule that `file` is the FRAGMENT
+      // rather than the rule's own file glob.
+      path: null,
+      comment: "added 2026-09-03 from alert 01M: An install started an AI tool"
+    }] })
+    var exported = Model.parseBaselineExport({ tuples: [
+      { rule: "moat-ai-cli-in-pkg-subtree", exe: "/usr/bin/claude",
+        count: 68, suppressed: true, last_seen: "2026-09-04T10:00:00Z" },
+      { rule: "moat-ai-cli-in-pkg-subtree", exe: "/usr/bin/claude",
+        count: 4, suppressed: true, parent: "/usr/bin/bash",
+        last_seen: "2026-09-04T11:00:00Z" }
+    ] })
+    var rows = Model.userRuleRows(parsed.rules, exported.tuples)
+    compare(rows.length, 1)
+    compare(rows[0].silenced, 72)
+    compare(rows[0].label, "claude, running during package installs")
+    // The provenance line is parsed, not printed: the daemon's comment carries
+    // an alert id and an old log-speak title, and neither belongs on screen.
+    compare(rows[0].provenance, "you added this on 2026-09-03")
+    compare(rows[0].provenance.indexOf("01M"), -1)
+    compare(rows[0].index, 1)
+    compare(rows[0].file, "user.toml")
+    verify(rows[0].removable)
+  }
+
+  function test_an_untracked_rule_says_not_counted_rather_than_zero() {
+    // "the daemon is not counting this one" and "it has silenced nothing" are
+    // different answers, and a 0 in that column would be a lie about the second.
+    var parsed = Model.parseAllowlist({ ok: true, rules: [{
+      index: 1, file: "/etc/moat/allowlist.d/user.toml", source: "user",
+      removable: true, name: "moat-cred-ssh-private-key-read", exe: "/usr/bin/rsync",
+      path: null
+    }] })
+    compare(Model.userRuleRows(parsed.rules, []).length, 1)
+    compare(Model.userRuleRows(parsed.rules, [])[0].silenced, -1)
+  }
+
+  function test_a_hand_written_comment_survives_and_a_machine_one_does_not() {
+    var hand = Model.ruleProvenance({ comment: "keeps my deploy script quiet" })
+    compare(hand, "keeps my deploy script quiet")
+    // A machine comment it cannot parse is dropped rather than printed: those
+    // are the ones carrying alert ids and file paths.
+    compare(Model.ruleProvenance({ comment: "added by something else entirely" }), "")
+    compare(Model.ruleProvenance({ comment: "learned 2026-09-03: seen 4 times on 1 day" }),
+            "Moat learned this on 2026-09-03, after 4 alerts")
+  }
+
+  // --- 2e, programs Moat knows ---------------------------------------------
+
+  function test_trusted_programs_are_only_the_ones_a_rule_covers() {
+    var exported = Model.parseBaselineExport({ tuples: [
+      { rule: "moat-cred-ssh-private-key-read", exe: "/usr/bin/ssh",
+        count: 204, learned: true, last_seen: "2026-09-04T09:00:00Z" },
+      { rule: "moat-persist-hypr-config-write", exe: "/usr/bin/nvim",
+        dir: "/home/dan/.config", count: 96, suppressed: true,
+        last_seen: "2026-09-04T11:00:00Z" },
+      // Observed but not trusted by anything: it is a log line, not a program
+      // Moat treats as yours, and listing it here would make this a log again.
+      { rule: "moat-exec-untrusted-home", exe: "/usr/bin/curl", count: 3 }
+    ] })
+    var rows = Model.trustedPrograms(exported.tuples, [])
+    compare(rows.length, 2)
+    var names = rows.map(function (r) { return r.program })
+    compare(names.indexOf("curl"), -1)
+    // Busiest first, and the scope is stated as a permission in plain words.
+    compare(rows[0].program, "ssh")
+    compare(rows[0].silenced, 204)
+    compare(rows[0].scope, "reading your keys")
+    compare(rows[1].scope, "writing under ~/.config")
+    compare(rows[1].scope.indexOf("/home/dan"), -1, "a home path is shortened")
+  }
+
+  function test_an_open_incident_marks_a_trusted_row_and_never_creates_one() {
+    // The handoff draws 2e with a `flea` row reading "nothing yet — one
+    // incident waiting on you". On a real machine with nine things waiting
+    // that inverts the screen: most of the rows under "programs Moat treats as
+    // yours" become programs it trusts for nothing. A program with no trust is
+    // an incident, and incidents live on Now.
+    var trusted = Model.parseBaselineExport({ tuples: [
+      { rule: "moat-persist-hypr-config-write", exe: "/usr/bin/nvim",
+        dir: "/home/dan/.config", count: 96, learned: true }
+    ] }).tuples
+
+    var waiting = incidentsOf([incAlert({ id: "01A", process: { exe: "/usr/bin/nvim" } })])
+    var rows = Model.trustedPrograms(trusted, waiting)
+    compare(rows.length, 1)
+    compare(rows[0].program, "nvim")
+    verify(rows[0].open)
+    verify(rows[0].trusted, "it still has its real permissions")
+    verify(rows[0].scope.indexOf("writing under ~/.config") === 0)
+    verify(rows[0].scope.indexOf("one thing waiting on you") !== -1)
+
+    // A program that is trusted for nothing gets no row, however loud it is.
+    var stranger = incidentsOf([incAlert({ id: "01B", process: { exe: "/tmp/x/nc" } })])
+    compare(Model.trustedPrograms(trusted, stranger).length, 1)
+    compare(Model.trustedPrograms(trusted, stranger)[0].program, "nvim")
+    compare(Model.trustedPrograms([], stranger).length, 0)
+  }
+
+  function test_one_verb_over_many_places_is_one_permission() {
+    // The verb said once and the places counted. Printed a sentence per tuple,
+    // this row read "writing under ~/.config/dir0, writing under
+    // ~/.config/dir1, writing und…" -- three quarters of the cell spent
+    // re-reading the verb, and the paths cut off just before they differed.
+    var tuples = []
+    for (var i = 0; i < 8; i++) {
+      tuples.push({ rule: "moat-persist-hypr-config-write", exe: "/usr/bin/quickshell",
+                    dir: "/home/dan/.config/dir" + i, count: 3, learned: true })
+    }
+    var rows = Model.trustedPrograms(Model.parseBaselineExport({ tuples: tuples }).tuples, [])
+    compare(rows.length, 1)
+    verify(rows[0].trusted)
+    compare(rows[0].scope, "writing under 8 places in ~/.config")
+    compare(rows[0].scope.indexOf("\n"), -1)
+
+    // One place still names it: a count is only worth more than a path when
+    // there is more than one path.
+    var single = Model.trustedPrograms(Model.parseBaselineExport({ tuples: [
+      { rule: "moat-exec-untrusted-home", exe: "/usr/bin/bwrap",
+        dir: "/tmp/build", count: 3, learned: true }
+    ] }).tuples, [])
+    compare(single[0].scope, "running from /tmp/build")
+
+    // Paths that share nothing above the root are counted without a place,
+    // because "3 places in /" tells a reader less than "3 places" does.
+    var scattered = Model.trustedPrograms(Model.parseBaselineExport({ tuples: [
+      { rule: "moat-exec-untrusted-home", exe: "/usr/bin/sh", dir: "/tmp/a", count: 1, learned: true },
+      { rule: "moat-exec-untrusted-home", exe: "/usr/bin/sh", dir: "/opt/b", count: 1, learned: true },
+      { rule: "moat-exec-untrusted-home", exe: "/usr/bin/sh", dir: "/srv/c", count: 1, learned: true }
+    ] }).tuples, [])
+    compare(scattered[0].scope, "running from 3 places")
+  }
+
+  function test_a_row_states_at_most_three_permissions() {
+    // Past three it is a list, and a list belongs behind the row rather than
+    // inside it: one program with twenty learned tuples was wrapping its row
+    // over three lines and pushing the table apart. Five DIFFERENT permissions
+    // are five things to know, so they cannot be collapsed the way repeated
+    // directories under one verb can.
+    var families = ["cred-ssh-private-key-read", "pkg-subtree-interpreter-spawn",
+                    "net-egress-new-host", "priv-setuid-exec", "shell-reverse-spawn"]
+    var tuples = []
+    for (var i = 0; i < families.length; i++) {
+      tuples.push({ rule: "moat-" + families[i], exe: "/usr/bin/quickshell",
+                    count: 3, learned: true })
+    }
+    var rows = Model.trustedPrograms(Model.parseBaselineExport({ tuples: tuples }).tuples, [])
+    compare(rows.length, 1)
+    verify(rows[0].trusted)
+    verify(rows[0].scope.indexOf("and 2 more") !== -1, rows[0].scope)
+    compare(rows[0].scope.indexOf("\n"), -1)
+  }
+
+  function test_a_baseline_export_from_an_older_daemon_is_an_empty_table() {
+    compare(Model.parseBaselineExport("").tuples.length, 0)
+    compare(Model.parseBaselineExport("not json").ok, false)
+    compare(Model.parseBaselineExport(null).tuples.length, 0)
+    compare(Model.trustedPrograms(null, null).length, 0)
+  }
+
+  // --- 2b / 3a, the sequence ------------------------------------------------
+  //
+  // Built from the real record on this machine (fixtures/chain.jsonl), because
+  // the reason the panel showed one lonely row for a correlated chain was that
+  // every part of this was checked against a shape nobody had ever seen come
+  // out of moatd.
+
+  /// A synthetic chain object in the daemon's exact shape, for the cases the
+  /// live record cannot produce (an escalation, a context step, a truncation).
+  function fakeChain(over) {
+    var base = {
+      v: 1, id: "01CH", ancestor: { pid: 41201, exe: "/usr/bin/npm" },
+      families: ["cred", "net"], severity: "critical", severity_base: "high",
+      severity_reason: "high -> critical: a credential was read and the same process tree then connected out",
+      first_ts: "2026-09-04T09:16:00Z", last_ts: "2026-09-04T09:17:00Z", span_secs: 60,
+      steps: [
+        { alert: "01S1", ts: "2026-09-04T09:16:00Z", family: "cred",
+          rule: "moat-cred-ssh-private-key-read", severity: "high",
+          title: "Private SSH key read", pid: 41233, exe: "/usr/bin/node", role: "trigger" },
+        { alert: "01S2", ts: "2026-09-04T09:17:00Z", family: "net",
+          rule: "moat-x-pkg-egress", severity: "medium",
+          title: "A package install talked to an unexpected host", pid: 41233,
+          exe: "/usr/bin/node", role: "trigger" }
+      ],
+      steps_total: 2, truncated: false,
+      summary: "2 things happened in 60 seconds under npm (pid 41201), crossing cred and net."
+    }
+    for (var k in over) base[k] = over[k]
+    return base
+  }
+
+  function test_a_chain_update_reaches_the_panel_at_all() {
+    // moatd writes the chain back onto every member as an `update` line,
+    // because correlation needs the second alert and by then the first is
+    // already on disk. `UPDATABLE` did not list `chain`, so every one of those
+    // lines was read, recognised and thrown away -- which is the whole of why
+    // a correctly correlated chain drew one row.
+    var alerts = suite.chainAlerts()
+    compare(alerts.length, 2, "the two members of the real chain")
+    for (var i = 0; i < alerts.length; i++) {
+      verify(!!alerts[i].chain, alerts[i].id + " lost the chain moatd wrote onto it")
+      compare(alerts[i].chain.id, "01M1Q4KAVQNH96MAW2ASV2QMCD")
+      compare(alerts[i].chain.steps_total, 2)
+      compare(alerts[i].chain.steps.length, 2)
+    }
+    // CONTRACT 4: every member carries the WHOLE chain, so either one can draw
+    // 2b without joining anything.
+    compare(alerts[0].chain.steps[0].alert, alerts[1].chain.steps[0].alert)
+  }
+
+  function test_a_triage_verdict_reaches_the_panel_at_all() {
+    // The same fault as `chain`, one field over. A verdict is ALWAYS an update
+    // -- the pass runs on a timer, long after the alert was written -- and
+    // `UPDATABLE` did not list `triage`, so every verdict moatd appended was
+    // read and dropped. The panel showed no AI analysis anywhere while
+    // `moatctl explain` on the same id printed it, because the socket carried
+    // the field and the log reader threw it away.
+    var alerts = suite.chainAlerts()
+    var withVerdict = null
+    for (var i = 0; i < alerts.length; i++) {
+      if (alerts[i].id === "01M1Q4KAVQNH96MAW2ASV2QMCD") withVerdict = alerts[i]
+    }
+    verify(!!withVerdict, "the alert the real triage line names is in the fixture")
+    verify(!!withVerdict.triage, "the verdict moatd appended was dropped by the reader")
+    compare(withVerdict.triage.verdict, "benign")
+    compare(withVerdict.triage.confidence, "high")
+    verify(withVerdict.triage.summary.length > 0, "a verdict with no summary shows nothing")
+  }
+
+  function test_a_sequence_says_which_day_it_happened_on() {
+    // "20:06:10" is unreadable a day later. Steps keep clock times -- a chain
+    // spans seconds, so a date per row is one string repeated -- and the day
+    // is stated once for the whole sequence, in full, year included.
+    var day = Model.chainDay(fakeChain())
+    compare(day, "Fri 4 Sep 2026")
+    // Taken from the chain's own first_ts, not from the reader's clock.
+    compare(Model.chainDay(fakeChain({ first_ts: "2026-01-02T08:00:00Z" })).slice(-4), "2026")
+    // Nothing to say beats saying something wrong.
+    compare(Model.chainDay(null), "")
+    compare(Model.chainDay({ first_ts: "not a date" }), "")
+  }
+
+  function test_a_kill_is_never_reported_as_a_quiet_day() {
+    // Two contradictions on one screen, both from reading system-wide state to
+    // describe one event: the headline said "Nothing needs you" and the
+    // sub-line said "Nothing has been blocked, because you are still in monitor
+    // mode" -- while an armed rule had just SIGKILLed a process in the user's
+    // terminal. A rule armed on its own enforces whatever the daemon-wide mode
+    // says, which is the whole point of arming one.
+    var killed = incAlert({
+      id: "01K", rule: "moat-cred-etc-shadow-read", severity: "high",
+      surface: "alerts", mode: "enforce", action_taken: "killed" })
+    var incidents = Model.buildIncidents(Model.foldText(JSON.stringify(killed) + "\n"), {})
+    compare(Model.stoppedIncidents(incidents).length, 1)
+
+    var v = Model.verdict(incidents, { ok: true, sensorUnhealthy: false, sensorsLoaded: 43 })
+    compare(v.state, "stopped")
+    compare(v.line, "Moat stopped one thing.")
+    // Not the alarm colour: it is over, and shouting about something already
+    // handled is how people learn to ignore the shouting.
+    compare(v.tone, "accent")
+
+    // Once acknowledged it stops being news.
+    killed.acked = true
+    var closed = Model.buildIncidents(Model.foldText(JSON.stringify(killed) + "\n"), {})
+    compare(Model.stoppedIncidents(closed).length, 0)
+    compare(Model.verdict(closed, { ok: true, sensorUnhealthy: false, sensorsLoaded: 43 }).state,
+            "quiet")
+  }
+
+  function test_the_apology_card_and_the_headline_never_disagree() {
+    // They were two functions answering "is this still outstanding" and only
+    // one of them looked at `acked`: after allowing a killed program the
+    // headline read "Nothing needs you" while the card apologising for that
+    // exact program sat directly underneath it.
+    var killed = incAlert({
+      id: "01K", rule: "moat-cred-etc-shadow-read", severity: "high",
+      surface: "alerts", mode: "enforce", action_taken: "killed" })
+    var open = Model.buildIncidents(Model.foldText(JSON.stringify(killed) + "\n"), {})
+    compare(Model.blockedIncidents(open).length, 1)
+    compare(Model.stoppedIncidents(open).length, 1)
+
+    killed.acked = true
+    var done = Model.buildIncidents(Model.foldText(JSON.stringify(killed) + "\n"), {})
+    compare(Model.stoppedIncidents(done).length, 0)
+    compare(Model.blockedIncidents(done).length, 0,
+            "the card goes when the headline does, or the page contradicts itself")
+
+    // A kill the USER asked for is not an apology moat owes: `mode` is the mode
+    // the rule was raised under, and `moatctl kill` is not enforcement.
+    var byHand = incAlert({
+      id: "01H", rule: "moat-cred-etc-shadow-read", severity: "high",
+      surface: "alerts", mode: "monitor", action_taken: "killed" })
+    var manual = Model.buildIncidents(Model.foldText(JSON.stringify(byHand) + "\n"), {})
+    compare(Model.blockedIncidents(manual).length, 0)
+  }
+
+  function test_an_exclusion_is_visible_and_undoable() {
+    // An excluded binary is a hole in an armed rule, and it lives inside a
+    // rendered policy under /run/moat that nobody will ever open. If it does
+    // not reach the panel the machine is quietly less protected than the Rules
+    // screen says -- and `normalizeStatus` is a whitelist, so a field nobody
+    // lists is dropped in silence. That has happened four times.
+    var st = Model.normalizeStatus(JSON.stringify({
+      ok: true,
+      kernel_exclusions: {
+        "moat-cred-etc-shadow-read": ["/usr/bin/cat"],
+        "moat-rootkit-ldso-preload-write": ["/usr/bin/tee", "/usr/bin/dd"],
+        "moat-broken": "not-a-list",
+        "": ["/usr/bin/x"]
+      }
+    }))
+    compare(st.exclusions.length, 3)
+    var seen = st.exclusions.map(function (e) { return e.rule + ":" + e.exe }).sort()
+    compare(seen[0], "moat-cred-etc-shadow-read:/usr/bin/cat")
+
+    // A daemon too old to report it leaves an empty list, not undefined: the
+    // section binds `visible` to its length.
+    compare(Model.normalizeStatus(JSON.stringify({ ok: true })).exclusions.length, 0)
+  }
+
+  function test_a_containment_is_visible_and_undoable() {
+    // The switch and the list both cross normalizeStatus, so both have to be
+    // whitelisted there or the screen renders empty and looks like a layout
+    // bug -- which is exactly how `enforceable` failed.
+    var st = Model.normalizeStatus(JSON.stringify({
+      ok: true,
+      contain_enabled: true,
+      contain: [
+        { chain: "01CH", exe: "/tmp/lab/browser-helper",
+          dests: ["192.168.44.122"], since: 10, expires: 610 },
+        // Dropped: nothing to name, nothing to release.
+        { chain: "", dests: ["1.2.3.4"] },
+        { chain: "01NO", dests: [] },
+        null
+      ]
+    }))
+    compare(st.containEnabled, true)
+    compare(st.contained.length, 1)
+    compare(st.contained[0].chain, "01CH")
+    compare(st.contained[0].dests[0], "192.168.44.122")
+
+    // Off is the default, and an old daemon that reports neither is off with
+    // nothing live rather than undefined.
+    var bare = Model.normalizeStatus(JSON.stringify({ ok: true }))
+    compare(bare.containEnabled, false)
+    compare(bare.contained.length, 0)
+  }
+
+  function test_the_armable_rules_survive_normalisation() {
+    // The fourth time a field was dropped by a whitelist and the screen that
+    // read it just rendered empty: `chain`, `triage` and `surface` in
+    // UPDATABLE, and now `enforceable` in normalizeStatus. It looked like a
+    // layout bug -- the section was there, deployed, above "Yours", and had
+    // nothing to draw.
+    var st = Model.normalizeStatus(JSON.stringify({
+      ok: true,
+      enforceable: [
+        { rule: "moat-net-tmpfs-binary-egress", enforce: "deny",
+          title: "Binary from /tmp connected out", severity: "critical", armed: false },
+        { rule: "moat-cred-etc-shadow-read", enforce: "kill",
+          title: "Password database read", severity: "critical", armed: true },
+        // Dropped: the panel could not say what arming it would do.
+        { rule: "moat-x-mystery", enforce: "maybe", title: "?" },
+        { enforce: "kill" },
+        null
+      ]
+    }))
+    compare(st.enforceable.length, 2)
+    compare(st.enforceable[0].enforce, "deny")
+    compare(st.enforceable[1].armed, true)
+    // A daemon too old to report the field leaves an empty list, not undefined:
+    // the section binds `visible` to its length.
+    compare(Model.normalizeStatus(JSON.stringify({ ok: true })).enforceable.length, 0)
+  }
+
+  function test_a_chain_can_raise_a_member_onto_the_badge() {
+    // The third field the log reader silently dropped, after `chain` and
+    // `triage`. moatd restamps `surface` when correlation concludes a sequence
+    // is worth interrupting for -- a per-alert rule only ever saw one event.
+    // On 2026-09-04 a live AUR attack was fully detected and fully correlated,
+    // and the user saw nothing, because every member sat on the timeline.
+    var a = Model.foldText(JSON.stringify(incAlert({
+      id: "01S1", severity: "medium", surface: "timeline" })) + "\n")[0]
+    compare(a.surface, "timeline")
+    Model.applyUpdate(a, { surface: "alerts" })
+    compare(a.surface, "alerts", "a high chain has to be able to reach the badge")
+
+    // An unrecognised value is not a licence to invent a third state.
+    Model.applyUpdate(a, { surface: "whatever" })
+    compare(a.surface, "alerts")
+  }
+
+  function test_a_later_update_never_blanks_a_verdict_already_recorded() {
+    // A re-triage that produced nothing is not an instruction to forget the
+    // verdict we have -- the same rule `incident` and `chain` follow.
+    var alerts = suite.chainAlerts()
+    var a = null
+    for (var i = 0; i < alerts.length; i++) {
+      if (alerts[i].id === "01M1Q4KAVQNH96MAW2ASV2QMCD") a = alerts[i]
+    }
+    var kept = a.triage.summary
+    Model.applyUpdate(a, { triage: null })
+    Model.applyUpdate(a, { triage: { verdict: "" } })
+    verify(!!a.triage, "a malformed verdict blanked one that was already recorded")
+    compare(a.triage.summary, kept)
+  }
+
+  function test_a_chain_is_one_incident_and_not_two_rows() {
+    // 3a's entire premise. The two alerts have different rules and would have
+    // been two incidents under the (rule, program) key.
+    var alerts = suite.chainAlerts()
+    compare(Model.buildIncidents(alerts, {}).length, 1,
+            "two alerts moatd put in one chain are one incident")
+    var g = suite.chainIncident()
+    compare(g.count, 2)
+    compare(g.alerts.length, 2)
+    // The subject is the process tree's root, not whichever member sorted
+    // first: the story is about what ran under node.
+    compare(g.program, "node")
+    compare(g.story.length, 2)
+    // And it still needs the user, because one member does.
+    compare(g.state, "needsYou")
+  }
+
+  function test_the_verdict_line_reaches_its_chain_state() {
+    // This state was unreachable: `buildIncidents` never set `chain`, and the
+    // condition read `chain.length > 1` against a field that is an OBJECT with
+    // a `steps` array. Both halves are fixed and this is the proof.
+    var inc = Model.buildIncidents(suite.chainAlerts(), {})
+    var healthy = { tetragon: "running", policies: 1, sensorsLoaded: 1, sensorUnhealthy: false }
+    compare(Model.verdictState(inc, healthy), Copy.VERDICT_CHAIN)
+    var v = Model.verdict(inc, healthy)
+    compare(v.line, "This one needs you now.")
+    compare(v.tone, "alarm")
+    verify(!!v.chain, "the view needs the chain to write 3a's sub-line")
+    compare(v.chain.steps_total, 2)
+    // The old shape would have found nothing to read.
+    compare(inc[0].chain.length, undefined,
+            "a chain is an object, not an array -- if this ever becomes a number, fix verdictState")
+  }
+
+  function test_a_chain_severity_never_prints_without_its_reason() {
+    // CONTRACT 4's obligation, and the reason it exists: moatd's escalation is
+    // written down or it does not happen, and the panel must not be the place
+    // it becomes a bare number.
+    var g = suite.chainIncident()
+    var line = Model.chainSeverityLine(g.chain)
+    verify(line.indexOf("high") === 0, "it leads with the severity: " + line)
+    verify(line.indexOf("stays high: persist and cred in one process tree") !== -1,
+           "and it carries moatd's own reason verbatim: " + line)
+
+    // No reason, no number. Not "high" on its own.
+    compare(Model.chainSeverityLine(Model.normalizeChain(
+      suite.fakeChain({ severity_reason: "" }))), "")
+    compare(Model.chainSeverityLine(null), "")
+  }
+
+  function test_a_chain_shows_the_daemons_severity_not_the_loudest_member() {
+    // "A reader that shows a chain must show `chain.severity`, not the maximum
+    // of its members" -- a sequence means more than its steps, and the members
+    // are deliberately not rewritten.
+    var text = JSON.stringify({
+      v: 1, id: "01S1", severity: "high", rule: "moat-cred-ssh-private-key-read",
+      family: "cred", title: "t", ts: "2026-09-04T09:16:00Z", surface: "alerts",
+      process: { exe: "/usr/bin/node" }, chain: suite.fakeChain({})
+    }) + "\n" + JSON.stringify({
+      v: 1, id: "01S2", severity: "medium", rule: "moat-x-pkg-egress",
+      family: "net", title: "t", ts: "2026-09-04T09:17:00Z", surface: "timeline",
+      process: { exe: "/usr/bin/node" }, chain: suite.fakeChain({})
+    }) + "\n"
+    var inc = Model.buildIncidents(Model.foldText(text), {})
+    compare(inc.length, 1)
+    compare(inc[0].severity, "critical", "the chain's severity, not its loudest member's")
+    // The members keep their own. The chain record IS the escalation.
+    compare(inc[0].alerts[0].severity, "medium")
+    compare(inc[0].alerts[1].severity, "high")
+    verify(Model.chainSeverityLine(inc[0].chain).indexOf("high -> critical") !== -1)
+  }
+
+  function test_the_panel_never_invents_an_escalation() {
+    // The rule the whole feature rests on: the daemon decides, the panel
+    // renders. A chain with no severity of its own does not get one made up
+    // for it -- the incident falls back to what its members already said.
+    var text = JSON.stringify({
+      v: 1, id: "01S1", severity: "high", rule: "r1", family: "cred", title: "t",
+      ts: "2026-09-04T09:16:00Z", surface: "alerts", process: { exe: "/usr/bin/node" },
+      chain: suite.fakeChain({ severity: "", severity_base: "" })
+    }) + "\n" + JSON.stringify({
+      v: 1, id: "01S2", severity: "medium", rule: "r2", family: "net", title: "t",
+      ts: "2026-09-04T09:17:00Z", surface: "timeline", process: { exe: "/usr/bin/node" },
+      chain: suite.fakeChain({ severity: "", severity_base: "" })
+    }) + "\n"
+    var inc = Model.buildIncidents(Model.foldText(text), {})
+    compare(inc[0].severity, "high", "the members' own maximum, unchanged")
+    // An unrecognized severity is not rendered raw either.
+    compare(Model.normalizeChain(suite.fakeChain({ severity: "catastrophic" })).severity, "")
+  }
+
+  function test_a_malformed_chain_never_blanks_one_already_recorded() {
+    // "A chain only ever grows, so a malformed one must be ignored rather than
+    // allowed to blank a sequence already recorded."
+    var good = suite.fakeChain({})
+    var text = JSON.stringify({
+      v: 1, id: "01S1", severity: "high", rule: "r1", family: "cred", title: "t",
+      ts: "2026-09-04T09:16:00Z", surface: "alerts", process: { exe: "/usr/bin/node" }
+    }) + "\n"
+    text += JSON.stringify({ v: 1, id: "01S1", update: { chain: good } }) + "\n"
+    text += JSON.stringify({ v: 1, id: "01S1", update: { chain: null } }) + "\n"
+    text += JSON.stringify({ v: 1, id: "01S1", update: { chain: "nonsense" } }) + "\n"
+    text += JSON.stringify({ v: 1, id: "01S1", update: { chain: { id: "01CH" } } }) + "\n"
+    text += JSON.stringify({ v: 1, id: "01S1", update: { chain:
+      suite.fakeChain({ steps: [good.steps[0]], steps_total: 1 }) } }) + "\n"
+    var a = Model.foldText(text)[0]
+    verify(!!a.chain, "four bad updates in a row did not erase the sequence")
+    compare(a.chain.steps.length, 2, "and none of them shrank it")
+
+    // One step is not a sequence, and drawing 2b's rail for it would show a
+    // story that never happened.
+    compare(Model.normalizeChain(suite.fakeChain({ steps: [good.steps[0]], steps_total: 1 })), null)
+    compare(Model.normalizeChain({ steps: good.steps }), null, "no id, no chain")
+    compare(Model.normalizeChain(null), null)
+    compare(Model.normalizeChain([]), null)
+  }
+
+  function test_an_unrecognized_step_role_is_a_trigger_not_a_permission() {
+    // `context` is the claim that the user had already allowed this step.
+    // Degrading an unknown role towards it would show an accusation as a
+    // permission, which is the wrong direction to fail in.
+    var chain = Model.normalizeChain(suite.fakeChain({ steps: [
+      { alert: "01S1", ts: "2026-09-04T09:16:00Z", family: "cred", rule: "r1",
+        severity: "high", title: "t", pid: 1, exe: "/usr/bin/node", role: "allowed" },
+      { alert: "01S2", ts: "2026-09-04T09:17:00Z", family: "net", rule: "r2",
+        severity: "medium", title: "t", pid: 1, exe: "/usr/bin/node" }
+    ] }))
+    compare(chain.steps[0].role, "trigger")
+    compare(chain.steps[1].role, "trigger")
+    // A step with no alert id is not joinable, ackable or openable, so it is
+    // dropped rather than rendered as a row that does nothing.
+    compare(Model.normalizeChain(suite.fakeChain({ steps: [
+      { ts: "x", family: "cred" },
+      { alert: "01S2", family: "net", title: "t" }] })), null)
+  }
+
+  function test_a_context_step_is_shown_but_not_as_an_accusation() {
+    // CONTRACT 4: a context step is one the user allowlisted or the noise guard
+    // demoted. It is in the story because that is what makes 2b readable, and
+    // showing it as a charge reverses a decision the user made.
+    var chain = Model.normalizeChain(suite.fakeChain({ steps: [
+      { alert: "01S1", ts: "2026-09-04T09:16:00Z", family: "cred", rule: "r1",
+        severity: "high", title: "Private SSH key read", pid: 1,
+        exe: "/usr/bin/node", role: "context" },
+      { alert: "01S2", ts: "2026-09-04T09:17:00Z", family: "net", rule: "r2",
+        severity: "medium", title: "Talked to an unexpected host", pid: 1,
+        exe: "/usr/bin/node", role: "trigger" }
+    ] }))
+    var story = Model.chainStory(chain, {})
+    compare(story.length, 2)
+    verify(story[0].isContext)
+    compare(story[0].status.label, "you had allowed this")
+    compare(story[0].status.tone, "calm")
+    verify(!story[1].isContext)
+    compare(story[1].status.label, "happened")
+
+    // What has already been done to a step outranks everything: a stopped step
+    // says so whatever its role.
+    var acted = Model.chainStory(chain, { alerts: [
+      { id: "01S2", action_taken: "killed" }, { id: "01S1", acked: true }] })
+    compare(acted[1].status.label, "Moat stopped it")
+    compare(acted[1].status.tone, "accent")
+    compare(acted[0].status.label, "you had allowed this",
+            "an allowed step is still an allowed step once it is acked")
+  }
+
+  function test_a_member_alert_says_it_is_part_of_a_sequence() {
+    // The user lands on the `.git/config` row. Without this they never learn
+    // that the same process read a credential a second later.
+    var alerts = suite.chainAlerts()
+    var git = suite.findAlert(alerts, "01M1Q4KAVQNH96MAW2ASV2QMCD")
+    var cred = suite.findAlert(alerts, "01M1Q4KAWNGBG1AHZ9DSBDBP4J")
+    compare(Model.chainPosition(git), 1)
+    compare(Model.chainPosition(cred), 2)
+    compare(Model.chainMarker(git), "Part of a sequence — step 1 of 2")
+    compare(Model.chainMarker(cred), "Part of a sequence — step 2 of 2")
+    // An alert in no chain says nothing, and the callers bind on "".
+    compare(Model.chainMarker(Model.foldText(JSON.stringify(suite.incAlert({})))[0]), "")
+    compare(Model.chainMarker(null), "")
+    compare(Model.chainPosition(null), 0)
+  }
+
+  function test_a_truncated_chain_says_so_rather_than_shrinking_the_story() {
+    // The correlator keeps a bounded number of steps. A member whose id is not
+    // among the ones kept still knows it is in a sequence.
+    var chain = Model.normalizeChain(suite.fakeChain({ steps_total: 7 }))
+    compare(chain.steps.length, 2)
+    compare(chain.steps_total, 7)
+    verify(chain.truncated, "more steps than were sent is a truncation whatever the flag says")
+    compare(Model.chainMarker({ id: "01S9", chain: chain }), "Part of a sequence of 7")
+  }
+
+  function test_the_story_reads_in_time_order_with_clock_times() {
+    // 2b is ancestry as a story WITH TIMES, and 3a's rows lead with one. A
+    // relative age would read the same on every step of a chain that spans a
+    // second, which is exactly when the sequence matters most.
+    var g = suite.chainIncident()
+    compare(g.story[0].alert, "01M1Q4KAVQNH96MAW2ASV2QMCD")
+    compare(g.story[1].alert, "01M1Q4KAWNGBG1AHZ9DSBDBP4J")
+    compare(g.story[0].family, "persist")
+    compare(g.story[1].family, "cred")
+    compare(g.story[0].position, 1)
+    verify(/^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/.test(g.story[0].time),
+           "a clock time, not an age: " + g.story[0].time)
+    // The panel's own words for each step, and what it costs the user under it.
+    compare(g.story[0].title, "Something changed where one of your repositories pushes to")
+    compare(g.story[1].title, "Something read a secret stored inside your project")
+    verify(g.story[0].note.length > 0, "each step says what it costs")
+    // An unparseable stamp is left blank rather than turned into a fake time.
+    compare(Model.clockTime("not a date"), "")
+    compare(Model.clockTime(""), "")
+  }
+
+  function test_a_step_renders_even_when_its_alert_has_not_been_folded() {
+    // The chain is the authority on what happened. Waiting for the log to
+    // catch up would draw a shorter story than moatd has.
+    var story = Model.chainStory(Model.normalizeChain(suite.fakeChain({})), { alerts: [] })
+    compare(story.length, 2)
+    compare(story[0].status.label, "happened")
+    verify(story[0].title.length > 0)
+  }
+
+  function test_advanced_gives_the_sequence_the_daemons_own_words() {
+    // Advanced is raw rule ids and severities; the default voice is neither.
+    var plain = suite.chainIncident()
+    var raw = suite.chainIncident({ rawDetail: true })
+    compare(plain.title, "One program set something to run again and read a credential")
+    compare(raw.title,
+            "2 things happened in 1 second under node (pid 1903747), crossing persist and cred.")
+    compare(raw.story[0].title, "A repository's .git/config written by something other than git")
+    compare(raw.story[0].note, "moat-persist-git-config-write  ·  high")
+    verify(plain.story[0].note.indexOf("moat-") === -1,
+           "the default voice never prints a rule id in a step")
+    // rawDetail reaches the wording and nothing else: same incident, same
+    // members, same state.
+    compare(raw.state, plain.state)
+    compare(raw.severity, plain.severity)
+    compare(raw.story.length, plain.story.length)
+  }
+
+  function test_a_chain_row_in_history_says_it_is_a_sequence() {
+    // 1d's rows are one line each, so the note beside the title is the only
+    // place a History row can say "this is several things, not one".
+    var g = suite.chainIncident()
+    verify(Model.historyNote(g).indexOf("a sequence of 2") !== -1, Model.historyNote(g))
+    // And it never reads "2 times", which would say two of the same thing.
+    compare(Model.historyNote(g).indexOf("times"), -1)
+  }
+
+  function test_the_chain_copy_stays_in_the_default_voice() {
+    // 3g's banned list applies to everything the panel says in its own voice,
+    // and a chain is where the daemon's vocabulary (families, pids, severity)
+    // is most tempting to pass straight through.
+    var chain = Model.normalizeChain(suite.fakeChain({}))
+    var lines = [
+      Copy.chainTitle(chain, false), Copy.chainStake(chain, false),
+      Copy.chainSummaryLine(chain, false), Copy.chainClosingLine(chain),
+      Copy.chainRuleNote(chain), Model.chainMarker({ id: "01S1", chain: chain })
+    ]
+    for (var f in Copy.FAMILY_DID) lines.push(Copy.FAMILY_DID[f])
+    for (var i = 0; i < lines.length; i++) {
+      var bad = Copy.bannedWordsIn(lines[i])
+      compare(bad.length, 0, "\"" + lines[i] + "\" says: " + bad.join(", "))
+    }
+    // And the sub-line is 3a's sentence about the sequence, not a count of
+    // things waiting.
+    compare(Copy.chainSummaryLine(chain, false),
+            "Two things happened in 1 minute and they all came out of the same program.")
+    compare(Copy.spanPhrase(0), "in the same second")
+    compare(Copy.spanPhrase(9), "in 9 seconds")
+    compare(Copy.spanPhrase(540), "in 9 minutes")
+    compare(Copy.spanPhrase(-1), "")
+  }
+
+  // --- 2b, what led here ----------------------------------------------------
+
+  function test_the_chain_is_oldest_first_and_invents_no_timestamps() {
+    var alerts = Model.foldText(JSON.stringify(incAlert({
+      id: "01A", ts: "2026-09-04T11:22:00Z",
+      process: { exe: "/usr/bin/flea", args: "--daemon",
+                 cwd: "/home/dan/proj", start_ts: "2026-09-04T11:21:00Z",
+                 ancestry: [{ pid: 3, exe: "/usr/bin/bash" },
+                            { pid: 2, exe: "/usr/lib/systemd/systemd" }] }
+    })) + "\n")
+    var steps = Model.chainSteps(alerts[0])
+    compare(steps.length, 3)
+    compare(steps[0].name, "systemd")
+    compare(steps[1].name, "bash")
+    compare(steps[2].name, "flea")
+    verify(steps[2].isAlert)
+    // moatd records {pid, exe} per ancestor and no stamp, so the steps above
+    // the alert carry no time and this does not make one up.
+    compare(steps[0].ts, "")
+    compare(steps[1].ts, "")
+    compare(steps[2].ts, "2026-09-04T11:22:00Z")
+    compare(steps[2].cwd, "~/proj")
+    compare(Model.chainSteps(null).length, 0)
+  }
+
+  // --- 3e, the bar glyph ----------------------------------------------------
+
+  function test_the_bar_has_exactly_three_states_and_they_are_the_verdicts() {
+    var quiet = Model.barState(Copy.VERDICT_QUIET, 0)
+    compare(quiet.state, "quiet")
+    compare(quiet.label, "", "the quiet glyph carries no text at all")
+
+    var needs = Model.barState(Copy.VERDICT_NEEDS, 3)
+    compare(needs.state, "needsYou")
+    compare(needs.tone, "alarm")
+    compare(needs.label, "3")
+
+    // A live chain is still "needs you" on the bar: the bar has three states,
+    // and a fourth would be a state the verdict line cannot say.
+    compare(Model.barState(Copy.VERDICT_CHAIN, 1).state, "needsYou")
+
+    var gap = Model.barState(Copy.VERDICT_GAP, 0)
+    compare(gap.state, "gap")
+    compare(gap.tone, "accent")
+    compare(gap.label, "gap")
+  }
+
+  function test_the_bar_tooltip_exists_only_for_the_two_loud_states() {
+    var inc = incidentsOf([incAlert({ id: "01A", rule: "moat-persist-hypr-config-write" })])
+    compare(Model.barTooltip(Copy.VERDICT_QUIET, inc, Date.now()), "",
+            "a tooltip on the quiet shield is one nobody ever needed")
+    var loud = Model.barTooltip(Copy.VERDICT_NEEDS, inc, Date.parse("2026-09-04T11:00:00Z"))
+    verify(loud.indexOf("Something added itself to your login") === 0,
+           "the tooltip leads with the consequence, not the detection")
+    verify(Model.barTooltip(Copy.VERDICT_GAP, [], Date.now()).length > 0)
+  }
+
+  // --- 2h, the three notification shapes -----------------------------------
+
+  function test_only_a_needs_you_incident_may_interrupt() {
+    // An alert an unattended pass read and the daemon ACTED on -- `outcome:
+    // "demoted"` -- is `explained`: Moat decided, the user may look.
+    // Interrupting for a decision that has already been made is how someone
+    // learns to dismiss the toast that matters.
+    var decided = incAlert({ id: "01A", severity: "critical",
+      triage: { verdict: "benign", confidence: "high", summary: "s", reasoning: "r",
+                outcome: "demoted" } })
+    var folded = Model.foldText(JSON.stringify(decided) + "\n")
+    verify(!Model.shouldNotify(folded[0], "high", false, {}))
+
+    var open = Model.foldText(JSON.stringify(incAlert({ id: "01B", severity: "high" })) + "\n")
+    verify(Model.shouldNotify(open[0], "high", false, {}))
+  }
+
+  function test_a_verdict_the_ceiling_withheld_still_asks_for_the_user() {
+    // The distinction the panel used to lose. `verdict: "benign"` alone was
+    // enough to mark an alert `explained`, which handed back exactly what the
+    // triage ceiling had just refused: on 2026-09-04 the ceiling withheld a
+    // demotion on the real C2 chain ("first time this pattern has been seen
+    // here") and the panel called it explained anyway and dropped it out of Now.
+    //
+    // The agent explains, and at most demotes. When the daemon declines to act,
+    // the verdict is still SHOWN -- being read is not being dismissed.
+    var withheld = incAlert({ id: "01C", severity: "critical",
+      triage: { verdict: "benign", confidence: "high", summary: "s", reasoning: "r",
+                outcome: "withheld: first time this pattern has been seen here" } })
+    var folded = Model.foldText(JSON.stringify(withheld) + "\n")
+    compare(Model.alertState(folded[0], {}), "needsYou",
+            "a benign verdict the daemon refused to act on must not silence the alert")
+    verify(!!folded[0].triage, "and the analysis is still there to read")
+    compare(folded[0].triage.withheld, "first time this pattern has been seen here")
+    verify(Model.shouldNotify(folded[0], "high", false, {}))
+  }
+
+  function test_never_means_never_including_the_noise_guards_exception() {
+    // 1f's third answer. It is checked before every exception below it,
+    // including the noise guard's own one-shot: a "never" with exceptions is
+    // not never.
+    var guard = Model.foldText(JSON.stringify(incAlert({
+      id: "01A", rule: "moat-x-noisy-rule", severity: "medium" })) + "\n")
+    verify(Model.shouldNotify(guard[0], "high", false, {}),
+           "the noise guard normally goes through at medium")
+    verify(!Model.shouldNotify(guard[0], "high", false, { notifyMuted: true }))
+    var critical = Model.foldText(JSON.stringify(incAlert({
+      id: "01B", severity: "critical", rarity: "first_seen" })) + "\n")
+    verify(!Model.shouldNotify(critical[0], "high", false, { notifyMuted: true }))
+  }
+
+  function test_a_burst_summary_names_the_program_not_the_rule() {
+    // 2h shape 3. "Claude tripped the same detection 40 more times", never
+    // "40 more from moat-ai-cli-in-pkg-subtree".
+    var store = Model.createStore()
+    var alert = Model.foldText(JSON.stringify(incAlert({
+      id: "01A", rule: "moat-ai-cli-in-pkg-subtree", severity: "high",
+      process: { exe: "/usr/bin/claude" } })) + "\n")[0]
+    var opts = { minNotifySeverity: "high", notifyCooldownMinutes: 10 }
+    compare(Model.notifyDecision(store, alert, 0, opts).toast, true)
+    Model.notifyDecision(store, alert, 1000, opts)
+    Model.notifyDecision(store, alert, 2000, opts)
+    var due = Model.flushCollapsed(store, 11 * 60000)
+    compare(due.length, 1)
+    compare(due[0].program, "claude")
+    compare(Copy.burstTitle(due[0].program, due[0].count),
+            "claude tripped the same detection 2 more times")
+  }
+
+  // --- 1g, the first week ---------------------------------------------------
+
+  function test_the_learning_card_is_a_progress_bar_with_both_ends() {
+    var now = Date.parse("2026-09-04T12:00:00Z")
+    var card = Model.learningCard(Model.normalizeStatus({
+      ok: true, installed_at: "2026-09-03T12:00:00Z",
+      baseline: { learning: true, learning_ends: "2026-09-12T12:00:00Z", learned: 412 }
+    }), now)
+    compare(card.dayTotal, 9)
+    compare(card.dayIndex, 2)
+    compare(card.daysLeft, 8)
+    compare(card.learned, 412)
+    verify(card.fraction > 0 && card.fraction < 1)
+
+    // Not learning: no card at all, rather than a bar stuck at 100%.
+    compare(Model.learningCard(Model.normalizeStatus({ ok: true,
+      baseline: { learning: false } }), now), null)
+  }
+
+  function test_the_enforce_question_is_asked_once_and_only_after_learning() {
+    var ended = "2026-09-04T09:00:00Z"
+    var status = Model.normalizeStatus({ ok: true, mode: "monitor",
+      baseline: { learning: false, learning_ends: ended, learned: 14 },
+      demoted_rules: ["moat-x"] })
+    var soon = Model.learningDoneCard(status, Date.parse("2026-09-04T12:00:00Z"))
+    compare(soon.learned, 14)
+    compare(soon.demoted, 1)
+    verify(!soon.enforcing)
+    // A week later it is not news any more. It is the one moment the enforce
+    // question can be asked honestly, not a permanent banner.
+    compare(Model.learningDoneCard(status, Date.parse("2026-09-11T12:00:00Z")), null)
+    // And never while the window is still open.
+    compare(Model.learningDoneCard(Model.normalizeStatus({ ok: true,
+      baseline: { learning: true, learning_ends: ended } }), Date.parse(ended)), null)
+  }
+
+  // --- 3d, after Moat blocked something ------------------------------------
+
+  function test_only_a_kernel_block_gets_the_apology() {
+    var blocked = incidentsOf([incAlert({ id: "01A", action_taken: "killed", mode: "enforce" })])
+    compare(Model.blockedIncidents(blocked).length, 1)
+    // The user pressing Stop it is not something to apologise for: they know
+    // what they did, and they were asked first.
+    var byHand = incidentsOf([incAlert({ id: "01B", action_taken: "killed", mode: "monitor" })])
+    compare(Model.blockedIncidents(byHand).length, 0)
+    compare(Model.blockedIncidents(incidentsOf([incAlert({ id: "01C" })])).length, 0)
+
+    var transcript = Model.blockTranscript({
+      process: { exe: "/home/dan/proj/deploy.sh", args: "./scripts/deploy.sh",
+                 cwd: "/home/dan/proj" } })
+    compare(transcript.command, "$ ./scripts/deploy.sh")
+    compare(transcript.killed, "Killed")
+    compare(transcript.cwd, "~/proj")
+  }
+
+  // --- one line means one line -------------------------------------------
+
+  function test_a_row_string_is_one_bounded_line() {
+    // Found live: moat's own triage pass invokes an agent CLI with a
+    // multi-kilobyte prompt as a single argument, moatd records that invocation
+    // as an install receipt like any other, and History rendered the whole
+    // prompt -- forty lines of it -- as one row. Text.PlainText stops such a
+    // string being read as MARKUP; it does nothing about it being read as
+    // LAYOUT, because an elided Text still honours an embedded newline.
+    var nasty = "line one\nline two\n\nline three   with   gaps"
+    compare(Copy.oneLine(nasty), "line one line two line three with gaps")
+    compare(Copy.oneLine("x".repeat(500), 20).length, 20)
+    verify(Copy.oneLine("x".repeat(500), 20).indexOf("\u2026") !== -1)
+    compare(Copy.oneLine(null), "")
+    compare(Copy.oneLine(undefined), "")
+
+    // Every row string that can carry process output goes through it.
+    var receipt = Model.normalizeReceipt({ receipt: {
+      root_exe: "/usr/bin/claude",
+      root_args: "-p " + "argument text\n".repeat(200),
+      cwd: "/home/dan/proj", duration_s: 3
+    } }, 0)
+    var summary = Model.receiptSummary(receipt)
+    compare(summary.indexOf("\n"), -1, "a receipt row must never carry a newline")
+    verify(summary.length < 220, "a receipt row is bounded, got " + summary.length)
+
+    // A detection with no copy falls back to the daemon's string, and the
+    // daemon's string is the one that has been near a process.
+    var title = Copy.titleFor({ rule: "moat-not-written-yet",
+                                title: "weird\ntitle\n" + "x".repeat(400) })
+    compare(title.indexOf("\n"), -1)
+    verify(title.length <= 120)
+  }
+
+  // --- the key is what a view is allowed to hold on to ---------------------
+
+  function test_an_incidents_key_is_stable_across_rebuilds() {
+    // Found live: IncidentCard reset its open drawers in onIncidentChanged, and
+    // `incident` is bound through buildIncidents -- which allocates brand-new
+    // objects on every rebuild, and rebuilds on the 10-second status poll and
+    // on every append to alerts.jsonl. So "Show evidence" collapsed itself a
+    // few seconds after every open. A view has to key on identity, and this is
+    // the guarantee that lets it.
+    var records = [
+      incAlert({ id: "01A", ts: "2026-09-04T10:00:00Z" }),
+      incAlert({ id: "01B", ts: "2026-09-04T10:05:00Z" })
+    ]
+    var first = incidentsOf(records)
+    var second = incidentsOf(records)
+    compare(first.length, 1)
+    compare(first[0].key, second[0].key)
+    verify(first[0] !== second[0], "a rebuild really does allocate a new object")
+
+    // And it survives a repeat joining the incident -- which is exactly when
+    // somebody is most likely to be mid-read. `id` does NOT: it follows the
+    // newest member, which is why a view must not key on it.
+    var later = incidentsOf(records.concat([
+      incAlert({ id: "01C", ts: "2026-09-04T10:09:00Z" })
+    ]))
+    compare(later[0].key, first[0].key)
+    verify(later[0].id !== first[0].id, "the id moves to the newest member")
+    compare(later[0].count, 3)
+  }
+
+  // =========================================================================
+  //  One question, one answer -- agreement tests
+  //
+  //  Every test here asserts that TWO consumers of one decision agree, in the
+  //  manner of test_every_surface_consumer_agrees_with_alertSurface. Each was
+  //  written after finding a pair that did not.
+  // =========================================================================
+
+  function test_the_bar_tone_is_the_headline_tone_for_every_verdict() {
+    // The verdict line grew a fifth form (`stopped`) and barState never learned
+    // it: the case fell to `default`, so the bar drew the calm shield while the
+    // headline under it said "Moat stopped one thing" in accent. The bar's
+    // tone must be the headline's for every state the headline can take.
+    var states = [Copy.VERDICT_QUIET, Copy.VERDICT_NEEDS, Copy.VERDICT_CHAIN,
+                  Copy.VERDICT_GAP, Copy.VERDICT_STOPPED]
+    for (var i = 0; i < states.length; i++) {
+      var bar = Model.barState(states[i], 1)
+      var headline = Copy.verdictTone(states[i])
+      // The bar spells "calm" as "quiet"; every other tone is the same word.
+      var expected = headline === "calm" ? "quiet" : headline
+      compare(bar.tone, expected, states[i] + ": bar tone vs headline tone")
+    }
+
+    // And end to end: a killed, unacked, enforce-mode alert makes the headline
+    // say "stopped", and the bar must not be the quiet shield over it.
+    var inc = incidentsOf([incAlert({ id: "01K", mode: "enforce", action_taken: "killed" })])
+    var v = Model.verdict(inc, healthy())
+    compare(v.state, Copy.VERDICT_STOPPED)
+    var bar = Model.barState(v.state, Model.needsYouIncidents(inc).length)
+    verify(bar.state !== "quiet", "the bar must not read quiet while the headline says stopped")
+    compare(bar.tone, v.tone)
+  }
+
+  function test_the_day_header_buckets_states_the_way_the_rows_word_them() {
+    // The header's catch-all `else` counted every `closed` incident -- acked,
+    // never read by anything -- as "explained", so it said "3 explained" over
+    // three rows whose state word was "closed". Header and row read the same
+    // `state`; they must bucket it the same.
+    var now = Date.parse("2026-09-04T12:00:00Z")
+    var inc = incidentsOf([
+      incAlert({ id: "01A", rule: "r1", ts: "2026-09-04T10:00:00Z", acked: true }),
+      incAlert({ id: "01B", rule: "r2", ts: "2026-09-04T10:01:00Z", acked: true }),
+      incAlert({ id: "01C", rule: "r3", ts: "2026-09-04T10:02:00Z",
+                 triage: { verdict: "benign", confidence: "high", demoted: true,
+                           outcome: "demoted", summary: "s" } })
+    ])
+    compare(inc.length, 3)
+    var days = Model.historyDays(inc, now)
+    compare(days.length, 1)
+    var d = days[0]
+    // Count the rows the way HistoryRow words them, then compare to the header.
+    var byWord = {}
+    for (var i = 0; i < d.incidents.length; i++) {
+      var w = Copy.stateWord(d.incidents[i].state)
+      byWord[w] = (byWord[w] || 0) + 1
+    }
+    compare(d.explained, byWord["explained"] || 0, "header 'explained' vs rows worded 'explained'")
+    compare(d.closed, byWord["closed"] || 0, "header 'closed' vs rows worded 'closed'")
+    compare(d.explained, 1)
+    compare(d.closed, 2)
+    compare(d.summary.indexOf("3 explained"), -1, "two acked rows are not 'explained'")
+    verify(d.summary.indexOf("2 closed") >= 0, d.summary)
+  }
+
+  function test_stopped_reads_every_member_the_state_does() {
+    // `buildIncidents` derives `state` from EVERY member ("an incident needs
+    // you if ANY member does"), but stoppedIncidents read only the head. A
+    // chain whose first step was killed under an armed rule and whose newest
+    // step was acked by hand was "contained" in History and invisible to the
+    // headline and the apology card at the same time.
+    var chain = { id: "01K1", severity: "high", severity_reason: "r", steps_total: 2,
+                  ancestor: { exe: "/usr/bin/bash", pid: 1 }, families: ["cred", "net"],
+                  steps: [{ alert: "01K1", rule: "moat-cred-etc-shadow-read", role: "trigger" },
+                          { alert: "01K2", rule: "moat-net-first-contact", role: "trigger" }] }
+    var inc = incidentsOf([
+      incAlert({ id: "01K1", rule: "moat-cred-etc-shadow-read", ts: "2026-09-04T10:00:00Z",
+                 mode: "enforce", action_taken: "killed", chain: chain }),
+      incAlert({ id: "01K2", rule: "moat-net-first-contact", ts: "2026-09-04T10:00:05Z",
+                 mode: "monitor", acked: true, chain: chain })
+    ])
+    compare(inc.length, 1, "one chain, one incident")
+    compare(inc[0].head.id, "01K2", "the acked step is the head")
+    compare(inc[0].state, "contained", "the row says you stopped it")
+    compare(Model.stoppedIncidents(inc).length, 1,
+            "so the headline and the apology card must say so too")
+    compare(Model.blockedIncidents(inc).length, 1)
+    compare(Model.verdict(inc, healthy()).state, Copy.VERDICT_STOPPED)
+
+    // The two agree in the other direction as well: an incident stoppedIncidents
+    // returns is always one the state calls contained (or louder).
+    var stopped = Model.stoppedIncidents(inc)
+    for (var i = 0; i < stopped.length; i++) {
+      verify(stopped[i].state === "contained" || stopped[i].state === "needsYou",
+             "a stopped incident is never quiet on its row: " + stopped[i].state)
+    }
+  }
+
+  function test_today_on_the_now_page_is_the_today_in_history() {
+    // "Moat looked at N things today" summed every incident in the log. The
+    // number must be the count of exactly the rows History files under its
+    // "Today" header, computed by the same day key.
+    var now = Date.parse("2026-09-04T12:00:00Z")
+    var inc = incidentsOf([
+      incAlert({ id: "01A", rule: "r1", ts: "2026-09-04T10:00:00Z", count: 5 }),
+      incAlert({ id: "01B", rule: "r2", ts: "2026-09-03T10:00:00Z", count: 40 }),
+      incAlert({ id: "01C", rule: "r3", ts: "2026-08-20T10:00:00Z", count: 400 })
+    ])
+    var days = Model.historyDays(inc, now)
+    var todayRows = 0
+    for (var i = 0; i < days.length; i++) {
+      if (days[i].label !== "Today") continue
+      for (var j = 0; j < days[i].incidents.length; j++) todayRows += days[i].incidents[j].count
+    }
+    compare(todayRows, 5)
+    compare(Model.seenToday(inc, now), todayRows, "Now's 'today' vs History's 'Today'")
+    // Not the whole log.
+    verify(Model.seenToday(inc, now) !== 445)
+    // And the next day (local time, like the day header), yesterday's are
+    // yesterday's.
+    compare(Model.seenToday(inc, Date.parse("2026-09-05T20:00:00Z")), 0)
+  }
+
+  function test_every_consumer_honours_a_surface_the_daemon_stamped_over_the_demoted_list() {
+    // The live case from 2026-09-05: a chain of 64 steps under makepkg reached
+    // `high`, and the daemon restamped its trigger steps `surface: "alerts"`
+    // -- with full knowledge that their rules were demoted, because a chain
+    // that reaches high has to be able to reach the badge. The panel then
+    // read `status.demoted_rules`, found those rules, and called every one of
+    // them "expected": the shield stayed quiet, no toast, no card, and
+    // `moatctl chain` was the only place the sequence existed.
+    //
+    // So: a stamped `alerts` under a listed rule is waiting on the user for
+    // EVERY consumer, and a stamped `timeline` is quiet for every consumer,
+    // and the list changes neither.
+    var chain = { id: "01C1", severity: "high", severity_reason: "r", steps_total: 2,
+                  ancestor: { exe: "/usr/bin/makepkg", pid: 1 }, families: ["exec", "pkg"],
+                  steps: [{ alert: "01C1", rule: "moat-exec-untrusted-tmpfs", role: "trigger" },
+                          { alert: "01C2", rule: "moat-exec-untrusted-home", role: "trigger" }] }
+    var text = JSON.stringify(incAlert({ id: "01C1", rule: "moat-exec-untrusted-tmpfs",
+      severity: "high", surface: "alerts", chain: chain, ts: "2026-09-05T14:26:04Z",
+      process: { exe: "/usr/bin/bash" } })) + "\n"
+    text += JSON.stringify(incAlert({ id: "01C2", rule: "moat-exec-untrusted-home",
+      severity: "medium", surface: "alerts", chain: chain, ts: "2026-09-05T14:26:05Z",
+      process: { exe: "/usr/bin/python3" } })) + "\n"
+    // And one the daemon really did put on the timeline, same rule.
+    text += JSON.stringify(incAlert({ id: "01Q", rule: "moat-exec-untrusted-tmpfs",
+      severity: "high", surface: "timeline", ts: "2026-09-05T14:00:00Z",
+      process: { exe: "/usr/bin/cargo" } })) + "\n"
+    var alerts = Model.foldText(text)
+    var listed = { demotedRules: ["moat-exec-untrusted-tmpfs", "moat-exec-untrusted-home"] }
+    var unlisted = {}
+
+    var opts = [listed, unlisted]
+    for (var o = 0; o < opts.length; o++) {
+      var tab = Model.surfaceAlerts(alerts, "alerts", opts[o])
+      compare(tab.length, 2, "the tab shows exactly what the daemon surfaced")
+      compare(Model.unackedCounts(alerts, opts[o]).badge, 2, "the badge counts the same two")
+      var inc = Model.buildIncidents(alerts, opts[o])
+      var needs = Model.needsYouIncidents(inc)
+      compare(needs.length, 1, "one chain incident is waiting")
+      compare(needs[0].chain.id, "01C1")
+      var v = Model.verdict(inc, healthy())
+      compare(v.state, Copy.VERDICT_CHAIN, "the headline is the chain form")
+      compare(Model.barState(v.state, needs.length).tone, "alarm", "and the bar is alarm")
+      var a1 = null, aq = null
+      for (var k = 0; k < alerts.length; k++) {
+        if (alerts[k].id === "01C1") a1 = alerts[k]
+        if (alerts[k].id === "01Q") aq = alerts[k]
+      }
+      verify(Model.shouldNotify(a1, "high", false, opts[o]), "a surfaced chain step notifies")
+      verify(!Model.shouldNotify(aq, "low", false, opts[o]), "a timelined one never does")
+      compare(Model.alertState(a1, opts[o].demotedRules), "needsYou")
+      compare(Model.alertState(aq, opts[o].demotedRules), "expected")
+    }
+    // And a needs-you row is never captioned "Moat stopped asking".
+    var rows = Model.buildIncidents(alerts, listed)
+    for (var r = 0; r < rows.length; r++) {
+      if (rows[r].state === "needsYou") compare(rows[r].coveredBy, "")
+    }
+  }
+
+  function test_the_panel_folds_both_halves_of_the_log_the_way_the_daemon_does() {
+    // moatd reads alerts.1.jsonl and then alerts.jsonl (`AlertStore::load`),
+    // and every daemon count -- status.unacked, the watchdog, triage_pending
+    // -- comes from that. The panel read one file. After a rotation the two
+    // disagreed about what was outstanding: on 2026-09-05 five unacked
+    // critical alerts lived only in the rotated half.
+    var rotated = JSON.stringify(incAlert({ id: "01R1", rule: "moat-rootkit-evidence-tamper",
+      severity: "critical", surface: "alerts", ts: "2026-09-05T12:40:56Z" })) + "\n"
+    rotated += JSON.stringify(incAlert({ id: "01R2", rule: "r2", severity: "high",
+      surface: "alerts", ts: "2026-09-05T12:41:00Z" }))   // no trailing newline
+    var current = JSON.stringify({ v: 1, id: "01R2", update: { acked: true } }) + "\n"
+    current += JSON.stringify(incAlert({ id: "01C1", rule: "r3", severity: "high",
+      surface: "alerts", ts: "2026-09-05T13:30:00Z" })) + "\n"
+
+    var store = Model.createStore()
+    var result = Model.ingestText(store, Model.logBody(rotated, current), {})
+    compare(result.alerts.length, 3, "both halves fold")
+    compare(result.initialLoad, true)
+    compare(result.newIds.length, 0, "the priming load never toasts, whichever half an id came from")
+    var byId = {}
+    for (var i = 0; i < result.alerts.length; i++) byId[result.alerts[i].id] = result.alerts[i]
+    compare(byId["01R2"].acked, true, "an ack in the live file lands on a rotated-out record")
+    compare(byId["01R1"].acked, false)
+    // What the daemon's unacked() counts -- unacked, unsuppressed, on the
+    // badge -- is what the panel counts.
+    var daemonStyle = 0
+    for (var j = 0; j < result.alerts.length; j++) {
+      var a = result.alerts[j]
+      if (!a.acked && !a.suppressed_by && a.surface === "alerts") daemonStyle++
+    }
+    compare(result.unacked.badge, daemonStyle)
+    compare(result.unacked.badge, 2)
+    compare(result.unacked.critical, 1, "the rotated-out critical is still waiting")
+
+    // An append to the live file is still an append to the whole body, so the
+    // incremental fold keeps working across the seam.
+    current += JSON.stringify(incAlert({ id: "01C2", rule: "r4", severity: "high",
+      surface: "alerts", ts: "2026-09-05T13:31:00Z" })) + "\n"
+    var again = Model.ingestText(store, Model.logBody(rotated, current), {})
+    compare(again.alerts.length, 4)
+    compare(again.newIds.length, 1)
+    compare(again.newIds[0], "01C2")
+    compare(again.reloaded, false)
+  }
+
+  function test_the_rotated_half_is_handed_over_once_and_never_concatenated() {
+    // The same fold as above, the way Service.qml now does it: the rotated
+    // text goes into the store once (setLogPrefix) and every ingest takes the
+    // live file alone. Concatenating 20 MB in front of ~100 appended bytes on
+    // every reload was the panel's largest allocation, twice a second.
+    var rotated = JSON.stringify(incAlert({ id: "01R1", rule: "moat-rootkit-evidence-tamper",
+      severity: "critical", surface: "alerts", ts: "2026-09-05T12:40:56Z" })) + "\n"
+    rotated += JSON.stringify(incAlert({ id: "01R2", rule: "r2", severity: "high",
+      surface: "alerts", ts: "2026-09-05T12:41:00Z" }))   // no trailing newline
+    var current = JSON.stringify({ v: 1, id: "01R2", update: { acked: true } }) + "\n"
+    current += JSON.stringify(incAlert({ id: "01C1", rule: "r3", severity: "high",
+      surface: "alerts", ts: "2026-09-05T13:30:00Z" })) + "\n"
+
+    var store = Model.createStore()
+    verify(Model.setLogPrefix(store, rotated), "a new prefix is a change")
+    verify(!Model.setLogPrefix(store, rotated), "the same prefix again is not")
+    var result = Model.ingestText(store, current, {})
+    compare(result.alerts.length, 3, "both halves fold")
+    compare(result.newIds.length, 0)
+    compare(result.byId["01R2"].acked, true, "an ack in the live file lands on a rotated-out record")
+    compare(result.byId["01R1"].acked, false)
+    compare(result.unacked.critical, 1, "the rotated-out critical is still waiting")
+    var fold = store.fold
+
+    // A live-file append is incremental across the seam: same fold object,
+    // one new id, nothing re-folded.
+    current += JSON.stringify(incAlert({ id: "01C2", rule: "r4", severity: "high",
+      surface: "alerts", ts: "2026-09-05T13:31:00Z" })) + "\n"
+    var again = Model.ingestText(store, current, {})
+    verify(store.fold === fold, "an append keeps the running fold")
+    compare(again.alerts.length, 4)
+    compare(again.newIds.length, 1)
+    compare(again.newIds[0], "01C2")
+    compare(again.reloaded, false)
+
+    // A half-written last line waits for its newline, across the seam too.
+    var partial = Model.ingestText(store, current + "{\"v\":1,\"id\":\"01C3\"", {})
+    compare(partial.alerts.length, 4)
+    var whole = Model.ingestText(store, current + JSON.stringify(incAlert({ id: "01C3", rule: "r5",
+      severity: "high", surface: "alerts", ts: "2026-09-05T13:32:00Z" })) + "\n", {})
+    compare(whole.alerts.length, 5)
+
+    // Rotation: the live file becomes the rotated one and a fresh live file
+    // starts. The prefix changes, so the fold is rebuilt over the new body;
+    // the body is shorter, so `reloaded` says so; and nothing that was seen
+    // comes back as new.
+    var rotatedNow = current
+    verify(Model.setLogPrefix(store, rotatedNow))
+    var afterRotation = Model.ingestText(store, "", {})
+    compare(afterRotation.reloaded, true)
+    // `rotatedNow` holds 01C1 and 01C2 plus the ack of 01R2, whose record
+    // went with the old rotated half: two alerts, one parked update.
+    compare(afterRotation.alerts.length, 2, "the old rotated half is gone; the old live half stays")
+    compare(afterRotation.newIds.length, 0)
+    verify(store.fold !== fold, "a new prefix is a new fold")
+    // ...and the empty live file still ends on a whole line: the fold consumed
+    // exactly the prefix.
+    compare(store.fold.consumed, rotatedNow.length)
+
+    // The live file alone, with no prefix, folds exactly as before.
+    var bare = Model.createStore()
+    var bareResult = Model.ingestText(bare, current, {})
+    compare(bareResult.alerts.length, 2)
   }
 }

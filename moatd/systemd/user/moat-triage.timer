@@ -1,0 +1,22 @@
+[Unit]
+Description=Moat unattended alert triage
+Documentation=file:///usr/share/doc/omarchy-moat/README.md
+
+[Timer]
+OnBootSec=1min
+# Near real-time. Ten minutes was chosen when every alert cost an agent call and
+# the queue was a list of events; now the queue is deduplicated by pattern and
+# a settle window holds a burst together, so a pass is usually empty and costs
+# one socket round trip. `Type=oneshot` means systemd will not start a second
+# pass while one is running, so this is a floor on latency, not a multiplier on
+# cost.
+OnUnitActiveSec=1min
+# A laptop that was asleep still gets its pass on wake.
+Persistent=true
+# Seconds, not minutes: a two-minute jitter on a one-minute timer is the
+# interval. It exists only to keep many machines from waking together.
+RandomizedDelaySec=15s
+Unit=moat-triage.service
+
+[Install]
+WantedBy=timers.target

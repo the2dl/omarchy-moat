@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
-# omarchy-moat shim: runs the real pip under moat-sandbox.
+# omarchy-moat shim for pip.
+#
+#   1. for install-shaped subcommands, scan the Python project in $PWD with
+#      moat-scan-pip (setup.py, pyproject.toml build hooks, *.pth,
+#      requirements files) before pip can execute any of it. Same contract as
+#      the npm and makepkg shims: 0 clean, 1 medium warns, 2 high asks.
+#   2. run the real pip under moat-sandbox.
+#
+# `pip install <name>` from a directory with no project reads nothing local
+# and is not scanned; `pip install .`, `pip install -e .` and
+# `pip install -r requirements.txt` all build from files that are right here.
+# `pip list`, `pip show` and `pip uninstall` execute nothing new.
+#
 # Installed as /usr/lib/moat/shims/pip; active only while
 # /etc/moat/sandbox.enabled exists (see /etc/profile.d/moat-shims.sh).
 set -euo pipefail
@@ -8,4 +20,17 @@ _shim_dir=${SHIM_SELF%/*}
 [[ $_shim_dir == "$SHIM_SELF" ]] && _shim_dir=/usr/lib/moat/shims
 # shellcheck source-path=SCRIPTDIR source=shim-common.sh
 . "$_shim_dir/shim-common.sh"
+
+pip_installs() {
+	case $1 in
+	install | wheel | download) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+subcmd=$(shim_subcmd "$@")
+if [[ -n $subcmd ]] && pip_installs "$subcmd"; then
+	shim_scan_python_tree pip
+fi
+
 shim_exec pip "$@"

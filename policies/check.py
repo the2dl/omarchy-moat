@@ -25,6 +25,16 @@ except ImportError:
 
 HOME = "/home/test"
 
+# List placeholders that `moatd render-policies` fills from the [telemetry]
+# section of moat.toml (moatd/src/render.rs). They stand in for a whole
+# sequence, so the representative values below are what the grammar checks see:
+# a scope entry has to be a directory Prefix and a suffix entry a Postfix, and
+# both are subject to Tetragon's length caps like any other literal.
+LIST_PLACEHOLDERS = {
+    "{{FILE_SCOPE}}": ["/usr/bin/", HOME + "/.local/bin/"],
+    "{{FILE_SUFFIXES}}": [".sh", ".js", ".mjs"],
+}
+
 # ---------------------------------------------------------------------------
 # Verified enums and limits (docs/TETRAGON-NOTES.md sections 1, 2, 3, 10)
 # ---------------------------------------------------------------------------
@@ -32,7 +42,14 @@ HOME = "/home/test"
 API_VERSION = "cilium.io/v1alpha1"
 KIND = "TracingPolicy"
 NAME_PREFIX = "moat-"
-FAMILIES = {"cred", "pkg", "persist", "shell", "rootkit", "priv", "ai", "net", "exec"}
+FAMILIES = {"cred", "pkg", "persist", "shell", "rootkit", "priv", "ai", "net", "exec",
+            # `telemetry` is not a detection family. A moat-telemetry-* policy
+            # is a record: moatd routes it past rule evaluation entirely
+            # (engine::handle_line) and it can never raise an alert. It is
+            # checked here like any other policy because a malformed one still
+            # takes the whole daemon down at load time.
+            "telemetry"}
+TELEMETRY_FAMILY = "telemetry"
 
 # notes section 1: spec keys accepted by the CRD (parsed strictly).
 SPEC_KEYS = {
@@ -127,9 +144,10 @@ REQUIRED_ANNOTATIONS = [
     "moat.omarchy/expected",
     "moat.omarchy/fp-hint",
 ]
-OPTIONAL_ANNOTATIONS = ["moat.omarchy/rotate"]
+OPTIONAL_ANNOTATIONS = ["moat.omarchy/rotate", "moat.omarchy/telemetry-class"]
+TELEMETRY_CLASSES = {"process", "network", "file"}
 SEVERITIES = {"critical", "high", "medium", "low"}
-ENFORCE = {"kill", "none"}
+ENFORCE = {"kill", "deny", "none"}
 FP_HINTS = {"exe", "exe+file", "rule", "parent"}
 UI_ACTIONS = {"kill", "quarantine", "ignore"}
 
@@ -290,10 +308,19 @@ def check_hook(p, where, kind, hook):
 
 def check_policy(path, text):
     p = Problems()
-    if "{{HOME}}" in text:
-        rendered = text.replace("{{HOME}}", HOME)
-    else:
-        rendered = text
+    rendered = text.replace("{{HOME}}", HOME)
+    for placeholder, values in LIST_PLACEHOLDERS.items():
+        if placeholder not in rendered:
+            continue
+        # The placeholder is always a whole sequence item. Expanding it inline
+        # as a flow sequence keeps the surrounding indentation valid whatever
+        # the item is nested under.
+        rendered = re.sub(
+            r"^(\s*)-\s*[\"']?" + re.escape(placeholder) + r"[\"']?\s*$",
+            lambda m, v=values: "\n".join("%s- %r" % (m.group(1), x) for x in v),
+            rendered,
+            flags=re.M,
+        )
     for m in re.finditer(r"\{\{(\w+)\}\}", rendered):
         p.add(path, "unknown template placeholder {{%s}} (only {{HOME}} is rendered)" % m.group(1))
     try:
@@ -319,7 +346,6 @@ def check_policy(path, text):
     family = name[len(NAME_PREFIX):].split("-")[0]
     if family not in FAMILIES:
         p.add(path, "family %r is not one of %s" % (family, sorted(FAMILIES)))
-
     ann = md.get("annotations") or {}
     for key in REQUIRED_ANNOTATIONS:
         if not str(ann.get(key, "")).strip():
@@ -327,6 +353,21 @@ def check_policy(path, text):
     for key in ann:
         if key not in REQUIRED_ANNOTATIONS + OPTIONAL_ANNOTATIONS:
             p.add(path, "unexpected annotation %s" % key)
+    if family == TELEMETRY_FAMILY:
+        cls = ann.get("moat.omarchy/telemetry-class")
+        if cls not in TELEMETRY_CLASSES:
+            p.add(path, "telemetry policy needs moat.omarchy/telemetry-class in %s, got %r"
+                        % (sorted(TELEMETRY_CLASSES), cls))
+        # A telemetry policy observes and never acts. Enforcement here would be
+        # a log line that kills things.
+        for sel_action in re.findall(r"action:\s*(\w+)", text):
+            if sel_action in ("Sigkill", "Signal", "Override", "NotifyEnforcer", "Set"):
+                p.add(path, "telemetry policy carries the %s action; telemetry observes "
+                            "and never acts" % sel_action)
+        if ann.get("moat.omarchy/enforce") != "none":
+            p.add(path, "telemetry policy must declare moat.omarchy/enforce: none")
+    elif ann.get("moat.omarchy/telemetry-class"):
+        p.add(path, "moat.omarchy/telemetry-class on a non-telemetry policy")
     sev = ann.get("moat.omarchy/severity")
     if sev not in SEVERITIES:
         p.add(path, "severity %r not in %s" % (sev, sorted(SEVERITIES)))
@@ -364,10 +405,20 @@ def check_policy(path, text):
             for a in sel.get("matchActions", []):
                 if a.get("action") in ("Sigkill", "Signal", "Override", "NotifyEnforcer"):
                     kills.add(a["action"])
-    if kills and enf != "kill":
-        p.add(path, "policy carries %s but annotation enforce is %r" % (sorted(kills), enf))
-    if not kills and enf == "kill":
-        p.add(path, "annotation enforce is kill but no enforcing action is present")
+    # Sigkill ends the process; Override refuses the operation and lets it live.
+    # Those are different promises to the user and the annotation has to say
+    # which one, because it is what the panel prints and what `moatctl` reports.
+    wants = set()
+    for a in kills:
+        wants.add("deny" if a == "Override" else "kill")
+    if len(wants) > 1:
+        p.add(path, "policy mixes %s: a rule either ends the process or refuses "
+                    "the operation, not both" % sorted(kills))
+    elif wants and enf not in wants:
+        p.add(path, "policy carries %s so annotation enforce must be %r, got %r"
+                    % (sorted(kills), sorted(wants)[0], enf))
+    if not kills and enf in ("kill", "deny"):
+        p.add(path, "annotation enforce is %r but no enforcing action is present" % enf)
 
     row = {
         "name": name,
@@ -427,9 +478,13 @@ def main():
     print("-" * len(hdr))
     per_sev = {s: sum(1 for r in rows if r["severity"] == s) for s in ("critical", "high", "medium", "low")}
     print("%d policies: %s" % (len(rows), ", ".join("%s %d" % (k, v) for k, v in per_sev.items())))
-    print("%d enforcing (Sigkill), %d monitor-only" % (
+    # Two kinds of enforcement, counted apart: ending the process and refusing
+    # the operation are different promises, and a single number hid the fact
+    # that every armed rule was a kill.
+    print("%d kill (Sigkill), %d deny (Override -EPERM), %d monitor-only" % (
         sum(1 for r in rows if r["enforce"] == "kill"),
-        sum(1 for r in rows if r["enforce"] != "kill")))
+        sum(1 for r in rows if r["enforce"] == "deny"),
+        sum(1 for r in rows if r["enforce"] not in ("kill", "deny"))))
 
     if problems:
         print("\n%d problem(s):" % len(problems))

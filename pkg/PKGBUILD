@@ -14,9 +14,9 @@
 
 pkgname=omarchy-moat
 pkgver=0.1.0
-pkgrel=15
+pkgrel=62
 _tetragonver=1.7.1
-pkgdesc='eBPF supply-chain sensor for Omarchy: Tetragon policies, an alert daemon, a bubblewrap sandbox and a PKGBUILD scanner'
+pkgdesc='eBPF supply-chain sensor for Omarchy: Tetragon policies, an alert daemon, a bubblewrap sandbox and pre-execution scanners for PKGBUILD, npm, cargo, pip and go'
 arch=('x86_64')
 url='https://github.com/the2dl/omarchy-moat'
 # Apache-2.0: the bundled, unmodified Tetragon v1.7.1 (its eBPF objects are
@@ -26,7 +26,7 @@ license=('Apache-2.0' 'MIT')
 depends=(
 	'bash'          # moat-sandbox, the shims and shim-common.sh
 	'bubblewrap'    # moat-sandbox is a bwrap wrapper; hard dependency
-	'python'        # moat-scan-pkgbuild, stdlib only, python3
+	'python'        # the moat-scan-* scanners, stdlib only, python3
 )
 makedepends=('cargo')
 optdepends=(
@@ -95,6 +95,10 @@ backup=(
 	etc/moat/allowlist.d/omarchy-default.toml
 	etc/moat/sandbox.conf
 	etc/moat/scanner-allow.conf
+	# moat-ship's destination and redaction settings. Holds no secret as
+	# shipped (prefer [https] token_file), but it is exactly the file a site
+	# admin edits, so an upgrade must leave it alone.
+	etc/moat/ship.toml
 )
 
 # The repository working tree, copied into $srcdir by prepare().
@@ -194,6 +198,11 @@ package() {
 	# --- policy templates ({{HOME}} placeholders) ----------------------
 	install -d "${pkgdir}/usr/lib/moat/policies"
 	install -m644 "${tree}/policies/"*.yaml "${pkgdir}/usr/lib/moat/policies/"
+	# The policy validator, installed rather than build-only: `moatd telemetry
+	# --apply` re-runs it over what it just rendered and refuses to restart
+	# the sensor if it fails. A profile switch is a policy load, and a bad
+	# policy load is a silent 25-minute outage (docs/SHIPPING.md section 6).
+	install -Dm755 "${tree}/policies/check.py" "${pkgdir}/usr/lib/moat/check.py"
 
 	# --- systemd ------------------------------------------------------
 	install -Dm644 "${tree}/policies/tetragon.service" \
@@ -204,6 +213,10 @@ package() {
 		"${pkgdir}/usr/lib/systemd/system/moat-feeds.service"
 	install -Dm644 "${tree}/moatd/systemd/moat-feeds.timer" \
 		"${pkgdir}/usr/lib/systemd/system/moat-feeds.timer"
+	# Not enabled by the .install: shipping anything off this machine is a
+	# decision the admin makes, and ship.toml ships with enabled = false.
+	install -Dm644 "${tree}/moatd/systemd/moat-ship.service" \
+		"${pkgdir}/usr/lib/systemd/system/moat-ship.service"
 	# The weekly digest (LEARNING section 5) is a *user* timer: desktop
 	# notifications belong to the session bus, and `moatctl digest --notify`
 	# needs no privilege. It is not enabled by the package; the .install
@@ -212,6 +225,10 @@ package() {
 		"${pkgdir}/usr/lib/systemd/user/moat-digest.service"
 	install -Dm644 "${tree}/moatd/systemd/user/moat-digest.timer" \
 		"${pkgdir}/usr/lib/systemd/user/moat-digest.timer"
+	install -Dm644 "${tree}/moatd/systemd/user/moat-triage.service" \
+		"${pkgdir}/usr/lib/systemd/user/moat-triage.service"
+	install -Dm644 "${tree}/moatd/systemd/user/moat-triage.timer" \
+		"${pkgdir}/usr/lib/systemd/user/moat-triage.timer"
 	install -Dm644 "${tree}/moatd/systemd/sysusers.d/moat.conf" \
 		"${pkgdir}/usr/lib/sysusers.d/moat.conf"
 	# /run/moat/policies (the rendered policies) comes from here, not
@@ -226,15 +243,31 @@ package() {
 	install -Dm755 "${tree}/moatd/target/release/moatd"      "${pkgdir}/usr/bin/moatd"
 	install -Dm755 "${tree}/moatd/target/release/moatctl"    "${pkgdir}/usr/bin/moatctl"
 	install -Dm755 "${tree}/moatd/target/release/moat-feeds" "${pkgdir}/usr/bin/moat-feeds"
+	install -Dm755 "${tree}/moatd/target/release/moat-ship"  "${pkgdir}/usr/bin/moat-ship"
 	install -Dm755 "${tree}/sandbox/moat-sandbox"          "${pkgdir}/usr/bin/moat-sandbox"
 	install -Dm755 "${tree}/scanner/moat-scan-pkgbuild"    "${pkgdir}/usr/bin/moat-scan-pkgbuild"
+	# The npm/pnpm/yarn/bun shims call this before an install runs; without it
+	# on PATH they print "moat-scan-npm not found, skipping" on every install
+	# and the pre-execution analysis silently does nothing.
+	install -Dm755 "${tree}/scanner/moat-scan-npm"         "${pkgdir}/usr/bin/moat-scan-npm"
+	# One implementation, three names: the cargo, pip/pip3/uv and go shims
+	# each call the tool for their own ecosystem, argv[0] selects the rules
+	# and the MOAT_SCANNER_* override in shim-common.sh is per ecosystem.
+	# The infrastructure (finding shape, allow file, exit codes) and most of
+	# the detection vocabulary are shared, so three files would have been
+	# three copies of it.
+	install -Dm755 "${tree}/scanner/moat-scan-build"       "${pkgdir}/usr/bin/moat-scan-build"
+	local _alias
+	for _alias in cargo pip go; do
+		ln -sf moat-scan-build "${pkgdir}/usr/bin/moat-scan-${_alias}"
+	done
 
 	# --- sandbox shims ------------------------------------------------
 	install -d "${pkgdir}/usr/lib/moat/shims"
 	# Sourced, never executed.
 	install -m644 "${tree}/sandbox/shims/shim-common.sh" "${pkgdir}/usr/lib/moat/shims/shim-common.sh"
 	local shim
-	for shim in npm npx pnpm yarn bun pip pip3 uv cargo makepkg; do
+	for shim in npm npx pnpm yarn bun pip pip3 uv cargo go makepkg; do
 		install -m755 "${tree}/sandbox/shims/${shim}" "${pkgdir}/usr/lib/moat/shims/${shim}"
 	done
 
@@ -257,6 +290,11 @@ package() {
 	# state written by the daemon and is deliberately NOT shipped.
 	install -Dm644 "${tree}/moatd/etc/allowlist.d/omarchy-default.toml" \
 		"${pkgdir}/etc/moat/allowlist.d/omarchy-default.toml"
+	# ship.toml holds no secret as shipped, which is why it is 0644 and
+	# readable: the header TEMPLATE is diffable, the token lives in its own
+	# 0600 file. An inline token makes moat-ship refuse to start until this
+	# file is 0600.
+	install -Dm644 "${tree}/moatd/etc/ship.toml"         "${pkgdir}/etc/moat/ship.toml"
 	install -Dm644 "${tree}/sandbox/sandbox.conf"        "${pkgdir}/etc/moat/sandbox.conf"
 	install -Dm644 "${srcdir}/scanner-allow.conf"        "${pkgdir}/etc/moat/scanner-allow.conf"
 
@@ -285,4 +323,8 @@ package() {
 		"${pkgdir}/usr/share/doc/${pkgname}/BASELINE.md"
 	install -Dm644 "${tree}/docs/LEARNING-AND-ANALYSIS.md" \
 		"${pkgdir}/usr/share/doc/${pkgname}/LEARNING-AND-ANALYSIS.md"
+	# moat-ship.service's Documentation= points here, and /etc/moat/ship.toml
+	# and the [telemetry] block of moat.toml both cite it by section.
+	install -Dm644 "${tree}/docs/SHIPPING.md" \
+		"${pkgdir}/usr/share/doc/${pkgname}/SHIPPING.md"
 }

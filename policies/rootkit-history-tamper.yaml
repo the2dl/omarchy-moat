@@ -1,0 +1,117 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-rootkit-history-tamper
+  annotations:
+    moat.omarchy/severity: "medium"
+    moat.omarchy/title: "Shell history deleted or emptied by something other than a shell"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "ignore"
+    moat.omarchy/why: >-
+      Wiping the history file is the oldest step in covering a trail, and it is the one
+      thing an intruder does that has no other purpose. On its own it is weak; next to a
+      credential read or a new service half an hour earlier it is the timestamp that ties
+      the two together.
+    moat.omarchy/expected: >-
+      You clearing your own history, and a dotfile manager replacing it. Note what this
+      cannot see: a shell rewrites its own history file on exit, so bash, zsh and fish
+      are excluded, and that also hides `> ~/.bash_history` typed at a prompt, because
+      the shell performs that redirection itself. What is left is another program - a
+      script, an installer, `truncate`, `shred` - erasing your history.
+    moat.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  # Only argument 1 is declared. Argument 0 is the parent directory, which for a
+  # history file is $HOME itself, and Prefix "$HOME" on an unlink hook would
+  # match every file deleted anywhere under it - one `rm -rf node_modules` would
+  # be tens of thousands of events. Postfix on the dentry costs nothing.
+  - call: "security_path_unlink"
+    syscall: false
+    message: "A shell history file was deleted"
+    args:
+    - index: 1
+      type: "dentry"
+    selectors:
+    - matchBinaries:
+      - operator: "NotPostfix"
+        values:
+        - "/bash"
+        - "/zsh"
+        - "/fish"
+        - "/sh"
+        - "/dash"
+        - "/atuin"
+        - "/nvim"
+        - "/vim"
+        - "/emacs"
+        - "/chezmoi"
+        - "/yadm"
+        - "/stow"
+      matchArgs:
+      - index: 1
+        operator: "Postfix"
+        values:
+        - "/.bash_history"
+        - "/.zsh_history"
+        - "/.sh_history"
+        - "/.histfile"
+        - "/.local/share/zsh/history"
+        - "/fish_history"
+        - "/.python_history"
+        - "/.node_repl_history"
+        - "/.psql_history"
+        - "/.mysql_history"
+        - "/.sqlite_history"
+        - "/atuin/history.db"
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"
+  # Emptying rather than deleting. The shells are excluded because a shell whose
+  # histappend is off truncates its own history file on every exit - that is the
+  # write this rule must never fire on.
+  - call: "security_path_truncate"
+    syscall: false
+    message: "A shell history file was emptied"
+    args:
+    - index: 0
+      type: "path"
+    selectors:
+    - matchBinaries:
+      - operator: "NotPostfix"
+        values:
+        - "/bash"
+        - "/zsh"
+        - "/fish"
+        - "/sh"
+        - "/dash"
+        - "/atuin"
+        - "/nvim"
+        - "/vim"
+        - "/emacs"
+        - "/chezmoi"
+        - "/yadm"
+        - "/stow"
+      matchArgs:
+      - index: 0
+        operator: "Postfix"
+        values:
+        - "/.bash_history"
+        - "/.zsh_history"
+        - "/.sh_history"
+        - "/.histfile"
+        - "/.local/share/zsh/history"
+        - "/fish_history"
+        - "/.python_history"
+        - "/.node_repl_history"
+        - "/.psql_history"
+        - "/.mysql_history"
+        - "/.sqlite_history"
+        - "/atuin/history.db"
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

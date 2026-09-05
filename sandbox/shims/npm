@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
-# omarchy-moat shim: runs the real npm under moat-sandbox.
+# omarchy-moat shim for npm.
+#
+#   1. for install-shaped subcommands, scan the package tree with
+#      moat-scan-npm (exit 0 clean, 1 medium, 2 high) before any lifecycle
+#      script can run. High findings prompt when interactive, refuse when not.
+#   2. run the real npm under moat-sandbox.
+#
+# Only install-shaped subcommands are scanned. `npm run build`, `npm test` and
+# `npm ls` execute nothing from the dependency tree that is not already on
+# disk, and scanning them would cost startup time for no signal.
+#
 # Installed as /usr/lib/moat/shims/npm; active only while
 # /etc/moat/sandbox.enabled exists (see /etc/profile.d/moat-shims.sh).
 set -euo pipefail
@@ -8,4 +18,22 @@ _shim_dir=${SHIM_SELF%/*}
 [[ $_shim_dir == "$SHIM_SELF" ]] && _shim_dir=/usr/lib/moat/shims
 # shellcheck source-path=SCRIPTDIR source=shim-common.sh
 . "$_shim_dir/shim-common.sh"
+
+# Subcommands that unpack packages and run their lifecycle scripts. The
+# spelling zoo is npm's own alias list (`npm help install`).
+npm_installs() {
+	case $1 in
+	install | i | in | ins | inst | insta | instal | isnt | isnta | isntal | isntall) return 0 ;;
+	add | ci | clean-install | ic | install-clean | isntall-clean) return 0 ;;
+	install-test | it | install-ci-test | cit | clean-install-test | sit) return 0 ;;
+	update | udpate | up | upgrade | rebuild | rb) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+subcmd=$(shim_js_subcmd "$@")
+if [[ -n $subcmd ]] && npm_installs "$subcmd"; then
+	shim_scan_js_tree npm "$@"
+fi
+
 shim_exec npm "$@"

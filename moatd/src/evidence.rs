@@ -63,6 +63,38 @@ const SECRET_MARKERS: &[&str] = &[
     "/etc/gshadow",
     "/etc/ssl/private/",
     "/secrets/",
+    // Browser and app credential stores. Added 2026-09-04 after an audit found
+    // a real Chrome `Login Data` staged on disk: this list is described as "the
+    // belt to the family check's braces", and for browser stores the belt had a
+    // hole exactly where the braces were doing all the work -- they were safe
+    // only because those rules happen to be classified `cred`. One misfiled
+    // rule and a cookie jar goes to the agent through the "safe" path.
+    "/.mozilla/firefox/",
+    "/.config/rclone/",
+    "/.pgpass",
+    "/.my.cnf",
+];
+
+/// Credential files that are identified by NAME rather than by location,
+/// because every Chromium-based app ships its own copy of them: Chrome, Brave,
+/// Edge, Spotify, Discord, Slack, and anything else built on Electron.
+const SECRET_BASENAMES: &[&str] = &[
+    "login data",
+    "login data for account",
+    "cookies",
+    "web data",
+    // Chromium's `Local State` holds the key that decrypts the cookie store,
+    // so it is credential material even though the name does not look it --
+    // which is exactly why the policy that watches these lists it too.
+    "local state",
+    "logins.json",
+    "key3.db",
+    "key4.db",
+    "cert9.db",
+    "cookies.sqlite",
+    "signons.sqlite",
+    ".env",
+    ".envrc",
 ];
 
 /// Suffixes that are key material by convention.
@@ -77,6 +109,14 @@ pub fn is_secret_path(path: &str) -> bool {
         return true;
     }
     if SECRET_SUFFIXES.iter().any(|s| p.ends_with(s)) {
+        return true;
+    }
+    let base = util::basename(&p);
+    if SECRET_BASENAMES.contains(&base) {
+        return true;
+    }
+    // `.env.production`, `.env.local`, ...
+    if base.starts_with(".env.") {
         return true;
     }
     // `id_rsa`, `id_ed25519`, … anywhere, not only under ~/.ssh.
@@ -134,7 +174,7 @@ fn may_stage(path: &str, is_target: bool, family: &str) -> Result<(), String> {
 ///
 /// Staged files are written mode 0400 with a `.suspect` extension: they are
 /// assumed hostile, and nothing should be able to execute one by accident.
-pub fn stage(alert: &Alert, dir: &Path, max_bytes: u64) -> Vec<Artifact> {
+pub fn stage(alert: &Alert, dir: &Path, max_bytes: u64, group: &str) -> Vec<Artifact> {
     let mut out = Vec::new();
     let family = alert.family.as_str();
 
@@ -184,13 +224,32 @@ pub fn stage(alert: &Alert, dir: &Path, max_bytes: u64) -> Vec<Artifact> {
                     let name = util::basename(&path);
                     let name = if name.is_empty() { "artifact" } else { name };
                     let dest = dir.join(format!("{}.{}.suspect", role, name));
-                    match copy_readonly(p, &dest) {
-                        Ok(()) => {
-                            a.staged_as = dest
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string());
-                        }
-                        Err(e) => a.withheld = Some(e),
+                    // Open FIRST, then re-run `may_stage` against what the
+                    // kernel says we are actually holding.
+                    //
+                    // `may_stage` above judged a string. `std::fs::copy`
+                    // followed it. So a file the attacker named `/tmp/bait`,
+                    // pointing at `/etc/shadow`, passed the credential check
+                    // under its own name and was then read BY ROOT into an
+                    // incident directory the `moat` group can read -- an
+                    // arbitrary root file-read for any group member, which on
+                    // this threat model is the attacker. Checking the string and
+                    // then following it is the whole bug; this checks the thing.
+                    match util::open_suspect(p) {
+                        Err(why) => a.withheld = Some(why),
+                        Ok((mut f, real)) => match may_stage(&real, is_target, family) {
+                            Err(why) => {
+                                a.withheld = Some(format!("{} (it resolved to {})", why, real))
+                            }
+                            Ok(()) => match copy_readonly_from(&mut f, &dest, group) {
+                                Ok(()) => {
+                                    a.staged_as = dest
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string());
+                                }
+                                Err(e) => a.withheld = Some(e),
+                            },
+                        },
                     }
                 }
             },
@@ -200,11 +259,24 @@ pub fn stage(alert: &Alert, dir: &Path, max_bytes: u64) -> Vec<Artifact> {
     out
 }
 
-fn copy_readonly(src: &Path, dest: &PathBuf) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::copy(src, dest).map_err(|e| format!("copy: {}", e))?;
-    std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o400))
-        .map_err(|e| format!("chmod 400: {}", e))?;
+/// Copy the accused file beside the bundle: read-only, and readable by the
+/// group that reads everything else in the incident directory.
+///
+/// **0440 root:<group>, not 0400.** The daemon is root and the agent is the
+/// user, so a 0400 root-owned copy is one nothing but moatd can open — which
+/// made the whole of §2b inert: the agent was told the artefact was staged for
+/// it, could not read a byte of it, and correctly dropped its confidence over
+/// evidence it had been promised and not given. Auto-triage then withheld every
+/// verdict on the confidence gate. "Read-only" is the property that matters
+/// here (nothing should ever execute or alter a staged suspect); "root-only"
+/// was never the point.
+fn copy_readonly_from(src: &mut std::fs::File, dest: &PathBuf, group: &str) -> Result<(), String> {
+    // From the descriptor, never from the path: the descriptor is the file that
+    // was checked, and nothing can swap it afterwards.
+    let mut out = std::fs::File::create(dest).map_err(|e| format!("create: {}", e))?;
+    std::io::copy(src, &mut out).map_err(|e| format!("copy: {}", e))?;
+    drop(out);
+    crate::util::secure_path(dest, group, 0o440).map_err(|e| format!("chmod 440: {}", e))?;
     Ok(())
 }
 
@@ -299,7 +371,7 @@ mod tests {
             sha256: None,
         });
 
-        let staged = stage(&a, dir.path(), MAX_STAGED_BYTES);
+        let staged = stage(&a, dir.path(), MAX_STAGED_BYTES, "moat");
         assert_eq!(staged.len(), 2);
 
         let act = staged.iter().find(|x| x.role == "actor").unwrap();
@@ -309,8 +381,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
             std::fs::metadata(&copied).unwrap().permissions().mode() & 0o777,
-            0o400,
-            "staged hostile files are read-only"
+            0o440,
+            "staged hostile files are read-only -- but readable by the group, or \
+             the agent they are staged for cannot open them"
         );
         assert!(copied.to_string_lossy().ends_with(".suspect"));
 
@@ -348,7 +421,7 @@ mod tests {
             sha256: None,
         });
 
-        let staged = stage(&a, dir.path(), 1024);
+        let staged = stage(&a, dir.path(), 1024, "moat");
         let act = staged.iter().find(|x| x.role == "actor").unwrap();
         assert!(act.staged_as.is_none());
         assert!(act.withheld.clone().unwrap().contains("staging limit"));
@@ -357,5 +430,41 @@ mod tests {
         let tgt = staged.iter().find(|x| x.role == "target").unwrap();
         assert!(tgt.staged_as.is_none());
         assert!(tgt.withheld.clone().unwrap().contains("not on disk"));
+    }
+}
+
+#[cfg(test)]
+mod symlink_tests {
+    use super::*;
+
+    /// The 2026-09-04 privilege escalation, pinned.
+    ///
+    /// `may_stage` judged the PATH STRING and `std::fs::copy` then followed it,
+    /// so a file the attacker named `/tmp/bait` -- pointing at a root-only file
+    /// -- passed the credential check under its own harmless name and was read
+    /// by root into an incident directory the `moat` group can read. That is an
+    /// arbitrary root file-read handed to any group member, and on this threat
+    /// model the group member IS the attacker.
+    #[test]
+    fn a_symlink_is_never_followed_when_staging_evidence() {
+        let dir = std::env::temp_dir().join(format!("moat-symlink-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let secret = dir.join("pretend-shadow");
+        std::fs::write(&secret, b"root:$6$notreal\n").unwrap();
+        let bait = dir.join("bait");
+        let _ = std::fs::remove_file(&bait);
+        std::os::unix::fs::symlink(&secret, &bait).unwrap();
+
+        let err = crate::util::open_suspect(&bait).expect_err("a symlink must be refused");
+        assert!(err.contains("symbolic link"), "{}", err);
+
+        // A regular file still stages, and reports the path actually opened.
+        let (_f, real) = crate::util::open_suspect(&secret).expect("a real file opens");
+        assert_eq!(real, secret.display().to_string());
+
+        // A directory and a FIFO are not evidence either.
+        assert!(crate::util::open_suspect(&dir).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

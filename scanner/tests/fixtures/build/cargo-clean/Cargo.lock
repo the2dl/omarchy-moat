@@ -1,0 +1,31 @@
+version = 3
+
+[[package]]
+name = "ordinary-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "sub",
+]
+
+[[package]]
+name = "sub"
+version = "0.1.0"
+
+[[package]]
+name = "anyhow"
+version = "1.0.86"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3d1d046238990b9cf5bcde22a3fb3584ee5cf65fb2765f454ed428c7a0063da"
+
+[[package]]
+name = "serde"
+version = "1.0.197"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fb1c873e1b9b056a4dc4c0c198b24c3ffa059243875552b2bd0933b1aee4ce2"
+
+[[package]]
+name = "patched"
+version = "0.2.0"
+source = "git+https://github.com/example/patched?rev=9f1c2b3a4d5e6f708192a3b4c5d6e7f809a1b2c3#9f1c2b3a4d5e6f708192a3b4c5d6e7f809a1b2c3"

@@ -1,0 +1,21 @@
+version = 3
+
+[[package]]
+name = "sneaky"
+version = "0.1.0"
+
+[[package]]
+name = "serde"
+version = "1.0.197"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fb1c873e1b9b056a4dc4c0c198b24c3ffa059243875552b2bd0933b1aee4ce2"
+
+[[package]]
+name = "backdoor"
+version = "0.1.0"
+source = "registry+https://crates.internal.example.net/index"
+
+[[package]]
+name = "unchecked"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"

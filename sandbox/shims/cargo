@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
-# omarchy-moat shim: runs cargo under moat-sandbox, but only for the
-# subcommands that fetch code from the network or execute code from the
-# dependency tree (build scripts, proc macros, test/bench harnesses).
+# omarchy-moat shim for cargo.
+#
+#   1. for the subcommands that compile, scan the project with
+#      moat-scan-cargo (build.rs, .cargo/config.toml, Cargo.toml, Cargo.lock)
+#      before any build script or proc macro can run. Same contract as the
+#      npm and makepkg shims: 0 clean, 1 medium warns, 2 high asks.
+#   2. run the real cargo under moat-sandbox, but only for the subcommands
+#      that fetch code from the network or execute code from the dependency
+#      tree (build scripts, proc macros, test/bench harnesses).
 #
 # Sandboxed:  build install add fetch update run test check
 #             (plus the aliases b, r, t, c and bench/clippy/doc, which all
@@ -54,6 +60,13 @@ for arg in "$@"; do
 done
 
 if [[ -n $subcmd ]] && cargo_needs_sandbox "$subcmd"; then
+	# `cargo build` on an untrusted crate is arbitrary code execution via
+	# build.rs; that is the whole reason this subcommand list exists, so it is
+	# also exactly the list worth scanning first. `cargo install foo` from a
+	# directory with no manifest reads nothing local, and stays silent.
+	if [[ -f ./Cargo.toml ]]; then
+		shim_run_scan cargo moat-scan-cargo --for cargo .
+	fi
 	shim_exec cargo "$@"
 fi
 

@@ -393,7 +393,7 @@ mod tests {
             .expect("the ssh policy template must exist");
         let text = std::fs::read_to_string(&src).unwrap();
         let (name, rendered) =
-            crate::render::render_text(&text, &["/home/dan".to_string()]).unwrap();
+            crate::render::render_text(&text, &["/home/dan".to_string()], &crate::render::default_lists(), &Default::default()).unwrap();
         assert_eq!(name, "moat-cred-ssh-private-key-read");
         assert!(!rendered.contains("{{HOME}}"));
         let doc: Value = serde_yaml::from_str(&rendered).unwrap();
@@ -570,7 +570,7 @@ spec:
                 continue;
             }
             let text = std::fs::read_to_string(&p).unwrap();
-            let Ok((name, rendered)) = crate::render::render_text(&text, &["/home/dan".into()])
+            let Ok((name, rendered)) = crate::render::render_text(&text, &["/home/dan".into()], &crate::render::default_lists(), &Default::default())
             else {
                 continue;
             };

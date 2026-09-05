@@ -1,0 +1,94 @@
+# TELEMETRY, not a detection. Rendered only when `telemetry.file = true`.
+#
+# The expensive class, and the one that had to be designed rather than switched
+# on. Measured on this machine while an `npm install` of 171 packages ran:
+#
+#   every write under $HOME .................. 42.3 events/s   (4359 in 103s)
+#   this policy's kernel filter .............. 19.2 events/s   (45% of them)
+#   after moatd's create/modify ladder ....... 0.32 events/s   (0.8%)
+#
+# So the kernel filter alone is NOT enough - it still costs as much as the whole
+# process class. What makes the class affordable is the second stage, in
+# moatd/src/telemetry.rs: a *create* under node_modules/, target/, .cache/ and
+# friends is dropped, and a *modify* of a file that already existed never is.
+# That is the ladder, and it is keyed on the file rather than on the operation:
+#
+#   create of something executable-shaped ......... interesting
+#   modify of something executable-shaped ......... more interesting
+#   anything else ................................. not recorded
+#
+# The second line is the one that matters. On 2026-09-04 a simulated npm package
+# took a command over a WebSocket and rewrote its own node_modules/express/
+# index.js, so the payload would survive every future require(). Nothing in moat
+# said a word. An installed script being rewritten after install is close to
+# unambiguous, and it is the difference between this class and "log every write".
+#
+# The two selectors below are the two reasons a path is worth looking at:
+#   0. its suffix says it is a script, anywhere on the system;
+#   1. its location says anything written there is worth a record.
+# Values come from `telemetry.file_suffixes` and `telemetry.file_scope` in
+# /etc/moat/moat.toml; {{HOME}} fans out over every human home. ELF magic-byte
+# detection is not expressible in a selector, so moatd does it in userspace on
+# the paths these two already caught.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-telemetry-file-exec-shape
+  annotations:
+    moat.omarchy/telemetry-class: "file"
+    moat.omarchy/severity: "low"
+    moat.omarchy/title: "Executable-shaped file written (telemetry)"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "ignore"
+    moat.omarchy/why: >-
+      Telemetry, not a finding. A record of scripts and binaries appearing or changing,
+      so that "when did this file become what it is now, and what wrote it" has an
+      answer months later. moatd routes this policy past rule evaluation entirely and
+      it can never raise an alert.
+    moat.omarchy/expected: >-
+      Constantly. Every package install, every editor save, every build that emits a
+      script. The value is in the record, not in any one line of it.
+    moat.omarchy/fp-hint: "rule"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  # security_file_post_open fires once per open, not once per write. Its
+  # per-write cousin security_file_permission would resolve d_path on every
+  # single write() and is explicitly warned against (NOTES section 10).
+  - call: "security_file_post_open"
+    syscall: false
+    message: "Executable-shaped file opened for writing (telemetry)"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int"
+    selectors:
+    # 0: a script by suffix, wherever it is.
+    - matchArgs:
+      - index: 0
+        operator: "Postfix"
+        values:
+        - "{{FILE_SUFFIXES}}"
+      - index: 1
+        operator: "Mask"
+        values: ["2"]          # MAY_WRITE
+      matchActions:
+      - action: Post
+        rateLimit: "30s"
+        rateLimitScope: "process"
+    # 1: a location where anything at all is worth recording.
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "{{FILE_SCOPE}}"
+      - index: 1
+        operator: "Mask"
+        values: ["2"]
+      matchActions:
+      - action: Post
+        rateLimit: "30s"
+        rateLimitScope: "process"

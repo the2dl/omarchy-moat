@@ -260,9 +260,21 @@ TestCase {
     }
     verify(seen > 1, "the flooding rule's alerts are all still in the log")
 
+    // Not counted in the badge -- because the DAEMON stamped every one of them
+    // `timeline`, not because the panel read the list: the count is the same
+    // with and without `demoted_rules`, and none of the rule's unacked alerts
+    // is on the Alerts surface.
     var counts = Model.unackedCounts(alerts(), options)
     var uncounted = Model.unackedCounts(alerts(), {})
-    verify(counts.total < uncounted.total, "a demoted rule is not counted in the badge")
+    compare(counts.badge, uncounted.badge, "the list is not a second surfacing decision")
+    var onBadge = 0, unackedOfRule = 0
+    for (var j = 0; j < list.length; j++) {
+      if (list[j].rule !== rule || list[j].acked) continue
+      unackedOfRule++
+      if (Model.alertSurface(list[j], status.demoted_rules) === "alerts") onBadge++
+    }
+    verify(unackedOfRule > 0)
+    compare(onBadge, 0, "a demoted rule is not counted in the badge")
 
     // ...and the guard's own alert names the rule it demoted.
     var guard = byRule(alerts(), "moat-x-noisy-rule")

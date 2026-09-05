@@ -40,6 +40,9 @@ pub struct Finding {
     /// Set when the policy asked for a kill; only a `process_exit` with
     /// `signal: SIGKILL` turns this into `action_taken: killed`.
     pub kill_expected: bool,
+    /// The kernel refused the operation outright (`Override` -> -EPERM). Not
+    /// "expected": it has already happened, and nothing has to confirm it.
+    pub denied: bool,
     /// Set by a userland rule that enforces in the daemon rather than in the
     /// kernel (`moat-pkg-subtree-netcat-exec`). The engine kills the process
     /// **only** in `enforce` mode, and only after re-verifying its start time.
@@ -79,6 +82,7 @@ impl Finding {
             what_override: None,
             mode: "monitor".into(),
             kill_expected: false,
+            denied: false,
             request_kill: false,
             actor: Default::default(),
             context: Default::default(),
@@ -113,7 +117,36 @@ impl Finding {
 
     /// Dedupe key: same rule + exe + file inside the window is one alert
     /// (CONTRACT §6.3).
+    ///
+    /// The `cred` family drops the file, because a credential SWEEP is one
+    /// event and not N. Every Chromium-based app ships a profile holding
+    /// `Cookies`, `Login Data` and `Local State`, so a recursive file search
+    /// that walks into Spotify, Discord and Slack opens fifteen credential
+    /// stores in a few seconds -- and so, deliberately, does an infostealer.
+    /// Keyed on the path that was fifteen separate high alerts, which is not
+    /// fifteen times the signal: it is one sweep, and it reads louder as a
+    /// single alert with a count than as a page of rows nobody finishes.
+    ///
+    /// The pid stays in the key so two different programs reading credentials
+    /// remain two events, and the rule stays in it so a sweep of browser
+    /// stores never merges with an SSH key read -- crossing rules is the
+    /// chain's job, not the dedupe's.
     pub fn dedupe_key(&self) -> String {
+        // Moat's own meta alerts key on their TITLE.
+        //
+        // They are raised through `self_proc`, so every one of them shares an
+        // exe and carries no file -- which made `(rule, exe, file)` identical
+        // for all of them and folded genuinely different statements into one
+        // row with a count. Switching to monitor, turning the sandbox off and
+        // clearing the queue are three things that happened, not one thing
+        // three times, and for the family whose whole job is to report on moat
+        // itself that distinction is the content.
+        if self.meta.family == "x" {
+            return format!("{}|{}", self.rule, self.meta.title);
+        }
+        if self.meta.family == "cred" {
+            return format!("{}|{}|pid:{}", self.rule, self.proc.exe, self.proc.pid);
+        }
         format!(
             "{}|{}|{}",
             self.rule,
@@ -189,7 +222,10 @@ pub fn build_alert(f: &Finding, id: &str, ts: &str, allowlist_file: &str, allowl
         ioc: f.ioc.clone(),
         rotate: f.meta.rotate.clone(),
         explain,
-        action_taken: "none".into(),
+        // A refusal is recorded the moment it is seen. A kill is not: it stays
+        // "none" until process_exit reports SIGKILL, because a kill that did
+        // not land must never be shown as one.
+        action_taken: if f.denied { "blocked".into() } else { "none".to_string() },
         actions: f.meta.actions.clone(),
         acked: false,
         mode: f.mode.clone(),
@@ -202,9 +238,19 @@ pub fn build_alert(f: &Finding, id: &str, ts: &str, allowlist_file: &str, allowl
         suppressed_by: f.suppressed_by.clone(),
         rarity: rarity.as_ref().map(|r| r.class).unwrap_or_default(),
         rarity_text: rarity.map(|r| r.text).unwrap_or_default(),
+        // Auto-triage runs later, from the user's session; a fresh alert has
+        // never been looked at.
+        triage: None,
         // The snapshot arrives as an update line once the capture finishes
         // (LEARNING §4): the alert must not wait on a /proc walk.
         incident: None,
+        // A sequence needs a second event, which by definition has not happened
+        // yet; the chain arrives as an update line on this id when it does
+        // (CONTRACT §4, design 2b).
+        chain: None,
+        // Content analysis only ever runs on a file a chain implicated, which
+        // needs a chain, which needs a second event (`content.rs`).
+        content: Vec::new(),
         exec_id: f.exec_id.clone(),
     }
 }
@@ -278,6 +324,15 @@ fn what_sentence(f: &Finding) -> String {
             None => format!("{} started a shell in a place a shell should not be.", comm),
         },
         "rootkit" => format!("{} tried to load kernel code or hide itself from the system.", comm),
+        // Telemetry is a record, not an accusation, and `engine::handle_line`
+        // routes it past rule evaluation so it should never reach this
+        // function at all. If it ever does — a policy renamed by hand, a
+        // future record shape — the sentence must say what it actually is
+        // rather than dressing a log line up as a finding.
+        "telemetry" => format!(
+            "{} produced a telemetry record ({}); this is a log entry, not a detection.",
+            comm, f.hook
+        ),
         "priv" => match file {
             Some(p) => format!("{} tried to raise privileges via {}.", comm, p),
             None => format!("{} tried to raise its privileges ({}).", comm, f.hook),
@@ -444,7 +499,7 @@ fn if_expected(f: &Finding, id: &str, allowlist_file: &str) -> IfExpected {
         "exe",
         RuleSpec {
             name: f.rule.clone(),
-            exe: Some(f.proc.exe.clone()),
+            exe: Some(literal(&f.proc.exe)),
             ..Default::default()
         },
     );
@@ -453,8 +508,8 @@ fn if_expected(f: &Finding, id: &str, allowlist_file: &str) -> IfExpected {
             "exe+file",
             RuleSpec {
                 name: f.rule.clone(),
-                exe: Some(f.proc.exe.clone()),
-                file: Some(file.path.clone()),
+                exe: Some(literal(&f.proc.exe)),
+                file: Some(literal(&file.path)),
                 ..Default::default()
             },
         );
@@ -464,7 +519,7 @@ fn if_expected(f: &Finding, id: &str, allowlist_file: &str) -> IfExpected {
             "parent",
             RuleSpec {
                 name: f.rule.clone(),
-                parent: Some(parent.exe.clone()),
+                parent: Some(literal(&parent.exe)),
                 ..Default::default()
             },
         );
@@ -492,18 +547,35 @@ fn if_expected(f: &Finding, id: &str, allowlist_file: &str) -> IfExpected {
 }
 
 /// Available ignore scopes for a finding, in the same order `if_expected` uses.
+/// A path, escaped so the allowlist matcher reads it as one literal path.
+///
+/// Allowlist fields are compiled with `globset`, and for a rule a PERSON wrote
+/// that is the point -- the baseline's learned entries deliberately say
+/// `~/.ssh/*`. It is not what the user agrees to when they click "This was me"
+/// on one program: these specs are built from a path the ATTACKER named, and
+/// `*`, `?`, `[` and `{` are all legal in a filename. A dropper in a directory
+/// called `**`, named `*`, turns one approval into a permanent root-owned rule
+/// matching `/tmp/**/*` -- far wider than the panel showed the user, silencing
+/// binaries they have never seen.
+///
+/// Escaped here rather than in `render_block` because that renderer is shared
+/// with the baseline, whose globs are intentional.
+fn literal(path: &str) -> String {
+    globset::escape(path)
+}
+
 pub fn scope_spec(f: &Finding, scope: &str) -> Result<RuleSpec, String> {
     match scope {
         "exe" => Ok(RuleSpec {
             name: f.rule.clone(),
-            exe: Some(f.proc.exe.clone()),
+            exe: Some(literal(&f.proc.exe)),
             ..Default::default()
         }),
         "exe+file" => match &f.file {
             Some(file) => Ok(RuleSpec {
                 name: f.rule.clone(),
-                exe: Some(f.proc.exe.clone()),
-                file: Some(file.path.clone()),
+                exe: Some(literal(&f.proc.exe)),
+                file: Some(literal(&file.path)),
                 ..Default::default()
             }),
             None => Err("this alert has no file, so scope exe+file does not apply".into()),
@@ -511,7 +583,7 @@ pub fn scope_spec(f: &Finding, scope: &str) -> Result<RuleSpec, String> {
         "parent" => match f.ancestry.first() {
             Some(p) => Ok(RuleSpec {
                 name: f.rule.clone(),
-                parent: Some(p.exe.clone()),
+                parent: Some(literal(&p.exe)),
                 ..Default::default()
             }),
             None => Err("this alert has no recorded parent, so scope parent does not apply".into()),
@@ -533,14 +605,14 @@ pub fn scope_spec_from_alert(a: &Alert, scope: &str) -> Result<RuleSpec, String>
     match scope {
         "exe" => Ok(RuleSpec {
             name: a.rule.clone(),
-            exe: Some(a.process.exe.clone()),
+            exe: Some(literal(&a.process.exe)),
             ..Default::default()
         }),
         "exe+file" => match &a.file {
             Some(f) => Ok(RuleSpec {
                 name: a.rule.clone(),
-                exe: Some(a.process.exe.clone()),
-                file: Some(f.path.clone()),
+                exe: Some(literal(&a.process.exe)),
+                file: Some(literal(&f.path)),
                 ..Default::default()
             }),
             None => Err("this alert has no file, so scope exe+file does not apply".into()),
@@ -548,7 +620,7 @@ pub fn scope_spec_from_alert(a: &Alert, scope: &str) -> Result<RuleSpec, String>
         "parent" => match a.process.ancestry.first() {
             Some(p) => Ok(RuleSpec {
                 name: a.rule.clone(),
-                parent: Some(p.exe.clone()),
+                parent: Some(literal(&p.exe)),
                 ..Default::default()
             }),
             None => Err("this alert has no recorded parent, so scope parent does not apply".into()),
@@ -675,6 +747,7 @@ mod tests {
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            sid: None,
         }
     }
 
@@ -707,6 +780,7 @@ mod tests {
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            sid: None,
         }, ProcInfo {
             exec_id: "e-1".into(),
             pid: 41201,
@@ -719,6 +793,7 @@ mod tests {
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            sid: None,
         }];
         f.ancestry_line = "npm -> sh -> node".into();
         f
@@ -952,13 +1027,48 @@ mod tests {
 
     #[test]
     fn dedupe_key_folds_rule_exe_file() {
-        let a = finding();
-        let mut b = finding();
+        // Outside the `cred` family the file still separates two alerts: two
+        // different desktop entries written is two things that happened.
+        let mut a = finding();
+        a.meta.family = "persist".into();
+        let mut b = a.clone();
         assert_eq!(a.dedupe_key(), b.dedupe_key());
         b.file = Some(FileRef {
             path: "/home/dan/.ssh/id_rsa".into(),
             sha256: None,
         });
         assert_ne!(a.dedupe_key(), b.dedupe_key());
+    }
+
+    #[test]
+    fn a_credential_sweep_is_one_alert_and_not_fifteen() {
+        // 2026-09-04: a recursive file search walked into Spotify, Discord and
+        // Slack -- every Chromium-based app ships `Cookies`, `Login Data` and
+        // `Local State` -- and raised fifteen separate high alerts in four
+        // seconds. An infostealer does exactly the same thing on purpose. One
+        // sweep with a count reads louder than fifteen rows nobody finishes.
+        let a = finding();
+        assert_eq!(a.meta.family, "cred", "fixture is the family under test");
+        let mut b = finding();
+        b.file = Some(FileRef {
+            path: "/home/dan/.config/discord/Cookies".into(),
+            sha256: None,
+        });
+        assert_eq!(
+            a.dedupe_key(),
+            b.dedupe_key(),
+            "two credential stores read by one process in the window are one sweep"
+        );
+
+        // Two different programs reading credentials stay two events...
+        let mut other = finding();
+        other.proc.pid = a.proc.pid + 1;
+        assert_ne!(a.dedupe_key(), other.dedupe_key());
+
+        // ...and a sweep never merges across rules. Crossing rules is what the
+        // chain correlates; folding them here would destroy that.
+        let mut other_rule = finding();
+        other_rule.rule = "moat-cred-browser-secrets-read".into();
+        assert_ne!(a.dedupe_key(), other_rule.dedupe_key());
     }
 }

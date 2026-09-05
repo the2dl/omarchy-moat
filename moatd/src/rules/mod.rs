@@ -25,6 +25,7 @@
 pub mod ai_cli;
 pub mod mass_read;
 pub mod netmatch;
+pub mod net_first_contact;
 pub mod new_exec_ioc;
 pub mod pkg_egress;
 pub mod pkg_subtree;
@@ -50,7 +51,23 @@ pub const INTERACTIVE: &[&str] = &[
     "alacritty", "foot", "kitty", "ghostty", "wezterm", "wezterm-gui", "gnome-terminal-server",
     "konsole", "xterm", "urxvt", "st", "tmux", "tmux: server", "screen", "sshd", "login",
     "systemd-logind", "code", "code-oss", "codium", "zed", "nvim", "vim", "emacs",
+    // A session host is a boundary whatever it is called. `herdr` sits between
+    // the terminal and the shells on this machine, so on 2026-09-04 it became
+    // the root of every tree below it and `chain.rs` welded an AUR attack to
+    // three unrelated connections from a Claude session seven minutes earlier:
+    // "7 things happened in 7 minutes under herdr" is shared ancestry, not a
+    // sequence. See the note on this list's fragility below.
+    "herdr",
 ];
+
+// NOTE: this list is a hardcoded set of NAMES, and that is its weakness. Any
+// terminal or session host not written here silently becomes the root of every
+// tree beneath it, which turns one chain into a bag of unrelated events -- and
+// nothing fails loudly when that happens. The general fix is to stop asking
+// what a process is CALLED and ask what it IS: a session leader (`sid == pid`
+// in /proc/<pid>/stat) is a boundary by definition, whatever it is named. That
+// needs the session id carried on ProcInfo, which the exec path does not read
+// today.
 
 /// The AI CLIs CONTRACT §6.4 names.
 pub const AI_CLIS: &[&str] = &["claude", "codex", "gemini", "opencode", "q", "amp"];
@@ -67,6 +84,10 @@ pub const SKIP_PERMISSION_FLAGS: &[&str] = &[
 pub struct RuleCtx<'a> {
     pub cfg: &'a Config,
     pub table: &'a ProcTable,
+    /// Read-only: a rule may ask whether this machine has ever seen a tuple
+    /// before, which is how "first contact" is told apart from "the registry
+    /// you use every day". Rules never `observe` -- the engine owns that.
+    pub rarity: &'a crate::rarity::RarityStore,
     pub feeds: &'a Feeds,
     /// Human homes, for "$HOME dotdir" tests.
     pub homes: &'a [String],
@@ -114,6 +135,7 @@ pub fn all() -> Vec<Box<dyn UserRule>> {
     vec![
         Box::new(ai_cli::AiCliHeadless),
         Box::new(pkg_egress::PkgEgress::default()),
+        Box::new(net_first_contact::NetFirstContact::default()),
         Box::new(new_exec_ioc::NewExecIoc::default()),
         Box::new(mass_read::MassRead::default()),
         Box::new(pkg_subtree::InterpreterSpawn::default()),
@@ -179,6 +201,133 @@ pub fn sensor_mismatch_meta(why: &str) -> PolicyMeta {
 /// `moat-x-noisy-rule`: one rule flooded the last 24 h, so the noise guard
 /// moved it to the timeline (BASELINE §4). Raised once per demotion.
 pub const NOISY_RULE: &str = "moat-x-noisy-rule";
+
+/// Rules that report on MOAT'S OWN INTEGRITY, and therefore cannot be silenced.
+///
+/// Everything else here can be allowlisted, and should be: a detection that is
+/// wrong for your machine is noise, and telling Moat to stop asking is the
+/// whole point of the allowlist. These are different. They do not describe
+/// something a program did -- they describe Moat being weakened, stopped,
+/// unwatched, or dropping events. An allowlist entry for "a protection was
+/// turned off" makes every future weakening silent, which is precisely the
+/// state an attacker wants and precisely what the alert exists to prevent.
+///
+/// So they carry no `ignore` action, and `cmd_ignore` refuses them outright.
+/// The only thing to do with one is read it and close it.
+pub const NEVER_SILENCE: &[&str] = &[
+    PROTECTION_CHANGED,
+    WAS_DOWN,
+    UNWATCHED,
+    SENSOR_THROTTLED,
+    "moat-x-sensor-mismatch",
+];
+
+/// Something turned a protection off. Recorded as an alert, never only a log
+/// line, because root's journal is not readable by the person being protected
+/// and a weakening nobody can see is the same as no protection at all.
+pub const PROTECTION_CHANGED: &str = "moat-x-protection-changed";
+
+/// Moat was not running, and now it is.
+pub const WAS_DOWN: &str = "moat-x-was-not-running";
+
+pub fn was_down_meta(mins: u64) -> PolicyMeta {
+    meta(
+        WAS_DOWN,
+        "x",
+        "high",
+        "Moat was not running for a while",
+        &format!(
+            "There is a {}-minute hole in the record: Moat stopped and started again, and \
+             nothing that happened in between was seen by anything. Stopping the daemon needs \
+             root, so this is either an update, a reboot, a crash -- or somebody with root \
+             turning it off, which is the first thing worth doing if you want to work \
+             unobserved.",
+            mins
+        ),
+        "A package upgrade, a reboot, or you restarting it yourself. Expected right after either \
+         of those and suspicious at any other time.",
+        &[],
+        // No `ignore`: see NEVER_SILENCE.
+        &[],
+        "rule",
+    )
+}
+
+/// Alerts are piling up and no panel has asked for them.
+pub const UNWATCHED: &str = "moat-x-nobody-is-watching";
+
+pub fn unwatched_meta(unacked: u64, quiet_mins: u64) -> PolicyMeta {
+    meta(
+        UNWATCHED,
+        "x",
+        "high",
+        "Alerts are waiting and nothing has been reading them",
+        &format!(
+            "{} alert(s) need an answer and no panel has asked Moat for its status in {} \
+             minutes. Notifications are drawn by a program in your own session, so anything \
+             running as you can stop them just by killing it -- and then Moat keeps recording \
+             faithfully while nobody sees a thing. This is Moat noticing that itself.",
+            unacked, quiet_mins
+        ),
+        "Logging out, locking the screen for a long time, or closing the panel on purpose. It \
+         means nobody would have seen an alert during that window, not that anything attacked \
+         you.",
+        &[],
+        // No `ignore`: see NEVER_SILENCE.
+        &[],
+        "rule",
+    )
+}
+
+/// The sensor is dropping events, so there is a hole in the record.
+pub const SENSOR_THROTTLED: &str = "moat-x-sensor-throttled";
+
+pub fn sensor_throttled_meta(cgroup: &str) -> PolicyMeta {
+    meta(
+        SENSOR_THROTTLED,
+        "x",
+        "high",
+        "The sensor hit its rate limit and is dropping events",
+        &format!(
+            "Tetragon throttled {}, which means events from it are being discarded rather than \
+             recorded. Whatever ran in that window is not in the timeline and never will be. A \
+             flood is the cheapest way to blind a sensor precisely because the evidence is the \
+             thing that goes missing, so the throttle itself has to be the alert.",
+            if cgroup.is_empty() { "a cgroup" } else { cgroup }
+        ),
+        "A genuinely busy build -- a large compile, a big npm install -- can reach the limit \
+         without anything being wrong. What matters is whether a flood arrived at the same time \
+         as something you would rather have seen.",
+        &[],
+        // No `ignore`: see NEVER_SILENCE.
+        &[],
+        "rule",
+    )
+}
+
+pub fn protection_changed_meta(action: &str, who: &str) -> PolicyMeta {
+    meta(
+        PROTECTION_CHANGED,
+        "x",
+        "high",
+        &format!("A protection was weakened: {}", action),
+        &format!(
+            "{} asked Moat to {}. The control socket is owned by the `moat` group, and on this \
+             machine's threat model -- a hijacked package running as you -- the attacker is in \
+             that group too. So every weakening is recorded here, with who asked, before it takes \
+             effect. If that was you, this line is the receipt; if it was not, it is the first \
+             thing that happened.",
+            who, action
+        ),
+        "You turning something off on purpose: switching to monitor, disarming a rule, allowing a \
+         program, or releasing a containment. Expected right after you touch a toggle, and never \
+         at any other time.",
+        &[],
+        // No `ignore`: see NEVER_SILENCE.
+        &[],
+        "rule",
+    )
+}
 
 pub fn noisy_rule_meta(rule: &str, count: u64, threshold: u64) -> PolicyMeta {
     meta(
@@ -372,13 +521,14 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), n, "rule ids must be unique");
-        assert_eq!(n, 8, "four gap rules plus the four that replaced pkg policies");
+        assert_eq!(n, 9, "four gap rules, the four that replaced pkg policies, and net-first-contact");
 
         // Every rule must be switchable off, or `[rules]` is a lie.
         let mut off = cfg();
         off.rules = crate::config::RuleToggles {
             ai_cli_headless: false,
             pkg_egress: false,
+            net_first_contact: false,
             new_exec_ioc: false,
             mass_read: false,
             pkg_subtree_interpreter_spawn: false,

@@ -1,0 +1,67 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-net-first-contact
+  annotations:
+    moat.omarchy/severity: "low"
+    moat.omarchy/title: "Outbound connection to somewhere new"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "ignore"
+    moat.omarchy/why: >-
+      On its own this is nothing: the first time you use any service is a first
+      contact. It exists to be the second half of a sequence. A credential file read
+      and then a connection to somewhere this machine has never talked to, from the
+      same process tree, is exfiltration - and neither half is worth interrupting you
+      for alone. moatd correlates the two into one chain and raises that.
+    moat.omarchy/expected: >-
+      Constantly, for the first few days: every host you use is new once. Each
+      destination reports at most once and then goes quiet for good, so this settles
+      by itself. It never notifies and never reaches the badge on its own.
+    moat.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  # Deliberately broad in the kernel and narrow in userspace.
+  #
+  # The kernel can only see addresses, so it cannot know which of them this
+  # machine has met before -- that lives in moatd's rarity store. So this posts
+  # every outbound TCP connection that is not loopback and lets
+  # `rules/net_first_contact.rs` drop the ones to destinations already seen.
+  # Measured on this machine at 0.26 connections/sec, which is 160x rarer than
+  # exec events and is what makes a broad network policy affordable where a
+  # broad file policy was not.
+  #
+  # `moat-net-suspicious-port-egress` excludes RFC1918 in-kernel because a
+  # workstation talks to its LAN constantly. This one deliberately does NOT: on
+  # 2026-09-04 a simulated npm package beaconed to a WebSocket C2 on
+  # 192.168.44.122, and every rule that could have seen it had excluded the LAN
+  # or required a package-install subtree the payload was not in. A LAN host is
+  # excluded here only by having been seen before, which your registry and your
+  # NAS earn within a day and an attacker's collector does not.
+  - call: "tcp_connect"
+    syscall: false
+    message: "Outbound connection to somewhere new"
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Family"
+        values: ["AF_INET", "AF_INET6"]
+      # Loopback only. A local proxy, a devcontainer registry and a dev server
+      # are ordinary and are not "somewhere"; everything else, including the
+      # LAN, is judged on whether it has been seen.
+      - index: 0
+        operator: "NotDAddr"
+        values:
+        - "127.0.0.0/8"
+        - "::1/128"
+      matchActions:
+      - action: Post
+        # Per process, so a client opening a connection pool reports once
+        # rather than once per socket.
+        rateLimit: "60s"
+        rateLimitScope: "process"

@@ -11,10 +11,14 @@ DefaultDependencies=no
 After=local-fs.target
 Before=shutdown.target
 Conflicts=shutdown.target
-# Restart on failure, but stop trying after 10 attempts in 2 minutes.
-# systemctl reset-failed tetragon clears the counter.
-StartLimitBurst=10
-StartLimitIntervalSec=2min
+# Never stop trying.
+#
+# This used to give up after 10 attempts in 2 minutes, which on a security
+# sensor is a switch anyone who can crash it ten times gets to flip: the sensor
+# stays down until a human runs `systemctl reset-failed`, and nothing says so.
+# A crash loop is noisy and visible; a sensor that quietly decided to stop is
+# neither. `StartLimitIntervalSec=0` disables the limit entirely.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -28,7 +32,9 @@ Group=root
 # so this must run before every start.
 ExecStartPre=/usr/bin/moatd render-policies
 ExecStart=/usr/bin/tetragon
-Restart=on-failure
+# `always`, not `on-failure`: a clean exit(0) must bring it back too. Only an
+# explicit `systemctl stop` should keep it down.
+Restart=always
 RestartSec=5
 TimeoutStopSec=30
 KillMode=mixed

@@ -1,0 +1,81 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-cred-ssh-agent-socket
+  annotations:
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "Connection to an ssh-agent socket by a program that is not ssh"
+    moat.omarchy/rotate: "ssh-key"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,ignore"
+    moat.omarchy/why: >-
+      An attacker running as you does not need your private key: it connects to the
+      agent and asks the agent to sign. The key file is never opened, so every rule that
+      watches ~/.ssh is bypassed, and ssh-agent is on the credential allowlist precisely
+      so it can do this. Signing is enough to log into every host that key opens.
+    moat.omarchy/expected: >-
+      ssh, scp, sftp, git pushing over ssh, ssh-add listing keys, and password managers
+      acting as the agent - all excluded. Anything else asking your agent to sign is
+      worth one look. This only sees agents whose socket is under /tmp/ssh-* or in your
+      home directory; a socket under /run/user/<your id>/ cannot be expressed here,
+      because the only path operators are Equal and Prefix and the user id sits in the
+      middle of that path.
+    moat.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  - call: "security_socket_connect"
+    syscall: false
+    message: "Unexpected program connected to an ssh-agent socket"
+    args:
+    - index: 1
+      type: "sockaddr_un"
+    selectors:
+    - matchBinaries:
+      - operator: "NotPostfix"
+        values:
+        - "/ssh"
+        - "/sshd"
+        - "/scp"
+        - "/sftp"
+        - "/ssh-add"
+        - "/ssh-agent"
+        - "/ssh-keygen"
+        - "/ssh-keyscan"
+        - "/ssh-copy-id"
+        - "/autossh"
+        - "/mosh"
+        - "/git"
+        - "/git-remote-http"
+        - "/git-remote-https"
+        - "/gh"
+        - "/rsync"
+        - "/ansible"
+        - "/ansible-playbook"
+        - "/op"
+        - "/1password"
+        - "/keepassxc"
+        - "/gcr-ssh-agent"
+        - "/gpg-agent"
+        - "/kitten"
+        - "/code"
+      matchArgs:
+      # `eval $(ssh-agent)` puts the socket in a mkdtemp'd /tmp/ssh-XXXXXX, and
+      # the password-manager agents put it in $HOME. The systemd, gcr and
+      # gnome-keyring agents put it under /run/user/<uid>/, which no operator
+      # here can match: sockaddr_un takes Equal and Prefix only, the uid is a
+      # middle component, and a Prefix of "/run/user/" would match every desktop
+      # socket on the machine.
+      - index: 1
+        operator: "Prefix"
+        values:
+        - "/tmp/ssh-"
+        - "{{HOME}}/.1password/agent.sock"
+        - "{{HOME}}/.ssh/agent"
+        - "{{HOME}}/.gnupg/S.gpg-agent.ssh"
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

@@ -58,4 +58,22 @@ echo "--- tst_wire"
 QT_QPA_PLATFORM=offscreen QML_XHR_ALLOW_FILE_READ=1 \
   "$runner" -input "$here/tst_wire.qml" || status=1
 
+# tst_tokens is the one suite that instantiates a view component. Tokens.qml
+# takes its theme values as properties and imports nothing from Quickshell
+# precisely so this can run: it checks that the redesign's palette, derived
+# from the user's theme rather than copied from the handoff's hex, still points
+# the right way on a LIGHT theme. That is the failure nobody running a dark
+# theme will ever see.
+echo "--- tst_tokens"
+QT_QPA_PLATFORM=offscreen \
+  "$runner" -input "$here/tst_tokens.qml" || status=1
+
+# tst_scroll measures the panel's wheel scrolling with real wheel events: one
+# notch is MoatScroll.wheelStep px and N notches are N steps at any cadence.
+# The stock Flickable this replaced managed 72 px for a lone notch and 14 px
+# per notch in a burst; the numbers and their sources are in MoatScroll.qml.
+echo "--- tst_scroll"
+QT_QPA_PLATFORM=offscreen \
+  "$runner" -input "$here/tst_scroll.qml" || status=1
+
 exit $status

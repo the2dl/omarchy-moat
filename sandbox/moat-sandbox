@@ -46,6 +46,20 @@ DEFAULT_DENY=(
 	"$HOME/.git-credentials"
 	"$HOME/.config/op"
 	"$HOME/.password-store"
+	# Shell and REPL history. Not a credential store, which is exactly why it
+	# gets missed: history routinely holds inline secrets -- `TOKEN=... cmd`,
+	# a curl with a bearer header, a password typed into the wrong prompt --
+	# and unlike a credential file nothing rotates it. A sandboxed build tool
+	# has no use for it, and neither does an analysis agent: it is the highest
+	# ratio of "leaks secrets" to "helps" on the disk.
+	"$HOME/.bash_history"
+	"$HOME/.zsh_history"
+	"$HOME/.local/share/fish/fish_history"
+	"$HOME/.python_history"
+	"$HOME/.node_repl_history"
+	"$HOME/.psql_history"
+	"$HOME/.mysql_history"
+	"$HOME/.sqlite_history"
 )
 
 # Package caches that must be writable for installs to work at all.
@@ -57,7 +71,11 @@ DEFAULT_CACHES=(
 	"$HOME/.cargo/registry"
 	"$HOME/.cargo/git"
 	"$HOME/.rustup"
-	"$HOME/.local/share/mise"
+	# NOT $HOME/.local/share/mise. It is on PATH via mise's shims, so a
+	# writable bind let a sandboxed install script drop a shim that the user
+	# then runs OUTSIDE the sandbox -- a full escape, on the next command they
+	# type. The read-only bind of / still lets a toolchain be USED in here;
+	# what is refused is installing one, which is not what this box is for.
 	"$HOME/.local/share/uv"
 	"$HOME/.bun"
 	"$HOME/.yarn"
@@ -101,6 +119,7 @@ in_list() {
 
 DENY=("${DEFAULT_DENY[@]}")
 ALLOW=()
+ALLOW_RO=()
 KEEP_ENV=()
 
 read_config() {
@@ -126,6 +145,7 @@ read_config() {
 		case $key in
 		deny) DENY+=("$(expand_path "$val")") ;;
 		allow) ALLOW+=("$(expand_path "$val")") ;;
+		allow-ro | allow_ro) ALLOW_RO+=("$(expand_path "$val")") ;;
 		keep-env | keep_env) KEEP_ENV+=("$val") ;;
 		*) warn "$file:$lineno: unknown key '$key'" ;;
 		esac
@@ -168,6 +188,16 @@ while (($# > 0)); do
 	--allow)
 		[[ $# -ge 2 ]] || die "--allow needs a PATH"
 		ALLOW+=("$(expand_path "$2")")
+		shift 2
+		;;
+	# Readable, never writable. For a directory the child must READ -- an
+	# agent's own credentials, a config it needs -- where handing it write
+	# access hands an injected prompt a way out: `~/.claude/settings.json`
+	# takes a hook, and the triage timer re-runs every minute, so one write
+	# there is code execution as the user on a guaranteed schedule.
+	--allow-ro)
+		[[ $# -ge 2 ]] || die "--allow-ro needs a PATH"
+		ALLOW_RO+=("$(expand_path "$2")")
 		shift 2
 		;;
 	--allow=*)
@@ -239,10 +269,10 @@ command -v bwrap >/dev/null 2>&1 || die "bwrap (bubblewrap) is not installed"
 # ------------------------------------------------------- resolve deny/allow ---
 
 # An explicit allow wins: drop exact matches from the deny list.
-if ((${#ALLOW[@]} > 0)); then
+if ((${#ALLOW[@]} > 0 || ${#ALLOW_RO[@]} > 0)); then
 	filtered=()
 	for d in "${DENY[@]}"; do
-		in_list "$d" "${ALLOW[@]}" || filtered+=("$d")
+		in_list "$d" "${ALLOW[@]}" "${ALLOW_RO[@]}" || filtered+=("$d")
 	done
 	DENY=("${filtered[@]}")
 fi
@@ -311,6 +341,14 @@ for c in "${DEFAULT_CACHES[@]}"; do
 done
 
 # Explicit allows, writable.
+# Read-only allows are un-denied but never made writable: the `--ro-bind / /`
+# at the top already exposes them, so all this does is keep a tmpfs mask off.
+for a in "${ALLOW_RO[@]}"; do
+	if [[ ! -e $a ]]; then
+		warn "--allow-ro $a does not exist"
+	fi
+done
+
 for a in "${ALLOW[@]}"; do
 	if [[ -e $a ]]; then
 		add_writable "$a"
@@ -343,6 +381,12 @@ ARGS=(
 	--ro-bind / /
 	--dev /dev
 	--proc /proc
+	# moatd's control socket lives here, it is group-writable, and the group is
+	# the one the sandboxed process runs as. Left visible, a hostile install
+	# script could drive the daemon from inside the box that exists to contain
+	# it: switch to monitor, allowlist itself, release a containment. The
+	# sandbox has to be closed on that side too.
+	--tmpfs /run/moat
 	--unshare-pid
 	--die-with-parent
 )

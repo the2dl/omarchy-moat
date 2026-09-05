@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# omarchy-moat shim for go.
+#
+#   1. for the subcommands that fetch or compile, scan the module with
+#      moat-scan-go (go:generate directives, go.mod replace targets,
+#      //go:linkname) before anything runs. Same contract as the npm and
+#      makepkg shims: 0 clean, 1 medium warns, 2 high asks.
+#   2. run the real go under moat-sandbox.
+#
+# Go is the least exposed of the ecosystems moat scans: `go build` compiles a
+# dependency, it never runs one, so there is no equivalent of build.rs or a
+# postinstall script. What is left is `go generate` - commands embedded in
+# source that execute the moment anyone types it - a module `replace` pointing
+# outside the tree, and //go:linkname.
+#
+# Sandboxed:  build install get run test generate mod work vet bench fix tool
+# Passed through: fmt env version doc list help clean. Those either touch no
+#             third-party code or, like `go env -w`, need to write the user
+#             config the sandbox deliberately makes read-only.
+#
+# Installed as /usr/lib/moat/shims/go; active only while
+# /etc/moat/sandbox.enabled exists (see /etc/profile.d/moat-shims.sh).
+set -euo pipefail
+SHIM_SELF=${BASH_SOURCE[0]}
+_shim_dir=${SHIM_SELF%/*}
+[[ $_shim_dir == "$SHIM_SELF" ]] && _shim_dir=/usr/lib/moat/shims
+# shellcheck source-path=SCRIPTDIR source=shim-common.sh
+. "$_shim_dir/shim-common.sh"
+
+go_needs_sandbox() {
+	case $1 in
+	build | install | get | run | test | generate) return 0 ;;
+	mod | work | vet | bench | fix | tool) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+go_scans() {
+	case $1 in
+	build | install | get | run | test | generate | mod | vet) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+subcmd=$(shim_subcmd "$@")
+
+if [[ -n $subcmd ]] && go_needs_sandbox "$subcmd"; then
+	if go_scans "$subcmd" && [[ -f ./go.mod ]]; then
+		shim_run_scan go moat-scan-go --for go .
+	fi
+
+	# The module cache and the install target are outside every path
+	# moat-sandbox makes writable by default, and a read-only GOMODCACHE
+	# fails every build that needs a dependency. Derive them the way the go
+	# tool does, without running `go env` (that would be a subprocess in
+	# front of every command for a value we already know).
+	if [[ ${MOAT_SANDBOX:-1} != 0 && ${MOAT_SANDBOX_ACTIVE:-0} != 1 ]]; then
+		_gopath=${GOPATH:-$HOME/go}
+		_gopath=${_gopath%%:*}
+		for _p in "${GOMODCACHE:-$_gopath/pkg/mod}" "${GOBIN:-$_gopath/bin}" \
+			"${GOCACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/go-build}"; do
+			[[ $_p == /* ]] || continue
+			mkdir -p -- "$_p" 2>/dev/null || true
+			SHIM_SANDBOX_ARGS+=(--allow "$_p")
+		done
+	fi
+
+	shim_exec go "$@"
+fi
+
+# Pass through unsandboxed.
+shim_resolve go
+PATH=$SHIM_PATH_REDUCED exec -- "$SHIM_REAL" "$@"

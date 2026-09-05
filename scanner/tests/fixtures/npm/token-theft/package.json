@@ -1,0 +1,8 @@
+{
+  "name": "token-theft",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "ui-kit": "^3.0.0"
+  }
+}

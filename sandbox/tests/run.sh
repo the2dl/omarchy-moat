@@ -113,6 +113,43 @@ else
 	no "\$HOME/.ssh is an empty tmpfs inside the sandbox" "got: $out"
 fi
 
+# Shell history is denied for the same reason as a credential file, and is
+# easier to forget because it does not look like one: it holds inline tokens
+# nothing ever rotates.
+printf 'export GITHUB_TOKEN=ghp_FAKESECRETDONOTUSE\n' >"$FAKE_HOME/.bash_history"
+out=$(cd "$PROJ" && sb --allow "$FAKE_HOME" -- cat "$FAKE_HOME/.bash_history" 2>&1)
+if [[ $out != *ghp_FAKESECRETDONOTUSE* ]]; then
+	ok "\$HOME/.bash_history leaks nothing inside the sandbox"
+
+# ---------------------------------------------------- escaping the sandbox ---
+#
+# Two ways out that an audit found on 2026-09-04. Both are one line of config
+# each, and both hand a hostile install script the thing the box exists to deny.
+
+say "escape routes"
+
+# mise's shim directory is on PATH. A writable bind let a package install drop a
+# shim there, which the user then runs OUTSIDE the sandbox on their next command.
+mkdir -p "$FAKE_HOME/.local/share/mise/shims"
+# shellcheck disable=SC2016  # $HOME must expand INSIDE the sandbox, not here.
+if out=$(sb -- sh -c 'touch "$HOME/.local/share/mise/shims/pwned" 2>&1'); rc=$?; [[ $rc -ne 0 ]]; then
+	ok "the mise shim directory is not writable inside the sandbox (rc=$rc)"
+else
+	no "a sandboxed process wrote a shim onto the host PATH" "$out"
+fi
+
+# moatd's control socket is group-writable and the sandboxed process runs as a
+# member of that group, so a hostile script could drive the daemon that is
+# supposed to be containing it.
+if out=$(sb -- sh -c 'ls /run/moat/control.sock 2>&1'); rc=$?; [[ $rc -ne 0 ]]; then
+	ok "moatd's control socket is not reachable inside the sandbox (rc=$rc)"
+else
+	no "the sandbox can see moatd's control socket" "$out"
+fi
+else
+	no "\$HOME/.bash_history leaks nothing inside the sandbox" "got: $out"
+fi
+
 # A denied *file* becomes an empty file, not a missing one.
 printf 'machine example.com password hunter2\n' >"$FAKE_HOME/.netrc"
 out=$(cd "$PROJ" && sb --allow "$FAKE_HOME" -- cat "$FAKE_HOME/.netrc" 2>&1)
@@ -394,13 +431,13 @@ fi
 
 # Every shim named in the contract exists and is executable.
 missing=()
-for n in npm npx pnpm yarn bun pip pip3 uv cargo makepkg; do
+for n in npm npx pnpm yarn bun pip pip3 uv cargo go makepkg; do
 	[[ -x $SHIMS/$n ]] || missing+=("$n")
 done
 if ((${#missing[@]} == 0)); then
-	ok "all ten contract shims are present and executable"
+	ok "all eleven contract shims are present and executable"
 else
-	no "all ten contract shims are present and executable" "missing: ${missing[*]}"
+	no "all eleven contract shims are present and executable" "missing: ${missing[*]}"
 fi
 
 # cargo passes through the subcommands that neither fetch nor build.
@@ -432,6 +469,81 @@ if [[ $out == "REAL cargo active:1 argv:+nightly test" ]]; then
 else
 	no "cargo +toolchain test is sandboxed" "got: $out"
 fi
+
+# The cargo shim scans the crate before any build script can run, but only
+# when there is a manifest here: `cargo install ripgrep` from an empty
+# directory reads nothing local. (Contract section 9; the full ladder is
+# covered by scanner/tests/test_build_shim.py.)
+cat >"$PROJ/moat-scan-cargo" <<'EOF'
+#!/usr/bin/env bash
+echo "scan: HIGH finding (fixture)"
+exit 2
+EOF
+chmod +x "$PROJ/moat-scan-cargo"
+
+out=$(cd "$PROJ" && "${cargo_env[@]}" "$SHIMS/cargo" build 2>&1)
+rc=$?
+if ((rc == 0)) && [[ $out != *"scan: HIGH"* ]]; then
+	ok "cargo build with no Cargo.toml is not scanned"
+else
+	no "cargo build with no Cargo.toml is not scanned" "rc=$rc out=$out"
+fi
+
+printf '[package]\nname = "t"\nversion = "0.1.0"\n' >"$PROJ/Cargo.toml"
+out=$(cd "$PROJ" && "${cargo_env[@]}" "$SHIMS/cargo" build </dev/null 2>&1)
+rc=$?
+if ((rc == 1)) && [[ $out == *"HIGH severity"* && $out != *"REAL cargo"* ]]; then
+	ok "cargo build refuses on HIGH findings when not interactive"
+else
+	no "cargo build refuses on HIGH findings when not interactive" "rc=$rc out=$out"
+fi
+
+out=$(cd "$PROJ" && "${cargo_env[@]}" MOAT_SANDBOX=0 "$SHIMS/cargo" build </dev/null 2>&1)
+rc=$?
+if ((rc == 0)) && [[ $out != *"scan: HIGH"* && $out == *"REAL cargo"* ]]; then
+	ok "MOAT_SANDBOX=0 skips the cargo scan as well as the sandbox"
+else
+	no "MOAT_SANDBOX=0 skips the cargo scan as well as the sandbox" "rc=$rc out=$out"
+fi
+rm -f "$PROJ/moat-scan-cargo" "$PROJ/Cargo.toml"
+
+# The go shim: same split as cargo. `go build` compiles a dependency but never
+# runs one, so the scan is about go:generate, replace and //go:linkname.
+cat >"$PROJ/go" <<'EOF'
+#!/usr/bin/env bash
+echo "REAL go active:${MOAT_SANDBOX_ACTIVE:-0} argv:$*"
+EOF
+chmod +x "$PROJ/go"
+
+out=$(cd "$PROJ" && "${cargo_env[@]}" "$SHIMS/go" env GOPATH 2>&1)
+if [[ $out == "REAL go active:0 argv:env GOPATH" ]]; then
+	ok "go env is passed through unsandboxed"
+else
+	no "go env is passed through unsandboxed" "got: $out"
+fi
+
+out=$(cd "$PROJ" && "${cargo_env[@]}" "$SHIMS/go" build ./... 2>&1)
+if [[ $out == "REAL go active:1 argv:build ./..." ]]; then
+	ok "go build is sandboxed"
+else
+	no "go build is sandboxed" "got: $out"
+fi
+
+cat >"$PROJ/moat-scan-go" <<'EOF'
+#!/usr/bin/env bash
+echo "scan: HIGH finding (fixture)"
+exit 2
+EOF
+chmod +x "$PROJ/moat-scan-go"
+printf 'module example.com/t\n\ngo 1.22\n' >"$PROJ/go.mod"
+out=$(cd "$PROJ" && "${cargo_env[@]}" "$SHIMS/go" generate ./... </dev/null 2>&1)
+rc=$?
+if ((rc == 1)) && [[ $out == *"HIGH severity"* && $out != *"REAL go"* ]]; then
+	ok "go generate refuses on HIGH findings when not interactive"
+else
+	no "go generate refuses on HIGH findings when not interactive" "rc=$rc out=$out"
+fi
+rm -f "$PROJ/moat-scan-go" "$PROJ/go.mod" "$PROJ/go"
 
 # The makepkg shim refuses on high findings when not interactive.
 cat >"$PROJ/moat-scan-pkgbuild" <<'EOF'
@@ -507,7 +619,8 @@ else
 	no "MOAT_SANDBOX=0 skips the PKGBUILD scan as well as the sandbox" "rc=$rc out=$out"
 fi
 
-rm -rf "$PROJ/PKGBUILD" "$PROJ/makepkg" "$PROJ/cargo" "$PROJ/npm" "$PROJ/moat-scan-pkgbuild" "$NOSCAN_BIN"
+rm -rf "$PROJ/PKGBUILD" "$PROJ/makepkg" "$PROJ/cargo" "$PROJ/go" "$PROJ/npm" \
+	"$PROJ/moat-scan-pkgbuild" "$PROJ/moat-scan-cargo" "$PROJ/moat-scan-go" "$NOSCAN_BIN"
 
 # ------------------------------------------------- (g) MOAT_SANDBOX=0 ----
 
@@ -668,7 +781,7 @@ if command -v shellcheck >/dev/null 2>&1; then
 	sc_out=$(cd "$SANDBOX_DIR" && shellcheck -x -s bash \
 		moat-sandbox shims/shim-common.sh shims/npm shims/npx shims/pnpm \
 		shims/yarn shims/bun shims/pip shims/pip3 shims/uv shims/cargo \
-		shims/makepkg tests/run.sh 2>&1)
+		shims/go shims/makepkg tests/run.sh 2>&1)
 	if [[ -z $sc_out ]]; then
 		ok "shellcheck is clean"
 	else
