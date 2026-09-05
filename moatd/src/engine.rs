@@ -3125,8 +3125,15 @@ impl Daemon {
         if !needs_cred.iter().any(|(_, on)| *on) {
             return Vec::new();
         }
-        let frag = std::path::Path::new("/etc/tetragon/tetragon.conf.d/enable-process-cred");
-        let enabled = std::fs::read_to_string(frag)
+        // Sibling of the export-allowlist fragment, so this follows the
+        // configured conf.d directory instead of a hardcoded /etc path -- which
+        // also stops the test depending on the state of THIS machine's /etc.
+        // A test that passes only where the product is not installed is not a
+        // test, and the scanner suite had the same fault this morning.
+        let Some(confd) = self.cfg.paths.export_allowlist.parent() else {
+            return Vec::new();
+        };
+        let enabled = std::fs::read_to_string(confd.join("enable-process-cred"))
             .map(|t| t.trim().eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         if enabled {
@@ -4887,13 +4894,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut d, _cfg) = dev_daemon(dir.path());
 
-        // The fragment does not exist in a test environment, so both rules --
-        // on by default -- are inert.
+        // Point at a conf.d of our own. Reading the real /etc made this pass
+        // only on a machine where the fragment was absent -- it failed the
+        // moment the fix was actually deployed, which is the worst possible
+        // time for a test to change its mind.
+        let confd = dir.path().join("conf.d");
+        std::fs::create_dir_all(&confd).unwrap();
+        d.cfg.paths.export_allowlist = confd.join("export-allowlist");
         d.cfg.rules.exec_memfd = true;
         d.cfg.rules.exec_privileges_raised = true;
+
         let inert = d.inert_rules();
-        assert_eq!(inert.len(), 2, "{:?}", inert);
+        assert_eq!(inert.len(), 2, "no fragment: both rules are inert, {:?}", inert);
         assert!(inert.iter().any(|r| r.contains("memfd")), "{:?}", inert);
+
+        // And with the flag actually enabled, nothing is inert.
+        std::fs::write(confd.join("enable-process-cred"), "true\n").unwrap();
+        assert!(d.inert_rules().is_empty(), "the fragment makes both rules live");
+
+        // Anything other than `true` is not enabled -- a fragment someone set
+        // to `false` must not read as working.
+        std::fs::write(confd.join("enable-process-cred"), "false\n").unwrap();
+        assert_eq!(d.inert_rules().len(), 2, "false is not true");
 
         // Switching a rule off is not the same as it being broken: nothing to
         // report, because nothing is claiming to watch.
