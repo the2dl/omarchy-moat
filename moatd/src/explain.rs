@@ -244,6 +244,7 @@ pub fn build_alert(f: &Finding, id: &str, ts: &str, allowlist_file: &str, allowl
         action_taken: if f.denied { "blocked".into() } else { "none".to_string() },
         actions: f.meta.actions.clone(),
         acked: false,
+        acked_by: None,
         mode: f.mode.clone(),
         count: None,
         actor: f.actor.clone(),

@@ -475,6 +475,8 @@ function normalizeAlert(record) {
     action_taken: String(r.action_taken || "none"),
     actions: Array.isArray(r.actions) ? r.actions.slice() : [],
     acked: r.acked === true,
+    // Who answered it. Empty for anything acked before the daemon recorded it.
+    acked_by: String(r.acked_by || ""),
     mode: String(r.mode || "monitor"),
     count: r.count === undefined ? 1 : Number(r.count),
 
@@ -1186,7 +1188,10 @@ function compareAlertsNewestFirst(a, b) {
 // explain` on the same id printed the verdict, because the socket carried it
 // and the log did not. That divergence between the two readers is the same
 // fault `incident` and `chain` were added here to fix.
-var UPDATABLE = ["acked", "action_taken", "count", "mode", "rotate", "actions", "ts",
+// `acked_by` rides with `acked`: the daemon stamps who answered an alert, and a
+// field this list forgets is a field that vanishes in silence -- which is how
+// `chain`, `triage` and `surface` went missing from here once already.
+var UPDATABLE = ["acked", "acked_by", "action_taken", "count", "mode", "rotate", "actions", "ts",
                  "incident", "chain", "triage", "surface"]
 
 function applyUpdate(target, patch) {

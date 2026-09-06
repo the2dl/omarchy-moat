@@ -3583,6 +3583,21 @@ impl Daemon {
             .map_err(|e| e.to_string())
     }
 
+    /// `mark`, plus WHO asked.
+    ///
+    /// Used by every ack path. The bulk cuts already raised a protection
+    /// change; the single and enumerated paths recorded nothing at all, so a
+    /// process that could read the alert list could also clear the badge and
+    /// leave no trace of having done it. The privilege is not the fix -- see
+    /// `Alert::acked_by` -- the attribution is.
+    pub fn mark_by(&mut self, id: &str, key: &str, value: Value, who: &str) -> Result<(), String> {
+        let mut line = UpdateLine::new(id).set(key, value);
+        if !who.is_empty() {
+            line = line.set("acked_by", Value::from(who.to_string()));
+        }
+        self.store.append_update(&line).map_err(|e| e.to_string())
+    }
+
     pub fn find_alert(&self, id: &str) -> Option<Alert> {
         self.store.find(id)
     }

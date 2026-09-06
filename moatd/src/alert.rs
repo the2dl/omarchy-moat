@@ -98,6 +98,18 @@ pub struct Alert {
     pub action_taken: String,
     pub actions: Vec<String>,
     pub acked: bool,
+    /// WHO answered this, when it was answered.
+    ///
+    /// An ack is not privileged and should not be: it is the commonest thing a
+    /// person does here, and a sudo prompt per click is how the meaningful
+    /// prompt gets waved through. But "not privileged" must not mean
+    /// "unattributed" -- a payload in the `moat` group can list alert ids and
+    /// ack them, and clearing the badge is how it stops being looked at. The
+    /// alert itself is never destroyed (this log is append-only); what an ack
+    /// changes is whether anyone is asked about it, so the record of who asked
+    /// for that is the thing that has to survive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acked_by: Option<String>,
     pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<u64>,
@@ -298,6 +310,7 @@ pub fn fold(alert: &mut Alert, update: &Map<String, Value>) {
     for (k, v) in update {
         match (k.as_str(), v) {
             ("acked", Value::Bool(b)) => alert.acked = *b,
+            ("acked_by", Value::String(s)) => alert.acked_by = Some(s.clone()),
             ("action_taken", Value::String(s)) => alert.action_taken = s.clone(),
             ("count", Value::Number(n)) => alert.count = n.as_u64(),
             ("severity", Value::String(s)) => alert.severity = s.clone(),
@@ -418,6 +431,7 @@ pub mod tests_support {
             action_taken: "none".into(),
             actions: vec!["kill".into()],
             acked: false,
+            acked_by: None,
             mode: "monitor".into(),
             count: None,
             actor: crate::provenance::Actor {

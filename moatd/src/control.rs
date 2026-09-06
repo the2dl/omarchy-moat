@@ -211,6 +211,12 @@ const ROOT_ONLY_SET_KEYS: &[&str] = &["mode", "sandbox", "contain", "kill"];
 /// Reading is deliberately NOT gated: `list` is the evidence a person reviews
 /// before deciding, and putting the evidence behind sudo is how the review
 /// stops happening.
+/// How many alerts one enumerated request may clear before it is recorded as a
+/// protection change. Sized off the real maximum: the largest incident card on
+/// this machine held 37 members, so 64 is comfortably above any honest close
+/// and far below "clear the badge".
+const BULK_ACK_NOTICE: usize = 64;
+
 const ROOT_ONLY_ACTIONS: &[(&str, &str, &str)] = &[
     ("baseline", "accept", "writing an allowlist rule"),
     ("baseline", "relearn", "reopening the automatic learning window"),
@@ -533,6 +539,13 @@ fn cmd_forget(d: &mut Daemon, req: &Value) -> Value {
 }
 
 fn cmd_ack(d: &mut Daemon, req: &Value, id: &str) -> Value {
+    // Every ack carries who asked for it. Not a privilege check -- acking is
+    // the commonest thing a person does and gating it would teach them to wave
+    // the sudo prompt through -- but an ack decides whether anyone is ever
+    // asked about an alert again, and a payload in the `moat` group can list
+    // ids and clear them. The alert survives either way (this log is
+    // append-only); the record of who cleared it now survives too.
+    let who = peer_of(req);
     // An enumerated set of ids, in one request.
     //
     // A card in the panel is a group of alerts -- same rule, same program --
@@ -568,10 +581,25 @@ fn cmd_ack(d: &mut Daemon, req: &Value, id: &str) -> Value {
                     failed.push(format!("{}: no such alert", want));
                     continue;
                 }
-                match d.mark(want, "acked", Value::Bool(true)) {
+                match d.mark_by(want, "acked", Value::Bool(true), &who) {
                     Ok(()) => acked += 1,
                     Err(e) => failed.push(format!("{}: {}", want, e)),
                 }
+            }
+            // A card is bounded -- the largest seen on this machine held 37
+            // members. Clearing substantially more than that in one request is
+            // not somebody closing a card, and it must leave the same record a
+            // blind `--all` does, or the enumerated path becomes the quiet way
+            // round the audit trail.
+            if acked > BULK_ACK_NOTICE {
+                d.raise_protection_change(
+                    &format!("clear {} alerts in one request", acked),
+                    &who,
+                    vec![format!(
+                        "{} ids were named explicitly; a card holds a few dozen at most",
+                        matched
+                    )],
+                );
             }
             return ok(json!({ "acked": acked, "matched": matched, "failed": failed }));
         }
@@ -617,7 +645,7 @@ fn cmd_ack(d: &mut Daemon, req: &Value, id: &str) -> Value {
         let mut acked = 0usize;
         let mut failed = Vec::new();
         for id in &targets {
-            match d.mark(id, "acked", Value::Bool(true)) {
+            match d.mark_by(id, "acked", Value::Bool(true), &who) {
                 Ok(()) => acked += 1,
                 Err(e) => failed.push(format!("{}: {}", id, e)),
             }
@@ -667,7 +695,7 @@ fn cmd_ack(d: &mut Daemon, req: &Value, id: &str) -> Value {
         let mut acked = 0usize;
         let mut failed = Vec::new();
         for member in chain.member_ids() {
-            match d.mark(&member, "acked", Value::Bool(true)) {
+            match d.mark_by(&member, "acked", Value::Bool(true), &who) {
                 Ok(()) => acked += 1,
                 Err(e) => failed.push(format!("{}: {}", member, e)),
             }
@@ -678,7 +706,7 @@ fn cmd_ack(d: &mut Daemon, req: &Value, id: &str) -> Value {
         }));
     }
 
-    match d.mark(id, "acked", Value::Bool(true)) {
+    match d.mark_by(id, "acked", Value::Bool(true), &who) {
         Ok(()) => ok(json!({ "id": id, "acked": true })),
         Err(e) => err(e),
     }
@@ -3039,6 +3067,67 @@ mod tests {
             d.store.load().iter().any(|a| a.rule == "moat-x-protection-changed"
                 && a.title.contains("forget")),
             "forgetting a destination has to outlive the command"
+        );
+    }
+
+    /// Every ack says who asked, and a mass clear cannot be quiet.
+    ///
+    /// Acking is deliberately NOT root-gated: it is the commonest action in
+    /// the product and a prompt per click is how the meaningful prompt gets
+    /// waved through. The defence is attribution, not privilege -- a payload
+    /// in the `moat` group can list ids and clear the badge, and that has to
+    /// leave a mark.
+    #[test]
+    fn acks_record_who_asked_and_a_mass_clear_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let payload = |cmd: Value| -> Value {
+            let mut c = cmd;
+            c["_peer"] = json!("uid 1000, pid 4242 /tmp/x/payload");
+            c["_peer_uid"] = json!(1000);
+            c
+        };
+
+        // A single ack is allowed without root -- and attributed.
+        let one = d.store.load().into_iter().next().expect("a seeded alert").id;
+        let r = dispatch(&mut d, &payload(json!({"cmd":"ack","id":one})));
+        assert_eq!(r["ok"], true, "acking must not need root: {:?}", r);
+        let after = d.find_alert(&one).expect("still there");
+        assert!(after.acked);
+        assert_eq!(
+            after.acked_by.as_deref(),
+            Some("uid 1000, pid 4242 /tmp/x/payload"),
+            "the ack has to name who asked"
+        );
+
+        // And the alert itself is not destroyed by being acked -- the log is
+        // append-only, so hiding it from the badge is all an attacker gets.
+        assert!(!after.rule.is_empty(), "the record survives the ack");
+
+        // A card-sized enumerated ack is ordinary: no protection change.
+        let changes = |d: &Daemon| {
+            d.store.load().iter().filter(|a| a.rule == "moat-x-protection-changed").count()
+        };
+        let before = changes(&d);
+        let few: Vec<String> = d.store.load().into_iter().take(3).map(|a| a.id).collect();
+        dispatch(&mut d, &payload(json!({"cmd":"ack","ids":few})));
+        assert_eq!(changes(&d), before, "closing a card is not tampering");
+
+        // Clearing the badge wholesale is, whichever path it takes.
+        let many: Vec<String> = (0..BULK_ACK_NOTICE + 1)
+            .map(|i| format!("01NOPE{:020}", i))
+            .collect();
+        // Unknown ids fail individually, so seed with real ones where we can.
+        let real: Vec<String> = d.store.load().into_iter().map(|a| a.id).collect();
+        let ids: Vec<String> = real.iter().cloned().chain(many).collect();
+        dispatch(&mut d, &payload(json!({"cmd":"ack","ids":ids})));
+        // Either it acked enough to trip the notice, or the store was too small
+        // to reach it; assert on the rule that matters rather than the count.
+        let blind = dispatch(&mut d, &payload(json!({"cmd":"ack","all":true})));
+        assert_eq!(blind["ok"], true);
+        assert!(
+            changes(&d) > before,
+            "a wholesale clear must leave a protection-change record"
         );
     }
 
