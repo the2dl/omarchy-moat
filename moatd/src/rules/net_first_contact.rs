@@ -32,7 +32,7 @@ use std::net::IpAddr;
 use crate::event::HookHit;
 use crate::explain::Finding;
 use crate::rules::netmatch::{contains_any, is_always_local, parse_all, Cidr};
-use crate::rules::{meta, RuleCtx, UserRule};
+use crate::rules::{signal_meta, RuleCtx, UserRule};
 
 pub const ID: &str = "moat-net-first-contact";
 
@@ -126,8 +126,9 @@ impl UserRule for NetFirstContact {
         cfg.rules.net_first_contact
     }
 
+    /// `tier: signal` — weak alone; exists to be a chain step (BASELINE §4).
     fn meta(&self) -> crate::policy::PolicyMeta {
-        meta(
+        signal_meta(
             ID,
             "net",
             "low",
@@ -171,6 +172,7 @@ mod tests {
             homes: &[],
             now: 100,
             mode: "monitor",
+            armed: &crate::rules::NO_RULES_ARMED,
         };
         let ev = HookEvent {
             function_name: Some("tcp_connect".into()),

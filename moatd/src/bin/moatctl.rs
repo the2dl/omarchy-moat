@@ -134,9 +134,12 @@ enum Cmd {
     Set {
         key: String,
         value: String,
-        /// Only this policy, leaving every other one — and the daemon-wide
+        /// Only this rule, leaving every other one — and the daemon-wide
         /// mode — untouched. The safe way to start enforcing: one rule whose
-        /// false-positive surface you have already measured.
+        /// false-positive surface you have already measured. Takes a kernel
+        /// policy or one of the userland rules that kills
+        /// (`moat-pkg-subtree-netcat-exec`, `moat-shell-stdio-socket`);
+        /// `moatctl status --json` lists them all under `enforceable`.
         #[arg(long)]
         rule: Option<String>,
     },
@@ -976,6 +979,15 @@ fn print_human(cmd: &Cmd, r: &Value) {
             } else if *all || rule.is_some() || before.is_some() {
                 let n = r["acked"].as_u64().unwrap_or(0);
                 println!("acked {} alert(s)", n);
+                // Say what was left alone, or a bulk ack that touched 13 of
+                // 1,854 rows looks like it silently failed on the rest.
+                if let Some(s) = r["skipped"].as_u64().filter(|s| *s > 0) {
+                    println!(
+                        "skipped {} recorded/suppressed row(s): they were never on the badge, so \
+                         there was nothing to answer",
+                        s
+                    );
+                }
                 if let Some(f) = r["failed"].as_array() {
                     for e in f {
                         eprintln!("  failed: {}", e.as_str().unwrap_or("?"));
@@ -1231,16 +1243,50 @@ fn print_incidents(r: &Value) {
     );
 }
 
+/// The `enforcing` line: what is armed, and then — loudly — the part of it the
+/// kernel does not agree with.
+///
+/// On 2026-09-05 this line listed seven rules as enforcing for a whole day
+/// while all seven sat in `monitor` in the kernel: the re-arm ran 2 s after
+/// start and tetragon needed 16 s to load 44 policies, every `tetra tp
+/// set-mode` failed, and nothing retried or checked. A list of rules that are
+/// "armed" is worth nothing on its own — what matters is whether the kernel
+/// will act on them — so the unverified set is printed on the same line, in the
+/// same shape as the `*** NOT PROTECTED ***` marker on `tetragon`.
+///
+/// `None` when nothing is armed: an empty line about enforcement is noise.
+fn enforcing_line(r: &Value) -> Option<String> {
+    let armed: Vec<&str> = r["enforcing_rules"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    if armed.is_empty() {
+        return None;
+    }
+    let unverified: Vec<&str> = r["enforcing_unverified"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    let suffix = if !unverified.is_empty() {
+        format!(
+            "   *** NOT ARMED IN KERNEL: {} — see journal: journalctl -u moatd -u tetragon ***",
+            unverified.join(", ")
+        )
+    } else if r["arming_pending"] == Value::Bool(true) {
+        "   (arming: waiting for the sensor to finish loading)".to_string()
+    } else {
+        String::new()
+    };
+    Some(format!("enforcing  {}{}", armed.join(", "), suffix))
+}
+
 fn print_status(r: &Value) {
     let u = &r["unacked"];
     println!("moatd  {}   mode {}", r["version"].as_str().unwrap_or("?"), r["mode"].as_str().unwrap_or("?"));
     // What is actually armed to kill, which is never obvious from `mode` alone
     // once rules can be enforced individually.
-    if let Some(e) = r["enforcing_rules"].as_array().filter(|e| !e.is_empty()) {
-        println!(
-            "enforcing  {}",
-            e.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")
-        );
+    if let Some(line) = enforcing_line(r) {
+        println!("{}", line);
     }
     let state = r["tetragon"].as_str().unwrap_or("?");
     println!(
@@ -1286,6 +1332,22 @@ fn print_status(r: &Value) {
                 .map(|s| s.replace("moat-x-", ""))
                 .collect::<Vec<_>>()
                 .join(", ")
+        );
+    }
+    // Three populations, three words, and only the first one is a queue.
+    //
+    // "unacked 1,854" was true and read as a backlog: 48% of it was
+    // allowlist-suppressed (already answered) and most of the rest was timeline
+    // rows that were never a question, while the badge said 13. A number is
+    // only honest with the word next to it, so the queue is printed first and
+    // under its own name, and the other two are printed beside it rather than
+    // folded into it. The severity breakdown stays, indented, because it is
+    // about the queue and nothing else.
+    let l = &r["ledger"];
+    if l.is_object() {
+        println!(
+            "needs you  {}   (recorded {}, of which {} signal; suppressed {})",
+            l["needs_you"], l["recorded"], l["signal"], l["suppressed"]
         );
     }
     println!(
@@ -1681,10 +1743,15 @@ fn print_set(key: &str, r: &Value) {
                     r["tetra"].as_str().unwrap_or("tetra")
                 );
             } else {
+                // WHERE it now enforces, because the two are different
+                // promises: a kernel policy stops being armed if tetragon
+                // restarts without moatd re-arming it, and a userland rule
+                // kills from moatd itself and never touches the kernel at all.
                 println!(
-                    "{} is now {} in the kernel; the daemon stays in {} mode",
+                    "{} is now {} {}; the daemon stays in {} mode",
                     rule,
                     r["requested"].as_str().unwrap_or("?"),
+                    if r["tetra_applied"] == false { "in moatd" } else { "in the kernel" },
                     r["mode"].as_str().unwrap_or("?")
                 );
             }
@@ -1752,6 +1819,55 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `moatctl status` must not print a reassuring list of armed rules when
+    /// the daemon has just told it the kernel disagrees. This is the surface
+    /// that lied all day on 2026-09-05.
+    #[test]
+    fn the_enforcing_line_names_the_rules_the_kernel_is_not_running() {
+        let armed = serde_json::json!(["moat-cred-a", "moat-net-b", "moat-priv-c"]);
+
+        // The honest good case: armed, and confirmed in the kernel.
+        let ok = serde_json::json!({
+            "enforcing_rules": armed,
+            "enforcing_verified": armed,
+            "enforcing_unverified": [],
+            "arming_pending": false,
+        });
+        let line = enforcing_line(&ok).unwrap();
+        assert_eq!(line, "enforcing  moat-cred-a, moat-net-b, moat-priv-c");
+
+        // The failure: the record says three, the kernel is running one.
+        let bad = serde_json::json!({
+            "enforcing_rules": armed,
+            "enforcing_verified": ["moat-cred-a"],
+            "enforcing_unverified": ["moat-net-b", "moat-priv-c"],
+            "arming_pending": false,
+        });
+        let line = enforcing_line(&bad).unwrap();
+        assert!(line.contains("NOT ARMED IN KERNEL"), "{}", line);
+        assert!(line.contains("moat-net-b, moat-priv-c"), "{}", line);
+        assert!(
+            line.starts_with("enforcing  moat-cred-a, moat-net-b, moat-priv-c"),
+            "the armed list is still printed in full, the warning is added to it: {}",
+            line
+        );
+        assert!(line.contains("journalctl"), "and says where to look: {}", line);
+
+        // Mid-boot is not a failure, and must not be shouted about.
+        let starting = serde_json::json!({
+            "enforcing_rules": armed,
+            "enforcing_verified": [],
+            "enforcing_unverified": [],
+            "arming_pending": true,
+        });
+        let line = enforcing_line(&starting).unwrap();
+        assert!(line.contains("waiting for the sensor"), "{}", line);
+        assert!(!line.contains("NOT ARMED"), "{}", line);
+
+        // Nothing armed: no line at all.
+        assert!(enforcing_line(&serde_json::json!({"enforcing_rules": []})).is_none());
+    }
 
     fn set_mode_resp(applied: u64, policies: u64) -> Value {
         json!({

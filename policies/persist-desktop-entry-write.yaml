@@ -16,6 +16,10 @@ metadata:
       here as a matter of course, which is why this is medium and not high; the omarchy
       helpers are suppressed in-kernel by the first selector.
     moat.omarchy/fp-hint: "exe"
+    # BASELINE 4: a building block, not a detection. Weak alone: installers write .desktop
+    # files constantly. It exists to be a chain step - a launcher rewritten by something
+    # that also read a credential is the finding.
+    moat.omarchy/tier: "signal"
 spec:
   options:
   - name: "policy-mode"

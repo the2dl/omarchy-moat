@@ -642,17 +642,18 @@ hardcoded `/usr/bin/moatctl`, `/var/lib/moat/alerts.jsonl`,
    on the timeline and never notified — confirmed live on 2026-09-03, 38
    allowlisted omarchy-shell plugin execs. `explain.rs` now forces `timeline`
    when `suppressed_by` is set, matching what the plugin recomputes, and the
-   contract test asserts nothing suppressed reaches the Alerts tab. The
-   demotion half below is unchanged.
+   contract test asserts nothing suppressed reaches the Alerts tab.
 
-   **A demoted rule's alerts land in the Alerts tab when the panel has no
-   status.** BASELINE §8 keeps `suppressed_by` null for a demoted alert and puts
-   the demotion in `status.demoted_rules`, which the panel does read — but a
-   reader working from `alerts.jsonl` alone (the setup screen, an offline
-   inspection) has only the record's own `surface` field, which the plugin
-   ignores in favour of recomputing. They agree on everything in the capture
-   (seam check g), so this is latent rather than live. Honouring a reported
-   `surface: "timeline"` would close it.
+   **RESOLVED for demotion too (2026-09-05).** The rest of this item read: "a
+   demoted rule's alerts land in the Alerts tab when the panel has no status,
+   because the demotion lives in `status.demoted_rules` and a reader working
+   from `alerts.jsonl` alone has only the record's own `surface`". The daemon
+   now stamps `surface` for every reason it has — suppression, a noise-guard
+   demotion, the `signal` tier, and the package-install escalation that
+   outranks the last two — in one function (`scoring::final_surface`), and
+   restamps the backlog a demotion covers (`engine::quieten_backlog`). The
+   panel reads the stamp and no longer applies `status.demoted_rules`
+   retroactively, so the record and the screen answer from the same field.
 
 8. **Cross-process `/proc/<pid>/environ` reads are not covered.** The technique
    is real credential theft — the environment holds `GITHUB_TOKEN`,

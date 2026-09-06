@@ -94,6 +94,13 @@ sleep 0.4   # let the tailer drain the sample log
 hr "moatctl status"
 ctl status
 
+# The machine-readable form, so the integration test can assert on the keys the
+# panel and CONTRACT §5 bind to rather than on prose. `enforcing_verified` /
+# `enforcing_unverified` are the 2026-09-05 fix: `enforcing_rules` alone said
+# seven rules were armed all day while the kernel had them in monitor.
+hr "moatctl status --json (the keys CONTRACT section 5 promises)"
+ctl --json status
+
 hr "moatctl list"
 ctl list --limit 10
 

@@ -148,6 +148,11 @@ pub struct RuleToggles {
     pub pkg_subtree_downloader: bool,
     pub pkg_subtree_netcat_exec: bool,
     pub ai_cli_in_pkg_subtree: bool,
+    /// `moat-shell-stdio-socket`: a shell whose fds 0/1/2 are a network socket
+    /// (the interpreter reverse shell), or whose parent's are (the pty
+    /// upgrade). Reads `/proc/<pid>/fd` at exec time; no kernel hook carries
+    /// file descriptors, so this cannot be a policy.
+    pub shell_stdio_socket: bool,
 }
 
 impl Default for RuleToggles {
@@ -164,6 +169,7 @@ impl Default for RuleToggles {
             pkg_subtree_downloader: true,
             pkg_subtree_netcat_exec: true,
             ai_cli_in_pkg_subtree: true,
+            shell_stdio_socket: true,
         }
     }
 }
@@ -210,6 +216,22 @@ pub struct Thresholds {
     pub state_interval_secs: u64,
     /// Feed file mtime poll interval.
     pub feeds_poll_secs: u64,
+    /// How long the daemon will wait for the sensor to finish loading its
+    /// policies before it gives up on re-arming them (`Daemon::arm_tick`).
+    ///
+    /// 2026-09-05: moatd is `Requires=/After=/PartOf=tetragon.service`, and
+    /// tetragon is `Type=simple` — so systemd calls it "started" the moment it
+    /// forks, while it is still loading. Loading 44 policies took **16
+    /// seconds** on this machine (21:08:45 start, last "Added TracingPolicy
+    /// with success" at 21:09:01); `reapply_enforcement` ran at **+2 s** and
+    /// every `tetra tp set-mode` failed with `tracing policy {moat-…} does not
+    /// exist`. Nothing retried, so all seven armed policies sat in `monitor` in
+    /// the kernel while `status.enforcing_rules` and the panel said ARMED.
+    ///
+    /// 120 s is roughly eight times the observed load time: generous enough for
+    /// a cold boot on a slow disk, bounded so a sensor that is never coming
+    /// back becomes a reported failure instead of an indefinite "arming".
+    pub arm_wait_secs: u64,
 }
 
 impl Default for Thresholds {
@@ -235,6 +257,7 @@ impl Default for Thresholds {
             alerts_max_bytes: 20 * 1024 * 1024,
             state_interval_secs: 5,
             feeds_poll_secs: 60,
+            arm_wait_secs: 120,
         }
     }
 }
@@ -317,6 +340,24 @@ impl Default for BaselineConfig {
             provenance_downgrade: true,
         }
     }
+}
+
+/// BASELINE §2b: the escape hatch for the context walk, and nothing more.
+///
+/// Context is decided first from the controlling terminal, which needs no
+/// configuration and covers every terminal and session host that allocates a
+/// pty. These two lists exist for the residue: something that hands a process
+/// to a person WITHOUT a pty (moat cannot see through it), or something that
+/// runs unattended under a name that looks interactive. Empty by default,
+/// because a config key that most people must set is a design that did not
+/// finish.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContextConfig {
+    /// Extra process names that mean a person is driving.
+    pub interactive_roots: Vec<String>,
+    /// Extra process names that mean nobody is.
+    pub service_roots: Vec<String>,
 }
 
 /// LEARNING §6: the rarity counters.
@@ -704,6 +745,7 @@ pub struct Config {
     pub net: NetConfig,
     pub ai: AiConfig,
     pub baseline: BaselineConfig,
+    pub context: ContextConfig,
     pub learning: LearningConfig,
     pub analysis: AnalysisConfig,
     pub incidents: IncidentsConfig,
@@ -766,6 +808,7 @@ impl Default for Config {
             net: NetConfig::default(),
             ai: AiConfig::default(),
             baseline: BaselineConfig::default(),
+            context: ContextConfig::default(),
             learning: LearningConfig::default(),
             analysis: AnalysisConfig::default(),
             incidents: IncidentsConfig::default(),
@@ -851,8 +894,8 @@ mod tests {
         let defaults = toml::Value::try_from(Config::default()).unwrap();
 
         for section in [
-            "rules", "ai", "thresholds", "net", "baseline", "learning", "analysis", "incidents",
-            "content", "digest", "telemetry",
+            "rules", "ai", "thresholds", "net", "baseline", "context", "learning", "analysis",
+            "incidents", "content", "digest", "telemetry",
         ] {
             let want = defaults.get(section).unwrap().as_table().unwrap();
             let got = shipped
@@ -881,6 +924,11 @@ mod tests {
             vec!["/usr/share/omarchy/bin/omarchy-agent-usage-*"]
         );
         assert_eq!(c.baseline, BaselineConfig::default(), "a shipped baseline key drifted");
+        assert_eq!(c.context, ContextConfig::default(), "a shipped context key drifted");
+        assert!(
+            c.context.interactive_roots.is_empty() && c.context.service_roots.is_empty(),
+            "the context lists ship empty: the tty is the mechanism, these are the escape hatch"
+        );
         assert_eq!(c.learning, LearningConfig::default(), "a shipped learning key drifted");
         assert_eq!(c.analysis, AnalysisConfig::default(), "a shipped analysis key drifted");
         assert_eq!(c.incidents, IncidentsConfig::default(), "a shipped incidents key drifted");

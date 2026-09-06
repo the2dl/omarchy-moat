@@ -1,8 +1,8 @@
 //! Scoring: provenance and context adjust severity, within limits
 //! (BASELINE §2 and §2b).
 //!
-//! Two adjustments run, in this order, after a base alert has been built and
-//! **before** the allowlist and the dedupe window see it:
+//! Two adjustments run, after a base alert has been built and **before** the
+//! allowlist and the dedupe window see it:
 //!
 //! 1. **Provenance** ([`provenance_delta`]). An official binary doing something
 //!    a package binary normally does earns one step down for the
@@ -11,6 +11,20 @@
 //! 2. **Context** ([`MATRIX`]). The same event scored by where it came from. The
 //!    matrix is data, not code, so it can be reviewed as a table — the test
 //!    `the_context_matrix_is_reviewable` prints it.
+//!
+//! The matrix goes first where it has an opinion. A cell holding
+//! [`Outcome::Sev`] *sets* the severity outright, so a provenance step taken
+//! before it was simply discarded — named in `severity_reason` and worth
+//! nothing. On 2026-09-05 quickshell, an official binary from the `quickshell`
+//! package, running an omarchy plugin script scored "medium → high: actor is
+//! official (package quickshell); service context: exec-opaque-dir": the
+//! official step is right there in the sentence and did not happen. So the
+//! matrix decides the severity the context deserves and provenance then takes
+//! its one step off that, under the same guards (§2: never for `pkg-install`,
+//! never for a locked rule, never for cred/rootkit/shell).
+//! [`Outcome::Timeline`] and [`Outcome::Nothing`] are already the floor and take
+//! no provenance step. Where the matrix has no opinion the order is unchanged:
+//! provenance, then §2b's general per-family rules.
 //!
 //! Rules of the matrix, from the doc:
 //!
@@ -376,6 +390,17 @@ pub struct Score {
     pub matrix_row: Option<&'static str>,
     /// The context said "nothing": recorded, never surfaced.
     pub context_silenced: bool,
+    /// **The product's thesis, as a boolean.** The matrix put this event at
+    /// `high` or `critical` *because it happened inside a package install*.
+    ///
+    /// A `/tmp` exec is a building block on a developer's machine and a
+    /// detection inside an install; that is the one cell where a `signal` rule
+    /// reaches the badge on its own, and it is the one alert a noise-guard
+    /// demotion may never move to the timeline. It is recorded rather than
+    /// re-derived because both of those decisions are taken later — the noise
+    /// guard retroactively, on records it reads back off disk
+    /// (`engine::quieten_backlog`), long after the process is gone.
+    pub pkg_install_escalation: bool,
 }
 
 impl Score {
@@ -388,6 +413,7 @@ impl Score {
             surface: surface_for(sev).into(),
             matrix_row: None,
             context_silenced: false,
+            pkg_install_escalation: false,
         }
     }
 }
@@ -420,27 +446,16 @@ pub fn score(
     let mut silenced = false;
     let locked = never_lowered(facts);
 
-    // --- 1. provenance ------------------------------------------------------
-    // A package install is never downgraded, by anything.
-    if provenance_downgrade && ctx != Context::PkgInstall && !locked {
-        let delta = provenance_delta(facts.family, facts.rule, actor.provenance);
-        if delta != 0 {
-            let next = step(&sev, delta);
-            if next != sev {
-                reasons.push(format!(
-                    "actor is official{}",
-                    actor
-                        .package
-                        .as_ref()
-                        .map(|p| format!(" (package {})", p))
-                        .unwrap_or_default()
-                ));
-                sev = next.to_string();
-            }
-        }
-    }
+    // The provenance step (§2), decided once. A package install is never
+    // downgraded, by anything, and neither is a locked rule. *Where* it is
+    // spent depends on the matrix: see the module header.
+    let prov = if provenance_downgrade && ctx != Context::PkgInstall && !locked {
+        provenance_delta(facts.family, facts.rule, actor.provenance)
+    } else {
+        0
+    };
 
-    // --- 2. context ---------------------------------------------------------
+    // --- context (§2b) ------------------------------------------------------
     let matrix = classify_row(facts);
     match matrix.map(|r| r.outcome(ctx)) {
         Some(Outcome::Sev(target)) => {
@@ -455,6 +470,10 @@ pub fn score(
                     reasons.push(format!("{} context: {}", ctx, matrix.unwrap().event));
                 }
                 sev = target.to_string();
+                // The context has decided what this event is worth here; §2's
+                // one step for an official actor comes off THAT, not off a
+                // severity the matrix is about to overwrite.
+                apply_provenance(&mut sev, &mut reasons, prov, actor);
             }
         }
         Some(Outcome::Timeline) => {
@@ -484,8 +503,10 @@ pub fn score(
             }
         }
         Some(Outcome::Unchanged) | None => {
-            // No row, or a row that says nothing about this context: the
-            // general rules of §2b apply.
+            // No row, or a row that says nothing about this context: nothing
+            // will overwrite the severity, so provenance goes first as §2
+            // describes, and then the general rules of §2b apply.
+            apply_provenance(&mut sev, &mut reasons, prov, actor);
             let delta = generic_context_delta(facts.family, ctx);
             if delta != 0 && !locked {
                 let mut next = step(&sev, delta);
@@ -519,6 +540,12 @@ pub fn score(
     };
 
     let surface = if timeline { "timeline" } else { surface_for(&sev) };
+    // Read off the matrix cell, not off the final severity: the question is
+    // "does the matrix call this a detection because it happened inside an
+    // install", and the answer must be the same whether or not a locked rule
+    // or a provenance step moved the number afterwards.
+    let pkg_install_escalation = ctx == Context::PkgInstall
+        && matches!(matrix.map(|r| r.pkg_install), Some(Outcome::Sev(s)) if severity_rank(s) >= 2);
     Score {
         severity_base: base.to_string(),
         severity: sev,
@@ -526,6 +553,67 @@ pub fn score(
         surface: surface.to_string(),
         matrix_row: matrix.map(|r| r.key),
         context_silenced: silenced,
+        pkg_install_escalation,
+    }
+}
+
+/// BASELINE §4 and §5: the surface a finding actually gets, once the tier, the
+/// noise guard and the allowlist have all had their say.
+///
+/// One function because the same three questions are asked in two places at two
+/// different times: `explain::build_alert` when the alert is written, and
+/// `engine::quieten_backlog` when a demotion reaches back over records already
+/// on disk. They disagreed once already (2026-09-03, allowlisted rows recorded
+/// as `alerts` while the panel drew them on the timeline) and the cost of
+/// disagreeing again is a detection nobody sees.
+///
+/// The order is the argument:
+///
+/// 1. **Suppressed wins.** An allowlist entry is the user's own answer, and
+///    nothing moat concludes afterwards overrides it.
+/// 2. **A package-install escalation is never quietened.** A `/tmp` exec inside
+///    an install IS a detection — that is the thing this project exists for —
+///    so neither a `signal` tier nor a noise-guard demotion may move it. On
+///    2026-09-04 a demotion did exactly that and hid a real dropper.
+/// 3. **A `signal` rule and a demoted pattern go to the timeline.** Both are
+///    statements that this row is not a conclusion on its own. Neither is a
+///    suppression: the row is recorded in full and is a full chain trigger.
+/// 4. Otherwise the severity decides, as §5 says.
+pub fn final_surface(score: &Score, tier: &str, demoted: bool, suppressed: bool) -> &'static str {
+    if suppressed {
+        return "timeline";
+    }
+    if score.pkg_install_escalation && severity_rank(&score.severity) >= 2 {
+        return "alerts";
+    }
+    if demoted || tier == crate::policy::TIER_SIGNAL {
+        return "timeline";
+    }
+    if score.surface == "alerts" {
+        "alerts"
+    } else {
+        "timeline"
+    }
+}
+
+/// Spend the provenance step, recording it only when it actually moved
+/// something. A step that lands on `low` and stays there is not a downgrade and
+/// must not claim to be one.
+fn apply_provenance(sev: &mut String, reasons: &mut Vec<String>, delta: i8, actor: &Actor) {
+    if delta == 0 {
+        return;
+    }
+    let next = step(sev, delta);
+    if next != *sev {
+        reasons.push(format!(
+            "actor is official{}",
+            actor
+                .package
+                .as_ref()
+                .map(|p| format!(" (package {})", p))
+                .unwrap_or_default()
+        ));
+        *sev = next.to_string();
     }
 }
 
@@ -763,6 +851,50 @@ mod tests {
     }
 
     #[test]
+    fn the_matrix_decides_the_cell_and_provenance_still_takes_its_step() {
+        // quickshell — an official binary from the `quickshell` package —
+        // running an omarchy plugin script lands in the exec-opaque-dir row,
+        // whose `service` cell is high. Provenance used to run first and be
+        // thrown away by that cell, so the alert read "medium → high: actor is
+        // official (package quickshell); service context: exec-opaque-dir":
+        // the official step named in the sentence bought nothing. §2 gives an
+        // official actor one step off the exec family, and it comes off what
+        // the context decided.
+        let homes = vec!["/home/dan".to_string()];
+        let f = EventFacts {
+            hook: "bprm_check_security",
+            exe: "/usr/bin/quickshell",
+            file: Some("/home/dan/.config/omarchy/plugins/io.github.x.thing/scripts/config"),
+            homes: &homes,
+            ..facts("exec", "moat-exec-untrusted-home")
+        };
+        let qs = Actor {
+            provenance: Provenance::Official,
+            package: Some("quickshell 0.3.1-1".into()),
+            script: None,
+        };
+        let s = score("medium", &f, &qs, Context::Service, true);
+        assert_eq!(s.matrix_row, Some("exec-opaque-dir"));
+        assert_eq!(s.severity, "medium");
+        assert_eq!(s.surface, "timeline");
+        assert_eq!(
+            s.severity_reason,
+            "stays medium: service context: exec of a binary under ~/.cache, ~/Downloads, \
+             ~/.config, a hidden dir, or /tmp with no build tool in the chain; \
+             actor is official (package quickshell 0.3.1-1)",
+            "the order in the sentence is the order it happened"
+        );
+
+        // The same cell for a user actor is the whole point of the row.
+        let s = score("medium", &f, &user_actor(), Context::Service, true);
+        assert_eq!(s.severity, "high");
+        assert_eq!(s.surface, "alerts");
+
+        // ...and an official actor during a package install still gets nothing.
+        assert_eq!(score("medium", &f, &qs, Context::PkgInstall, true).severity, "high");
+    }
+
+    #[test]
     fn a_package_install_is_never_downgraded() {
         let f = EventFacts { file: Some("/home/dan/.zshrc"), ..facts("persist", "moat-persist-shell-rc-write") };
         let s = score("high", &f, &official(), Context::PkgInstall, true);
@@ -854,5 +986,60 @@ mod tests {
         assert_eq!(surface_for("high"), "alerts");
         assert_eq!(surface_for("medium"), "timeline");
         assert_eq!(surface_for("low"), "timeline");
+    }
+
+    /// The one cell the whole product is about, recorded as a fact rather than
+    /// re-derived: a `/tmp` exec is a building block on a developer's machine
+    /// and a detection inside a package install.
+    #[test]
+    fn the_matrix_records_when_a_package_install_is_what_made_it_severe() {
+        let tmp_exec = EventFacts {
+            hook: "bprm_check_security",
+            file: Some("/tmp/.stage2"),
+            ..facts("exec", "moat-exec-untrusted-tmpfs")
+        };
+        let install = score("high", &tmp_exec, &official(), Context::PkgInstall, true);
+        assert_eq!(install.matrix_row, Some("exec-opaque-dir"));
+        assert_eq!(install.severity, "high");
+        assert!(install.pkg_install_escalation);
+
+        // The same event anywhere else is not an escalation, whatever it scores.
+        for ctx in [Context::Interactive, Context::Service, Context::Unknown] {
+            let s = score("high", &tmp_exec, &official(), ctx, true);
+            assert!(!s.pkg_install_escalation, "{:?} is not a package install", ctx);
+        }
+        // And a row whose pkg-install cell is not high/critical is not one
+        // either: an interpreter spawning inside an install is still low.
+        let spawn = facts("pkg", "moat-pkg-subtree-interpreter-spawn");
+        let s = score("low", &spawn, &official(), Context::PkgInstall, true);
+        assert_eq!(s.matrix_row, Some("interpreter-spawn"));
+        assert!(!s.pkg_install_escalation, "the cell is low, so there is nothing to protect");
+    }
+
+    /// The order of the three questions in `final_surface`, spelled out. Each
+    /// line is a decision that has been got wrong at least once.
+    #[test]
+    fn the_surface_puts_suppression_first_and_a_package_install_above_the_tier() {
+        let detection = crate::policy::TIER_DETECTION;
+        let signal = crate::policy::TIER_SIGNAL;
+        let plain = Score::unadjusted("high");
+
+        assert_eq!(final_surface(&plain, detection, false, false), "alerts");
+        // The user's own answer outranks everything moat concludes.
+        assert_eq!(final_surface(&plain, detection, false, true), "timeline");
+        // A declared building block, and a demoted pattern, both step aside.
+        assert_eq!(final_surface(&plain, signal, false, false), "timeline");
+        assert_eq!(final_surface(&plain, detection, true, false), "timeline");
+
+        // ...but not inside a package install. This is the 2026-09-04 miss:
+        // a /tmp dropper in a `preinstall` went to the timeline because the
+        // machine's own builds had made a different shape of that rule noisy.
+        let mut escalated = Score::unadjusted("high");
+        escalated.pkg_install_escalation = true;
+        assert_eq!(final_surface(&escalated, signal, false, false), "alerts");
+        assert_eq!(final_surface(&escalated, detection, true, false), "alerts");
+        assert_eq!(final_surface(&escalated, signal, true, false), "alerts");
+        // Except when the user allowlisted it, which still wins.
+        assert_eq!(final_surface(&escalated, signal, true, true), "timeline");
     }
 }

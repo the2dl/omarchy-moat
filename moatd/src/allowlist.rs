@@ -452,9 +452,13 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 parents: vec![],
             })
             .is_some());
+        // A rule id that EXISTS and is outside the glob's family. It read
+        // `moat-net-reverse-shell` until 2026-09-05, and no such rule has ever
+        // existed — a synthetic id in a test about matching real rule names is
+        // one anybody can grep for and not find.
         assert!(a
             .find(&Candidate {
-                rule: "moat-net-reverse-shell",
+                rule: "moat-shell-reverse-shell-connect",
                 exe: "/usr/bin/gnome-keyring-daemon",
                 file: None,
                 parents: vec![],
@@ -648,11 +652,12 @@ exe = "/usr/bin/gnome-keyring-daemon"
         };
         assert_eq!(
             al.len(),
-            7,
-            "two test-suite rules x two exe globs, the omarchy-shell plugin exec \
-             entry, the agent-usage credential read, the sandbox suite's \
-             fake toolchain — nothing else. Moat's own triage pass has NO entry: \
-             see the note at the end of omarchy-default.toml"
+            10,
+            "two test-suite rules x two path globs, the omarchy-shell plugin exec \
+             entry, the agent-usage credential read, the three scanner suites' \
+             fake toolchains, the incident-writer chmod — nothing else. Moat's own \
+             triage pass has NO entry: see the note at the end of \
+             omarchy-default.toml"
         );
 
         // omarchy-shell running its own plugins' helper scripts. Scoped to that
@@ -731,22 +736,35 @@ exe = "/usr/bin/gnome-keyring-daemon"
         }
 
         let parent = "/home/dan/Projects/omarchy-moat/moatd/target/debug/deps/moatd-16a3beb0";
-        // The two rules the paragraph names, for both globs.
-        for rule in ["moat-exec-untrusted-tmpfs", "moat-pkg-subtree-netcat-exec"] {
-            for exe in ["/tmp/.tmpAbC123/nc", "/tmp/.tmpAbC123/moat-helper"] {
-                assert!(
-                    al.find(&Candidate {
-                        rule,
-                        exe,
-                        file: None,
-                        parents: vec![parent.to_string()],
-                    })
-                    .is_some(),
-                    "{} {} is the test suite",
-                    rule,
-                    exe
-                );
-            }
+        // The netcat rule is a userland rule whose actor IS the copied binary,
+        // so there the executed path arrives as `exe`.
+        for exe in ["/tmp/.tmpAbC123/nc", "/tmp/.tmpAbC123/moat-helper"] {
+            assert!(
+                al.find(&Candidate {
+                    rule: "moat-pkg-subtree-netcat-exec",
+                    exe,
+                    file: None,
+                    parents: vec![parent.to_string()],
+                })
+                .is_some(),
+                "moat-pkg-subtree-netcat-exec {} is the test suite",
+                exe
+            );
+        }
+        // The tmpfs rule hangs off `bprm_check_security`, where the actor is the
+        // test binary and the executed path arrives as `file`.
+        for file in ["/tmp/.tmpAbC123/nc", "/tmp/.tmpAbC123/moat-helper"] {
+            assert!(
+                al.find(&Candidate {
+                    rule: "moat-exec-untrusted-tmpfs",
+                    exe: parent,
+                    file: Some(file),
+                    parents: vec![parent.to_string()],
+                })
+                .is_some(),
+                "moat-exec-untrusted-tmpfs {} is the test suite",
+                file
+            );
         }
         // Nothing wider: a real dropper, the same binary from a shell, another
         // rule, or a plain /tmp path all still alert.
@@ -760,14 +778,108 @@ exe = "/usr/bin/gnome-keyring-daemon"
             assert!(
                 al.find(&Candidate {
                     rule,
-                    exe,
-                    file: None,
+                    exe: parent,
+                    file: Some(exe),
                     parents: parents.iter().map(|s| s.to_string()).collect(),
                 })
                 .is_none(),
                 "{} {} must still alert",
                 rule,
                 exe
+            );
+        }
+    }
+
+    /// The shipped entries must be written against the fields `engine::emit`
+    /// actually fills in, or they are decoration.
+    ///
+    /// On 2026-09-05 the two tmpfs entries named `exe = "/tmp/.tmp*/nc"` and
+    /// `exe = "/tmp/.tmp*/moat-*"`. For a `bprm_check_security` finding the
+    /// actor is the CALLER — the cargo test binary — and the executed path is
+    /// `file`, so those two entries could never match anything: 50 of 50 such
+    /// alerts were unsuppressed. The candidates below are copied from real
+    /// alerts, field for field, so an entry that reads plausibly but cannot
+    /// fire is caught here instead of on the badge.
+    #[test]
+    fn the_shipped_entries_match_the_candidates_the_engine_really_builds() {
+        let p =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("etc/allowlist.d/omarchy-default.toml");
+        let al = Allowlist {
+            rules: Allowlist::load_file(&p).unwrap(),
+            ..Default::default()
+        };
+        let runner = "/home/dan/Projects/omarchy-moat/moatd/target/release/deps/moatd-decac2790eaa7887";
+        let shim = "/home/dan/Projects/omarchy-moat/pkg/src/omarchy-moat-tree/sandbox/shims/cargo";
+
+        // `cargo test` execs a copied `sleep` named `nc` out of a tempdir. The
+        // exec'ing process appears at the head of its own ancestry.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-exec-untrusted-tmpfs",
+                exe: runner,
+                file: Some("/tmp/.tmpFIBj5s/nc"),
+                parents: vec![runner.into(), "/usr/bin/cargo".into(), "/usr/bin/bash".into()],
+            })
+            .is_some(),
+            "the cargo tempdir nc case"
+        );
+
+        // The scanner suites: bash execs the fake toolchain the shim built, and
+        // the shim script itself is what identifies the run in the ancestry.
+        for file in [
+            "/tmp/moat-shim-test.n_b42zuu/bin/moat-scan-npm",
+            "/tmp/moat-build-shim-test.2o96mi62/bin/moat-scan-cargo",
+            "/tmp/moat-sandbox-test.FkzONpNE/bin/moat-shim-probe",
+        ] {
+            assert!(
+                al.find(&Candidate {
+                    rule: "moat-exec-untrusted-tmpfs",
+                    exe: "/usr/bin/bash",
+                    file: Some(file),
+                    parents: vec![
+                        "/usr/bin/bash".into(),
+                        shim.into(),
+                        "/usr/bin/python3".into(),
+                        "/usr/bin/makepkg".into(),
+                    ],
+                })
+                .is_some(),
+                "the shim-suite case: {}",
+                file
+            );
+        }
+
+        // The incident writer chmodding its own fixtures. `path_chmod` does not
+        // put the actor in its own ancestry, which is why this entry is scoped
+        // by exe.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-priv-setuid-chmod",
+                exe: runner,
+                file: Some("/tmp/.tmpgdwbQe/incidents/01M1SR6NRX4JVX1R993SAX2XYX/.pkg.json.663928.tmp"),
+                parents: vec!["/usr/bin/cargo".into(), "/usr/bin/bash".into()],
+            })
+            .is_some(),
+            "the setuid case"
+        );
+
+        // And the shape this file exists to keep alerting on: a payload dropped
+        // in /tmp by an install script. No moat runner, no shim, no prefix.
+        for rule in [
+            "moat-exec-untrusted-tmpfs",
+            "moat-pkg-subtree-netcat-exec",
+            "moat-priv-setuid-chmod",
+        ] {
+            assert!(
+                al.find(&Candidate {
+                    rule,
+                    exe: "/usr/bin/bash",
+                    file: Some("/tmp/x/payload"),
+                    parents: vec!["/usr/bin/makepkg".into(), "/usr/bin/bash".into()],
+                })
+                .is_none(),
+                "a dropper must still alert: {}",
+                rule
             );
         }
     }

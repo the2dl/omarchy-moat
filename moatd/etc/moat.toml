@@ -139,6 +139,25 @@ pkg_subtree_netcat_exec = true
 # claude/codex/gemini/opencode/q/amp started from inside an install. High.
 ai_cli_in_pkg_subtree = true
 
+# A shell (bash/sh/dash/zsh/fish/busybox/ash/ksh/mksh/tcsh/csh) whose standard
+# input or output IS a network socket -- read from /proc/<pid>/fd/{0,1,2} at
+# exec time, because no kernel hook carries file descriptors.
+#
+# This is the interpreter reverse shell: `python -c 'import socket,os,
+# subprocess; s.connect(...); os.dup2(s.fileno(),0); ...; subprocess.call(
+# ["/bin/sh","-i"])'`, and the perl/php/ruby/node equivalents. The interpreter
+# connects and the shell only inherits the socket, so nothing a `tcp_connect`
+# policy watches ever happens. A second rung catches the `pty.spawn` /
+# `script /dev/null` upgrade, where the shell gets a pty and the PARENT's stdio
+# is the socket.
+#
+# Unlike the kernel rule it does NOT exclude private addresses: a reverse shell
+# to a LAN pivot is the normal case. Critical for an off-machine peer (and the
+# one rung that kills in enforce mode), medium for a loopback peer, high for the
+# pty rung. Unix sockets on stdio -- journald's stdout, which systemd gives
+# every service -- never fire.
+shell_stdio_socket = true
+
 [ai]
 # Ancestors that are allowed to launch an AI CLI without a terminal, as globs.
 # Matched against each ancestor's binary AND each of its arguments, so a shebang
@@ -193,6 +212,37 @@ ancestry_max = 8
 # only a question of how much history to keep -- and the answer for an EDR is
 # "as much as is reasonable".
 alerts_max_bytes = 20971520
+
+# How long moatd will wait for the sensor to finish loading before it gives up
+# on re-arming the policies the user armed.
+#
+# Arming is `tetra tp set-mode <policy> enforce`, and it only works on a policy
+# the kernel already has. tetragon.service is `Type=simple`, so systemd calls it
+# "started" the instant it forks -- and moatd is `Requires=/After=/PartOf=` it,
+# so moatd starts believing the sensor is up while it is still loading.
+#
+# 2026-09-05: loading 44 policies took 16 seconds (21:08:45 start, last "Added
+# TracingPolicy with success" at 21:09:01). moatd re-armed at +2 s. All seven
+# armed policies failed -- once with `dial tcp [::1]:54321: address family not
+# supported`, then six times with `tracing policy {moat-...} does not exist` --
+# nothing retried, and `moatctl status` and the panel went on listing all seven
+# as enforcing while the kernel had them in `monitor`. Seven times that day.
+#
+# So moatd now waits for the pin count under [paths] tetragon_bpf_dir to reach
+# the number of rendered policies before it arms anything, retries a `set-mode`
+# that fails, and reads the kernel back afterwards (`enforcing_verified` /
+# `enforcing_unverified` in `moatctl status`). The wait runs on the periodic
+# tick, so it never blocks the event tail.
+#
+# 120 s is about eight times the observed load time: generous for a cold boot on
+# a slow disk, and bounded so a sensor that is never coming back becomes a
+# reported failure and one alert instead of an indefinite "arming".
+#
+# tetragon.service also runs `moatd wait-sensor` as an ExecStartPost, which
+# fixes the boot ORDER. This setting is the defence in depth for everything
+# else: a tetragon that reloads policies later, a policy re-added by
+# `moatctl allow --kernel`, a sensor that restarts without taking moatd with it.
+arm_wait_secs = 120
 
 # state.json write interval, and feed-file mtime poll interval.
 state_interval_secs = 5
@@ -265,6 +315,40 @@ noisy_rule_per_day = 20
 # cred, rootkit and shell never move — an official binary reading your SSH key
 # is still worth a look — and a `pkg-install` context is never downgraded at all.
 provenance_downgrade = true
+
+[context]
+# BASELINE §2b decides one context per process — interactive / pkg-install /
+# service / unknown — and it does NOT start from a list of names.
+#
+#   1. inside a package-manager subtree            -> pkg-install (wins outright)
+#   2. a controlling terminal (a pty) on the acting
+#      process or any ancestor                     -> interactive
+#   3. only if no /proc was left to read: the name
+#      walk, nearest ancestor first                -> interactive / service
+#   4. otherwise                                   -> unknown
+#
+# Step 2 is the mechanism and it needs no configuration: whatever allocated the
+# pty — a terminal nobody has heard of, a multiplexer, `ssh`, a session host
+# written last week — the kernel already recorded it, so there is no list to
+# keep up to date. These two keys are the escape hatch for the residue, and
+# they ship empty on purpose.
+#
+# `interactive_roots`: extra names that mean a person is driving. Use this for
+# a session host moat cannot see a tty through — something that hands you a
+# shell without allocating a pty of its own. On this machine `herdr` sits
+# between systemd --user and every Claude pane; it reports tty 0 itself, but
+# the shells beneath it have a pty, so step 2 already covers it and this key
+# stays empty. A host whose children have no pty either would go here:
+#
+#   interactive_roots = ["herdr"]
+#
+# `service_roots`: extra names that mean nobody is. Use this for something that
+# runs unattended under a name the walk would otherwise read as interactive.
+#
+# Both are matched on the basename of the binary, exactly, and both are only
+# consulted on the name-walk fallback — a pty beats them.
+interactive_roots = []
+service_roots = []
 
 [learning]
 # Rarity counters (docs/LEARNING-AND-ANALYSIS.md §1). Not a model: four decayed

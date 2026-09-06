@@ -9,7 +9,7 @@ Three binaries from one crate:
 
 | binary           | what it does                                                        |
 |------------------|---------------------------------------------------------------------|
-| `moatd`      | `render-policies` (ExecStartPre) and `run` (the daemon)             |
+| `moatd`      | `render-policies` (ExecStartPre), `wait-sensor` (ExecStartPost) and `run` (the daemon) |
 | `moatctl`    | thin CLI over the control socket                                    |
 | `moat-feeds` | hourly abuse.ch indicator fetch                                     |
 
@@ -44,9 +44,11 @@ cargo build --release && cargo test && cargo clippy
           │     BEFORE any kill                  │
           │ 10. pkg root exits: install receipt  │
           │ 11. every 5 s: prune, pacman check,  │
-          │     state.json                       │
+          │     state.json, arm when the sensor  │
+          │     is loaded                        │
           │ 12. every 60 s: feeds, rarity.json,  │
-          │     baseline.json                    │
+          │     baseline.json, verify the armed  │
+          │     set against the kernel           │
           └──────────────────────────────────────┘
 ```
 
@@ -108,6 +110,41 @@ Step by step:
 | `SIGTERM`/`SIGINT`| flush rarity.json and baseline.json, write state.json, remove the socket, exit 0 |
 
 `systemctl reload moatd` sends the HUP. The process table survives a reload.
+
+### Starting up — do not restart by hand
+
+Use `sudo moatd telemetry --apply`, or restart **tetragon** and let moatd follow
+it (`PartOf=`). Restarting the two by hand in the wrong order leaves moatd
+tailing a file nothing is writing.
+
+More importantly, "tetragon has started" and "tetragon is ready" are not the
+same event, and for a long time nothing in this project knew the difference.
+tetragon.service is `Type=simple`, so systemd calls it started the instant it
+forks; on 2026-09-05 it then spent **16 seconds** loading 44 policies. moatd is
+`Requires=/After=/PartOf=` it, so it started, believed the sensor was up, and
+pushed the armed set into the kernel at **+2 s** — where every `tetra tp
+set-mode` failed against a policy name the kernel did not have yet, nothing
+retried, and `status`, `moatctl` and the panel all went on saying seven rules
+were armed while the kernel had them in `monitor`. All day. (NOTES §7.1.)
+
+**`moatd wait-sensor` is what makes the order safe.** It counts the policies
+pinned under `/sys/fs/bpf/tetragon` and blocks until that reaches the rendered
+count, and it is wired as `ExecStartPost=-/usr/bin/moatd wait-sensor
+--timeout 120` on tetragon.service. A unit with an `ExecStartPost` stays in
+`activating` until the command returns, so this is what finally makes
+`After=tetragon.service` mean *after it is loaded* rather than *after it
+forked*. The `-` prefix keeps a slow load from failing the sensor unit and
+handing it to `Restart=always`; run it without the prefix yourself
+(`sudo moatd wait-sensor`) and it exits 0 loaded, 1 timed out, 2 bpffs never
+appeared.
+
+The daemon waits on its own account too (`[thresholds] arm_wait_secs`, 120 s),
+and that is not redundant: the unit fix only orders a boot. A tetragon that
+reloads a policy later, a policy re-added by a kernel exclusion, a sensor that
+restarts without taking moatd with it — none of those are boot-order problems,
+and all of them silently drop a policy back to the `monitor` its file declares.
+`verify_enforcement` reads the kernel back once a minute for exactly that
+reason; see §5 for what `status` publishes.
 
 ---
 
@@ -181,13 +218,18 @@ sensor that has contradicted itself.
 | `moat-pkg-subtree-downloader` | `curl`,`wget`,`aria2c`,`base64`,`openssl`,`xxd`,`xh`,`httpie`, or `python -c/-m` / `node -e` carrying an http URL, execs inside a package subtree | high |
 | `moat-pkg-subtree-netcat-exec` | `nc`,`ncat`,`netcat`,`socat`,`telnet` execs inside a package subtree. In `enforce` mode moatd SIGKILLs the process itself | critical |
 | `moat-ai-cli-in-pkg-subtree` | an AI CLI execs inside a package subtree | high |
-| `moat-x-noisy-rule`      | one rule raised more than `noisy_rule_per_day` alerts in a rolling 24 h; it is demoted to the timeline, not switched off (§9.4) | medium |
+| `moat-shell-stdio-socket` | a shell (`bash`,`sh`,`dash`,`zsh`,`fish`,`busybox`,`ash`,`ksh`,`mksh`,`tcsh`,`csh`) execs with fd 0, 1 or 2 pointing at a network socket — the interpreter reverse shell, where `python`/`perl`/`node` connects, `dup2`s the socket onto stdio and execs `/bin/sh`. LAN and loopback **included**: unlike the kernel rule it does not exclude private addresses. In `enforce` mode moatd SIGKILLs the process itself, on this rung only | critical (medium for a loopback peer) |
+|                              | …or the shell's stdio is a pty **and the parent's** stdio is a network socket — the `pty.spawn` / `script /dev/null` upgrade. Not "the parent holds a socket somewhere": that is every IDE on the machine | high |
+| `moat-x-noisy-rule`      | one (rule, exe, parent, dir) pattern raised more than `noisy_rule_per_day` alerts in a rolling 24 h; that pattern is demoted to the timeline, not switched off — and past five quiet patterns the alert says the rule itself wants retuning (§9.4) | medium |
 | `moat-x-baseline-revoked`| a learned baseline entry's actor stopped being official, so the entry was disabled in place (§9.5) | low |
 
-The last four keep the ids and severities of the kernel policies they replaced,
+The four subtree rules (`moat-pkg-subtree-*` and `moat-ai-cli-in-pkg-subtree`)
+keep the ids and severities of the kernel policies they replaced,
 so allowlist entries, the plugin and the docs are unaffected — only the place
 the subtree decision is made changed. They fire on `process_exec`, which is
-exported unconditionally, so no policy has to be loaded for them to work.
+exported unconditionally, so no policy has to be loaded for them to work — and
+so does `moat-shell-stdio-socket`, which is why it keeps working when the
+`shell` policies are not loaded at all.
 
 Design notes worth knowing:
 
@@ -196,11 +238,25 @@ Design notes worth knowing:
 * `pkg-egress` is medium, not high, because CDN address space moves and the
   allowlist is necessarily coarse: there is no DNS in the kernel and no hostname
   in the export (gap 4);
-* `moat-pkg-subtree-netcat-exec` is the only rule that acts on its own. It kills
+* `moat-pkg-subtree-netcat-exec` and `moat-shell-stdio-socket` are the only two
+  rules that act on their own. They kill
   **only** in enforce mode, only the process itself (not the tree), and only
   after `/proc/<pid>` proves the start time still matches — the same check the
   `kill` socket command uses. The outcome is recorded either way: `killed`, or an
-  evidence line saying why it was not.
+  evidence line saying why it was not. `moat-shell-stdio-socket` asks only on
+  its `critical` rung: a loopback peer (medium) and the pty rung (high) are
+  where the rule is least certain, and killing there would make its weakest
+  cases its most destructive ones. Both are armable **one at a time**:
+  `moatctl set mode enforce --rule moat-shell-stdio-socket` arms that rule and
+  leaves the daemon in monitor. They declare `enforce: "kill"` in their own
+  meta, so `enforceable()` lists them (with `"by": "moatd"` rather than
+  `"kernel"`), `maybe_enforce` gates on `mode_for(rule)`, and the rule itself
+  asks `RuleCtx::enforcing(id)`. Nothing is pushed into the kernel for them —
+  there is no policy to set a mode on — so arming applies immediately and cannot
+  fail; the arming survives a restart through `enforcing_rules` in `state.json`,
+  like a kernel rule. Until 2026-09-05 these two were the only rules that act on
+  their own and the only ones the per-rule switch refused, so the only way to
+  arm either was to arm the whole machine.
 
 ### 3.2 The package-subtree classifier (`rules/pkgtree.rs`)
 
@@ -326,10 +382,13 @@ they parse as neither an alert nor an update, so every existing reader ignores
 them.
 
 A **suppressed** alert is still appended, so the timeline can show it greyed
-out; it never notifies and never counts towards `unacked`. A **demoted** rule is
-not a suppression: its alerts keep `suppressed_by: null` and get
-`surface: "timeline"`. Every one of these fields has a `serde` default, so a
-record written by an older moatd still loads.
+out; it never notifies and never counts towards `unacked`. A **demoted** pattern
+and a **`signal`-tier** rule are not suppressions: their alerts keep
+`suppressed_by: null` and get `surface: "timeline"`, and the record carries
+`tier` and `pkg_install_escalation` so a reader can tell the three apart
+(BASELINE §4a, §8). Every one of these fields has a `serde` default, so a record
+written by an older moatd still loads — and the default for `tier` is
+`detection`, so silence is never the failure mode of a missing field.
 
 ---
 
@@ -344,7 +403,7 @@ moatd to kill or move something the sensor did not already flag.
 
 | request | response (on success) |
 |---|---|
-| `{"cmd":"status"}` | version, mode, tetragon, policies, policies_failed, feeds, unacked, sandbox, socket_group |
+| `{"cmd":"status"}` | version, mode, tetragon, policies, policies_failed, feeds, unacked, `ledger` (`needs_you` / `recorded` / `suppressed` / `signal`), sandbox, socket_group, and the enforcement triple below |
 | `{"cmd":"list","since":"<ULID>","limit":100}` | `alerts: [...]`, updates folded |
 | `{"cmd":"explain","id":"…"}` | `alert: {...}` with the full explain block |
 | `{"cmd":"ack","id":"…"}` | appends `{"acked":true}` |
@@ -392,6 +451,38 @@ answers `ok: true` (it did persist the choice), but **`moatctl set mode` exits 2
 when `applied` is 0** and prints what to check: the mode was recorded while
 nothing in the kernel changed, which is exactly the case a script must catch.
 
+### Armed, and actually armed
+
+`status` reports enforcement three ways, and the difference between them is the
+whole point:
+
+| field | meaning |
+|---|---|
+| `enforcing_rules` | what the **record** says is armed — the user's request, restored from `state.json`. What the panel binds to. |
+| `enforcing_verified` | the subset the **kernel** confirms is in `enforce` |
+| `enforcing_unverified` | the subset the kernel says is **not** — listed as armed, will kill nothing |
+| `enforcement_unhealthy` | `enforcing_unverified` is non-empty. The analogue of `sensor_unhealthy`. |
+| `arming_pending` | still waiting for the sensor to load before arming. Normal for a few seconds after a boot. |
+
+The kernel's answer comes from `tetra tracingpolicy list -o json` — the `mode`
+field of `TracingPolicyStatus`, a `TracingPolicyMode` (`TP_MODE_ENFORCE` 1,
+`TP_MODE_MONITOR` 2). `verify_enforcement` reads it once a minute, re-arms
+anything that disagrees, reads the kernel *back* rather than trusting the
+`set-mode` exit status, and raises exactly one `moat-x-protection-changed` alert
+for a gap that persists — deduped on the unverified set, cleared when a policy
+comes back. `moatctl status` prints the unverified names on the `enforcing` line
+itself:
+
+```
+enforcing  moat-cred-a, moat-net-b   *** NOT ARMED IN KERNEL: moat-net-b — see journal: journalctl -u moatd -u tetragon ***
+```
+
+Being unable to *ask* is never reported as a gap: an empty
+`enforcing_verified` **and** an empty `enforcing_unverified` next to a non-empty
+`enforcing_rules` means moatd could not reach the sensor, which is
+`sensor_unhealthy`'s story to tell. None of the three persist across a restart —
+agreement observed before a restart says nothing about the kernel after one.
+
 ---
 
 ## 6. Configuration
@@ -426,13 +517,14 @@ version; the reference:
 | `thresholds.ancestry_max` | 8 | chain cap |
 | `thresholds.alerts_max_bytes` | 20 MiB | rotation |
 | `thresholds.state_interval_secs` / `feeds_poll_secs` | 5 / 60 | timers |
+| `thresholds.arm_wait_secs` | 120 | how long to wait for the sensor to load before giving up on re-arming (§1, NOTES §7.1) |
 | `net.registry_cidrs` | Fastly/GitHub/Cloudflare blocks | pkg-egress allowlist |
 | `net.allow_private` | `true` | RFC1918 etc. never alert |
 | `net.egress_severity` | `medium` | severity of a pkg-egress hit |
 | `baseline.trusted_repos` | `["core","extra","multilib","omarchy"]` | repos whose signature makes a package `official` |
 | `baseline.learning_days` | 7 | how long recurring official patterns auto-apply |
 | `baseline.learn_min_days` | 3 | distinct days a tuple must recur on |
-| `baseline.noisy_rule_per_day` | 20 | 24 h alerts before a rule is demoted |
+| `baseline.noisy_rule_per_day` | 20 | 24 h alerts from one pattern before that pattern is demoted |
 | `baseline.provenance_downgrade` | `true` | section 2 of BASELINE |
 | `learning.half_life_days` | 30 | rarity decay |
 | `learning.rare_max_count` | 3 | under this many sightings a tuple is `rare` |
@@ -640,15 +732,39 @@ entry already covers. After the window the same condition produces a
 **proposal** in `state.json.proposals[]` carrying the exact TOML that accepting
 would write.
 
-**The noise guard.** More than `noisy_rule_per_day` (20) alerts from one rule in
-a rolling 24 h (hourly buckets) demotes it: it keeps writing to `alerts.jsonl`,
-it just stops being an Alerts-tab item. One `moat-x-noisy-rule` alert at medium
-names the rule's top five tuples and offers two `if_expected` options —
-`these-are-expected` (`moatctl baseline propose --rule …`, which proposes
-baseline entries for exactly those tuples) and `keep-watching` (`moatctl
-baseline undemote …`). The demotion clears itself after 24 h under the
-threshold. Suppressed alerts do not count towards it, because they are not noise
-the user can see.
+**The rule tier.** A rule can declare itself a **building block** rather than a
+detection: `moat.omarchy/tier: "signal"` on a policy, `rules::signal_meta` for a
+userland rule (BASELINE §4a). A `signal` rule keeps its severity, is recorded in
+full, and is a full trigger for `chain.rs` — it just never reaches the badge on
+its own, takes no incident snapshot and is never queued for triage. Two things
+put one on the badge anyway: the §2b matrix escalating it inside a `pkg-install`
+(a `/tmp` exec inside a package install IS a detection), and a chain that
+reached `high` re-stamping it. Seven rules carry it, and they are exactly the
+set the old fan-out demotion kept rediscovering.
+
+**The noise guard.** More than `noisy_rule_per_day` (20) alerts from one
+**(rule, exe, parent, dir) pattern** in a rolling 24 h (hourly buckets) demotes
+that pattern: it keeps writing to `alerts.jsonl`, it just stops being an
+Alerts-tab item, and the daemon restamps the backlog the demotion covers. One
+`moat-x-noisy-rule` alert at medium names the rule's top five tuples and offers
+two `if_expected` options — `these-are-expected` (`moatctl baseline propose
+--rule …`, which proposes baseline entries for exactly those tuples) and
+`keep-watching` (`moatctl baseline undemote …`). The demotion clears itself
+after 24 h under the threshold.
+
+Three kinds of alert never count towards it: suppressed ones (the user already
+answered), `signal`-tier ones (the rule already said it is not a conclusion),
+and anything the severity table keeps off the badge anyway. And a demotion never
+moves a **package-install escalation** to the timeline — the guard's arithmetic
+is about how often a shape fires on this machine, which says nothing about what
+a package install did.
+
+There is **no rule-wide demotion**. The old fan-out backstop silenced a whole
+rule once five of its patterns had gone quiet, including shapes nobody had ever
+seen; on 2026-09-04 that hid a real `/tmp` dropper inside a package install.
+Past `noisy_rule_fanout` (5) quiet patterns the `moat-x-noisy-rule` alert now
+*says* the rule itself is the problem — retune it, or declare it `signal` —
+and silences nothing further.
 
 ### 9.5 Revocation
 

@@ -148,6 +148,7 @@ mod tests {
             homes,
             now: 100,
             mode: "monitor",
+            armed: &crate::rules::NO_RULES_ARMED,
         };
         rule.on_exec(&ExecEvent::default(), id, &ctx)
     }

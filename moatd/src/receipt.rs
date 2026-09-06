@@ -423,6 +423,7 @@ mod tests {
             exit_signal: None,
             exe_note: None,
             sid: None,
+            tty: None,
         }
     }
 

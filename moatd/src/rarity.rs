@@ -176,6 +176,7 @@ const TEMP_ROOTS: &[&str] = &["/tmp/", "/var/tmp/", "/dev/shm/"];
 /// `/tmp/bun-dl-UfNh13/x` -> `/tmp/bun-dl-*/x`
 /// `/tmp/moat-keyv-lab-1788533528861-694175` -> `/tmp/moat-keyv-lab-*`
 /// `/tmp/.tmpAb12Cd/nc` -> `/tmp/.tmp*/nc`
+/// `/tmp/moat-shim-test.ab_3x9kq/bin` -> `/tmp/moat-shim-test.*/bin`
 ///
 /// Every dedup mechanism moat has keys on the (rule, exe, parent, dir) tuple:
 /// the baseline learns on it, the noise guard demotes on it, and triage
@@ -218,15 +219,24 @@ fn collapse_segment(seg: &str) -> Option<String> {
     loop {
         // A previous pass leaves the prefix ending in the separator that
         // introduced the run it removed; skip back over it to find the next.
+        // `_` is NOT skipped here: it is part of a run, not a separator, since
+        // `tempfile.mkdtemp` draws it from its own alphabet (see below).
         let mut search = end;
-        while search > 0 && matches!(seg.as_bytes()[search - 1], b'-' | b'.' | b'_') {
+        while search > 0 && matches!(seg.as_bytes()[search - 1], b'-' | b'.') {
             search -= 1;
         }
         let Some(start) = random_run_start(&seg[..search]) else { break };
-        if start == 0 {
-            // The whole remaining name is random. Collapsing that would merge
-            // every unrelated scratch directory on the machine into one tuple,
-            // so a bare `/tmp/aB12cD` keeps its identity.
+        if seg[..start].bytes().all(|b| matches!(b, b'-' | b'.' | b'_')) {
+            // Nothing but separators would survive. The whole remaining name is
+            // random, and collapsing that would merge every unrelated scratch
+            // directory on the machine into one tuple, so a bare `/tmp/aB12cD`
+            // keeps its identity.
+            //
+            // On 2026-09-05 this guard was `start == 0`, which let 22 of the 52
+            // `tempfile` directories on this machine collapse to `/tmp/.*` --
+            // one tuple covering every hidden scratch directory there is. A
+            // dropper landing in `/tmp/.evil42X` would have inherited the
+            // `common` rarity that `cargo test` had already bought for it.
             break;
         }
         end = start;
@@ -238,25 +248,59 @@ fn collapse_segment(seg: &str) -> Option<String> {
     Some(format!("{}*", &seg[..end]))
 }
 
+/// Prefixes a temp-directory library hard-codes, where the random part is
+/// appended with no case change and no separator to find it by.
+/// `tempfile::tempdir()` -- the crate moatd's own tests use -- names every
+/// directory `.tmp` plus six random alphanumerics, and in `.tmpxSardd` there is
+/// no boundary a general rule can see.
+const KNOWN_PREFIXES: &[&str] = &[".tmp"];
+
 /// Where the trailing random run begins, or `None` if there isn't one.
 ///
-/// Returns the **rightmost** valid boundary, i.e. the shortest run that still
-/// looks random. `.tmpAb12Cd` splits at the case change into `.tmp` + `Ab12Cd`
-/// rather than at the dot into `.` + `tmpAb12Cd` -- the whole alnum run also
-/// looks random, and taking it would throw away the part that names the tool.
+/// Three boundaries count, tried in this order:
 ///
-/// Two boundaries count: the start of the trailing alphanumeric run (a
-/// separator preceded it, as in `name-XXXXXX`) and a lowercase -> uppercase or
-/// digit transition inside it (`mktemp` appended straight onto a prefix).
+/// 1. The start of the trailing run when a `-` or `.` introduced it, as in
+///    `name-XXXXXX`, and there is a real name in front of that separator.
+/// 2. A hard-coded prefix from [`KNOWN_PREFIXES`] with a random run after it.
+/// 3. A lowercase -> uppercase or digit transition inside the run (`mktemp`
+///    appended straight onto a prefix), rightmost first.
+///
+/// The separator has to come first. It used to be tried last, so the
+/// **rightmost** boundary won and the random part leaked into the name:
+/// `moat-build-shim-test.2o96mi62` split at the interior `o->9` into
+/// `moat-build-shim-test.2o` + `96mi62`, and every mktemp run therefore still
+/// minted a fresh tuple. On 2026-09-05 that left a live alert reading "first
+/// time /usr/bin/bash has executed something in
+/// /tmp/moat-build-shim-test.2o*/bin", and 376 of 1467 alerts that day were
+/// `first_seen` or `rare` for what were five repeating shapes. A separator is
+/// the strongest boundary evidence there is -- a human put it there -- so it
+/// wins, and the case-change rule stays for `.tmpAb12Cd`, which has none.
 fn random_run_start(seg: &str) -> Option<usize> {
     let b = seg.as_bytes();
     let mut run_start = seg.len();
-    while run_start > 0 && b[run_start - 1].is_ascii_alphanumeric() {
+    while run_start > 0 && (b[run_start - 1].is_ascii_alphanumeric() || b[run_start - 1] == b'_') {
         run_start -= 1;
     }
     if run_start == seg.len() {
         return None;
     }
+    // 1. `name-XXXXXX` / `name.XXXXXXXX`. `run_start >= 2` keeps a leading dot
+    //    out of it: `.tmpAb12Cd` must not become `.*`.
+    if run_start >= 2 && matches!(b[run_start - 1], b'-' | b'.') {
+        let run = &seg[run_start..];
+        if is_random_run(run) || (b[run_start - 1] == b'.' && is_mkdtemp_suffix(run)) {
+            return Some(run_start);
+        }
+    }
+    // 2. A library prefix we know by name.
+    for p in KNOWN_PREFIXES {
+        if let Some(rest) = seg.strip_prefix(p) {
+            if is_random_run(rest) {
+                return Some(p.len());
+            }
+        }
+    }
+    // 3. A case or digit change inside the run.
     for k in (run_start..=seg.len().saturating_sub(6)).rev() {
         let boundary = k == run_start
             || (b[k - 1].is_ascii_lowercase()
@@ -268,9 +312,25 @@ fn random_run_start(seg: &str) -> Option<usize> {
     None
 }
 
-/// Six or more alphanumerics that no human chose: all digits (a timestamp or a
+/// Python's `tempfile.mkdtemp` draws eight characters from
+/// `abcdefghijklmnopqrstuvwxyz0123456789_`, so its suffix carries none of the
+/// evidence [`is_random_run`] looks for: no case change, and often no digit at
+/// all (`moat-shim-test.agokzoqa`, `moat-shim-test.gsbicdj_`). Length is the
+/// only signal left, so this is deliberately allowed **only** directly after a
+/// `.` -- the shape `mkdtemp(prefix="moat-shim-test.")` produces. After a `-`
+/// it would swallow ordinary names: `/tmp/gnome-software` and
+/// `/tmp/systemd-private` are exactly this shape minus the dot.
+fn is_mkdtemp_suffix(run: &str) -> bool {
+    run.len() >= 8
+        && run
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Six or more run characters that no human chose: all digits (a timestamp or a
 /// pid), mixed case, or letters mixed with digits. `private`, `cargo` and
-/// `build` are none of those.
+/// `build` are none of those. `_` counts as part of a run, not a separator,
+/// because `mkdtemp` puts it inside one (`moat-shim-test.ab_3x9kq`).
 fn is_random_run(run: &str) -> bool {
     if run.len() < 6 {
         return false;
@@ -643,6 +703,126 @@ mod tests {
     }
 
     #[test]
+    fn a_separator_beats_a_case_change_so_the_random_prefix_cannot_leak() {
+        // The boundary search returned the RIGHTMOST candidate, so a random run
+        // that happened to start with a lowercase letter kept its first
+        // characters in the tuple: `moat-build-shim-test.2o96mi62` split at the
+        // interior `o -> 9` and collapsed to `moat-build-shim-test.2o*`. Every
+        // run of the suite therefore minted a fresh tuple anyway, which is the
+        // whole thing collapse_volatile exists to stop. On 2026-09-05 a live
+        // alert read "first time /usr/bin/bash has executed something in
+        // /tmp/moat-build-shim-test.2o*/bin", and 376 of 1467 alerts that day
+        // were first_seen or rare for five repeating shapes.
+        assert_eq!(
+            dir_of("/tmp/moat-build-shim-test.2o96mi62/bin/moat-scan-cargo"),
+            "/tmp/moat-build-shim-test.*/bin"
+        );
+        assert_eq!(
+            dir_of("/tmp/moat-build-shim-test.7x5l9900/bin/x"),
+            "/tmp/moat-build-shim-test.*/bin",
+            "two runs of the same suite are one tuple"
+        );
+        // The same shape wherever the run begins with a digit, an uppercase
+        // letter, or a lowercase one.
+        for seg in ["9okwtvhs", "Zokwtvhs", "aokwtvh2"] {
+            assert_eq!(
+                dir_of(&format!("/tmp/moat-shim-test.{}/bin/x", seg)),
+                "/tmp/moat-shim-test.*/bin",
+                "{}",
+                seg
+            );
+        }
+    }
+
+    #[test]
+    fn a_python_mkdtemp_suffix_collapses_even_without_a_case_change() {
+        // `tempfile.mkdtemp` draws 8 characters from a-z0-9_ , so the run can
+        // contain an underscore -- which used to split it into two short runs,
+        // neither long enough to look random, so the name was not collapsed at
+        // all -- and it can be all lowercase, carrying no case change and no
+        // digit for is_random_run to find.
+        assert_eq!(dir_of("/tmp/moat-shim-test.ab_3x9kq/bin/x"), "/tmp/moat-shim-test.*/bin");
+        assert_eq!(dir_of("/tmp/moat-shim-test.gsbicdj_/bin/x"), "/tmp/moat-shim-test.*/bin");
+        assert_eq!(dir_of("/tmp/moat-shim-test.agokzoqa/bin/x"), "/tmp/moat-shim-test.*/bin");
+        assert_eq!(dir_of("/tmp/moat-build-shim-test._lfzuzkt/x"), "/tmp/moat-build-shim-test.*");
+        assert_eq!(dir_of("/tmp/moat-linux-memfd-xdk1_5k5/x"), "/tmp/moat-linux-memfd-*");
+        // Only after a dot. A bare `-` plus eight lowercase letters is an
+        // ordinary name, and there are real ones under /tmp.
+        assert_eq!(dir_of("/tmp/gnome-software/x"), "/tmp/gnome-software");
+        assert_eq!(dir_of("/tmp/systemd-private/x"), "/tmp/systemd-private");
+        // An underscore inside a name nobody generated is still a name.
+        assert_eq!(dir_of("/tmp/hsperfdata_dan/x"), "/tmp/hsperfdata_dan");
+    }
+
+    #[test]
+    fn a_collapse_that_would_leave_only_punctuation_is_refused() {
+        // `.tmpxSardd` has no case change the search can find (`p -> x` is
+        // lowercase to lowercase), so the only boundary left was the start of
+        // the run itself -- and that collapsed the name to `.*`. On 2026-09-05
+        // 22 of the 52 tempfile directories in the store had done exactly that:
+        // one tuple standing for every hidden scratch directory on the machine,
+        // so a dropper landing in /tmp/.evil42X would have inherited the
+        // `common` rarity `cargo test` had already bought.
+        assert_eq!(dir_of("/tmp/.tmpxSardd/nc"), "/tmp/.tmp*");
+        assert_eq!(dir_of("/tmp/.tmpFIBj5s/nc"), "/tmp/.tmp*");
+        assert_eq!(dir_of("/tmp/.abcXY12/nc"), "/tmp/.abcXY12",
+                   "a hidden directory that is only random keeps its identity");
+    }
+
+    /// Every `/tmp/moat-*` and `/tmp/.tmp*` shape the live store held on
+    /// 2026-09-05, one sample per suite plus the ones that used to escape.
+    /// Each suite must land on exactly one directory tuple.
+    #[test]
+    fn every_scratch_suite_in_the_live_store_lands_on_one_tuple() {
+        let suites: &[(&str, &[&str])] = &[
+            (
+                "/tmp/moat-build-shim-test.*/bin",
+                &[
+                    "/tmp/moat-build-shim-test.2o96mi62/bin/moat-scan-cargo",
+                    "/tmp/moat-build-shim-test.41oet1lv/bin/moat-scan-cargo",
+                    "/tmp/moat-build-shim-test.agokzoqa/bin/moat-scan-cargo",
+                    "/tmp/moat-build-shim-test._byvuvfb/bin/moat-scan-cargo",
+                    "/tmp/moat-build-shim-test.z00000ja/bin/moat-scan-cargo",
+                ],
+            ),
+            (
+                "/tmp/moat-shim-test.*/bin",
+                &[
+                    "/tmp/moat-shim-test.3cilat0t/bin/moat-scan-npm",
+                    "/tmp/moat-shim-test.e844f7xs/bin/moat-scan-npm",
+                    "/tmp/moat-shim-test.bxetowxi/bin/moat-scan-npm",
+                    "/tmp/moat-shim-test.gsbicdj_/bin/moat-scan-npm",
+                    "/tmp/moat-shim-test._lfzuzkt/bin/moat-scan-npm",
+                ],
+            ),
+            (
+                "/tmp/moat-sandbox-test.*/bin",
+                &[
+                    "/tmp/moat-sandbox-test.wV0grbBB/bin/moat-shim-probe",
+                    "/tmp/moat-sandbox-test.gfJUtmV9/bin/moat-shim-probe",
+                    "/tmp/moat-sandbox-test.0kyOTYdd/bin/moat-shim-probe",
+                ],
+            ),
+            (
+                "/tmp/.tmp*",
+                &[
+                    "/tmp/.tmpFIBj5s/nc",
+                    "/tmp/.tmpxSardd/nc",
+                    "/tmp/.tmplAs095/nc",
+                    "/tmp/.tmp11ynjO/nc",
+                    "/tmp/.tmpCXXXO0/nc",
+                ],
+            ),
+        ];
+        for (want, paths) in suites {
+            let got: Vec<String> = paths.iter().map(|p| dir_of(p)).collect();
+            for (p, g) in paths.iter().zip(&got) {
+                assert_eq!(g, want, "{} collapsed to {}", p, g);
+            }
+        }
+    }
+
+    #[test]
     fn the_actor_is_collapsed_too_not_just_what_it_touched() {
         // The fix above was applied to `dir` and not to `exe`, so a tool run
         // from a mktemp directory still minted a brand-new tuple every run.
@@ -892,3 +1072,4 @@ mod cap_tests {
         assert!(s.has_seen(&hot), "the coldest go first, not the busiest");
     }
 }
+

@@ -47,6 +47,16 @@ fn dev_run_script_completes() {
         "IF THIS IS EXPECTED",
         "WHAT TO DO",
         "[[rule]]",
+        // CONTRACT §5: the enforcement triple, over the real control socket.
+        // `enforcing_rules` on its own is what told this machine seven rules
+        // were armed for a day while the kernel had all seven in `monitor`
+        // (NOTES §7.1), so a status response without the verified/unverified
+        // split is a regression the panel cannot detect.
+        "\"enforcing_rules\"",
+        "\"enforcing_verified\"",
+        "\"enforcing_unverified\"",
+        "\"enforcement_unhealthy\"",
+        "\"arming_pending\"",
         "OK — dev run complete",
     ] {
         assert!(
@@ -189,4 +199,76 @@ fn render_policies_is_idempotent_from_the_cli() {
     assert_eq!(lines[0], r#"{"event_set":["PROCESS_EXEC","PROCESS_EXIT"]}"#);
     assert!(lines[1].contains(r#""policy_names":["moat-"#));
     assert!(lines[1].starts_with(r#"{"event_set":["PROCESS_KPROBE""#));
+}
+
+/// `moatd wait-sensor` is what makes systemd's "tetragon started" mean "the
+/// policies are loaded" — it is the `ExecStartPost` on tetragon.service, and
+/// `After=tetragon.service` is only true in the sense that matters because of
+/// it. Its exit codes are the contract, so they are tested.
+///
+/// 0 loaded, 1 timed out with a readable bpffs, 2 bpffs never appeared. The
+/// last two are the distinction `count_pinned` draws with `Some(n)` vs `None`,
+/// and conflating them is how `moatd telemetry --apply` came to ask a root
+/// caller whether they were root (2026-09-05).
+#[test]
+fn wait_sensor_exit_codes_say_which_kind_of_not_ready_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let policies = manifest_dir().join("testdata/policies");
+    let bpf = dir.path().join("bpf");
+
+    let cfg = dir.path().join("moat.toml");
+    let write_cfg = |bpf_dir: &std::path::Path| {
+        std::fs::write(
+            &cfg,
+            format!(
+                "[paths]\ntetragon_bpf_dir = {:?}\npolicies_dir = {:?}\n",
+                bpf_dir, policies
+            ),
+        )
+        .unwrap();
+    };
+    let run = |timeout: &str, dir_arg: Option<&std::path::Path>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_moatd"));
+        c.args(["--config", cfg.to_str().unwrap()])
+            .arg("wait-sensor")
+            .args(["--timeout", timeout]);
+        if let Some(d) = dir_arg {
+            c.args(["--policies-dir", d.to_str().unwrap()]);
+        }
+        c.output().expect("wait-sensor failed to run")
+    };
+
+    // Nothing rendered: nothing to wait for, and waiting anyway would stall
+    // every boot of a machine with no policies for the full timeout.
+    write_cfg(&bpf);
+    let empty = dir.path().join("no-policies");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = run("1", Some(&empty));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // bpffs is not there at all: exit 2, and the message offers the two real
+    // causes rather than asserting one.
+    let out = run("1", None);
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("never appeared"), "{}", stderr);
+    assert!(stderr.contains("sudo"), "{}", stderr);
+
+    // bpffs is readable and short: exit 1, naming the shortfall. This is the
+    // sensor that started and did not finish loading.
+    std::fs::create_dir_all(bpf.join("moat-one")).unwrap();
+    let out = run("1", None);
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("TIMED OUT"), "{}", stderr);
+    assert!(stderr.contains("1/5"), "it must name the shortfall: {}", stderr);
+
+    // Fully pinned: exit 0, immediately.
+    for i in 0..5 {
+        std::fs::create_dir_all(bpf.join(format!("moat-{}", i))).unwrap();
+    }
+    let out = run("30", None);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("sensor loaded"), "{}", stdout);
 }

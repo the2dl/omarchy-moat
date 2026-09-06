@@ -21,6 +21,10 @@ metadata:
       context. Playwright, Cypress, Puppeteer and electron-builder run executables from
       ~/.cache on purpose and will fire.
     moat.omarchy/fp-hint: "exe"
+    # BASELINE 4: a building block, not a detection. Weak alone: a developer runs binaries
+    # out of $HOME all day. It exists to be a chain step - and inside a package install
+    # the context matrix makes it the detection it really is.
+    moat.omarchy/tier: "signal"
 spec:
   options:
   - name: "policy-mode"

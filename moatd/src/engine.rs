@@ -77,6 +77,18 @@ struct Dedupe {
     count: u64,
 }
 
+/// One chain's answer to "is moat confident enough to ACT on this", shared by
+/// the kill and the quarantine (`Daemon::chain_gate`).
+struct ChainGate {
+    facts: Vec<crate::contain::StepFact>,
+    /// The trigger families, sorted and deduped, for the decisions record.
+    families: Vec<String>,
+    /// The uid every trigger ran as, for `refuse_to_kill`.
+    uid: u32,
+    /// `Ok` to act; `Err(why)` is the sentence both refusals print.
+    verdict: Result<(), String>,
+}
+
 pub struct Daemon {
     pub cfg: Config,
     pub cfg_path: PathBuf,
@@ -167,6 +179,22 @@ pub struct Daemon {
     /// (`maybe_enforce`) gates on that, so leaving it at monitor means only the
     /// kernel policy named here can kill anything.
     pub enforcing_rules: std::collections::BTreeSet<String>,
+    /// Where the post-start re-arming has got to. See `arm_tick`.
+    pub arming: Arming,
+    /// Kernel policies `verify_enforcement` last confirmed are in `enforce`.
+    ///
+    /// Deliberately NOT persisted: "the kernel agreed with us before the last
+    /// restart" is not evidence about the kernel now, and a restart is exactly
+    /// when the agreement breaks.
+    pub enforcing_verified: std::collections::BTreeSet<String>,
+    /// Kernel policies `enforcing_rules` claims are armed and the kernel says
+    /// are not. Non-empty means the panel is lying and `status` has to say so.
+    pub enforcing_unverified: std::collections::BTreeSet<String>,
+    /// The unverified set the last `moat-x-protection-changed` alert named, so
+    /// a failure that persists for a week is one alert and not one a minute.
+    last_arm_alert_set: std::collections::BTreeSet<String>,
+    /// Unix seconds of the last `verify_enforcement` run.
+    last_verify: u64,
     /// Monotonic ULID source. Alert ids are the timeline: `store.load()` keys a
     /// BTreeMap on them, `moatctl list` calls the last one newest, and
     /// `--since <id>` pages on them. A plain `Ulid::new()` only orders by the
@@ -321,6 +349,11 @@ impl Daemon {
             chains: ChainStore::new(),
             ids: ulid::Generator::new(),
             enforcing_rules: persisted_enforcing_rules(&state),
+            arming: Arming::Idle,
+            enforcing_verified: std::collections::BTreeSet::new(),
+            enforcing_unverified: std::collections::BTreeSet::new(),
+            last_arm_alert_set: std::collections::BTreeSet::new(),
+            last_verify: 0,
             telemetry,
             telemetry_written: 0,
             telemetry_filtered: 0,
@@ -342,6 +375,10 @@ impl Daemon {
         // hot-reloadable), but the file must not keep growing in the meantime.
         self.telemetry = open_telemetry(&self.cfg);
         self.policies = PolicySet::load(&self.cfg.paths.policies_dir);
+        // A reload can change which policies exist, and therefore which ones
+        // `enforcement_to_apply` wants armed. Re-read the kernel on the next
+        // tick rather than leaving `status` quoting the previous policy set.
+        self.invalidate_verification();
         self.allowlist = Allowlist::load(&self.cfg.paths.allowlist_dir);
         self.homes = util::human_homes(&self.cfg.paths.passwd);
         self.subvols = util::subvol_roots(Path::new("/proc/self/mounts"));
@@ -675,6 +712,7 @@ impl Daemon {
             homes: &self.homes,
             now,
             mode: &self.mode,
+            armed: &self.enforcing_rules,
         }
     }
 
@@ -800,6 +838,54 @@ impl Daemon {
         }
     }
 
+    /// The one decision behind BOTH acting on a chain and moving its files.
+    ///
+    /// `maybe_kill_tree` had this reasoning to itself, and quarantine had none
+    /// at all: every `high` chain's exec/persist trigger files were moved
+    /// aside. On 2026-09-05 at 22:03Z that meant a `critical` chain raised by
+    /// the project's own `cargo test` run tried to quarantine
+    /// `<repo>/target/release/moatctl` — the developer's build output, deleted
+    /// from under them — and failed only because the mount happened to be
+    /// read-only. Quarantine is not gentler than a kill; it is the same
+    /// judgement with a slower failure. So it asks the same question, gets the
+    /// same answer, and its refusal is written to `decisions.jsonl` in the same
+    /// words, because the argument for ever trusting either action is a week of
+    /// refusals that are all correct.
+    fn chain_gate(&self, c: &crate::chain::Chain) -> ChainGate {
+        // Facts from the alerts, not from the steps: a step carries no rarity,
+        // and rarity is what separates a build from a first run.
+        let mut facts: Vec<crate::contain::StepFact> = Vec::new();
+        let mut uid = 0u32;
+        for step in c.steps.iter().filter(|s| s.is_trigger()) {
+            let Some(a) = self.find_alert(&step.alert) else { continue };
+            if a.suppressed_by.is_some() {
+                continue;
+            }
+            uid = a.process.uid;
+            facts.push(crate::contain::StepFact {
+                family: a.family.clone(),
+                novel: matches!(
+                    a.rarity,
+                    crate::rarity::Rarity::FirstSeen | crate::rarity::Rarity::Rare
+                ),
+                pid: step.pid,
+            });
+        }
+        let families: Vec<String> = {
+            let mut f: Vec<String> = facts.iter().map(|x| x.family.clone()).collect();
+            f.sort_unstable();
+            f.dedup();
+            f
+        };
+        let verdict = crate::contain::worth_killing_for(&c.severity, &facts);
+        ChainGate {
+            facts,
+            families,
+            uid,
+            verdict,
+        }
+    }
+
     /// Move the artefacts a chain implicates out of the way.
     ///
     /// This replaces what was going to be a generated `Sigkill` policy for the
@@ -814,10 +900,45 @@ impl Daemon {
     /// are moved aside, chmod 000, with a manifest recording where they came
     /// from. Re-execution fails because the file is gone; `moatctl quarantine
     /// --restore` puts it back if this was wrong.
+    ///
+    /// **It passes the same gate a kill does** (`chain_gate`). Moving a file
+    /// aside is not the gentle option: it deletes the developer's build output
+    /// from where they left it, and the failure is silent until something goes
+    /// looking. A chain the kill gate would spare is one moat is not confident
+    /// about, and there is no confidence level at which taking someone's files
+    /// is right and ending a process is wrong.
+    ///
+    /// **A `signal`-tier step's file is never moved unless the chain is
+    /// `critical`.** A signal rule is a building block by declaration: right
+    /// about what it saw, weak about what it means. `moat-exec-untrusted-tmpfs`
+    /// names the binary a build just produced under `/tmp` hundreds of times a
+    /// day, and acting on the file a weak rule pointed at, on the strength of a
+    /// correlation that only reached `high`, is the one shape where this can
+    /// destroy work while being technically correct about every step.
     fn quarantine_chain_artifacts(&mut self, c: &crate::chain::Chain) {
         if !self.cfg.contain.enabled {
             return;
         }
+        let gate = self.chain_gate(c);
+        if let Err(why) = &gate.verdict {
+            // The same wording as the kill's own refusal, so `moatctl
+            // decisions` reads as one gate that governs both and not two
+            // policies that happen to agree.
+            let families = gate.families.clone();
+            let why = why.clone();
+            log::info!("chain {}: not quarantining -- {}", c.id, why);
+            self.record_decision(
+                &c.id,
+                &c.severity,
+                &families,
+                "quarantine_spared",
+                &why,
+                &[],
+            );
+            return;
+        }
+        let critical = crate::alert::severity_rank(&c.severity)
+            >= crate::alert::severity_rank("critical");
         let mut roots = self.homes.clone();
         roots.extend(["/tmp".into(), "/var/tmp".into(), "/dev/shm".into()]);
         let base = self.cfg.paths.quarantine();
@@ -832,6 +953,16 @@ impl Daemon {
             }
             let Some(a) = self.find_alert(&step.alert) else { continue };
             if a.suppressed_by.is_some() || a.action_taken != "none" {
+                continue;
+            }
+            if a.is_building_block() && !critical {
+                log::info!(
+                    "chain {}: not quarantining the file named by {} -- it is a signal rule and \
+                     the chain is {}, not critical",
+                    c.id,
+                    a.rule,
+                    c.severity
+                );
                 continue;
             }
             let Some(path) = a.file.as_ref().map(|f| f.path.clone()) else { continue };
@@ -874,29 +1005,9 @@ impl Daemon {
             return;
         }
 
-        // Facts from the alerts, not from the steps: a step carries no rarity,
-        // and rarity is what separates a build from a first run.
-        let mut facts: Vec<crate::contain::StepFact> = Vec::new();
-        let mut uid = 0u32;
-        for step in c.steps.iter().filter(|s| s.is_trigger()) {
-            let Some(a) = self.find_alert(&step.alert) else { continue };
-            if a.suppressed_by.is_some() {
-                continue;
-            }
-            uid = a.process.uid;
-            facts.push(crate::contain::StepFact {
-                family: a.family.clone(),
-                novel: matches!(a.rarity, crate::rarity::Rarity::FirstSeen | crate::rarity::Rarity::Rare),
-                pid: step.pid,
-            });
-        }
-        let families: Vec<String> = {
-            let mut f: Vec<String> = facts.iter().map(|x| x.family.clone()).collect();
-            f.sort_unstable();
-            f.dedup();
-            f
-        };
-        if let Err(why) = crate::contain::worth_killing_for(&c.severity, &facts) {
+        let gate = self.chain_gate(c);
+        let (facts, families, uid) = (gate.facts, gate.families, gate.uid);
+        if let Err(why) = gate.verdict {
             self.record_decision(&c.id, &c.severity, &families, "spared", &why, &[]);
             // INFO, not DEBUG. The refusals are the whole point of `log` mode:
             // the argument for ever moving to `kill` is a week of these that
@@ -1218,6 +1329,16 @@ impl Daemon {
     ///
     /// Pure, so the decision can be tested without a kernel: `run()` does the
     /// applying.
+    ///
+    /// **Kernel policies only, deliberately.** An armed userland rule
+    /// (`moat-pkg-subtree-netcat-exec`, `moat-shell-stdio-socket`) has nothing
+    /// to push into the kernel — it kills from `maybe_enforce`, in this
+    /// process, gated on `mode_for`. So it needs no re-arming after a tetragon
+    /// restart, and calling `tetra tp set-mode` on a name the kernel has never
+    /// heard of would fail and be reported as enforcement that did not take.
+    /// Its round trip across a daemon restart is `enforcing_rules` in
+    /// state.json, which `write_state` writes and `persisted_enforcing_rules`
+    /// reads back, exactly as for a kernel rule.
     pub fn enforcement_to_apply(&self) -> Vec<String> {
         self.policies
             .names()
@@ -1238,8 +1359,8 @@ impl Daemon {
     /// is the worst state this daemon can be in: the user believes a thing is
     /// guarded and it is not.
     ///
-    /// Called on every start, so the kernel and the record agree from the first
-    /// second rather than from the next time somebody touches a toggle.
+    /// Called from `arm_tick`, which owns the *when*. Calling it directly is
+    /// "push now, whatever the sensor is doing", which is the 2026-09-05 bug.
     pub fn reapply_enforcement(&mut self) -> (usize, usize) {
         let want = self.enforcement_to_apply();
         if want.is_empty() {
@@ -1247,7 +1368,7 @@ impl Daemon {
         }
         let (mut ok, mut failed) = (0usize, 0usize);
         for name in &want {
-            if self.tetra_policy(&["tp", "set-mode", name, "enforce"]) {
+            if self.tetra_arm(name) {
                 ok += 1;
             } else {
                 failed += 1;
@@ -1255,15 +1376,320 @@ impl Daemon {
         }
         if failed > 0 {
             log::error!(
-                "re-arming after start: {} of {} policies did NOT take; the panel would \
+                "re-arming: {} of {} policies did NOT take; the panel would \
                  otherwise show them armed",
                 failed,
                 want.len()
             );
         } else {
-            log::info!("re-armed {} policy/policies in the kernel after start", ok);
+            log::info!("re-armed {} policy/policies in the kernel", ok);
         }
         (ok, failed)
+    }
+
+    /// `tetra tp set-mode <name> enforce`, with the clock bounded.
+    ///
+    /// Same reason as `kernel_policy_modes`: this runs from the tick, under the
+    /// daemon mutex, and `tetra`'s default 30 s timeout with a retry means one
+    /// unreachable sensor could hold the event tail for minutes -- times the
+    /// number of armed policies. The arming state machine retries on its own
+    /// clock, so a short per-call bound loses nothing.
+    fn tetra_arm(&self, name: &str) -> bool {
+        self.tetra_policy(&["tp", "set-mode", name, "enforce", "--timeout", "3s", "--retries", "1"])
+    }
+
+    // ------------------------------------------------------- arming, verified
+
+    /// Is the sensor loaded enough for `tetra tp set-mode` to mean anything?
+    ///
+    /// Two independent answers, because either can be unavailable:
+    ///
+    /// 1. The bpffs pin count (`sensors_loaded`) against the policies on disk.
+    ///    This is the same signal `tetragon_state` trusts and it asks the
+    ///    kernel, but it reads `/sys/fs/bpf/tetragon`, which is root-only and
+    ///    does not exist at all until the sensor creates it.
+    /// 2. `tetra tracingpolicy list`, which has to name every policy we are
+    ///    about to arm. Slower (a gRPC round trip) and used only when the pin
+    ///    count is unreadable — but it is the *exact* question, since a name
+    ///    the daemon is about to `set-mode` either exists or does not.
+    ///
+    /// Neither available means "cannot tell", which is reported as NOT ready:
+    /// waiting a bounded 120 s costs nothing, and arming into a half-loaded
+    /// sensor costs the whole point of arming.
+    pub fn sensor_ready_for(&self, want: &[String]) -> bool {
+        let expected = self.policies.len();
+        if let Some(n) = self.sensors_loaded() {
+            return expected > 0 && n >= expected;
+        }
+        match self.kernel_policy_modes() {
+            Some(modes) if !modes.is_empty() => want.iter().all(|n| modes.contains_key(n)),
+            _ => false,
+        }
+    }
+
+    /// Start the bounded wait-then-arm. Called once per daemon start.
+    ///
+    /// It does NOT arm here. On 2026-09-05 arming here (2 s after start, from
+    /// `run()`, before the first event) failed seven times out of seven with
+    /// `tracing policy {moat-…} does not exist`, because tetragon was still
+    /// loading — 16 s of loading, on a unit systemd had already called
+    /// "started" because it is `Type=simple`.
+    pub fn begin_arming(&mut self, now: u64) {
+        if self.enforcement_to_apply().is_empty() {
+            self.arming = Arming::Idle;
+            return;
+        }
+        self.arming = Arming::Waiting {
+            deadline: now.saturating_add(self.cfg.thresholds.arm_wait_secs.max(1)),
+            next_try: now,
+            tries: 0,
+        };
+    }
+
+    /// The arming state machine, driven from `tick` — never from the event
+    /// path, so a 120 s wait for the sensor cannot stall the tail for 120 s.
+    ///
+    /// `Waiting` -> (sensor ready) -> push, verify -> `Idle` when every policy
+    /// took; back to `Waiting` with backoff when any did not, until the
+    /// deadline. On the deadline it pushes once regardless and lets
+    /// `verify_enforcement` publish whatever is true.
+    pub fn arm_tick(&mut self, now: u64) {
+        let Arming::Waiting { deadline, next_try, tries } = self.arming else {
+            return;
+        };
+        if now < next_try {
+            return;
+        }
+        let want = self.enforcement_to_apply();
+        if want.is_empty() {
+            self.arming = Arming::Idle;
+            return;
+        }
+        let out_of_time = now >= deadline;
+        if !self.sensor_ready_for(&want) {
+            if !out_of_time {
+                if tries == 0 {
+                    log::info!(
+                        "arming pending: waiting up to {}s for the sensor to load before \
+                         re-arming {} policy/policies",
+                        self.cfg.thresholds.arm_wait_secs,
+                        want.len()
+                    );
+                }
+                self.arming = Arming::Waiting {
+                    deadline,
+                    next_try: now.saturating_add(arm_backoff(tries)),
+                    tries: tries.saturating_add(1),
+                };
+                return;
+            }
+            log::error!(
+                "the sensor is still not loaded {}s after start; arming {} policy/policies \
+                 anyway so the attempt and its outcome are on the record",
+                self.cfg.thresholds.arm_wait_secs,
+                want.len()
+            );
+        }
+
+        let (_, failed) = self.reapply_enforcement();
+        if failed == 0 || out_of_time {
+            self.arming = Arming::Idle;
+        } else {
+            self.arming = Arming::Waiting {
+                deadline,
+                next_try: now.saturating_add(arm_backoff(tries)),
+                tries: tries.saturating_add(1),
+            };
+        }
+        // Whatever happened, say what is true rather than what was attempted.
+        self.verify_enforcement(now);
+    }
+
+    /// Ask the kernel what mode each policy is actually in.
+    ///
+    /// `tetra tracingpolicy list -o json` (tetra v1.7.1) returns
+    /// `ListTracingPoliciesResponse`, whose `policies` array carries
+    /// `TracingPolicyStatus { name, mode, … }`; `mode` is the
+    /// `TracingPolicyMode` enum — `TP_MODE_ENFORCE` (1), `TP_MODE_MONITOR` (2).
+    /// Field numbers and names read out of the descriptor embedded in
+    /// /usr/bin/tetra, not guessed.
+    ///
+    /// `None` means we could not ask (no tetra, gRPC refused, unparseable) —
+    /// which is "cannot tell", never "not armed". A verifier that reports a
+    /// failure it did not observe is the same lie as the one this fixes,
+    /// pointing the other way.
+    pub fn kernel_policy_modes(&self) -> Option<std::collections::BTreeMap<String, String>> {
+        let out = std::process::Command::new(&self.cfg.paths.tetra)
+            // `tetra` defaults to a 30 s gRPC dial timeout, i.e. up to a
+            // minute across its two attempts -- and this runs on the tick,
+            // holding the daemon mutex, which is the event tail and the control
+            // socket. A verification that freezes the daemon for a minute
+            // whenever the sensor is unreachable is worse than the gap it is
+            // looking for. Cobra takes global flags after the subcommand.
+            //
+            // `--retries 0` is NOT the way to shorten this: it builds a gRPC
+            // retry policy with MaxAttempts 1, which gRPC rejects as invalid,
+            // and every call fails before it dials. Verified against
+            // /usr/bin/tetra v1.7.1. The default of 1 (two attempts) stays; the
+            // dial timeout is what gets cut.
+            .args(["tracingpolicy", "list", "-o", "json", "--timeout", "3s", "--retries", "1"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            log::debug!(
+                "tetra tracingpolicy list: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return None;
+        }
+        parse_policy_modes(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// Compare the kernel against `enforcing_rules`, re-arm the difference, and
+    /// publish whichever answer survives.
+    ///
+    /// Runs after arming and once a minute for ever after, because `tetra tp
+    /// set-mode` changes a LIVE policy: anything that reloads a policy later —
+    /// `exclude_binary`, a tetragon that restarts without taking moatd with it,
+    /// a human with `tetra` — drops it back to the `monitor` its file declares,
+    /// silently.
+    pub fn verify_enforcement(&mut self, now: u64) {
+        self.last_verify = now;
+        let want = self.enforcement_to_apply();
+        if want.is_empty() {
+            self.enforcing_verified.clear();
+            if !self.enforcing_unverified.is_empty() {
+                log::info!("nothing is armed in the kernel any more; the arming gap is closed");
+                self.enforcing_unverified.clear();
+            }
+            self.last_arm_alert_set.clear();
+            return;
+        }
+        let Some(modes) = self.kernel_policy_modes() else {
+            // Could not ask. Keep the previous answer: an unreachable sensor is
+            // `sensor_unhealthy`'s story to tell, and inventing a second one
+            // out of the same silence would double-count it.
+            return;
+        };
+
+        let disagreed = disagreeing(&want, &modes);
+        // The steady state is one `tetra` call a minute: nothing disagrees, so
+        // there is nothing to re-arm and nothing to re-read.
+        let still_wrong = if disagreed.is_empty() {
+            Vec::new()
+        } else {
+            log::warn!(
+                "the kernel disagrees about {} armed policy/policies; re-arming",
+                disagreed.len()
+            );
+            for name in &disagreed {
+                self.tetra_arm(name);
+            }
+            // Read the kernel BACK rather than trusting the exit status: a
+            // `set-mode` that returns 0 is a claim, and claims are what this
+            // whole function exists because of. If the sensor stopped answering
+            // between the two calls, keep the previous verdict rather than
+            // publishing a gap nobody observed.
+            match self.kernel_policy_modes() {
+                Some(m) => disagreeing(&want, &m),
+                None => return,
+            }
+        };
+
+        let unverified: std::collections::BTreeSet<String> = still_wrong.iter().cloned().collect();
+        let verified: std::collections::BTreeSet<String> =
+            want.iter().filter(|n| !unverified.contains(*n)).cloned().collect();
+        for name in self.enforcing_unverified.difference(&unverified) {
+            log::warn!("{} is armed in the kernel again", name);
+        }
+        self.enforcing_verified = verified;
+        self.enforcing_unverified = unverified;
+
+        if self.enforcing_unverified.is_empty() {
+            // Clearing this is what lets the NEXT gap raise its own alert.
+            self.last_arm_alert_set.clear();
+            return;
+        }
+        log::error!(
+            "enforcement did not take for {} of {} armed policy/policies: {}",
+            self.enforcing_unverified.len(),
+            want.len(),
+            self.enforcing_unverified.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+        if self.enforcing_unverified != self.last_arm_alert_set {
+            self.last_arm_alert_set = self.enforcing_unverified.clone();
+            let names: Vec<String> = self.enforcing_unverified.iter().cloned().collect();
+            let total = want.len();
+            self.raise_enforcement_gap(&names, total);
+        }
+    }
+
+    /// One alert, in the `moat-x-protection-changed` family, for enforcement
+    /// that is recorded but not running.
+    ///
+    /// Same family as a human disarming a rule, and deliberately so: the effect
+    /// on this machine is identical — a rule the panel shows as armed that will
+    /// not kill anything — and the difference is only that nobody chose it.
+    /// `NEVER_SILENCE` covers the family, so this cannot be allowlisted away.
+    fn raise_enforcement_gap(&mut self, names: &[String], total: usize) {
+        if self.in_meta_alert {
+            return;
+        }
+        let action = format!(
+            "enforcement did not take in the kernel for {} of {} armed policy/policies",
+            names.len(),
+            total
+        );
+        let meta = crate::rules::protection_changed_meta(&action, "moatd");
+        let mut f = Finding::new(crate::rules::PROTECTION_CHANGED, meta, self_proc("arming"));
+        f.hook = "userland".into();
+        f.mode = self.mode.clone();
+        f.what_override = Some(format!(
+            "Moat's own check found {} of {} armed policy/policies in `monitor` in the kernel. \
+             They are listed as enforcing and they will not kill anything.",
+            names.len(),
+            total
+        ));
+        f.extra_evidence.push(format!("not armed in the kernel: {}", names.join(", ")));
+        f.extra_evidence.push(
+            "Moat re-armed them and read the kernel back; they are still in monitor.".into(),
+        );
+        f.extra_evidence.push(
+            "check: `moatctl status` (the `enforcing` line names them), then \
+             `journalctl -u moatd -u tetragon -n 100`"
+                .into(),
+        );
+        f.extra_evidence.push(
+            "fix: `sudo systemctl restart tetragon` — moatd re-arms once the sensor \
+             reports the policies loaded"
+                .into(),
+        );
+        self.in_meta_alert = true;
+        let _ = self.emit(f);
+        self.in_meta_alert = false;
+    }
+
+    /// Anything that changes what SHOULD be armed, or reloads a policy in the
+    /// kernel, makes the last verification describe a machine that no longer
+    /// exists. Marking it stale makes the next tick re-read the kernel instead
+    /// of leaving `status` quoting an answer about the previous arrangement.
+    pub fn invalidate_verification(&mut self) {
+        self.last_verify = 0;
+    }
+
+    /// Cheap enough for every tick; the gRPC round trip is throttled to a
+    /// minute. Skipped entirely while `arm_tick` is still working, because
+    /// during the startup wait "the kernel says monitor" is expected and
+    /// alerting on it would fire on every boot.
+    pub fn verify_tick(&mut self, now: u64) {
+        const EVERY: u64 = 60;
+        if matches!(self.arming, Arming::Waiting { .. }) {
+            return;
+        }
+        if now.saturating_sub(self.last_verify) < EVERY {
+            return;
+        }
+        self.verify_enforcement(now);
     }
 
     /// Stop an ARMED policy watching one binary, in the kernel.
@@ -1328,6 +1754,10 @@ impl Daemon {
             self.tetra_policy(&["tp", "set-mode", rule, "enforce"]);
         }
         self.policies = crate::policy::PolicySet::load(&self.cfg.paths.policies_dir);
+        // The policy was deleted and re-added, so its kernel mode was reset to
+        // the `monitor` its file declares and the re-arm above may not have
+        // taken. Re-verify on the next tick.
+        self.invalidate_verification();
         self.write_state();
         Ok(path)
     }
@@ -1384,6 +1814,10 @@ impl Daemon {
             self.tetra_policy(&["tp", "set-mode", rule, "enforce"]);
         }
         self.policies = crate::policy::PolicySet::load(&self.cfg.paths.policies_dir);
+        // The policy was deleted and re-added, so its kernel mode was reset to
+        // the `monitor` its file declares and the re-arm above may not have
+        // taken. Re-verify on the next tick.
+        self.invalidate_verification();
         self.write_state();
         log::warn!("{} is watched again by {}", exe, rule);
         Ok(path)
@@ -1458,28 +1892,56 @@ impl Daemon {
         util::under_any(path, &roots)
     }
 
+    /// The userland rules that end a process themselves, and are therefore
+    /// armable one at a time exactly as a kernel policy is.
+    ///
+    /// `meta().enforce == "kill"` is the declaration; `maybe_enforce` does the
+    /// signalling after re-verifying the pid's start time. Only ENABLED rules:
+    /// offering to arm a rule that is switched off in `[rules]` would be a
+    /// switch that does nothing.
+    pub fn armable_userland_rules(&self) -> Vec<crate::policy::PolicyMeta> {
+        self.rules
+            .iter()
+            .filter(|r| r.enabled(&self.cfg))
+            .map(|r| r.meta())
+            .filter(|m| m.enforce == "kill" || m.enforce == "deny")
+            .collect()
+    }
+
     /// The rules that can be armed, with what arming one does.
+    ///
+    /// Kernel policies **and** the userland rules that kill. Listing only the
+    /// policies was the reason `moatctl set mode enforce --rule
+    /// moat-pkg-subtree-netcat-exec` was refused outright: the two rules that
+    /// act on their own were the two the per-rule switch could not reach, so
+    /// the only way to make either of them kill was to arm every rule on the
+    /// machine — the all-or-nothing that per-rule enforcement exists to avoid.
     fn enforceable(&self) -> Vec<serde_json::Value> {
-        let mut out: Vec<serde_json::Value> = self
+        let policies = self
             .policies
             .names()
             .into_iter()
-            .filter_map(|name| {
-                let meta = self.policies.meta_or_fallback(&name);
-                if meta.enforce != "kill" && meta.enforce != "deny" {
-                    return None;
-                }
-                Some(json!({
-                    "rule": name,
+            .map(|name| self.policies.meta_or_fallback(&name))
+            .filter(|m| m.enforce == "kill" || m.enforce == "deny");
+        let mut out: Vec<serde_json::Value> = policies
+            .chain(self.armable_userland_rules())
+            .map(|meta| {
+                json!({
+                    "rule": meta.name,
                     "enforce": meta.enforce,
                     "title": meta.title,
                     "severity": meta.severity,
-                    // What the KERNEL is doing for this rule, which is what the
-                    // switch on the Rules tab claims to show. Under a daemon-wide
+                    // What is actually doing the killing. A kernel policy is
+                    // armed with `tetra tp set-mode`; a userland rule is armed
+                    // in this daemon and pushes nothing into the kernel, and
+                    // anything offering the switch should be able to say which.
+                    "by": if self.policies.get(&meta.name).is_some() { "kernel" } else { "moatd" },
+                    // What the rule is doing right now, which is what the switch
+                    // on the Rules tab claims to show. Under a daemon-wide
                     // enforce every one of these kills, and `enforcing_rules`
                     // lists none of them.
-                    "armed": self.mode_for(&name) == "enforce",
-                }))
+                    "armed": self.mode_for(&meta.name) == "enforce",
+                })
             })
             .collect();
         out.sort_by(|a, b| a["rule"].as_str().cmp(&b["rule"].as_str()));
@@ -1764,9 +2226,13 @@ impl Daemon {
 
         // --- 1. who acted, and from where (BASELINE §1 and §2b) -------------
         f.actor = self.provenance.classify_proc(&f.proc);
-        f.context = context::classify(&self.table, &f.exec_id);
-        f.extra_evidence
-            .push(context::evidence(&self.table, &f.exec_id, f.context));
+        f.context = context::classify(&self.table, &f.exec_id, &self.cfg.context);
+        f.extra_evidence.push(context::evidence(
+            &self.table,
+            &f.exec_id,
+            f.context,
+            &self.cfg.context,
+        ));
 
         // --- 2. severity (BASELINE §2 and §2b) ------------------------------
         let build_tool = self.build_tool_in_chain(&f.exec_id);
@@ -1957,17 +2423,25 @@ impl Daemon {
         self.note_baseline(&f, now);
         // Only what the user can actually SEE counts as noise.
         //
-        // Two exclusions, for the same reason. A suppressed alert is one the
-        // user already answered, and a finding that never reaches the badge is
-        // not something they are being asked about -- demoting it would move
-        // it from the timeline to the timeline, while still raising a
-        // `moat-x-noisy-rule` alert that DOES surface. Counting timeline rows
+        // Three exclusions, for the same reason. A suppressed alert is one the
+        // user already answered; a `signal`-tier row is one the RULE says is
+        // not a conclusion; and a finding that never reaches the badge on
+        // severity is not something anyone is being asked about -- demoting it
+        // would move it from the timeline to the timeline, while still raising
+        // a `moat-x-noisy-rule` alert that DOES surface. Counting timeline rows
         // would mean every `sudo` on the machine (medium, timeline, by design)
         // producing a noise complaint within a day, and then -- through the
         // re-demotion counter -- an offer to allowlist sudo. Noise about
         // noise, generated by the machinery meant to reduce it.
-        let on_the_badge = crate::scoring::surface_for(&f.severity()) == "alerts";
-        if f.suppressed_by.is_none() && on_the_badge {
+        //
+        // Deliberately `surface_for(severity)` and NOT `alert.surface`: a row
+        // this guard has already demoted still has to be counted, or the
+        // rolling 24 h window would age out under a live flood and
+        // `clear_stale_demotions` would hand the flood back to the badge.
+        // `note_alert` returns `None` for an already-demoted tuple, so counting
+        // it costs one map lookup and raises nothing.
+        let on_the_badge = crate::scoring::surface_for(f.severity()) == "alerts";
+        if f.suppressed_by.is_none() && !f.is_building_block() && on_the_badge {
             if let Some(d) = self.baseline.note_alert(&f.rule, &noise_tuple(&f), now) {
                 self.quieten_backlog(&d);
                 self.raise_noisy_rule(&d, now);
@@ -1992,10 +2466,18 @@ impl Daemon {
     /// panel can read `surface` and nothing else.
     ///
     /// Only alerts the demotion actually covers move: unacked, on the badge,
-    /// this rule, and -- for a pattern demotion -- this pattern. A trigger
-    /// step of a chain that reached `high` is left alone: the correlator put
-    /// it back on the badge knowing the rule was noisy, and the noise guard
-    /// does not get to undo correlation.
+    /// this rule, and this pattern. Two are left alone.
+    ///
+    /// A trigger step of a chain that reached `high`: the correlator put it
+    /// back on the badge knowing the rule was noisy, and the noise guard does
+    /// not get to undo correlation.
+    ///
+    /// And an alert the context matrix escalated inside a **package install**.
+    /// That is the 2026-09-04 failure closed in general rather than for one
+    /// path: a `/tmp` dropper executed by a package `preinstall` went to the
+    /// timeline because the developer's own `cargo test` had made a different
+    /// shape of the same rule noisy. Frequency on this machine is not evidence
+    /// about a package install, and a demotion is arithmetic about frequency.
     fn quieten_backlog(&mut self, d: &Demotion) {
         let high = crate::alert::severity_rank("high");
         let mut moved = 0usize;
@@ -2003,7 +2485,10 @@ impl Daemon {
             if a.rule != d.rule || a.acked || a.surface != "alerts" {
                 continue;
             }
-            if !d.tuple.is_empty() && a.tuple_key() != d.tuple {
+            if a.tuple_key() != d.tuple {
+                continue;
+            }
+            if a.pkg_install_escalation {
                 continue;
             }
             let raised_by_chain = a.chain.as_ref().map_or(false, |c| {
@@ -2470,6 +2955,16 @@ impl Daemon {
         if f.suppressed_by.is_some() {
             return None;
         }
+        // A `signal` rule is a building block, not a detection (BASELINE §4):
+        // no snapshot. `moat-exec-untrusted-tmpfs` fires hundreds of times a
+        // day from this machine's own builds, and a snapshot each time is a
+        // /proc walk plus a hash of every implicated file for a row nobody is
+        // being asked about. The exception is the same one that puts it on the
+        // badge -- inside a package install it IS a detection, and that is
+        // precisely the case where the evidence has to exist afterwards.
+        if f.is_building_block() {
+            return None;
+        }
         if !severity_at_least(f.severity(), &self.cfg.incidents.snapshot_min_severity) {
             return None;
         }
@@ -2615,10 +3110,19 @@ impl Daemon {
                 .map(|n| (n / 1_000_000_000) as u64 >= since)
                 .unwrap_or(true)
         };
-        let incidents = self
+        // The same three populations `status.ledger` names, over one week. A
+        // `signal` building block is not an incident, whatever its severity:
+        // that is what declaring the tier means.
+        let incidents = self.store.count_alerts(|a| {
+            !a.is_suppressed() && !a.is_building_block() && a.severity_rank() >= 2 && in_window(&a.ts)
+        }) as u64;
+        let recorded = self
             .store
-            .count_alerts(|a| !a.is_suppressed() && a.severity_rank() >= 2 && in_window(&a.ts))
+            .count_alerts(|a| !a.is_suppressed() && a.surface != "alerts" && in_window(&a.ts))
             as u64;
+        let suppressed = self
+            .store
+            .count_alerts(|a| a.is_suppressed() && in_window(&a.ts)) as u64;
         let installs = self
             .store
             .receipts()
@@ -2631,6 +3135,8 @@ impl Daemon {
             last_sent: self.digest_last_sent,
             summary: digest::Summary {
                 incidents,
+                recorded,
+                suppressed,
                 installs,
                 proposals: self.baseline.proposals().len() as u64,
             },
@@ -2830,6 +3336,20 @@ impl Daemon {
             "rolling 24 h count for {}: {} (threshold {})",
             d.rule, d.count, self.cfg.baseline.noisy_rule_per_day
         ));
+        // A rule quiet in many shapes at once is the rule being wrong, not one
+        // workload being loud. Said here, once, instead of silencing the rule:
+        // a rule-wide demotion covers shapes nobody has seen, and on 2026-09-04
+        // that hid a real /tmp dropper inside a package install (BASELINE §4).
+        if d.patterns_quiet >= self.baseline.noisy_rule_fanout {
+            f.extra_evidence.push(format!(
+                "{} distinct patterns of {} are now quiet. That is the rule being wrong for this \
+                 machine rather than one noisy workload: it wants retuning, or a \
+                 `moat.omarchy/tier: signal` declaration if it is a building block other rules \
+                 correlate on. Moat has NOT silenced the rest of the rule — a shape nobody has \
+                 seen yet still reaches the badge.",
+                d.patterns_quiet, d.rule
+            ));
+        }
         if top.is_empty() {
             f.extra_evidence
                 .push("no per-tuple history yet for this rule".into());
@@ -2943,6 +3463,10 @@ impl Daemon {
         self.baseline_tick(now, force_save);
         self.contain_tick(now);
         self.watchdog_tick(now);
+        // Arming first: it owns the verification while it is still working, and
+        // `verify_tick` stands down for exactly that window.
+        self.arm_tick(now);
+        self.verify_tick(now);
     }
 
     pub fn baseline_tick(&mut self, now: u64, force_save: bool) {
@@ -2988,8 +3512,13 @@ impl Daemon {
         if !f.request_kill {
             return false;
         }
-        if self.mode != "enforce" {
-            // Belt and braces: the rule already checks the mode.
+        // `mode_for`, not `self.mode`. The rule asked because IT is armed --
+        // either daemon-wide or on its own -- and reading the daemon-wide mode
+        // here vetoed every per-rule arming: `moatctl set mode enforce --rule
+        // moat-shell-stdio-socket` recorded the arming, the rule set
+        // `request_kill`, and this returned false because the daemon was still
+        // in monitor. Belt and braces either way: the rule checks first.
+        if self.mode_for(&f.rule) != "enforce" {
             return false;
         }
         let pid = f.proc.pid;
@@ -3184,6 +3713,7 @@ impl Daemon {
 
     pub fn status(&self) -> Value {
         let unacked = self.store.unacked();
+        let ledger = self.store.ledger();
         let now = util::unix_secs();
         let mut digest_summary = self.digest(now).to_json();
         if let Some(o) = digest_summary.as_object_mut() {
@@ -3230,9 +3760,13 @@ impl Daemon {
             // incident shows nothing about analysis at all and the feature is
             // invisible until it happens to have finished.
             "auto_triage": self.cfg.analysis.auto_triage.as_str(),
-            "triage_pending": self
-                .store
-                .count_alerts(|a| a.surface == "alerts" && !a.acked && a.triage.is_none()),
+            // The badge, and nothing else — the same set `cmd_triage` offers,
+            // or the panel counts work the runner will never be given. A
+            // `signal` row is on the timeline by construction and so is out of
+            // this number; a suppressed row is out of it explicitly.
+            "triage_pending": self.store.count_alerts(|a| {
+                a.surface == "alerts" && !a.acked && !a.is_suppressed() && a.triage.is_none()
+            }),
             "rarity_counters": self.rarity.len(),
 
             // --- telemetry -------------------------------------------------
@@ -3285,6 +3819,48 @@ impl Daemon {
         // presenting this as a switch has to be able to say which one the user
         // is turning on.
         if let Some(o) = out.as_object_mut() {
+            // The three plainly named populations of alerts.jsonl, so nothing
+            // downstream has to print a count under a word that means something
+            // else. `unacked` above is unchanged and stays the badge -- the
+            // panel builds against it -- and `ledger.needs_you` is that same
+            // set as one number. See `AlertStore::ledger`.
+            o.insert(
+                "ledger".into(),
+                json!({
+                    "needs_you": ledger.needs_you,
+                    "recorded": ledger.recorded,
+                    "suppressed": ledger.suppressed,
+                    "signal": ledger.signal,
+                }),
+            );
+            // What the RECORD says (`enforcing_rules`, above) split by what the
+            // KERNEL says. The panel keeps binding to `enforcing_rules`; these
+            // two are the honest breakdown of it, and they are the difference
+            // between "seven rules are armed" and "seven rules are listed as
+            // armed and none of them will kill anything" -- which is what this
+            // machine was in for most of 2026-09-05.
+            //
+            // An empty `enforcing_unverified` alongside an empty
+            // `enforcing_verified` and a non-empty `enforcing_rules` means
+            // moatd could not ask the kernel, not that the kernel agreed.
+            // `enforcement_unhealthy` is the single boolean, exactly like
+            // `sensor_unhealthy`.
+            o.insert(
+                "enforcing_verified".into(),
+                Value::from(self.enforcing_verified.iter().cloned().collect::<Vec<_>>()),
+            );
+            o.insert(
+                "enforcing_unverified".into(),
+                Value::from(self.enforcing_unverified.iter().cloned().collect::<Vec<_>>()),
+            );
+            o.insert(
+                "enforcement_unhealthy".into(),
+                Value::from(!self.enforcing_unverified.is_empty()),
+            );
+            o.insert(
+                "arming_pending".into(),
+                Value::from(matches!(self.arming, Arming::Waiting { .. })),
+            );
             o.insert("enforceable".into(), Value::from(self.enforceable()));
             // Also what `write_state` persists, which is how a containment
             // survives a restart. A policy moatd forgot is one nobody will ever
@@ -3422,6 +3998,129 @@ fn read_state(path: &Path) -> Option<Value> {
     serde_json::from_str(&text).ok()
 }
 
+// ---------------------------------------------------------------- arming
+
+/// Where the post-start re-arming has got to. See `Daemon::arm_tick`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arming {
+    /// Nothing left to do: everything took, or nothing is armed, or the
+    /// deadline passed and the outcome is published in `enforcing_unverified`.
+    Idle,
+    /// Waiting for the sensor to finish loading, or retrying a `set-mode` that
+    /// failed. All three fields are unix seconds / attempt counts.
+    Waiting { deadline: u64, next_try: u64, tries: u32 },
+}
+
+/// Seconds until the next arming attempt. Bounded and monotone: quick while the
+/// sensor is plausibly still loading (16 s on this machine), slower once it is
+/// clear something is actually wrong, so a dead sensor does not mean a `tetra`
+/// fork every five seconds for two minutes.
+fn arm_backoff(tries: u32) -> u64 {
+    match tries {
+        0..=3 => 2,
+        4..=7 => 5,
+        8..=15 => 15,
+        _ => 30,
+    }
+}
+
+/// The wanted policies the kernel does NOT report as enforcing.
+///
+/// A name the kernel has never heard of counts as disagreeing, not as
+/// "unknown": a policy that is not loaded is certainly not enforcing.
+fn disagreeing(
+    want: &[String],
+    modes: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    want.iter()
+        .filter(|n| modes.get(*n).map(|m| m != "enforce").unwrap_or(true))
+        .cloned()
+        .collect()
+}
+
+/// `TP_MODE_ENFORCE` / `1` / `"enforce"` -> `"enforce"`, and the monitor forms
+/// likewise. Anything else stays as it came, lowercased, so an unrecognised
+/// mode is reported rather than silently counted as one of the two we know.
+fn normalise_mode(v: &Value) -> String {
+    if let Some(n) = v.as_u64() {
+        // TracingPolicyMode from the descriptor in /usr/bin/tetra (v1.7.1):
+        // UNKNOWN 0, ENFORCE 1, MONITOR 2, MONITOR_ONLY 3.
+        return match n {
+            1 => "enforce".into(),
+            2 | 3 => "monitor".into(),
+            _ => "unknown".into(),
+        };
+    }
+    let s = v.as_str().unwrap_or("").to_ascii_uppercase();
+    if s.contains("ENFORCE") {
+        "enforce".into()
+    } else if s.contains("MONITOR") {
+        "monitor".into()
+    } else {
+        s.to_ascii_lowercase()
+    }
+}
+
+/// `tetra tracingpolicy list -o json` -> `{policy name: mode}`.
+///
+/// Deliberately shape-tolerant. The response is
+/// `{"policies":[{"name":…,"mode":…}]}` in v1.7.1, but the enum can serialise
+/// as a name or a number depending on which marshaller is in the path, and
+/// tetra has moved this output around between releases. So this walks the JSON
+/// for any object carrying both a name and a mode rather than pinning one
+/// path — a parser that breaks on an upgrade would take enforcement
+/// verification down with it, silently, which is the failure it exists to
+/// catch. Falls back to the `ID NAME STATE … MODE` text table.
+fn parse_policy_modes(text: &str) -> Option<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    if let Ok(v) = serde_json::from_str::<Value>(text) {
+        collect_policy_modes(&v, &mut out);
+        if !out.is_empty() {
+            return Some(out);
+        }
+        // Valid JSON that named no policy: the sensor is up and running none.
+        // That is an answer, not a parse failure.
+        return Some(out);
+    }
+    // Text table: `ID NAME STATE FILTERID NAMESPACE SENSORS KERNELMEMORY MODE
+    // NPOST NENFORCE NMONITOR`, space-padded by Go's tabwriter.
+    //
+    // Read by SHAPE, not by column index. tabwriter pads with spaces, so an
+    // empty column (NAMESPACE, always empty here) is invisible once the line is
+    // split and every index after it is wrong. The id is a number, the name
+    // follows it, and the mode is the only `TP_MODE_*` token on the line.
+    let mut saw_header = false;
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.contains(&"NAME") && f.contains(&"MODE") {
+            saw_header = true;
+            continue;
+        }
+        if !saw_header || f.len() < 3 || f[0].parse::<u64>().is_err() {
+            continue;
+        }
+        if let Some(mode) = f.iter().find(|t| t.starts_with("TP_MODE_")) {
+            out.insert(f[1].to_string(), normalise_mode(&Value::from(*mode)));
+        }
+    }
+    saw_header.then_some(out)
+}
+
+fn collect_policy_modes(v: &Value, out: &mut std::collections::BTreeMap<String, String>) {
+    match v {
+        Value::Array(a) => a.iter().for_each(|e| collect_policy_modes(e, out)),
+        Value::Object(o) => {
+            let name = o.get("name").or_else(|| o.get("Name")).and_then(|n| n.as_str());
+            let mode = o.get("mode").or_else(|| o.get("Mode"));
+            if let (Some(name), Some(mode)) = (name, mode) {
+                out.insert(name.to_string(), normalise_mode(mode));
+            }
+            o.values().for_each(|e| collect_policy_modes(e, out));
+        }
+        _ => {}
+    }
+}
+
 /// Per-rule enforcement survives a restart the same way `mode` does: through
 /// state.json, which is `status()` written back out.
 fn persisted_enforcing_rules(state: &Option<Value>) -> std::collections::BTreeSet<String> {
@@ -3551,6 +4250,7 @@ fn persisted_u64(state: &Option<Value>, section: &str, key: &str) -> u64 {
 /// A synthetic process for the alerts moat raises about itself. The pid is our
 /// own so `ps -fp` shows something real, and there is nothing to kill.
 fn self_proc(about: &str) -> ProcInfo {
+    let (sid, tty) = crate::proctable::read_session(std::process::id());
     ProcInfo {
         exec_id: String::new(),
         pid: std::process::id(),
@@ -3565,7 +4265,8 @@ fn self_proc(about: &str) -> ProcInfo {
         exited_at: None,
         exit_signal: None,
         exe_note: None,
-        sid: crate::proctable::read_sid(std::process::id()),
+        sid,
+        tty,
     }
 }
 
@@ -3614,10 +4315,16 @@ impl Default for RunOptions {
 
 pub fn run(daemon: Arc<Mutex<Daemon>>, opts: RunOptions) {
     {
-        // Before the first event: the kernel has to agree with what the record
-        // says is armed. See `reapply_enforcement`.
+        // The kernel has to agree with what the record says is armed -- but
+        // NOT yet. `begin_arming` only starts the clock; `tick` does the
+        // arming, once the sensor says it has the policies. Arming here, 2 s
+        // after start, is the 2026-09-05 outage: tetragon is `Type=simple`, so
+        // systemd calls it started while it is still 16 seconds from loading
+        // the last of 44 policies, and all seven `set-mode` calls failed
+        // against a sensor that did not have those names yet.
         let mut d = daemon.lock().expect("daemon lock");
-        d.reapply_enforcement();
+        let now = util::unix_secs();
+        d.begin_arming(now);
         d.report_downtime();
     }
     let (log_path, state_every, feeds_every, feeds_dir) = {
@@ -4131,6 +4838,7 @@ mod tests {
             exit_signal: None,
             exe_note: None,
             sid: None,
+            tty: None,
         };
         let node = proc("e-node", 1_876_167, "/home/dan/.no-such-mise/node/26.5.0/bin/node");
         let bash = proc("e-bash", 581_833, "/usr/bin/bash");
@@ -4243,6 +4951,7 @@ mod tests {
             exit_signal: None,
             exe_note: None,
             sid: None,
+            tty: None,
         };
         let actor = proc("e-drop", 4242, &dropper.display().to_string());
         let parent = proc("e-bash", 4241, "/usr/bin/bash");
@@ -4452,6 +5161,7 @@ mod tests {
             exit_signal: None,
             exe_note: None,
             sid: None,
+            tty: None,
         };
         let actor = proc("e-imp", 7100, "/tmp/no-such-lab/implant");
         let root = proc("e-mk", 7000, "/usr/bin/no-such-makepkg");
@@ -4595,6 +5305,7 @@ mod tests {
             exit_signal: None,
             exe_note: None,
             sid: None,
+            tty: None,
         };
         let mut f = Finding::new(
             "moat-net-first-contact",
@@ -4640,6 +5351,386 @@ mod tests {
             assert_eq!(r["armed"], true, "{} kills under mode enforce", rule);
             assert_eq!(r["armed"] == true, d.mode_for(rule) == "enforce");
         }
+        // The two userland rules that end a process are armable rules like any
+        // other. Listing kernel policies only was why the per-rule switch could
+        // not reach the only two rules that act on their own (CONTRACT §6.5).
+        let names: Vec<&str> = rows.iter().filter_map(|r| r["rule"].as_str()).collect();
+        for id in ["moat-pkg-subtree-netcat-exec", "moat-shell-stdio-socket"] {
+            assert!(names.contains(&id), "{} must be armable: {:?}", id, names);
+            let row = rows.iter().find(|r| r["rule"] == id).unwrap();
+            assert_eq!(row["enforce"], "kill");
+            assert_eq!(row["by"], "moatd", "it kills in the daemon, not in the kernel");
+        }
+    }
+
+    /// One userland rule armed, the daemon still in monitor, nothing pushed
+    /// into the kernel — and the arming survives a restart.
+    ///
+    /// `moat-pkg-subtree-netcat-exec` and `moat-shell-stdio-socket` are the two
+    /// rules that kill from userland, and until 2026-09-05 they were the two
+    /// the per-rule switch refused: `enforceable()` listed policies only,
+    /// `set mode --rule` rejected the name, and `maybe_enforce` read the
+    /// daemon-wide `mode` instead of `mode_for`. So arming either of them meant
+    /// arming every rule on the machine, which is exactly the all-or-nothing
+    /// per-rule enforcement exists to avoid.
+    #[test]
+    fn one_userland_rule_can_be_armed_while_the_daemon_stays_in_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, cfg) = dev_daemon(dir.path());
+        let rule = "moat-shell-stdio-socket";
+        d.enforcing_rules.insert(rule.to_string());
+
+        assert_eq!(d.mode, "monitor", "the daemon as a whole is not enforcing");
+        assert_eq!(d.mode_for(rule), "enforce", "but this one rule is");
+        assert_eq!(d.mode_for("moat-pkg-subtree-netcat-exec"), "monitor", "and only this one");
+        // The rule itself reads the same switch the daemon does.
+        let ctx = d.ctx(util::unix_secs());
+        assert!(ctx.enforcing(rule));
+        assert!(!ctx.enforcing("moat-pkg-subtree-netcat-exec"));
+        // Nothing is pushed into the kernel for it: there is no policy to set a
+        // mode on, and `tetra tp set-mode` on an unknown name would fail and be
+        // reported as enforcement that did not take.
+        assert!(
+            !d.enforcement_to_apply().contains(&rule.to_string()),
+            "a userland rule has no kernel mode to re-apply"
+        );
+        assert_eq!(
+            d.enforceable()
+                .iter()
+                .find(|r| r["rule"] == rule)
+                .map(|r| r["armed"].clone()),
+            Some(Value::Bool(true))
+        );
+
+        // And it round-trips across a restart the way a kernel rule does.
+        d.write_state();
+        let restarted = Daemon::new(cfg.clone(), &dir.path().join("moat.toml")).unwrap();
+        assert!(restarted.enforcing_rules.contains(rule));
+        assert_eq!(restarted.mode, "monitor");
+        assert_eq!(restarted.mode_for(rule), "enforce");
+    }
+
+    // ------------------------------------------------- arming and verifying
+
+    /// A `tetra` that keeps its own idea of what the kernel holds.
+    ///
+    /// `<dir>/modes` is the kernel: `name=mode` per line. `tp set-mode` edits
+    /// it and refuses a name that is not there, exactly as the real one did
+    /// seven times on 2026-09-05 (`tracing policy {moat-…} does not exist`).
+    /// `tracingpolicy list -o json` reports it in the v1.7.1 shape. `<dir>/fail`
+    /// makes every `set-mode` fail, for the sensor that never comes good.
+    /// `<dir>/calls` is the transcript.
+    fn fake_tetra(dir: &Path, loaded: &[(String, &str)]) -> PathBuf {
+        let bin = dir.join("tetra");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/bash
+d="$(dirname "$0")"
+echo "$*" >> "$d/calls"
+sub="$2"
+case "$sub" in
+  list)
+    [ -f "$d/modes" ] || exit 1
+    printf '{"policies":['
+    first=1
+    while IFS='=' read -r n m; do
+      [ -z "$n" ] && continue
+      [ $first -eq 1 ] || printf ','
+      first=0
+      printf '{"id":"1","name":"%s","state":"TP_STATE_ENABLED","mode":"TP_MODE_%s"}' \
+        "$n" "$(echo "$m" | tr 'a-z' 'A-Z')"
+    done < "$d/modes"
+    printf ']}\n'
+    ;;
+  set-mode)
+    n="$3"; m="$4"
+    if [ -f "$d/fail" ] || ! grep -q "^$n=" "$d/modes" 2>/dev/null; then
+      echo "tracing policy {$n} does not exist" >&2
+      exit 1
+    fi
+    sed -i "s|^$n=.*|$n=$m|" "$d/modes"
+    ;;
+  *) exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let body: String = loaded.iter().map(|(n, m)| format!("{}={}\n", n, m)).collect();
+        std::fs::write(dir.join("modes"), body).unwrap();
+        bin
+    }
+
+    fn tetra_calls(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Pretend Tetragon has pinned `n` policies under its bpffs directory.
+    fn pin(bpf: &Path, n: usize) {
+        let _ = std::fs::remove_dir_all(bpf);
+        std::fs::create_dir_all(bpf).unwrap();
+        for i in 0..n {
+            std::fs::create_dir_all(bpf.join(format!("moat-fake-{}", i))).unwrap();
+        }
+    }
+
+    /// Arm every kernel policy and point the daemon at a fake sensor.
+    fn armed_daemon(dir: &Path) -> (Daemon, Vec<String>) {
+        let (mut d, _) = dev_daemon(dir);
+        let names = d.policies.names();
+        let loaded: Vec<(String, &str)> =
+            names.iter().map(|n| (n.clone(), "monitor")).collect();
+        d.cfg.paths.tetra = fake_tetra(dir, &loaded);
+        d.cfg.paths.tetragon_bpf_dir = dir.join("bpf");
+        d.cfg.thresholds.dedupe_secs = 0;
+        for n in &names {
+            d.enforcing_rules.insert(n.clone());
+        }
+        (d, names)
+    }
+
+    /// The 2026-09-05 outage, as a test.
+    ///
+    /// moatd re-armed 2 s after start while tetragon was 16 s from having
+    /// loaded the last of 44 policies, so every `set-mode` failed against a
+    /// name the kernel did not have yet — and nothing retried. The fix is that
+    /// arming does not happen at all until the sensor says it is loaded.
+    #[test]
+    fn readiness_waits_for_the_pin_count_and_arms_once_it_is_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, names) = armed_daemon(dir.path());
+        let bpf = d.cfg.paths.tetragon_bpf_dir.clone();
+        assert_eq!(names.len(), 5, "the fixture set");
+
+        // The sensor has started but loaded nothing yet.
+        pin(&bpf, 0);
+        d.begin_arming(1_000);
+        assert!(matches!(d.arming, Arming::Waiting { .. }), "arming is pending");
+        d.arm_tick(1_000);
+        assert!(
+            !tetra_calls(dir.path()).iter().any(|c| c.contains("set-mode")),
+            "nothing may be armed while the sensor is still loading: {:?}",
+            tetra_calls(dir.path())
+        );
+        assert!(matches!(d.arming, Arming::Waiting { .. }), "still waiting");
+
+        // Half-loaded is still not loaded. This is the state the old code
+        // armed into.
+        pin(&bpf, 3);
+        d.arm_tick(1_010);
+        assert!(!tetra_calls(dir.path()).iter().any(|c| c.contains("set-mode")));
+
+        // Fully loaded: arm, and confirm against the kernel rather than the
+        // exit status.
+        pin(&bpf, names.len());
+        d.arm_tick(1_020);
+        for n in &names {
+            assert!(
+                tetra_calls(dir.path())
+                    .iter()
+                    .any(|c| c.starts_with(&format!("tp set-mode {} enforce", n))),
+                "{} was never armed",
+                n
+            );
+        }
+        assert_eq!(d.arming, Arming::Idle, "arming is done");
+        assert!(d.enforcing_unverified.is_empty(), "{:?}", d.enforcing_unverified);
+        assert_eq!(d.enforcing_verified.len(), names.len());
+
+        // And `status` says so, which is the surface that lied.
+        let st = d.status();
+        assert_eq!(st["enforcing_unverified"], json!([]));
+        assert_eq!(st["enforcement_unhealthy"], json!(false));
+        assert_eq!(st["arming_pending"], json!(false));
+        assert_eq!(st["enforcing_verified"].as_array().unwrap().len(), names.len());
+    }
+
+    /// A sensor that never takes the mode produces exactly one alert and an
+    /// honest `status` — not silence, and not one alert a minute for ever.
+    #[test]
+    fn arming_that_keeps_failing_is_retried_then_reported_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, names) = armed_daemon(dir.path());
+        pin(&d.cfg.paths.tetragon_bpf_dir.clone(), names.len());
+        // The policies are loaded, and `set-mode` refuses them anyway.
+        std::fs::write(dir.path().join("fail"), "").unwrap();
+        d.cfg.thresholds.arm_wait_secs = 10;
+
+        d.begin_arming(2_000);
+        d.arm_tick(2_000);
+        let after_first = tetra_calls(dir.path())
+            .iter()
+            .filter(|c| c.contains("set-mode"))
+            .count();
+        assert!(after_first >= names.len(), "every policy was attempted");
+        assert_eq!(d.enforcing_unverified.len(), names.len(), "none of them took");
+        assert!(matches!(d.arming, Arming::Waiting { .. }), "a failure is retried");
+
+        // Retried, on backoff, inside the window.
+        d.arm_tick(2_005);
+        assert!(
+            tetra_calls(dir.path()).iter().filter(|c| c.contains("set-mode")).count()
+                > after_first,
+            "the failure must be retried, not accepted"
+        );
+
+        // And past the deadline it stops trying and stands by its answer.
+        d.arm_tick(2_100);
+        assert_eq!(d.arming, Arming::Idle);
+        assert_eq!(d.enforcing_unverified.len(), names.len());
+        assert!(d.enforcing_verified.is_empty());
+
+        // Verifying again changes nothing about the alert count.
+        d.verify_enforcement(2_200);
+        d.verify_enforcement(2_300);
+
+        let alerts: Vec<_> = d
+            .store
+            .load()
+            .into_iter()
+            .filter(|a| a.rule == crate::rules::PROTECTION_CHANGED)
+            .collect();
+        assert_eq!(
+            alerts.len(),
+            1,
+            "a persistent failure is one alert, not one per tick: {:?}",
+            alerts.iter().map(|a| a.explain.what.clone()).collect::<Vec<_>>()
+        );
+        let ev = alerts[0].explain.evidence.join(" ");
+        for n in &names {
+            assert!(ev.contains(n.as_str()), "the alert must name {}: {}", n, ev);
+        }
+        assert!(ev.contains("moatctl status"), "and say what to run: {}", ev);
+
+        // `status` is the surface the panel and `moatctl` read.
+        let st = d.status();
+        assert_eq!(st["enforcement_unhealthy"], json!(true));
+        assert_eq!(
+            st["enforcing_rules"].as_array().unwrap().len(),
+            st["enforcing_unverified"].as_array().unwrap().len(),
+            "everything listed as armed is unverified"
+        );
+    }
+
+    /// The steady-state check: something reloaded a policy and it dropped back
+    /// to the `monitor` its file declares. Nothing announces that, so moat has
+    /// to go and look.
+    #[test]
+    fn verify_reconciles_a_policy_the_kernel_reports_as_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, names) = armed_daemon(dir.path());
+        pin(&d.cfg.paths.tetragon_bpf_dir.clone(), names.len());
+        // Four of five are enforcing in the kernel; one quietly is not.
+        let slipped = names[2].clone();
+        let body: String = names
+            .iter()
+            .map(|n| format!("{}={}\n", n, if *n == slipped { "monitor" } else { "enforce" }))
+            .collect();
+        std::fs::write(dir.path().join("modes"), body).unwrap();
+
+        d.verify_enforcement(3_000);
+
+        assert!(
+            tetra_calls(dir.path())
+                .iter()
+                .any(|c| c.starts_with(&format!("tp set-mode {} enforce", slipped))),
+            "the one that slipped must be re-armed: {:?}",
+            tetra_calls(dir.path())
+        );
+        assert_eq!(
+            tetra_calls(dir.path())
+                .iter()
+                .filter(|c| c.contains("set-mode"))
+                .count(),
+            1,
+            "and only that one -- re-arming the four that are fine is churn"
+        );
+        assert!(d.enforcing_unverified.is_empty(), "it came back");
+        assert_eq!(d.enforcing_verified.len(), names.len());
+        assert!(
+            !d.store
+                .load()
+                .iter()
+                .any(|a| a.rule == crate::rules::PROTECTION_CHANGED),
+            "a gap moat closed by itself is not an alert"
+        );
+    }
+
+    /// "Cannot ask the kernel" must never be reported as "the kernel says no".
+    #[test]
+    fn a_tetra_that_cannot_answer_leaves_the_previous_verdict_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, names) = armed_daemon(dir.path());
+        pin(&d.cfg.paths.tetragon_bpf_dir.clone(), names.len());
+        let all_enforcing: String =
+            names.iter().map(|n| format!("{}=enforce\n", n)).collect();
+        std::fs::write(dir.path().join("modes"), all_enforcing).unwrap();
+        d.verify_enforcement(4_000);
+        assert_eq!(d.enforcing_verified.len(), names.len());
+
+        // Now take the answer away: no `modes` file, so `list` exits 1.
+        std::fs::remove_file(dir.path().join("modes")).unwrap();
+        d.verify_enforcement(4_100);
+        assert!(
+            d.enforcing_unverified.is_empty(),
+            "silence from tetra is not evidence of a gap"
+        );
+        assert_eq!(d.enforcing_verified.len(), names.len(), "the last answer stands");
+        assert!(!d
+            .store
+            .load()
+            .iter()
+            .any(|a| a.rule == crate::rules::PROTECTION_CHANGED));
+    }
+
+    /// The field this all turns on, read out of `tetra tracingpolicy list`.
+    #[test]
+    fn policy_modes_are_read_from_whatever_shape_tetra_reports() {
+        // v1.7.1: ListTracingPoliciesResponse.policies[].{name,mode}, with
+        // TracingPolicyMode serialised by name.
+        let m = parse_policy_modes(
+            r#"{"policies":[
+                 {"id":"1","name":"moat-a","state":"TP_STATE_ENABLED","mode":"TP_MODE_ENFORCE"},
+                 {"id":"2","name":"moat-b","state":"TP_STATE_ENABLED","mode":"TP_MODE_MONITOR"}]}"#,
+        )
+        .expect("the documented shape");
+        assert_eq!(m.get("moat-a").map(String::as_str), Some("enforce"));
+        assert_eq!(m.get("moat-b").map(String::as_str), Some("monitor"));
+
+        // The same enum as a number, which is what a plain JSON marshaller
+        // emits. UNKNOWN 0, ENFORCE 1, MONITOR 2, MONITOR_ONLY 3 -- read out of
+        // the descriptor embedded in /usr/bin/tetra, not guessed.
+        let m = parse_policy_modes(r#"[{"name":"moat-a","mode":1},{"name":"moat-b","mode":2}]"#)
+            .unwrap();
+        assert_eq!(m.get("moat-a").map(String::as_str), Some("enforce"));
+        assert_eq!(m.get("moat-b").map(String::as_str), Some("monitor"));
+
+        // And the text table, for a tetra whose JSON output moved. NAMESPACE is
+        // empty on every policy moat loads, and tabwriter pads it with spaces,
+        // so counting columns from the left lands on the wrong one: the mode is
+        // found by shape instead.
+        let m = parse_policy_modes(
+            "ID  NAME    STATE             FILTERID  NAMESPACE  SENSORS         KERNELMEMORY  MODE             NPOST  NENFORCE  NMONITOR\n\
+             1   moat-a  TP_STATE_ENABLED  0                    generic_kprobe  4096          TP_MODE_ENFORCE  0      0         0\n\
+             2   moat-b  TP_STATE_ENABLED  0                    generic_kprobe  4096          TP_MODE_MONITOR  0      0         0\n",
+        )
+        .unwrap();
+        assert_eq!(m.get("moat-a").map(String::as_str), Some("enforce"));
+        assert_eq!(m.get("moat-b").map(String::as_str), Some("monitor"));
+
+        // Nothing usable is `None`, which callers must not read as "monitor".
+        assert!(parse_policy_modes("not json, not a table").is_none());
+
+        // A policy the kernel does not have at all is a policy that is not
+        // enforcing -- the exact case that failed seven times on 2026-09-05.
+        let want = vec!["moat-a".to_string(), "moat-gone".to_string()];
+        let modes = parse_policy_modes(r#"{"policies":[{"name":"moat-a","mode":1}]}"#).unwrap();
+        assert_eq!(disagreeing(&want, &modes), vec!["moat-gone".to_string()]);
     }
 
     /// A hole in the record is itself a finding.
@@ -4709,6 +5800,7 @@ mod tests {
             exit_signal: None,
             exe_note: None,
             sid: None,
+            tty: None,
         };
         let mut f = Finding::new(
             "moat-persist-git-config-write",
@@ -4817,6 +5909,7 @@ mod tests {
             exit_signal: None,
             exe_note: None,
             sid: None,
+            tty: None,
         };
         let actor = proc("e-py", 2_257_600, "/usr/bin/no-such-python");
         let makepkg = proc("e-mk", 2_257_581, "/usr/bin/no-such-makepkg");
@@ -4831,24 +5924,24 @@ mod tests {
             f
         };
 
-        // Flood the exec rule across enough distinct shapes that the guard
-        // gives up on the rule as a whole -- what a week of `cargo test` does.
-        // The names are plain lowercase so `collapse_volatile` leaves them as
-        // five separate patterns instead of folding them into one.
+        // Flood the exact shape the attack will later use, so the guard demotes
+        // the pattern the attack trips. (The rule-wide "fan-out backstop" that
+        // this used to lean on is gone -- see `note_alert` -- because silencing
+        // shapes nobody has seen is what caused the 2026-09-04 miss in the
+        // first place. The demotion still has to be survivable by a chain, and
+        // that is what this test pins.)
         d.baseline.noisy_rule_per_day = 2;
-        for dirname in ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"] {
-            for _ in 0..4 {
-                let _ = d.emit(finding(
-                    "moat-exec-untrusted-tmpfs",
-                    "exec",
-                    "high",
-                    format!("/tmp/{}/bin/tool", dirname),
-                ));
-            }
+        for i in 0..6 {
+            let _ = d.emit(finding(
+                "moat-exec-untrusted-tmpfs",
+                "exec",
+                "high",
+                format!("/tmp/moat-aur-regression-no-such-lab/tool{}", i),
+            ));
         }
         assert!(
-            d.baseline.is_demoted("moat-exec-untrusted-tmpfs"),
-            "precondition: the flood demoted the rule the attack later trips"
+            d.baseline.demoted_rules().contains(&"moat-exec-untrusted-tmpfs".to_string()),
+            "precondition: the flood demoted the pattern the attack later trips"
         );
 
         // Now the attack: the demoted /tmp exec, and egress in the same tree.
@@ -4857,15 +5950,20 @@ mod tests {
                 "moat-exec-untrusted-tmpfs",
                 "exec",
                 "high",
-                "/tmp/moat-aur-lab-dljiwccr/browser-helper".to_string(),
+                "/tmp/moat-aur-regression-no-such-lab/browser-helper".to_string(),
             ))
             .expect("a demoted rule still records an alert");
+        assert_eq!(
+            d.find_alert(&a).unwrap().surface,
+            "timeline",
+            "precondition: the demotion did put this step on the timeline"
+        );
         let b = d
             .emit(finding(
                 "moat-x-pkg-egress",
                 "net",
                 "medium",
-                "/tmp/moat-aur-lab-dljiwccr/beacon".to_string(),
+                "/tmp/moat-aur-regression-no-such-lab/beacon".to_string(),
             ))
             .expect("the egress must raise an alert");
 
@@ -4886,6 +5984,490 @@ mod tests {
                    "chain is {} with a high trigger in it", chain.severity);
         // ...and it reaches the user, which is the part that failed live.
         assert_eq!(by_id(&a).surface, "alerts", "a high chain has to reach the badge");
+    }
+
+    // ------------------------------------------------- BASELINE §4, the tier
+
+    /// A `signal` finding, ready to hand to `emit`.
+    ///
+    /// `severity` is the rule's own and is deliberately `high`: the whole point
+    /// of the tier is that it does NOT touch the severity, because chains need
+    /// `>= medium` triggers, the baseline learns on severity and rarity does
+    /// not see the tier at all.
+    fn signal_finding(actor: &ProcInfo, parent: &ProcInfo, path: &str) -> Finding {
+        let rule = "moat-exec-untrusted-tmpfs";
+        let mut m = crate::policy::PolicyMeta::fallback(rule);
+        m.family = "exec".into();
+        m.severity = "high".into();
+        m.tier = crate::policy::TIER_SIGNAL.into();
+        let mut f = Finding::new(rule, m, actor.clone());
+        f.hook = "bprm_check_security".into();
+        f.ancestry = vec![parent.clone()];
+        f.file = Some(crate::alert::FileRef { path: path.into(), sha256: None });
+        f
+    }
+
+    fn no_such_proc(exec_id: &str, pid: u32, exe: &str) -> ProcInfo {
+        ProcInfo {
+            exec_id: exec_id.into(),
+            pid,
+            uid: 1000,
+            exe: exe.into(),
+            args: String::new(),
+            cwd: "/tmp/moat-tier-test-no-such-dir".into(),
+            start_time: util::now_rfc3339(),
+            parent_exec_id: None,
+            exited_at: None,
+            exit_signal: None,
+            exe_note: None,
+            sid: None,
+            tty: None,
+        }
+    }
+
+    /// The declaration, in every place that consults it.
+    ///
+    /// `signal` is the sentence "this rule is a building block, not a
+    /// detection", said by the rule instead of discovered by a 24 h circuit
+    /// breaker that forgets. What it changes and what it must not change are
+    /// both load-bearing, so both are asserted here.
+    #[test]
+    fn a_signal_rule_is_recorded_at_full_severity_and_never_reaches_the_badge() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.thresholds.dedupe_secs = 0;
+        let actor = no_such_proc("e-drop", 4_100_100, "/usr/bin/no-such-dropper");
+        let parent = no_such_proc("e-sh", 4_100_000, "/usr/bin/no-such-shell");
+
+        let id = d
+            .emit(signal_finding(&actor, &parent, "/tmp/moat-tier-test-no-such-dir/x"))
+            .expect("a signal rule still records an alert");
+        let a = d.find_alert(&id).unwrap();
+
+        assert_eq!(a.tier, "signal", "the tier is on the record (CONTRACT §4)");
+        assert_eq!(a.severity, "high", "the tier does NOT move the severity");
+        assert_eq!(a.surface, "timeline", "and it never reaches the badge on its own");
+        assert_eq!(a.suppressed_by, None, "a signal rule is not a suppression");
+        assert!(a.is_building_block());
+        assert!(a.incident.is_none(), "no snapshot for a building block");
+        assert_eq!(
+            d.store.unacked()["high"],
+            0,
+            "and nothing about it is waiting for a person"
+        );
+        assert!(
+            a.explain.evidence.iter().any(|e| e.starts_with("tier: ")),
+            "the alert says why it is on the timeline: {:?}",
+            a.explain.evidence
+        );
+
+        // The ledger names it, so "recorded" can be read as "how much of this
+        // is scaffolding".
+        let l = d.store.ledger();
+        assert_eq!(l.needs_you, 0);
+        assert_eq!(l.recorded, 1);
+        assert_eq!(l.signal, 1);
+        assert_eq!(l.suppressed, 0);
+        assert_eq!(d.status()["ledger"]["signal"], 1);
+        assert_eq!(d.status()["triage_pending"], 0, "not a question, not queued");
+    }
+
+    /// The noise guard counts what a person can be asked about, and a `signal`
+    /// row is not that.
+    ///
+    /// Before the tier existed this was the ONLY mechanism that could say "this
+    /// rule is a building block", and it said it by demoting — so the seven
+    /// building-block rules spent their lives tripping a circuit breaker,
+    /// raising a `moat-x-noisy-rule` alert each time, and being re-demoted
+    /// after every 24 h of quiet. Declaring the tier ends the cycle rather than
+    /// making it cheaper.
+    #[test]
+    fn the_noise_guard_never_counts_a_signal_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.thresholds.dedupe_secs = 0;
+        d.baseline.noisy_rule_per_day = 2;
+        let actor = no_such_proc("e-drop", 4_100_100, "/usr/bin/no-such-dropper");
+        let parent = no_such_proc("e-sh", 4_100_000, "/usr/bin/no-such-shell");
+        for i in 0..20 {
+            let _ = d.emit(signal_finding(
+                &actor,
+                &parent,
+                &format!("/tmp/moat-tier-test-no-such-dir/x{}", i),
+            ));
+        }
+        assert!(
+            d.baseline.demoted_rules().is_empty(),
+            "a rule that declared itself a building block cannot also be 'too noisy'"
+        );
+        assert!(
+            !d.store.load().iter().any(|a| a.rule == crate::rules::NOISY_RULE),
+            "and no noise complaint is raised about it"
+        );
+    }
+
+    /// The product's thesis, as a test: a `/tmp` exec is a building block on a
+    /// developer's machine and a DETECTION inside a package install.
+    ///
+    /// This is the one cell where a `signal` rule reaches the badge on its own,
+    /// and it is the exact shape that went to the timeline on 2026-09-04 — a
+    /// package `preinstall` that downloaded a binary into `/tmp` and ran it,
+    /// while the rule sat demoted because `cargo test` trips the same rule all
+    /// day.
+    #[test]
+    fn a_signal_rule_inside_a_package_install_is_a_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.thresholds.dedupe_secs = 0;
+        // A real ancestry, because the context comes from the process table.
+        // `node` rather than `sh`, so `moat-pkg-subtree-interpreter-spawn` does
+        // not also fire and make this test about two rules.
+        d.handle_line(&exec_line("e-npm", 4_200_000, "/usr/bin/npm", "install", ""));
+        d.handle_line(&exec_line("e-node", 4_200_001, "/usr/bin/node", "install.js", "e-npm"));
+        let actor = d.table.get("e-node").expect("the table has it").clone();
+        let parent = d.table.get("e-npm").expect("the table has it").clone();
+
+        let id = d
+            .emit(signal_finding(&actor, &parent, "/tmp/moat-tier-test-no-such-dir/stage2"))
+            .expect("the alert");
+        let a = d.find_alert(&id).unwrap();
+        assert_eq!(a.context, crate::context::Context::PkgInstall);
+        assert!(a.pkg_install_escalation, "the matrix escalated it, and the record says so");
+        assert_eq!(a.severity, "high");
+        assert_eq!(
+            a.surface, "alerts",
+            "a /tmp exec inside an install IS a detection: {}",
+            a.severity_reason
+        );
+        assert!(!a.is_building_block(), "so it is not treated as one anywhere");
+        assert_eq!(d.store.unacked()["high"], 1);
+        assert_eq!(d.store.ledger().needs_you, 1);
+    }
+
+    /// A demotion may never move a package-install escalation to the timeline.
+    ///
+    /// The 2026-09-04 miss, closed in general rather than for one path. The
+    /// noise guard is arithmetic about how often a shape fires ON THIS MACHINE;
+    /// that is not evidence about what a package install did, and the two must
+    /// not be allowed to cancel out. Asserted against the retroactive half
+    /// (`quieten_backlog`), which is the half that reaches back over records
+    /// already on disk.
+    #[test]
+    fn a_demotion_never_quietens_a_package_install_escalation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.thresholds.dedupe_secs = 0;
+        d.baseline.noisy_rule_per_day = 2;
+        d.handle_line(&exec_line("e-npm", 4_200_000, "/usr/bin/npm", "install", ""));
+        d.handle_line(&exec_line("e-node", 4_200_001, "/usr/bin/node", "install.js", "e-npm"));
+        let actor = d.table.get("e-node").unwrap().clone();
+        let parent = d.table.get("e-npm").unwrap().clone();
+
+        // One pattern, flooded past the threshold. Every one of these is a
+        // package-install escalation, so every one is on the badge.
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            ids.push(
+                d.emit(signal_finding(
+                    &actor,
+                    &parent,
+                    &format!("/tmp/moat-tier-test-no-such-dir/stage{}", i),
+                ))
+                .unwrap(),
+            );
+        }
+        assert!(
+            d.baseline
+                .demoted_rules()
+                .contains(&"moat-exec-untrusted-tmpfs".to_string()),
+            "precondition: the shape was demoted"
+        );
+        for id in &ids {
+            let a = d.find_alert(id).unwrap();
+            assert_eq!(
+                a.surface, "alerts",
+                "alert {} was escalated by the pkg-install matrix and must stay on the badge",
+                id
+            );
+        }
+    }
+
+    /// `chain::Observation.silenced` reads `suppressed_by` and nothing else, so
+    /// a `signal` step is a full trigger — which is the entire reason the tier
+    /// is safe to declare.
+    ///
+    /// The lab AUR attack was caught by `moat-exec-untrusted-tmpfs` appearing
+    /// in a chain. That rule is now `signal`, so if declaring the tier cost it
+    /// its place in a sequence, this change would have traded 14,859 quiet rows
+    /// for the one detection that has ever mattered here.
+    #[test]
+    fn a_signal_step_is_still_a_chain_trigger_and_a_high_chain_still_reaches_the_badge() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.thresholds.dedupe_secs = 0;
+        let actor = no_such_proc("e-drop", 4_100_100, "/usr/bin/no-such-dropper");
+        let parent = no_such_proc("e-mk", 4_100_000, "/usr/bin/no-such-makepkg");
+
+        let a = d
+            .emit(signal_finding(&actor, &parent, "/tmp/moat-tier-test-no-such-dir/helper"))
+            .expect("the signal step");
+        assert_eq!(d.find_alert(&a).unwrap().surface, "timeline", "precondition");
+
+        // A second family in the same tree.
+        let mut m = crate::policy::PolicyMeta::fallback("moat-x-pkg-egress");
+        m.family = "net".into();
+        m.severity = "medium".into();
+        let mut f = Finding::new("moat-x-pkg-egress", m, actor.clone());
+        f.hook = "file_post_open".into();
+        f.hook_detail = Some("read".into());
+        f.ancestry = vec![parent.clone()];
+        f.file = Some(crate::alert::FileRef {
+            path: "/tmp/moat-tier-test-no-such-dir/beacon".into(),
+            sha256: None,
+        });
+        let b = d.emit(f).expect("the egress step");
+
+        let chain = d.find_alert(&a).unwrap().chain.expect("the two must correlate");
+        assert_eq!(d.find_alert(&b).unwrap().chain.map(|c| c.id), Some(chain.id.clone()));
+        assert!(
+            chain.steps.iter().all(|s| s.is_trigger()),
+            "a signal tier must not turn a step into context"
+        );
+        assert!(
+            crate::alert::severity_rank(&chain.severity) >= 2,
+            "chain is {} with a high signal trigger in it",
+            chain.severity
+        );
+        assert_eq!(
+            d.find_alert(&a).unwrap().surface,
+            "alerts",
+            "and a high chain re-stamps its trigger onto the badge"
+        );
+    }
+
+    // ------------------------------------------- the kill gate and quarantine
+
+    /// Put a finished alert straight into the store, so a chain can be built
+    /// over facts (rarity, family, path) the test chooses.
+    fn stored_alert(
+        d: &mut Daemon,
+        id: &str,
+        rule: &str,
+        family: &str,
+        path: &str,
+        rarity: crate::rarity::Rarity,
+    ) -> Alert {
+        let mut a = crate::alert::tests_support::demo_alert(id);
+        a.rule = rule.into();
+        a.family = family.into();
+        a.severity = "high".into();
+        a.rarity = rarity;
+        a.file = Some(crate::alert::FileRef { path: path.into(), sha256: None });
+        a.process.pid = 4_300_000 + (id.len() as u32);
+        d.store.append_alert(&a).unwrap();
+        a
+    }
+
+    fn chain_over(d: &Daemon, alerts: &[Alert], severity: &str) -> crate::chain::Chain {
+        let steps: Vec<crate::chain::Step> = alerts
+            .iter()
+            .map(|a| crate::chain::Step {
+                alert: a.id.clone(),
+                ts: a.ts.clone(),
+                family: a.family.clone(),
+                rule: a.rule.clone(),
+                severity: a.severity.clone(),
+                title: a.title.clone(),
+                pid: a.process.pid,
+                exe: a.process.exe.clone(),
+                role: "trigger".into(),
+            })
+            .collect();
+        let _ = d;
+        let mut families: Vec<String> = alerts.iter().map(|a| a.family.clone()).collect();
+        families.sort();
+        families.dedup();
+        crate::chain::Chain {
+            v: 1,
+            id: "01CHAINQUARANTINE".into(),
+            ancestor: crate::alert::Ancestor {
+                pid: 4_299_999,
+                exe: "/usr/bin/no-such-makepkg".into(),
+            },
+            families,
+            severity: severity.into(),
+            severity_base: "high".into(),
+            severity_reason: "r".into(),
+            first_ts: util::now_rfc3339(),
+            last_ts: util::now_rfc3339(),
+            span_secs: 1,
+            steps_total: steps.len(),
+            triggers_total: steps.len(),
+            members: steps.iter().map(|s| s.alert.clone()).collect(),
+            steps,
+            truncated: false,
+            summary: "s".into(),
+        }
+    }
+
+    fn decisions(d: &Daemon) -> Vec<Value> {
+        let path = d.cfg.paths.state_dir.join("decisions.jsonl");
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    /// Quarantine passes the kill gate, and says so when it refuses.
+    ///
+    /// On 2026-09-05 at 22:03Z a `critical` chain raised by this project's own
+    /// `cargo test` run made the daemon try to quarantine
+    /// `…/target/release/moatctl` — the developer's build output — and it
+    /// failed only because the mount was read-only. The kill gate had already
+    /// looked at chains of that shape and refused them; quarantine had no gate
+    /// at all. Moving a file aside is not the gentle option, so it is the same
+    /// decision, recorded in the same words.
+    #[test]
+    fn a_chain_the_kill_gate_would_spare_is_not_quarantined_either() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.contain.enabled = true;
+
+        // Real files, under the tempdir (which is under /tmp, one of the roots
+        // quarantine will act in). They must still exist afterwards.
+        let build_output = dir.path().join("target-release-moatctl");
+        let unit = dir.path().join("some.service");
+        std::fs::write(&build_output, b"ELF-ish").unwrap();
+        std::fs::write(&unit, b"[Unit]").unwrap();
+
+        // One novel family and one the machine has seen: exactly the shape the
+        // kill gate spares, and exactly a developer's build.
+        let a = stored_alert(
+            &mut d,
+            "01QA0000000000000000000000",
+            "moat-exec-untrusted-tmpfs",
+            "exec",
+            &build_output.to_string_lossy(),
+            crate::rarity::Rarity::FirstSeen,
+        );
+        let b = stored_alert(
+            &mut d,
+            "01QB0000000000000000000000",
+            "moat-persist-autostart-write",
+            "persist",
+            &unit.to_string_lossy(),
+            crate::rarity::Rarity::Common,
+        );
+        let c = chain_over(&d, &[a.clone(), b.clone()], "high");
+        d.quarantine_chain_artifacts(&c);
+
+        assert!(build_output.exists(), "the developer's build output is still there");
+        assert!(unit.exists());
+        assert_eq!(d.find_alert(&a.id).unwrap().action_taken, "none");
+        let refusals: Vec<Value> = decisions(&d)
+            .into_iter()
+            .filter(|r| r["verdict"] == "quarantine_spared")
+            .collect();
+        assert_eq!(refusals.len(), 1, "the refusal is a record, not a log line");
+        assert!(
+            refusals[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("this machine has seen this shape before"),
+            "the same sentence the kill gate prints: {}",
+            refusals[0]["reason"]
+        );
+    }
+
+    /// ...and a chain that WOULD be killed is quarantined, so the gate is a
+    /// gate and not an off switch.
+    #[test]
+    fn a_chain_that_would_kill_does_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.contain.enabled = true;
+        let dropper = dir.path().join("browser-helper");
+        std::fs::write(&dropper, b"ELF-ish").unwrap();
+
+        let a = stored_alert(
+            &mut d,
+            "01QC0000000000000000000000",
+            "moat-exec-untrusted-home",
+            "exec",
+            &dropper.to_string_lossy(),
+            crate::rarity::Rarity::FirstSeen,
+        );
+        let b = stored_alert(
+            &mut d,
+            "01QD0000000000000000000000",
+            "moat-persist-autostart-write",
+            "persist",
+            &dir.path().join("no-such-file").to_string_lossy(),
+            crate::rarity::Rarity::FirstSeen,
+        );
+        let c = chain_over(&d, &[a.clone(), b.clone()], "critical");
+        assert!(
+            crate::contain::worth_killing_for(
+                &c.severity,
+                &[
+                    crate::contain::StepFact { family: "exec".into(), novel: true, pid: 1 },
+                    crate::contain::StepFact { family: "persist".into(), novel: true, pid: 2 },
+                ]
+            )
+            .is_ok(),
+            "precondition: this is a shape the kill gate passes"
+        );
+        d.quarantine_chain_artifacts(&c);
+        assert!(!dropper.exists(), "the dropped binary was moved aside");
+        assert_eq!(d.find_alert(&a.id).unwrap().action_taken, "quarantined");
+    }
+
+    /// A `signal` step's file is not taken on a `high` chain.
+    ///
+    /// A signal rule is right about what it saw and weak about what it means,
+    /// and `moat-exec-untrusted-tmpfs` names the binary a build just produced
+    /// hundreds of times a day. Acting on the file a weak rule pointed at, on a
+    /// correlation that only reached `high`, is the one shape where moat can
+    /// destroy work while being technically correct about every step.
+    #[test]
+    fn a_signal_steps_file_is_only_quarantined_when_the_chain_is_critical() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.contain.enabled = true;
+        let built = dir.path().join("test-binary");
+
+        for (severity, must_survive) in [("high", true), ("critical", false)] {
+            std::fs::write(&built, b"ELF-ish").unwrap();
+            let mut a = stored_alert(
+                &mut d,
+                &format!("01QE{:022}", severity.len()),
+                "moat-exec-untrusted-tmpfs",
+                "exec",
+                &built.to_string_lossy(),
+                crate::rarity::Rarity::FirstSeen,
+            );
+            // The declaration, on the record.
+            a.tier = crate::policy::TIER_SIGNAL.into();
+            d.store.append_alert(&a).unwrap();
+            let b = stored_alert(
+                &mut d,
+                &format!("01QF{:022}", severity.len()),
+                "moat-persist-autostart-write",
+                "persist",
+                &dir.path().join("no-such-file").to_string_lossy(),
+                crate::rarity::Rarity::FirstSeen,
+            );
+            let c = chain_over(&d, &[a.clone(), b], severity);
+            d.quarantine_chain_artifacts(&c);
+            assert_eq!(
+                built.exists(),
+                must_survive,
+                "a {} chain and a signal step: file should {}",
+                severity,
+                if must_survive { "survive" } else { "be taken" }
+            );
+        }
     }
 
     /// A rule that is on and cannot fire must say so.
@@ -4950,6 +6532,7 @@ mod tests {
             exit_signal: None,
             exe_note: None,
             sid: None,
+            tty: None,
         };
         let finding = |rule: &str, family: &str, severity: &str, path: &str| {
             let mut f = Finding::new(rule, crate::policy::PolicyMeta::fallback(rule), node.clone());
@@ -5311,7 +6894,7 @@ mod tests {
         let alerts = d.store.load();
         let rules: Vec<&str> = alerts.iter().map(|a| a.rule.as_str()).collect();
         assert!(rules.contains(&"moat-cred-ssh-private-key-read"));
-        assert!(rules.contains(&"moat-net-reverse-shell"));
+        assert!(rules.contains(&"moat-shell-reverse-shell-connect"));
         assert!(rules.contains(&"moat-x-ai-cli-headless"));
 
         for a in &alerts {
@@ -5350,7 +6933,7 @@ mod tests {
             .store
             .load()
             .into_iter()
-            .find(|a| a.rule == "moat-net-reverse-shell")
+            .find(|a| a.rule == "moat-shell-reverse-shell-connect")
             .unwrap();
         // The event carried KPROBE_ACTION_SIGKILL and the sample log has the
         // matching SIGKILL exit, so this one is confirmed.
@@ -5372,7 +6955,7 @@ mod tests {
             .store
             .load()
             .into_iter()
-            .find(|a| a.rule == "moat-net-reverse-shell")
+            .find(|a| a.rule == "moat-shell-reverse-shell-connect")
             .unwrap();
         assert_eq!(a2.action_taken, "none");
     }
@@ -5747,12 +7330,22 @@ mod tests {
         let s = d.status();
         for k in [
             "ok", "version", "mode", "tetragon", "policies", "policies_failed", "feeds",
-            "unacked", "sandbox", "socket_group",
+            "unacked", "ledger", "sandbox", "socket_group",
         ] {
             assert!(s.get(k).is_some(), "status missing {}", k);
         }
         assert_eq!(s["socket_group"], "moat");
         assert!(s["unacked"].get("critical").is_some());
+        // CONTRACT §5: three plainly named populations, and `needs_you` is
+        // `unacked` as one number — the two must never be able to disagree.
+        for k in ["needs_you", "recorded", "suppressed", "signal"] {
+            assert!(s["ledger"].get(k).is_some(), "ledger missing {}", k);
+        }
+        let unacked: u64 = ["critical", "high", "medium", "low"]
+            .iter()
+            .map(|k| s["unacked"][k].as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(s["ledger"]["needs_you"].as_u64(), Some(unacked));
     }
 
     #[test]
@@ -5953,6 +7546,7 @@ mod tests {
                     exit_signal: None,
                     exe_note: None,
                     sid: None,
+                    tty: None,
                 },
             );
             f.meta.family = "cred".into();
@@ -6045,6 +7639,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut d, _) = dev_daemon(dir.path());
         d.cfg.thresholds.dedupe_secs = 0;
+        // This test is about the noise guard, not about provenance. Since
+        // provenance applies AFTER the context matrix (2026-09-05), the fixture
+        // actor `/usr/bin/restic` is official under the pacman test db and its
+        // `persist` alerts score medium — off the badge, never counted by the
+        // guard, and the test would be measuring the wrong mechanism.
+        d.cfg.baseline.provenance_downgrade = false;
         d.handle_line(&exec_line("e-hypr", 1, "/usr/bin/Hyprland", "", ""));
         // A different pattern of the same rule, on the badge before the flood.
         // Same actor, different directory: a different (rule, exe, parent,
@@ -6077,8 +7677,9 @@ mod tests {
                 &format!("/home/dan/.config/hypr/gen{}.conf", i % 4),
             ));
         }
-        assert!(
-            !d.baseline.is_demoted("moat-persist-hypr-config-write"),
+        assert_eq!(
+            d.baseline.demoted_pattern_count(),
+            1,
             "one pattern flooded, not the rule"
         );
         let alerts = d.store.load();
@@ -6153,6 +7754,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut d, _) = dev_daemon(dir.path());
         d.cfg.thresholds.dedupe_secs = 0;
+        // See `a_demotion_quietens_the_backlog_it_covers_and_nothing_else`:
+        // `/usr/bin/restic` is official under the test pacman db, so with the
+        // provenance step on these alerts never reach the badge and the noise
+        // guard — the thing under test — never counts them.
+        d.cfg.baseline.provenance_downgrade = false;
         d.handle_line(&exec_line("e-hypr", 1, "/usr/bin/Hyprland", "", ""));
         for i in 0..25u32 {
             d.handle_line(&read_line(
@@ -6167,7 +7773,7 @@ mod tests {
         }
         // One shape flooding demotes that shape, not the whole rule -- which is
         // the point: another shape of this rule stays on the badge.
-        assert!(!d.baseline.is_demoted("moat-persist-hypr-config-write"));
+        assert_eq!(d.baseline.demoted_pattern_count(), 1);
         assert!(d
             .baseline
             .demoted_rules()

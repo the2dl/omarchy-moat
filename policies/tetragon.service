@@ -32,10 +32,39 @@ Group=root
 # so this must run before every start.
 ExecStartPre=/usr/bin/moatd render-policies
 ExecStart=/usr/bin/tetragon
+
+# Make "started" mean "the policies are loaded".
+#
+# `Type=simple` calls this unit started the instant /usr/bin/tetragon forks. On
+# 2026-09-05 that was 16 seconds and 44 policies too early: moatd is
+# `After=tetragon.service` and re-armed its policies 2 s after start, so all
+# seven `tetra tp set-mode` calls failed against names the kernel did not have
+# yet -- once with `dial tcp [::1]:54321: address family not supported`, then
+# six times with `tracing policy {moat-...} does not exist`. Nothing retried,
+# and `moatctl status` and the panel went on listing all seven as enforcing.
+#
+# A unit with an ExecStartPost stays in `activating` until that command
+# returns, so this is what finally makes `After=tetragon.service` order against
+# a LOADED sensor. It counts the policies pinned under /sys/fs/bpf/tetragon,
+# which is the same signal `moatctl status` trusts.
+#
+# The `-` prefix is deliberate. A slow load must not fail this unit and hand it
+# to `Restart=always` in a loop -- the ordering is the point, and the exit code
+# is for a human running `moatd wait-sensor` by hand. moatd waits for the
+# sensor on its own account too ([thresholds] arm_wait_secs): this fixes the
+# boot order, and only the boot order, while a tetragon that reloads policies
+# later needs the daemon-side wait.
+ExecStartPost=-/usr/bin/moatd wait-sensor --timeout 120
+
 # `always`, not `on-failure`: a clean exit(0) must bring it back too. Only an
 # explicit `systemctl stop` should keep it down.
 Restart=always
 RestartSec=5
+# Must exceed the ExecStartPost wait above (120 s) plus the render, or systemd
+# would kill a sensor that is loading normally and `Restart=always` would do it
+# again. 16 s is the observed load time for 44 policies; this is the ceiling for
+# a cold boot on a slow disk, not the expected case.
+TimeoutStartSec=180
 TimeoutStopSec=30
 KillMode=mixed
 OOMScoreAdjust=-500

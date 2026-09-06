@@ -102,6 +102,22 @@ impl Finding {
             .unwrap_or(self.meta.severity.as_str())
     }
 
+    /// The matrix escalated this inside a package install (scoring §2b). False
+    /// until `engine::emit` has scored the finding.
+    pub fn pkg_install_escalation(&self) -> bool {
+        self.score
+            .as_ref()
+            .map(|s| s.pkg_install_escalation)
+            .unwrap_or(false)
+    }
+
+    /// A `signal`-tier finding the package-install matrix has not escalated: a
+    /// building block, not a detection (BASELINE §4). The same question
+    /// `Alert::is_building_block` asks of a stored record.
+    pub fn is_building_block(&self) -> bool {
+        self.meta.is_signal() && !self.pkg_install_escalation()
+    }
+
     /// The directory the baseline tuple keys on: the file's, or `""`.
     pub fn file_dir(&self) -> String {
         self.file
@@ -184,20 +200,20 @@ pub fn build_alert(f: &Finding, id: &str, ts: &str, allowlist_file: &str, allowl
         .clone()
         .unwrap_or_else(|| crate::scoring::Score::unadjusted(&f.meta.severity));
     let rarity = f.rarity.clone();
-    // A demoted rule is not suppressed; it just stops being an Alerts-tab item.
-    // A suppressed alert belongs on the timeline exactly as a demoted one does.
-    // The plugin already recomputes it that way, so only the *recorded* surface
-    // was wrong — but that is the field anything reading alerts.jsonl on its own
-    // has to trust (an offline audit, the setup screen, a measurement of how
-    // noisy an idle machine is). INTEGRATION.md section 6.7 predicted this as
-    // latent; on 2026-09-03 it was live: 38 allowlisted omarchy-shell plugin
-    // execs were recorded surface "alerts" while the UI correctly showed them on
-    // the timeline and never notified.
-    let surface = if f.demoted || f.suppressed_by.is_some() {
-        "timeline".to_string()
-    } else {
-        score.surface.clone()
-    };
+    // A demoted rule is not suppressed; it just stops being an Alerts-tab item,
+    // and neither is a `signal` rule. A suppressed alert belongs on the
+    // timeline exactly as a demoted one does. The plugin already recomputes it
+    // that way, so only the *recorded* surface was wrong — but that is the
+    // field anything reading alerts.jsonl on its own has to trust (an offline
+    // audit, the setup screen, a measurement of how noisy an idle machine is).
+    // INTEGRATION.md section 6.7 predicted this as latent; on 2026-09-03 it was
+    // live: 38 allowlisted omarchy-shell plugin execs were recorded surface
+    // "alerts" while the UI correctly showed them on the timeline and never
+    // notified. The order of the three questions, and the package-install
+    // exception that outranks two of them, is in `scoring::final_surface`.
+    let surface =
+        crate::scoring::final_surface(&score, &f.meta.tier, f.demoted, f.suppressed_by.is_some())
+            .to_string();
 
     Alert {
         v: ALERT_V,
@@ -235,6 +251,8 @@ pub fn build_alert(f: &Finding, id: &str, ts: &str, allowlist_file: &str, allowl
         severity_base: score.severity_base.clone(),
         severity_reason: score.severity_reason.clone(),
         surface,
+        tier: f.meta.tier.clone(),
+        pkg_install_escalation: score.pkg_install_escalation,
         suppressed_by: f.suppressed_by.clone(),
         rarity: rarity.as_ref().map(|r| r.class).unwrap_or_default(),
         rarity_text: rarity.map(|r| r.text).unwrap_or_default(),
@@ -457,6 +475,26 @@ fn evidence(f: &Finding, allowlist_note: &str) -> Vec<String> {
              `moatctl baseline undemote {}` starts watching it again",
             f.rule, f.rule
         ));
+    }
+    // Say the tier out loud. A reader who finds a `first_seen` /tmp exec sitting
+    // on the timeline is entitled to know that was a declared decision about the
+    // RULE and not moat missing it, and that the row still counts inside a
+    // sequence.
+    if f.meta.is_signal() {
+        ev.push(if f.pkg_install_escalation() {
+            format!(
+                "tier: {} is a signal rule (a building block, not a conclusion), but this one \
+                 happened inside a package install, which is the case it exists to catch — so it \
+                 is on the badge",
+                f.rule
+            )
+        } else {
+            format!(
+                "tier: {} is a signal rule — weak on its own, so it is recorded on the timeline \
+                 rather than the badge. It is still a full step of any sequence moat correlates",
+                f.rule
+            )
+        });
     }
 
     ev.extend(f.extra_evidence.iter().cloned());
@@ -748,6 +786,7 @@ mod tests {
             exit_signal: None,
             exe_note: None,
             sid: None,
+            tty: None,
         }
     }
 
@@ -781,6 +820,7 @@ mod tests {
             exit_signal: None,
             exe_note: None,
             sid: None,
+            tty: None,
         }, ProcInfo {
             exec_id: "e-1".into(),
             pid: 41201,
@@ -794,6 +834,7 @@ mod tests {
             exit_signal: None,
             exe_note: None,
             sid: None,
+            tty: None,
         }];
         f.ancestry_line = "npm -> sh -> node".into();
         f

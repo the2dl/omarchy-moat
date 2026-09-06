@@ -193,6 +193,7 @@ mod tests {
             homes: &homes,
             now,
             mode: "monitor",
+            armed: &crate::rules::NO_RULES_ARMED,
         };
         rule.on_hook(
             &HookHit {

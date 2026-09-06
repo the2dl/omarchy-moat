@@ -186,6 +186,7 @@ mod tests {
             homes: &homes,
             now: 100,
             mode: "monitor",
+            armed: &crate::rules::NO_RULES_ARMED,
         };
         let h = HookHit {
             kind: HookKind::Kprobe,
@@ -231,6 +232,7 @@ mod tests {
             homes: &homes,
             now: 100,
             mode: "monitor",
+            armed: &crate::rules::NO_RULES_ARMED,
         };
         let h = HookHit {
             kind: HookKind::Kprobe,

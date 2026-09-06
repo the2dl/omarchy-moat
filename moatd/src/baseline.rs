@@ -187,8 +187,9 @@ pub const REDEMOTED_REASON: &str =
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Demotion {
     pub rule: String,
-    /// The (rule, exe, parent, dir) tuple this demotion is scoped to. Empty
-    /// when the whole rule was demoted by the fan-out backstop.
+    /// The (rule, exe, parent, dir) tuple this demotion is scoped to. **Always
+    /// set**: there is no such thing as a rule-wide demotion any more, see
+    /// `note_alert`.
     #[serde(default)]
     pub tuple: String,
     /// unix seconds
@@ -197,6 +198,11 @@ pub struct Demotion {
     pub count: u64,
     /// unix seconds of the last alert from this rule.
     pub last_seen: u64,
+    /// How many distinct patterns of this rule are quiet now, this one
+    /// included. Past `noisy_rule_fanout` the alert says the rule itself is the
+    /// problem; nothing is silenced by it.
+    #[serde(default)]
+    pub patterns_quiet: usize,
 }
 
 /// Everything the baseline persists, in `<state_dir>/baseline.json`.
@@ -211,8 +217,6 @@ pub struct BaselineState {
     pub tuples: HashMap<String, TupleStat>,
     #[serde(default)]
     pub proposals: Vec<Proposal>,
-    #[serde(default)]
-    pub demoted: BTreeMap<String, Demotion>,
     /// Demotions scoped to one (rule, exe, parent, dir) tuple. Keyed by the
     /// tuple, so a noisy shape goes quiet without silencing shapes of the same
     /// rule that nobody has seen yet.
@@ -290,9 +294,10 @@ pub struct Baseline {
     pub learning_days: u64,
     pub learn_min_days: usize,
     pub noisy_rule_per_day: u64,
-    /// How many distinct tuples of one rule must each be demoted before the
-    /// rule is demoted wholesale. The backstop for a rule that is noisy in
-    /// general rather than in one shape.
+    /// How many distinct demoted patterns of one rule make the rule itself the
+    /// problem. **Nothing is silenced at this point**: it is the count at which
+    /// `moat-x-noisy-rule` stops saying "one shape of this rule floods" and
+    /// starts saying "this rule is wrong for this machine" (BASELINE §4).
     pub noisy_rule_fanout: usize,
     dirty: bool,
     last_save: u64,
@@ -689,20 +694,30 @@ impl Baseline {
     /// shape loud, so this can only ever reduce what reaches the badge for
     /// patterns already established, and never hides a new one.
     ///
-    /// A rule-wide demotion remains as a backstop for a rule that is noisy in
-    /// *general* rather than in one shape: once `noisy_rule_fanout` distinct
-    /// tuples of it have each been demoted on their own, the rule goes quiet
-    /// wholesale. Without that, a rule firing once each from hundreds of
-    /// distinct tuples would never trip the guard at all.
+    /// **There is no rule-wide demotion.** There was one: a "fan-out backstop"
+    /// that silenced a whole rule once `noisy_rule_fanout` of its patterns had
+    /// each gone quiet on their own. It was removed on 2026-09-05 with the
+    /// `signal` tier, and the two changes are the same change.
+    ///
+    /// The backstop existed because some rules flood in general rather than in
+    /// one shape, and the guard was the only mechanism moat had for saying
+    /// "this rule is a building block, not a detection". It said it through a
+    /// 24 h circuit breaker that forgets, which is the wrong instrument for a
+    /// permanent fact about a rule: on 2026-09-04 it hid a real `/tmp` dropper
+    /// inside a package install, and on 2026-09-05 moat's own test suite
+    /// re-created the same rule-wide silence in seconds. The demoted set it
+    /// arrived at was, every time, the same seven rules — which is a
+    /// declaration the rules can simply make (`moat.omarchy/tier: signal`).
+    ///
+    /// So the fan-out no longer silences anything. A *detection* rule that
+    /// floods across many patterns is a rule bug, and the output for a rule bug
+    /// is the `moat-x-noisy-rule` alert saying so, plus the per-pattern
+    /// demotions that were happening anyway — never a rule-wide silence, which
+    /// covers shapes nobody has seen yet and is exactly how a real detection
+    /// gets lost.
     pub fn note_alert(&mut self, rule: &str, tuple: &str, now: u64) -> Option<Demotion> {
         let hour = now / 3_600;
         let cutoff = hour.saturating_sub(23);
-
-        // Rule already quiet wholesale: keep its counter fresh and say nothing.
-        if let Some(d) = self.state.demoted.get_mut(rule) {
-            d.last_seen = now;
-            return None;
-        }
 
         let w = self.state.windows.entry(tuple.to_string()).or_default();
         *w.entry(hour).or_insert(0) += 1;
@@ -719,14 +734,21 @@ impl Baseline {
             return None;
         }
 
-        let d = Demotion {
+        let mut d = Demotion {
             rule: rule.to_string(),
             tuple: tuple.to_string(),
             since: now,
             count,
             last_seen: now,
+            patterns_quiet: 0,
         };
         self.state.demoted_tuples.insert(tuple.to_string(), d.clone());
+        d.patterns_quiet = self
+            .state
+            .demoted_tuples
+            .values()
+            .filter(|t| t.rule == rule)
+            .count();
         let seen = self.state.redemotions.entry(tuple.to_string()).or_insert(0);
         *seen += 1;
         let times = *seen;
@@ -739,51 +761,40 @@ impl Baseline {
             rule,
             count
         );
-
-        // Backstop: noisy in general, not in one shape.
-        let fanout = self
-            .state
-            .demoted_tuples
-            .values()
-            .filter(|t| t.rule == rule)
-            .count();
-        if fanout >= self.noisy_rule_fanout {
-            let whole = Demotion {
-                rule: rule.to_string(),
-                tuple: String::new(),
-                since: now,
-                count,
-                last_seen: now,
-            };
-            self.state.demoted.insert(rule.to_string(), whole.clone());
+        if d.patterns_quiet >= self.noisy_rule_fanout {
+            // Said out loud, and nothing else. See `note_alert`'s doc: a
+            // detection rule that floods across many shapes is a rule bug, and
+            // the fix for a rule bug is a person changing the rule -- not a
+            // 24 h silence over every shape of it, including the ones nobody
+            // has seen.
             log::warn!(
-                "noise guard: {} is noisy across {} distinct patterns; demoting the whole rule",
+                "noise guard: {} is now quiet in {} distinct patterns. That is the rule being \
+                 wrong for this machine rather than one noisy shape -- it wants retuning, or a \
+                 `moat.omarchy/tier: signal` declaration if it is a building block. Nothing has \
+                 been silenced beyond those {} patterns.",
                 rule,
-                fanout
+                d.patterns_quiet,
+                d.patterns_quiet
             );
-            return Some(whole);
         }
         Some(d)
     }
 
-    /// Is this exact pattern demoted, or the whole rule?
-    pub fn is_demoted_tuple(&self, rule: &str, tuple: &str) -> bool {
-        self.state.demoted.contains_key(rule) || self.state.demoted_tuples.contains_key(tuple)
-    }
-
-    pub fn is_demoted(&self, rule: &str) -> bool {
-        self.state.demoted.contains_key(rule)
-    }
-
-    /// Every rule that has been quietened in any way — wholesale, or in one or
-    /// more of its patterns.
+    /// Is this exact pattern demoted?
     ///
-    /// `is_demoted` stays narrow ("the whole rule is quiet") because that is
-    /// what the engine and the docs mean by it. This is the list a *person*
-    /// wants: what has Moat stopped asking me about, and what can I turn back
-    /// on. `undemote` on any of these clears the rule and all its patterns.
+    /// The `rule` argument is kept for the call sites' readability and because
+    /// the tuple key embeds it; there is no rule-wide state left to consult.
+    pub fn is_demoted_tuple(&self, _rule: &str, tuple: &str) -> bool {
+        self.state.demoted_tuples.contains_key(tuple)
+    }
+
+    /// Every rule with at least one quietened pattern.
+    ///
+    /// The list a *person* wants: what has Moat stopped asking me about, and
+    /// what can I turn back on. `undemote` on any of these clears every pattern
+    /// under it.
     pub fn demoted_rules(&self) -> Vec<String> {
-        let mut out: Vec<String> = self.state.demoted.keys().cloned().collect();
+        let mut out: Vec<String> = Vec::new();
         for d in self.state.demoted_tuples.values() {
             if !out.contains(&d.rule) {
                 out.push(d.rule.clone());
@@ -799,11 +810,11 @@ impl Baseline {
     }
 
     /// "keep watching": clear a demotion on request.
-    /// "keep watching" a rule: clears the rule-wide demotion AND every
-    /// pattern-scoped one under it, because a user asking to be told about a
-    /// rule again means all of it, not the shapes that happen not to be quiet.
+    /// "keep watching" a rule: clears every pattern-scoped demotion under it,
+    /// because a user asking to be told about a rule again means all of it, not
+    /// the shapes that happen not to be quiet.
     pub fn undemote(&mut self, rule: &str) -> bool {
-        let mut hit = self.state.demoted.remove(rule).is_some();
+        let mut hit = false;
         let tuples: Vec<String> = self
             .state
             .demoted_tuples
@@ -830,24 +841,8 @@ impl Baseline {
         let hour = now / 3_600;
         let cutoff = hour.saturating_sub(23);
         let mut cleared = Vec::new();
-        let rules: Vec<String> = self.state.demoted.keys().cloned().collect();
-        for rule in rules {
-            let count: u64 = self
-                .state
-                .windows
-                .get(&rule)
-                .map(|w| w.iter().filter(|(h, _)| **h >= cutoff).map(|(_, c)| *c).sum())
-                .unwrap_or(0);
-            let since = self.state.demoted.get(&rule).map(|d| d.since).unwrap_or(0);
-            if count <= self.noisy_rule_per_day && now.saturating_sub(since) >= DAY {
-                self.state.demoted.remove(&rule);
-                self.dirty = true;
-                cleared.push(rule);
-            }
-        }
-        // Pattern-scoped demotions clear on the same terms. Without this a
-        // demotion scoped to a tuple would be permanent, which is a worse
-        // promise than the rule-wide one it replaced.
+        // Every demotion is pattern-scoped. Without this they would be
+        // permanent, which is a worse promise than a circuit breaker.
         let tuples: Vec<(String, String, u64)> = self
             .state
             .demoted_tuples
@@ -946,7 +941,10 @@ impl Baseline {
                     "last_seen": t.last_seen,
                     "rarity": t.rarity,
                     "suppressed": t.suppressed,
-                    "demoted": t.demoted || self.is_demoted(&t.rule),
+                    // This tuple's own demotion. It used to be OR'd with a
+                    // rule-wide one; there is no such thing any more, and a row
+                    // that reads `demoted: true` now means this exact shape.
+                    "demoted": t.demoted || self.is_demoted_tuple(&t.rule, &t.key()),
                     "learned": t.learned,
                     "max_severity": crate::alert::severity_name(t.max_rank),
                     "max_rule_severity": crate::alert::severity_name(t.max_base_rank),
@@ -1326,13 +1324,28 @@ mod tests {
         // real supply-chain exec because the machine's own builds had made a
         // *different* shape of the same rule noisy.
         assert!(!b.is_demoted_tuple(rule, "t2"), "an unseen pattern stays on the badge");
-        assert!(!b.is_demoted(rule), "the rule itself is not demoted by one noisy shape");
+        assert_eq!(d.patterns_quiet, 1, "one shape of this rule is quiet, not the rule");
     }
 
+    /// A rule that floods across many shapes says so and silences NOTHING it
+    /// has not seen.
+    ///
+    /// This test asserted the opposite until 2026-09-05: the "fan-out backstop"
+    /// demoted the whole rule once five of its patterns had gone quiet, so
+    /// every shape of it — including shapes nobody had ever seen — went to the
+    /// timeline for 24 h. That is how a real `/tmp` dropper inside a package
+    /// install was hidden on 2026-09-04, and moat's own test suite re-created
+    /// the same rule-wide silence in seconds.
+    ///
+    /// The backstop existed because the noise guard was the only mechanism that
+    /// could say "this rule is a building block, not a detection". Rules say it
+    /// themselves now (`moat.omarchy/tier: signal`), and what is left over — a
+    /// DETECTION rule flooding in general — is a rule bug. The output for a rule
+    /// bug is the report, not a blanket silence: a 24 h circuit breaker that
+    /// forgets cannot fix a rule, and while it is tripped it is covering shapes
+    /// that were never noisy.
     #[test]
-    fn a_rule_noisy_across_many_patterns_still_goes_quiet_wholesale() {
-        // The backstop. Without it a rule firing a flood from many distinct
-        // tuples would never trip the guard at all.
+    fn a_rule_noisy_across_many_patterns_reports_itself_and_silences_nothing_unseen() {
         let dir = tempfile::tempdir().unwrap();
         let mut b = baseline(dir.path(), NOW);
         let rule = "moat-x-pkg-egress";
@@ -1345,13 +1358,26 @@ mod tests {
                 }
             }
         }
-        let d = last.expect("the fifth distinct noisy pattern demotes the rule");
+        let d = last.expect("each flooding pattern is demoted on its own");
         assert_eq!(d.rule, rule);
-        assert_eq!(d.tuple, "", "a rule-wide demotion is not scoped to a tuple");
-        assert!(b.is_demoted(rule));
+        assert_eq!(d.tuple, "tuple-4", "every demotion is scoped to one pattern");
+        assert_eq!(
+            d.patterns_quiet, 5,
+            "and it carries the fan-out count, which is what the alert reports"
+        );
+        assert!(d.patterns_quiet >= b.noisy_rule_fanout, "past the fan-out threshold");
+        // The five flooding shapes are quiet, one at a time.
+        for t in 0..5 {
+            assert!(b.is_demoted_tuple(rule, &format!("tuple-{t}")));
+        }
+        // A shape nobody has seen is still loud. This is the whole change.
+        assert!(
+            !b.is_demoted_tuple(rule, "never-seen"),
+            "a rule flooding in five known shapes must not silence a sixth nobody has seen"
+        );
+        // The rule is still listed as quietened, so a person can undemote it.
         assert_eq!(b.demoted_rules(), vec![rule]);
-        // And now every shape of it is quiet, including unseen ones.
-        assert!(b.is_demoted_tuple(rule, "never-seen"));
+        assert_eq!(b.demoted_pattern_count(), 5);
     }
 
     #[test]

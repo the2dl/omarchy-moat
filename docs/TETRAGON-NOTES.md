@@ -334,6 +334,22 @@ Verified at: `SRC api/v1/tetragon/tetragon.proto`, `capabilities.proto`
 (ProcessPrivilegesChanged), `SRC pkg/reader/exec/exec.go` (FlagStrings), `TARBALL
 usr/local/bin/tetragon --help` (`--enable-ancestors`, env flags).
 
+**Session id and controlling terminal are NOT in the process record**, and both
+are things moatd has to ask about constantly: `chain.rs` needs "is this a
+session leader" to find the root of a story, and `context.rs` needs "is a person
+at the other end of this" to score an alert. The list above is the whole record
+and neither field is on it. `auid` is the login uid and is identical across
+every pane of one login; the systemd cgroup is identical too (every pane shares
+one `app-*.scope`). So `proctable::read_session` reads `/proc/<pid>/stat` once at
+exec time and takes fields 6 and 7 — `session` and `tty_nr` — off the same line;
+the second one is free, and `ProcInfo` carries both as `sid` and `tty`. `None`
+means /proc was already gone (the process had exited before we looked), which is
+deliberately distinct from `Some(0)`, "the kernel says there is no controlling
+terminal". Measured on this machine 2026-09-05: `claude` 11536 tty_nr 34821
+(pts/5), `herdr` 0, `quickshell` 0. The comm field can contain spaces and
+parentheses, so the fields after it are found from the LAST `)` rather than by
+splitting the line.
+
 ## 5. Network
 
 ```yaml
@@ -445,8 +461,66 @@ Verified at: local `/proc/kallsyms`, local BTF via `TARBALL usr/local/lib/tetrag
   moatd keeps its own mode state and confirms via the next `process_exit` with
   `"signal":"SIGKILL"` for that `exec_id`.
 - `tetra tp list [-o json]` shows `MODE`; `tetra` needs the root-only gRPC socket.
+  `-o json` returns `ListTracingPoliciesResponse`, whose `policies[]` are
+  `TracingPolicyStatus { id, name, namespace, info, sensors, enabled(deprecated),
+  filter_id, error, state, kernel_memory_bytes, mode, stats }`. **`mode` (field 11) is the
+  one moatd reads**, a `TracingPolicyMode`: `TP_MODE_UNKNOWN` 0, `TP_MODE_ENFORCE` 1,
+  `TP_MODE_MONITOR` 2, `TP_MODE_MONITOR_ONLY` 3. Field numbers and JSON names read out of
+  the FileDescriptorProto embedded in `/usr/bin/tetra` (v1.7.1), not from the docs — see
+  `Daemon::kernel_policy_modes`. The text table is
+  `ID NAME STATE FILTERID NAMESPACE SENSORS KERNELMEMORY MODE NPOST NENFORCE NMONITOR`;
+  `NAMESPACE` is empty for every moat policy and tabwriter pads it with spaces, so the
+  text parser finds the `TP_MODE_*` token by shape rather than counting columns.
 - `disable-kprobe-multi` forces classic kprobes (only if attach fails); `enable-policy-filter`
   is k8s-only, leave off.
+
+### 7.1 The arming race (2026-09-05)
+
+`set-mode` only works on a policy the kernel **already has**, and nothing in the unit
+ordering guaranteed that.
+
+tetragon.service is `Type=simple`, so systemd calls it started the instant
+`/usr/bin/tetragon` forks. moatd is `Requires=/After=/PartOf=tetragon.service`, so it
+started, believed the sensor was up, and ran `reapply_enforcement` — `tetra tp set-mode
+<name> enforce` for each armed policy — about **2 seconds** in.
+
+The numbers from that day's journal: tetragon started at 21:08:45, the "Added TracingPolicy
+with success" lines ran until 21:09:01, and "Listening for events…" landed at 21:09:01.
+**16 seconds to load 44 policies. The re-arm ran at +2 s.** The first call failed with
+`dial tcp [::1]:54321: address family not supported` (the gRPC server was not listening
+yet); the six after it failed with `tracing policy {moat-…} does not exist`. moatd logged
+`ERROR re-arming after start: 7 of 7 policies did NOT take` and then did nothing about it —
+no retry, no verification.
+
+Meanwhile `status.enforcing_rules`, `moatctl status`'s `enforcing` line, and the panel all
+went on listing the seven as armed, because that list is restored from `state.json` and had
+never been checked against the kernel. Every policy renders as `policy-mode: monitor`
+(`Set option policy-mode = monitor` in the tetragon journal), so all seven sat in monitor
+for the rest of the day. It happened **seven times** that day: every boot, every
+`sudo moatd telemetry --apply`, every tetragon restart. The six moatd-only restarts
+succeeded, because tetragon was already loaded — which is why it was invisible.
+
+The fix has three parts, and each one covers a case the others do not:
+
+1. **`ExecStartPost=-/usr/bin/moatd wait-sensor --timeout 120`** on tetragon.service. A unit
+   with an `ExecStartPost` stays in `activating` until it returns, so this is what makes
+   `After=tetragon.service` order against a *loaded* sensor instead of a *forked* one.
+   `wait-sensor` counts the policies pinned under `/sys/fs/bpf/tetragon`. The `-` prefix is
+   deliberate: a slow load must not fail the sensor unit and hand it to `Restart=always`.
+   `TimeoutStartSec=180` covers the wait.
+2. **`[thresholds] arm_wait_secs` (120 s) in the daemon.** `Daemon::arm_tick` polls the pin
+   count against the rendered policy count — falling back to `tetra tp list` naming the
+   wanted policies when bpffs is unreadable — and does not call `set-mode` at all until the
+   sensor is ready, retrying failures on a backoff inside the window. It runs on the
+   periodic tick, never on the event path, so the wait cannot stall the tail. The unit fix
+   does nothing for a tetragon that reloads policies *later*; this does.
+3. **`Daemon::verify_enforcement`, once a minute, for ever.** Reads `mode` per policy from
+   `tetra tp list -o json` and compares it with `enforcing_rules`. A disagreement is
+   re-armed, the kernel is read *back* (a `set-mode` exit status is a claim, and claims were
+   the problem), and whatever survives is published as `enforcing_verified` /
+   `enforcing_unverified` — with one deduped `moat-x-protection-changed` alert, not one per
+   tick. Being unable to *ask* is never reported as a gap: that is `sensor_unhealthy`'s
+   story, and inventing a second one from the same silence double-counts it.
 
 Verified at: `SRC bpf/lib/policy_conf.h`, `SRC bpf/process/generic_calls.h` (do_action/do_actions),
 `SRC pkg/policyconf/policyconf.go`, `DOC concepts/tracing-policy/mode.md`, `TARBALL tetra tp set-mode --help`,
@@ -531,7 +605,7 @@ Samples (shape from proto + docs; values synthetic; one line each in the file):
 {"process_kprobe":{"process":{"...":"..."},"parent":{"...":"..."},"function_name":"security_file_permission","args":[{"file_arg":{"path":"/home/dan/.ssh/id_rsa","permission":"-rw-------"}},{"int_arg":4}],"return":{"int_arg":0},"action":"KPROBE_ACTION_POST","policy_name":"moat-cred-ssh-private-key-read","return_action":"KPROBE_ACTION_POST","message":"SSH private key read","tags":["observability.filesystem"]},"node_name":"mars","time":"2026-09-03T16:21:07.001000000Z"}
 ```
 ```json
-{"process_kprobe":{"process":{"...":"..."},"parent":{"...":"..."},"function_name":"tcp_connect","args":[{"sock_arg":{"family":"AF_INET","type":"SOCK_STREAM","protocol":"IPPROTO_TCP","saddr":"192.168.1.20","daddr":"1.2.3.4","sport":51234,"dport":4444,"cookie":"1234567","state":"TCP_SYN_SENT"}}],"action":"KPROBE_ACTION_SIGKILL","policy_name":"moat-net-reverse-shell","kernel_stack_trace":[{"address":"18446744072119856613","offset":"5","symbol":"tcp_connect"}]},"node_name":"mars","time":"2026-09-03T16:22:00.000000000Z"}
+{"process_kprobe":{"process":{"...":"..."},"parent":{"...":"..."},"function_name":"tcp_connect","args":[{"sock_arg":{"family":"AF_INET","type":"SOCK_STREAM","protocol":"IPPROTO_TCP","saddr":"192.168.1.20","daddr":"1.2.3.4","sport":51234,"dport":4444,"cookie":"1234567","state":"TCP_SYN_SENT"}}],"action":"KPROBE_ACTION_SIGKILL","policy_name":"moat-shell-reverse-shell-connect","kernel_stack_trace":[{"address":"18446744072119856613","offset":"5","symbol":"tcp_connect"}]},"node_name":"mars","time":"2026-09-03T16:22:00.000000000Z"}
 ```
 (Stack traces only with `kernelStackTrace: true`; addresses 0 unless `--expose-stack-addresses`.
 Other oneofs: `int_arg` (int32), `uint_arg`, `size_arg`, `long_arg`, `string_arg`,

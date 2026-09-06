@@ -15,6 +15,7 @@
 //! | `moat-pkg-subtree-downloader`       | exact package-subtree membership              |
 //! | `moat-pkg-subtree-netcat-exec`      | exact package-subtree membership              |
 //! | `moat-ai-cli-in-pkg-subtree`        | exact package-subtree membership              |
+//! | `moat-shell-stdio-socket`           | fds 0/1/2 of a live process (no hook has them)|
 //!
 //! The last four keep the ids and severities of the kernel policies they
 //! replace, because docs, the allowlist and the shell plugin all name them.
@@ -32,6 +33,7 @@ pub mod pkg_egress;
 pub mod pkg_subtree;
 pub mod pkgtree;
 pub mod self_proc_read;
+pub mod shell_stdio_socket;
 
 use crate::config::Config;
 use crate::event::{ExecEvent, HookHit};
@@ -64,11 +66,24 @@ pub const INTERACTIVE: &[&str] = &[
 // NOTE: this list is a hardcoded set of NAMES, and that is its weakness. Any
 // terminal or session host not written here silently becomes the root of every
 // tree beneath it, which turns one chain into a bag of unrelated events -- and
-// nothing fails loudly when that happens. The general fix is to stop asking
-// what a process is CALLED and ask what it IS: a session leader (`sid == pid`
-// in /proc/<pid>/stat) is a boundary by definition, whatever it is named. That
-// needs the session id carried on ProcInfo, which the exec path does not read
-// today.
+// nothing fails loudly when that happens.
+//
+// It is now a FALLBACK everywhere it is used, not the answer, because the
+// general fix is to stop asking what a process is CALLED and ask what it IS,
+// and /proc has both halves of that:
+//
+// * `chain::is_boundary` asks `sid == pid` -- a session leader is a session
+//   boundary by definition, whatever it is named (2026-09-04);
+// * `context::classify` and `moat-x-ai-cli-headless` ask whether the process or
+//   any ancestor holds a controlling terminal -- a pty means somebody opened
+//   one, whatever allocated it (2026-09-05, after `herdr` put nine of thirteen
+//   badge alerts in the `service` context).
+//
+// The list is consulted only when /proc could not be read, i.e. the process had
+// already exited. Adding a name here is a patch for one host; it is never the
+// fix. `context.rs` extends it with `INTERACTIVE_EXTRA` (editors, `sudo`)
+// rather than growing it, because "a person is driving this" and "this is the
+// root of a story" are different questions and `sudo` answers them differently.
 
 /// The AI CLIs CONTRACT §6.4 names.
 pub const AI_CLIS: &[&str] = &["claude", "codex", "gemini", "opencode", "q", "amp"];
@@ -82,6 +97,11 @@ pub const SKIP_PERMISSION_FLAGS: &[&str] = &[
     "--auto-approve",
 ];
 
+/// "no rule is armed on its own", for every caller that only exercises the
+/// daemon-wide mode. A `static` rather than a temporary because `RuleCtx` holds
+/// a borrow of the daemon's real set.
+pub static NO_RULES_ARMED: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
 pub struct RuleCtx<'a> {
     pub cfg: &'a Config,
     pub table: &'a ProcTable,
@@ -94,6 +114,20 @@ pub struct RuleCtx<'a> {
     pub homes: &'a [String],
     pub now: u64,
     pub mode: &'a str,
+    /// The rules armed INDIVIDUALLY while the daemon stays in monitor
+    /// (`Daemon::enforcing_rules`). A userland rule that can kill has to read
+    /// this as well as `mode`, or `moatctl set mode enforce --rule <it>` would
+    /// arm a switch that nothing consults — which is what it did until
+    /// 2026-09-05.
+    pub armed: &'a std::collections::BTreeSet<String>,
+}
+
+impl RuleCtx<'_> {
+    /// Is this rule allowed to end a process right now? The daemon-wide mode,
+    /// or this one rule armed on its own. Mirrors `Daemon::mode_for`.
+    pub fn enforcing(&self, rule: &str) -> bool {
+        self.mode == "enforce" || self.armed.contains(rule)
+    }
 }
 
 impl RuleCtx<'_> {
@@ -145,6 +179,7 @@ pub fn all() -> Vec<Box<dyn UserRule>> {
         Box::new(pkg_subtree::Downloader),
         Box::new(pkg_subtree::NetcatExec),
         Box::new(pkg_subtree::AiCliInPkgSubtree),
+        Box::new(shell_stdio_socket::ShellStdioSocket::default()),
     ]
 }
 
@@ -173,7 +208,35 @@ pub fn meta(
         expected: expected.into(),
         fp_hint: fp_hint.into(),
         mode_default: "monitor".into(),
+        // BASELINE §4: a userland rule is a detection unless it says otherwise,
+        // for the same reason a policy is — a rule that forgot to declare its
+        // tier must keep asking, never go quiet. `signal` is set by the handful
+        // of rules that are building blocks (`signal_meta`).
+        tier: crate::policy::TIER_DETECTION.into(),
     }
+}
+
+/// The same builder, for a rule that is a **building block, not a detection**
+/// (BASELINE §4, `moat.omarchy/tier: signal`).
+///
+/// `why` still has to stand on its own, and `signal` does not soften it: the
+/// severity is unchanged, the rule is a full chain trigger, and it is recorded
+/// exactly as before. What changes is that it never reaches the badge alone.
+#[allow(clippy::too_many_arguments)]
+pub fn signal_meta(
+    name: &str,
+    family: &str,
+    severity: &str,
+    title: &str,
+    why: &str,
+    expected: &str,
+    rotate: &[&str],
+    actions: &[&str],
+    fp_hint: &str,
+) -> PolicyMeta {
+    let mut m = meta(name, family, severity, title, why, expected, rotate, actions, fp_hint);
+    m.tier = crate::policy::TIER_SIGNAL.into();
+    m
 }
 
 /// `moat-x-sensor-mismatch`: raised in place of a policy alert when the kernel
@@ -435,21 +498,32 @@ pub(crate) mod testkit {
         }
     }
 
-    /// A table with `fish -> npm -> node` already in it.
+    /// A table with `fish -> npm -> node` already in it, on a pty.
+    ///
+    /// The sids and ttys are stated rather than left to `observe`, which reads
+    /// them from the real /proc: pid 41101 belongs to whatever happens to be
+    /// running on the machine under test, and since 2026-09-05 the tty decides
+    /// what these fixtures mean.
     pub fn table_with_install() -> ProcTable {
         let mut t = ProcTable::new(8, 60);
         t.observe(&proc("e-term", 41100, "/usr/bin/alacritty", "", None));
         t.observe(&proc("e-fish", 41101, "/usr/bin/fish", "", Some("e-term")));
         t.observe(&proc("e-npm", 41201, "/usr/bin/npm", "install", Some("e-fish")));
         t.observe(&proc("e-node", 41250, "/usr/bin/node", "install.js", Some("e-npm")));
+        for id in ["e-term", "e-fish", "e-npm", "e-node"] {
+            t.set_session(id, Some(41100), Some(34821));
+        }
         t
     }
 
-    /// A table with no terminal anywhere: systemd -> node.
+    /// A table with no terminal and no pty anywhere: systemd -> node.
     pub fn table_headless() -> ProcTable {
         let mut t = ProcTable::new(8, 60);
         t.observe(&proc("e-sd", 1, "/usr/lib/systemd/systemd", "", None));
         t.observe(&proc("e-node", 41250, "/usr/bin/node", "server.js", Some("e-sd")));
+        for id in ["e-sd", "e-node"] {
+            t.set_session(id, Some(1), Some(0));
+        }
         t
     }
 
@@ -525,9 +599,10 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), n, "rule ids must be unique");
         assert_eq!(
-            n, 11,
+            n, 12,
             "four gap rules, the four that replaced pkg policies, net-first-contact, \
-             and the two that read binary_properties (memfd, privileges raised)"
+             the two that read binary_properties (memfd, privileges raised), and \
+             shell-stdio-socket"
         );
 
         // Every rule must be switchable off, or `[rules]` is a lie.
@@ -544,6 +619,7 @@ mod tests {
             pkg_subtree_downloader: false,
             pkg_subtree_netcat_exec: false,
             ai_cli_in_pkg_subtree: false,
+            shell_stdio_socket: false,
         };
         for r in &rules {
             assert!(r.enabled(&cfg()), "{} is off by default", r.id());

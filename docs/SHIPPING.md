@@ -380,7 +380,7 @@ Plain HTTP to anything else is refused with the reason.
 > writes (every Tetragon start re-walks `/proc`). Turning `network` or `file`
 > on or off is exactly that operation.
 
-Use the command. It does the four things doing it by hand skips:
+Use the command. It does the five things doing it by hand skips:
 
 ```console
 $ sudoedit /etc/moat/moat.toml        # the [telemetry] block
@@ -397,11 +397,28 @@ $ sudo moatd telemetry --apply
 3. **Restart tetragon, then moatd, in that order.** moatd is `PartOf=`
    tetragon.service and tails the log tetragon writes; the other order leaves it
    waiting on a file nothing is writing.
-4. **Verify, rather than assume.** Poll `/sys/fs/bpf/tetragon` until the number
-   of *pinned* policies matches what was rendered. That asks the kernel, which
-   is the only source that goes to zero the instant the sensor dies. If it does
-   not come back inside `--verify-timeout` (60s), the command exits non-zero
-   and says so loudly, with the rollback instruction.
+4. **Verify the load, rather than assume.** Poll `/sys/fs/bpf/tetragon` until
+   the number of *pinned* policies matches what was rendered. That asks the
+   kernel, which is the only source that goes to zero the instant the sensor
+   dies. If it does not come back inside `--verify-timeout` (60s), the command
+   exits non-zero and says so loudly, with the rollback instruction.
+
+   The directory **not existing yet** is "not yet", not "not root": tetragon
+   recreates it as it pins its first policy, so it is genuinely absent for the
+   first second or two after the restart this command just issued. Until
+   2026-09-05 that was read as "are you root?" and exited 1 — under `sudo`,
+   after both restarts had already happened. `--apply` now checks for root
+   **before** it touches the sensor, where the answer can still prevent
+   something; after the deadline, an absent bpffs is reported as "never
+   appeared", with the journal commands.
+
+5. **Verify the arming.** Loading is not arming. Pinned policies say the sensor
+   read the files; they say nothing about whether the rules you armed are in
+   `enforce`, which is a separate thing moatd does afterwards — and which failed
+   silently for a whole day on 2026-09-05 (NOTES §7.1). So the last thing
+   `--apply` does is ask the running daemon for `enforcing_unverified` over the
+   control socket and print it. A non-empty answer is a warning, not a failure:
+   moatd retries on its own, and `moatctl status` is where to watch it.
 
 `moatd telemetry` with no `--apply` reports and changes nothing.
 `--no-restart` renders and validates but tells you plainly that the kernel has

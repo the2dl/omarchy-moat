@@ -29,7 +29,7 @@ use crate::explain::Finding;
 use crate::policy::PolicyMeta;
 use crate::proctable::{ProcInfo, ProcTable};
 use crate::rules::pkgtree;
-use crate::rules::{meta, RuleCtx, UserRule, AI_CLIS};
+use crate::rules::{meta, signal_meta, RuleCtx, UserRule, AI_CLIS};
 use crate::util::basename;
 
 pub const INTERPRETER_SPAWN: &str = "moat-pkg-subtree-interpreter-spawn";
@@ -116,8 +116,9 @@ impl UserRule for InterpreterSpawn {
         cfg.rules.pkg_subtree_interpreter_spawn
     }
 
+    /// `tier: signal` — weak alone; exists to be a chain step (BASELINE §4).
     fn meta(&self) -> PolicyMeta {
-        meta(
+        signal_meta(
             INTERPRETER_SPAWN,
             "pkg",
             "low",
@@ -272,7 +273,7 @@ impl UserRule for NetcatExec {
     }
 
     fn meta(&self) -> PolicyMeta {
-        meta(
+        let mut m = meta(
             NETCAT_EXEC,
             "pkg",
             "critical",
@@ -286,7 +287,12 @@ impl UserRule for NetcatExec {
             &[],
             &["kill", "quarantine", "ignore"],
             "parent",
-        )
+        );
+        // Arming this rule ends the process, so it says `kill` like a kernel
+        // policy and `enforceable()` lists it. moatd does the signalling
+        // (`maybe_enforce`); nothing is pushed into the kernel for it.
+        m.enforce = "kill".into();
+        m
     }
 
     fn on_exec(&mut self, _ev: &ExecEvent, exec_id: &str, ctx: &RuleCtx) -> Vec<Finding> {
@@ -298,16 +304,22 @@ impl UserRule for NetcatExec {
             return Vec::new();
         }
 
-        let enforcing = ctx.mode == "enforce";
+        // The DAEMON-wide mode, or this one rule armed on its own. Until
+        // 2026-09-05 only the first existed here, so `moatctl set mode enforce
+        // --rule moat-pkg-subtree-netcat-exec` recorded an arming that nothing
+        // read: the only way to make this rule kill was to arm every rule on
+        // the machine, which is exactly the all-or-nothing that per-rule
+        // enforcement exists to avoid (CONTRACT §6.5).
+        let enforcing = ctx.enforcing(NETCAT_EXEC);
         // In enforce mode the engine appends the *outcome* line (it is the one
         // that knows whether the signal landed), so say nothing here.
         let mut extra = vec![format!("matched on network tool `{}`", comm)];
         if !enforcing {
-            extra.push(
-                "monitor mode: nothing was killed. `moatctl kill <id>` stops it, or switch to \
-                 enforce with `moatctl set mode enforce`"
-                    .to_string(),
-            );
+            extra.push(format!(
+                "monitor mode: nothing was killed. `moatctl kill <id>` stops it, or arm this one \
+                 rule with `moatctl set mode enforce --rule {}`",
+                NETCAT_EXEC
+            ));
         }
 
         let mut out: Vec<Finding> = subtree_finding(
@@ -425,6 +437,7 @@ mod tests {
             homes: &homes,
             now: 1_000,
             mode,
+            armed: &crate::rules::NO_RULES_ARMED,
         };
         rule.on_exec(&ExecEvent::default(), exec_id, &ctx)
     }

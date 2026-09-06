@@ -1,10 +1,15 @@
 //! `moatd` — the daemon and the policy renderer.
 //!
-//! Two subcommands:
+//! Subcommands:
 //!
 //! * `render-policies` — runs as tetragon.service's `ExecStartPre`; expands
 //!   `{{HOME}}` and regenerates the export-allowlist.
+//! * `wait-sensor` — runs as tetragon.service's `ExecStartPost`; blocks until
+//!   the rendered policies are actually pinned in the kernel, so
+//!   `After=tetragon.service` orders against a LOADED sensor rather than a
+//!   forked one (NOTES §7.1).
 //! * `run` — tails the export, serves the control socket.
+//! * `config`, `telemetry` — report, and apply a telemetry profile.
 //!
 //! Every path is overridable, which is what makes dev mode possible:
 //!
@@ -50,6 +55,18 @@ enum Cmd {
     Config,
     /// Show or apply the selectable telemetry classes.
     Telemetry(TelemetryArgs),
+    /// Block until Tetragon has actually loaded the rendered policies.
+    WaitSensor(WaitSensorArgs),
+}
+
+#[derive(Args)]
+struct WaitSensorArgs {
+    /// Seconds to wait before giving up.
+    #[arg(long, default_value_t = 120)]
+    timeout: u64,
+    /// Rendered policies to count against (default `[paths] policies_dir`).
+    #[arg(long)]
+    policies_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -156,6 +173,7 @@ fn main() -> std::process::ExitCode {
         Cmd::RenderPolicies(a) => cmd_render(cfg, a),
         Cmd::Run(a) => cmd_run(cfg, cfg_path, a),
         Cmd::Telemetry(a) => cmd_telemetry(cfg, cfg_path, a),
+        Cmd::WaitSensor(a) => cmd_wait_sensor(cfg, a),
         Cmd::Config => {
             println!("{}", toml::to_string_pretty(&cfg).unwrap_or_default());
             std::process::ExitCode::SUCCESS
@@ -498,6 +516,26 @@ fn cmd_telemetry(cfg: Config, cfg_path: PathBuf, a: TelemetryArgs) -> std::proce
     }
 
     // ---- 3. restart, in the documented order -----------------------------
+    // Root, and say so BEFORE touching the sensor.
+    //
+    // Until 2026-09-05 this check lived in step 4, phrased as "cannot read
+    // /sys/fs/bpf/tetragon (are you root?)" -- so a non-root caller got both
+    // restarts issued and then a question about their privileges, and (worse)
+    // a *root* caller got the same message and exit 1 the moment bpffs had not
+    // been recreated yet, which is the normal state two seconds after a
+    // tetragon restart. Both halves of the confusion are fixed here: the
+    // privilege question is asked once, up front, where it can still prevent
+    // something.
+    let is_root = unsafe { libc::geteuid() } == 0;
+    if !is_root {
+        eprintln!(
+            "moatd telemetry --apply needs root: it restarts tetragon.service and \
+             moatd.service, and verifies the result by reading {}.\n  \
+             sudo moatd telemetry --apply",
+            cfg.paths.tetragon_bpf_dir.display()
+        );
+        return std::process::ExitCode::from(1);
+    }
     // tetragon first: moatd is PartOf=tetragon.service and tails the log
     // tetragon writes, so restarting moatd first would just make it wait.
     for unit in ["tetragon.service", "moatd.service"] {
@@ -528,10 +566,9 @@ fn cmd_telemetry(cfg: Config, cfg_path: PathBuf, a: TelemetryArgs) -> std::proce
     // ---- 4. verify, rather than assume -----------------------------------
     let expected = report.rendered.len();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(a.verify_timeout);
-    let mut last;
+    let mut last = None;
     loop {
-        let loaded = count_pinned(&cfg.paths.tetragon_bpf_dir);
-        match loaded {
+        match count_pinned(&cfg.paths.tetragon_bpf_dir) {
             Some(n) if n >= expected => {
                 println!(
                     "sensor verified: {}/{} policies pinned under {}",
@@ -540,40 +577,203 @@ fn cmd_telemetry(cfg: Config, cfg_path: PathBuf, a: TelemetryArgs) -> std::proce
                     cfg.paths.tetragon_bpf_dir.display()
                 );
                 println!("telemetry classes now on: {}", classes.join(", "));
+                report_arming(&cfg);
                 return std::process::ExitCode::SUCCESS;
             }
-            Some(n) => last = n,
-            None => {
-                // Cannot read bpffs at all — almost always "not root". That is
-                // "cannot tell", not "all good", and it must be said as such.
-                eprintln!(
-                    "WARNING: cannot read {} to verify the sensor (are you root?). \
-                     The restart was issued but NOT verified — check \
-                     `moatctl status` before trusting this machine.",
-                    cfg.paths.tetragon_bpf_dir.display()
-                );
-                return std::process::ExitCode::from(1);
-            }
+            Some(n) => last = Some(n),
+            // `None` here is "NOT YET", not "not root": the caller is root (we
+            // checked before restarting anything) and tetragon recreates
+            // /sys/fs/bpf/tetragon as it pins its first policy, so the
+            // directory genuinely does not exist for the first second or two
+            // after the restart this command just issued. Treating that as a
+            // hard failure is what happened on 2026-09-05, under sudo: the
+            // restart worked, the verification exited 1 anyway, and the
+            // operator was asked whether they were root.
+            None => {}
         }
         if std::time::Instant::now() >= deadline {
             break;
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    eprintln!(
-        "SENSOR NOT HEALTHY after {}s: {}/{} policies pinned under {}.\n\
-         The machine may be unprotected right now. This is the 2026-09-03 failure mode:\n\
-           journalctl -u tetragon -n 50\n\
-           moatctl status\n\
-         To roll back, put the previous [telemetry] block into {} and run \
-         `moatd telemetry --apply` again.",
-        a.verify_timeout,
-        last,
-        expected,
-        cfg.paths.tetragon_bpf_dir.display(),
-        cfg_path.display()
-    );
+    match last {
+        Some(n) => eprintln!(
+            "SENSOR NOT HEALTHY after {}s: {}/{} policies pinned under {}.\n\
+             The machine may be unprotected right now. This is the 2026-09-03 failure mode:\n\
+               journalctl -u tetragon -n 50\n\
+               moatctl status\n\
+             To roll back, put the previous [telemetry] block into {} and run \
+             `moatd telemetry --apply` again.",
+            a.verify_timeout,
+            n,
+            expected,
+            cfg.paths.tetragon_bpf_dir.display(),
+            cfg_path.display()
+        ),
+        None => eprintln!(
+            "SENSOR NOT HEALTHY after {}s: {} never appeared, so tetragon has not pinned a \
+             single one of {} policies.\n\
+             The machine is unprotected right now:\n\
+               journalctl -u tetragon -n 50\n\
+               systemctl status tetragon\n\
+             To roll back, put the previous [telemetry] block into {} and run \
+             `moatd telemetry --apply` again.",
+            a.verify_timeout,
+            cfg.paths.tetragon_bpf_dir.display(),
+            expected,
+            cfg_path.display()
+        ),
+    }
     std::process::ExitCode::from(1)
+}
+
+/// Loading is not arming.
+///
+/// Pinned policies say the sensor read the files; they say nothing about
+/// whether the rules the user armed are in `enforce`, which is a separate
+/// thing moatd does afterwards and which failed silently for a whole day on
+/// 2026-09-05. So the last thing `--apply` does is ask the daemon that just
+/// restarted. Best-effort: the socket may not be back yet, and that is a
+/// "check `moatctl status`", not a failure of the apply.
+fn report_arming(cfg: &Config) {
+    let req = serde_json::json!({"cmd": "status"});
+    for attempt in 0..10 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        let Ok(r) = control::request(&cfg.paths.socket, &req) else {
+            continue;
+        };
+        let unverified: Vec<&str> = r["enforcing_unverified"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+            .unwrap_or_default();
+        if !unverified.is_empty() {
+            eprintln!(
+                "WARNING: {} armed policy/policies are NOT armed in the kernel: {}\n  \
+                 moatd is retrying; check `moatctl status` and \
+                 `journalctl -u moatd -u tetragon`.",
+                unverified.len(),
+                unverified.join(", ")
+            );
+            return;
+        }
+        if r["arming_pending"] == serde_json::Value::Bool(true) {
+            println!("arming: moatd is still waiting for the sensor; check `moatctl status`");
+            return;
+        }
+        match r["enforcing_rules"].as_array() {
+            Some(e) if !e.is_empty() => println!(
+                "enforcement verified: {} policy/policies armed in the kernel",
+                e.len()
+            ),
+            _ => println!("enforcement: nothing is armed"),
+        }
+        return;
+    }
+    println!(
+        "(could not reach {} to check arming; run `moatctl status`)",
+        cfg.paths.socket.display()
+    );
+}
+
+/// `moatd wait-sensor` — make systemd's "tetragon started" mean "the policies
+/// are loaded".
+///
+/// tetragon.service is `Type=simple`, so systemd calls it started the instant
+/// it forks. On 2026-09-05 that was 16 seconds and 44 policies before the
+/// sensor could answer for any of them, and moatd — ordered `After=` it, and
+/// therefore believing it — re-armed 2 s in and had all seven `tetra tp
+/// set-mode` calls fail against names the kernel did not have yet.
+///
+/// Wired as `ExecStartPost=-` on tetragon.service, this closes that: a unit
+/// with an `ExecStartPost` stays in `activating` until the command returns, so
+/// `After=tetragon.service` finally orders against *loaded* rather than
+/// *forked*. The `-` prefix is deliberate — a timeout here must not fail the
+/// sensor unit and hand it to `Restart=always` in a loop; the ordering is the
+/// point, the exit code is for a human running it by hand.
+///
+/// Exit: 0 loaded, 1 timed out, 2 could not read bpffs at all (not root).
+fn cmd_wait_sensor(cfg: Config, a: WaitSensorArgs) -> std::process::ExitCode {
+    let dir = a.policies_dir.unwrap_or_else(|| cfg.paths.policies_dir.clone());
+    let expected = moatd::policy::PolicySet::load(&dir).len();
+    let bpf = &cfg.paths.tetragon_bpf_dir;
+    if expected == 0 {
+        println!("wait-sensor: no policies in {}, nothing to wait for", dir.display());
+        return std::process::ExitCode::SUCCESS;
+    }
+
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(a.timeout);
+    let mut reported = usize::MAX;
+    let mut last = None;
+    loop {
+        let now = count_pinned(bpf);
+        // Keep the best answer we ever got: a bpffs that appeared and then
+        // vanished is a sensor that died, and saying "never appeared" there
+        // would send the reader looking for a permissions problem instead.
+        last = now.or(last);
+        match now {
+            Some(n) if n >= expected => {
+                println!(
+                    "sensor loaded: {}/{} policies pinned under {} after {}s",
+                    n,
+                    expected,
+                    bpf.display(),
+                    start.elapsed().as_secs()
+                );
+                return std::process::ExitCode::SUCCESS;
+            }
+            // Progress, not silence: 16 seconds of nothing on the console is
+            // indistinguishable from a hang, and this runs on every boot.
+            Some(n) if n != reported => {
+                println!("waiting for the sensor: {}/{} policies pinned", n, expected);
+                reported = n;
+            }
+            Some(_) => {}
+            None => {
+                // The directory does not exist YET on a cold start -- tetragon
+                // creates it as it pins the first policy. "Cannot read it" is
+                // only "are you root" once the deadline has passed.
+                if reported == usize::MAX {
+                    println!(
+                        "waiting for the sensor: {} does not exist yet",
+                        bpf.display()
+                    );
+                    reported = 0;
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    match last {
+        Some(n) => {
+            eprintln!(
+                "wait-sensor: TIMED OUT after {}s with {}/{} policies pinned under {}.\n\
+                 The sensor is up but not fully loaded; anything armed will not be enforcing.\n  \
+                 journalctl -u tetragon -n 50\n  moatctl status",
+                a.timeout,
+                n,
+                expected,
+                bpf.display()
+            );
+            std::process::ExitCode::from(1)
+        }
+        None => {
+            eprintln!(
+                "wait-sensor: {} never appeared in {}s.\n\
+                 If you are not root, this command cannot see it at all -- run it with sudo.\n\
+                 If you are root, tetragon has not pinned a single policy:\n  \
+                 journalctl -u tetragon -n 50",
+                bpf.display(),
+                a.timeout
+            );
+            std::process::ExitCode::from(2)
+        }
+    }
 }
 
 /// Same count as `Daemon::sensors_loaded`, without needing a daemon.

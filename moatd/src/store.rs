@@ -256,6 +256,56 @@ impl AlertStore {
         });
         counts
     }
+
+    /// The three numbers `moatctl status` and the panel print, in the three
+    /// words they print them in.
+    ///
+    /// One count was never three questions. `unacked` counts the badge and is
+    /// right about it, but everything downstream printed it under a word --
+    /// "unacked" -- that a person reads as a backlog, so a day of quickshell
+    /// plugin execs read as 1,854 things waiting for an answer. 48% of those
+    /// records were allowlisted (the user had already answered) and the rest
+    /// were timeline rows that were never a question. Naming the three
+    /// populations separately is the whole fix; nothing is filtered or dropped.
+    ///
+    /// * **needs you** — on the badge, unacked, not suppressed. `unacked`
+    ///   summed, and the only number a person is being asked about.
+    /// * **recorded** — timeline rows. Everything moat saw, wrote down and did
+    ///   not ask about, including every `signal`-tier building block.
+    /// * **suppressed** — an allowlist entry matched. Recorded and never
+    ///   counted, BASELINE §8.
+    /// * **signal** — the part of `recorded` that came from a `signal` rule, so
+    ///   "recorded" can be read as "how much of this is scaffolding".
+    pub fn ledger(&self) -> Ledger {
+        let mut l = Ledger::default();
+        self.with_fold(|c| {
+            for a in c.map.values() {
+                if a.is_suppressed() {
+                    l.suppressed += 1;
+                } else if a.surface == "alerts" {
+                    if !a.acked {
+                        l.needs_you += 1;
+                    }
+                } else {
+                    l.recorded += 1;
+                    if a.tier == crate::policy::TIER_SIGNAL {
+                        l.signal += 1;
+                    }
+                }
+            }
+        });
+        l
+    }
+}
+
+/// What is in `alerts.jsonl`, split by what it asks of a person
+/// (`AlertStore::ledger`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Ledger {
+    pub needs_you: u64,
+    pub recorded: u64,
+    pub suppressed: u64,
+    pub signal: u64,
 }
 
 #[cfg(test)]
@@ -358,6 +408,47 @@ mod tests {
         s.append_update(&UpdateLine::new(&b.id).set("suppressed_by", Value::from("user.toml#1")))
             .unwrap();
         assert_eq!(s.unacked()["high"], 0);
+    }
+
+    /// Three populations, three names, and every record in exactly one of them.
+    ///
+    /// The bug this closes is a wording bug with a real cost: `unacked` was
+    /// right about the badge and was printed under a word people read as a
+    /// backlog, so a day of quickshell plugin execs showed as "1,854" next to a
+    /// badge of 13. Nothing here filters anything — it names what is already
+    /// there.
+    #[test]
+    fn the_ledger_splits_the_file_into_needs_you_recorded_and_suppressed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store(dir.path(), 1 << 20);
+        let mut put = |id: &str, surface: &str, tier: &str, sup: Option<&str>, acked: bool| {
+            let mut a = demo_alert(id);
+            a.surface = surface.into();
+            a.tier = tier.into();
+            a.suppressed_by = sup.map(|x| x.to_string());
+            a.acked = acked;
+            s.append_alert(&a).unwrap();
+        };
+        put("01L00000000000000000000001", "alerts", "detection", None, false);
+        put("01L00000000000000000000002", "alerts", "detection", None, true);
+        put("01L00000000000000000000003", "timeline", "detection", None, false);
+        put("01L00000000000000000000004", "timeline", "signal", None, false);
+        put("01L00000000000000000000005", "timeline", "signal", None, false);
+        // A suppressed row is suppressed first, whatever else it looks like.
+        put("01L00000000000000000000006", "timeline", "signal", Some("user.toml#1"), false);
+
+        let l = s.ledger();
+        assert_eq!(l.needs_you, 1, "acked rows have been answered");
+        assert_eq!(l.recorded, 3);
+        assert_eq!(l.signal, 2, "the part of `recorded` that is scaffolding");
+        assert_eq!(l.suppressed, 1);
+        // `needs_you` is `unacked` as one number, and always will be.
+        assert_eq!(l.needs_you, s.unacked().values().sum::<u64>());
+        assert_eq!(
+            l.needs_you + l.recorded + l.suppressed + 1,
+            s.load().len() as u64,
+            "every record is in exactly one population (+1 for the acked badge row)"
+        );
     }
 
     /// Receipts live in the same file and must be invisible to every alert

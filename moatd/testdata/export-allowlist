@@ -1,2 +1,2 @@
 {"event_set":["PROCESS_EXEC","PROCESS_EXIT"]}
-{"policy_names":["moat-cred-cloud-credential-read","moat-cred-ssh-private-key-read","moat-net-reverse-shell","moat-priv-ptrace-attach","moat-priv-setuid-chmod"]}
+{"policy_names":["moat-cred-cloud-credential-read","moat-cred-ssh-private-key-read","moat-priv-ptrace-attach","moat-priv-setuid-chmod","moat-shell-reverse-shell-connect"]}

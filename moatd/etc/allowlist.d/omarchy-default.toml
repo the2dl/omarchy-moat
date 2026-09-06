@@ -16,32 +16,55 @@
 # The daemon's test suite proves its rules against real processes: it copies
 # `sleep` to `<tmpdir>/nc` and executes it to show that the netcat rule fires
 # and that enforce mode kills, and it executes small helpers from temp
-# directories. On the machine that develops moat, `cargo test` would therefore
-# raise a critical alert every run — which is exactly how a security tool
+# directories. The scanner suite does the same one level up: it builds a fake
+# toolchain in a `tempfile.mkdtemp` directory and runs the real `sandbox/shims`
+# against it. On the machine that develops moat, `cargo test` and `makepkg`
+# would therefore raise alerts every run — which is exactly how a security tool
 # teaches its owner to ignore it.
 #
-# The scope is deliberately as narrow as it can be written:
+# **Which field names the binary depends on the hook, and getting that wrong
+# writes an entry that can never fire.** `engine::emit` builds the allowlist
+# candidate as `exe` = the acting process, `file` = the path the hook named,
+# `parents` = every exe in the ancestry:
 #
-#   * the exe glob is `/tmp/.tmp*/…`, the shape `tempfile::tempdir()` produces,
-#     never `/tmp/*`;
-#   * the basename is `nc` or `moat-*`, the only names the suite uses;
-#   * `parent` must be a cargo test runner — `*/target/*/deps/moatd-*` is the
-#     hashed test binary cargo builds, which nothing else on the machine is.
+#   * `moat-exec-untrusted-tmpfs` hangs off `bprm_check_security`, so the actor
+#     is the CALLER (the cargo test binary, or the bash the shim invoked) and
+#     the executed binary is `file`;
+#   * `moat-pkg-subtree-netcat-exec` is a userland rule whose actor is `nc`
+#     itself, so there the executed binary IS `exe`;
+#   * `moat-priv-setuid-chmod` hangs off `path_chmod`, where the actor is the
+#     test binary and its own exe does NOT appear in the ancestry.
 #
-# All three must match (CONTRACT §6.3: every field present must match), so a
-# real dropper in /tmp, or the same binary run from a shell, still alerts.
+# On 2026-09-05 the first two entries below named `exe = "/tmp/.tmp*/nc"` and
+# `exe = "/tmp/.tmp*/moat-*"`, which is the `file` of that event: 50 of 50 such
+# alerts were unsuppressed, the shim suites added 1132 more, and two
+# `moat-priv-setuid-chmod` alerts pushed two `cargo test` chains to CRITICAL —
+# which triggered an automatic quarantine attempt on the repo's own moatctl.
+#
+# The scope is still deliberately as narrow as it can be written:
+#
+#   * the path glob is `/tmp/.tmp*/…` (the shape `tempfile::tempdir()`
+#     produces) or the suite's own `mkdtemp` prefix, never `/tmp/*`;
+#   * the basename is `nc` or `moat-*` where the suite only uses those names;
+#   * the runner must be moat's own — `*/target/*/deps/moatd-*` is the hashed
+#     test binary cargo builds and `*/sandbox/shims/*` is a shim script from
+#     this tree, neither of which anything else on the machine is.
+#
+# Every field present must match (CONTRACT §6.3), so a real dropper in /tmp, or
+# the same binary run from a shell, still alerts.
 
 # `cargo test` executes a copied `sleep` named `nc` from a tempdir to prove the
-# exec-from-tmpfs rule fires and that enforce mode kills it.
+# exec-from-tmpfs rule fires and that enforce mode kills it. The actor is the
+# test binary doing the exec, so the copied `nc` is `file`, not `exe`.
 [[rule]]
 name = "moat-exec-untrusted-tmpfs"
-exe = "/tmp/.tmp*/nc"
+file = "/tmp/.tmp*/nc"
 parent = "*/target/*/deps/moatd-*"
 
 # The same suite executes its own helpers (`moat-*`) out of a tempdir.
 [[rule]]
 name = "moat-exec-untrusted-tmpfs"
-exe = "/tmp/.tmp*/moat-*"
+file = "/tmp/.tmp*/moat-*"
 parent = "*/target/*/deps/moatd-*"
 
 # The netcat rule is the one those tests exist to exercise: a fake `nc` under a
@@ -100,6 +123,43 @@ file = "/home/*/.claude/.credentials.json"
 name = "moat-exec-untrusted-tmpfs"
 file = "/tmp/moat-sandbox-test.*/*"
 parent = "*/sandbox/shims/*"
+
+# `scanner/tests/test_npm_shim.py` is the same idea for the node shims: it
+# builds a fake `npm`/`yarn`/`pnpm`/`bun` toolchain under
+# /tmp/moat-shim-test.* with `tempfile.mkdtemp(prefix="moat-shim-test.")` and
+# runs the shipped shims against it, from `python3 -m unittest` in the
+# PKGBUILD's check(). The entry above only named the sandbox suite's prefix, so
+# on 2026-09-05 these were 348 unsuppressed alerts in one day. Same ancestry
+# scoping and the same limits: the exec is done by bash as often as by the shim.
+[[rule]]
+name = "moat-exec-untrusted-tmpfs"
+file = "/tmp/moat-shim-test.*/*"
+parent = "*/sandbox/shims/*"
+
+# ...and `scanner/tests/test_build_shim.py` for the build shims
+# (cargo/pip/pip3/uv/go), under its own /tmp/moat-build-shim-test.* prefix:
+# 784 unsuppressed alerts on 2026-09-05, the single noisiest shape on the
+# machine that develops moat.
+[[rule]]
+name = "moat-exec-untrusted-tmpfs"
+file = "/tmp/moat-build-shim-test.*/*"
+parent = "*/sandbox/shims/*"
+
+# `cargo test` runs the incident writer against a real directory tree, and
+# writing an incident chmods the files it drops — which is `moat-priv-setuid-chmod`
+# doing its job on moat's own test fixtures. Two of those on 2026-09-05 were
+# enough to carry two `cargo test` chains to CRITICAL and start an automatic
+# quarantine of the repo's own `target/release/moatctl`.
+#
+# Scoped by ACTOR, not by ancestry: `path_chmod` names the test binary as the
+# actor and its ancestry begins at `/usr/bin/cargo`, so the binary never appears
+# in `parents` and a `parent` glob here would be dead on arrival. The exe glob is
+# the hashed cargo test binary, and the file must be inside a `tempfile` scratch
+# directory — a chmod anywhere else, or by anything else, still alerts.
+[[rule]]
+name = "moat-priv-setuid-chmod"
+exe = "*/target/*/deps/moatd-*"
+file = "/tmp/.tmp*/*"
 
 # Moat's own unattended triage (LEARNING §2c) launches the user's agent with no
 # terminal, which is what `moat-x-ai-cli-headless` looks for. There is NO

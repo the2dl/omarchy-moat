@@ -15,6 +15,9 @@ metadata:
       Your editor adding a menu entry, and the omarchy-* helper scripts (suppressed
       in-kernel by the first selector).
     moat.omarchy/fp-hint: "exe"
+    # BASELINE 4: a building block, not a detection. Weak alone: persistence that needs a
+    # click, written by editors and the omarchy helpers. It exists to be a chain step.
+    moat.omarchy/tier: "signal"
 spec:
   options:
   - name: "policy-mode"

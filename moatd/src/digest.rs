@@ -1,7 +1,8 @@
 //! The weekly digest (LEARNING §5).
 //!
-//! One normal-urgency notification a week — "moat: 0 incidents, 18 installs
-//! watched, 3 baseline proposals to review" — and it is the **only** scheduled
+//! One normal-urgency notification a week — "moat: 0 needed you, 4812 recorded,
+//! 1193 suppressed, 18 installs watched, 3 baseline proposals to review" — and
+//! it is the **only** scheduled
 //! notification moat ever sends. Its job is to remind the user the thing is on
 //! and working without becoming noise, which is why it says how much was
 //! watched, not just what was wrong.
@@ -26,10 +27,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// What one week looked like.
+///
+/// `needed_you` / `recorded` / `suppressed` are the same three words
+/// `moatctl status` prints and the same three populations `AlertStore::ledger`
+/// counts, in the past tense. The digest is the one message a person reads
+/// without having asked for it, so it is the last place two different numbers
+/// should share one word: "0 incidents" next to a badge of 13 and a status
+/// screen saying "unacked 1,854" is three answers to one question.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Summary {
-    /// High and critical alerts that were not suppressed.
+    /// High and critical alerts that were not suppressed and were not `signal`
+    /// building blocks: the ones that asked for a person.
     pub incidents: u64,
+    /// Timeline rows written in the window. Seen, written down, not asked
+    /// about.
+    pub recorded: u64,
+    /// Rows an allowlist entry matched: recorded and never counted
+    /// (BASELINE §8).
+    pub suppressed: u64,
     /// Install receipts, i.e. package-manager subtrees that ran to completion.
     pub installs: u64,
     /// Baseline proposals waiting for a decision.
@@ -40,9 +55,11 @@ impl Summary {
     /// The notification body of LEARNING §5.
     pub fn text(&self) -> String {
         format!(
-            "moat: {} incident{}, {} install{} watched, {} baseline proposal{} to review",
+            "moat: {} needed you, {} recorded, {} suppressed, {} install{} watched, {} baseline \
+             proposal{} to review",
             self.incidents,
-            plural(self.incidents),
+            self.recorded,
+            self.suppressed,
             self.installs,
             plural(self.installs),
             self.proposals,
@@ -153,6 +170,9 @@ impl Digest {
             "weekday": self.weekday,
             "hour": self.hour,
             "incidents": self.summary.incidents,
+            "needs_you": self.summary.incidents,
+            "recorded": self.summary.recorded,
+            "suppressed": self.summary.suppressed,
             "installs": self.summary.installs,
             "proposals": self.summary.proposals,
         })
@@ -182,21 +202,27 @@ mod tests {
     fn the_text_is_the_sentence_from_the_doc() {
         let s = Summary {
             incidents: 0,
+            recorded: 4_812,
+            suppressed: 1_193,
             installs: 18,
             proposals: 3,
         };
         assert_eq!(
             s.text(),
-            "moat: 0 incidents, 18 installs watched, 3 baseline proposals to review"
+            "moat: 0 needed you, 4812 recorded, 1193 suppressed, 18 installs watched, \
+             3 baseline proposals to review"
         );
         let one = Summary {
             incidents: 1,
+            recorded: 1,
+            suppressed: 1,
             installs: 1,
             proposals: 1,
         };
         assert_eq!(
             one.text(),
-            "moat: 1 incident, 1 install watched, 1 baseline proposal to review"
+            "moat: 1 needed you, 1 recorded, 1 suppressed, 1 install watched, \
+             1 baseline proposal to review"
         );
         assert_eq!(s.urgency(), "normal");
     }
@@ -260,6 +286,9 @@ mod tests {
         assert!(v["due"].as_str().unwrap().ends_with("Z"));
         assert!(v["last_sent"].is_null());
         assert_eq!(v["urgency"], "normal");
-        assert!(v["text"].as_str().unwrap().starts_with("moat: 0 incidents"));
+        assert!(v["text"].as_str().unwrap().starts_with("moat: 0 needed you"));
+        assert_eq!(v["needs_you"], 0);
+        assert_eq!(v["recorded"], 0);
+        assert_eq!(v["suppressed"], 0);
     }
 }

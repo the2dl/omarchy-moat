@@ -18,6 +18,10 @@ metadata:
       destination reports at most once and then goes quiet for good, so this settles
       by itself. It never notifies and never reaches the badge on its own.
     moat.omarchy/fp-hint: "exe"
+    # BASELINE 4: a building block, not a detection. Weak alone by design: every host you
+    # use is new once. It exists to be the second half of a sequence - a credential read
+    # and then a connection somewhere new, from the same tree.
+    moat.omarchy/tier: "signal"
 spec:
   options:
   - name: "policy-mode"

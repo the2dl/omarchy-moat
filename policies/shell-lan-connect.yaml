@@ -1,0 +1,80 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-shell-lan-connect
+  annotations:
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "Shell or netcat connected to a private address"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,ignore"
+    moat.omarchy/why: >-
+      The same shape as moat-shell-reverse-shell-connect - a shell or a netcat opening a
+      TCP connection - but to an address inside your own network. That rule excludes
+      RFC1918 in-kernel, which means a reverse shell to a machine on the LAN, the shape
+      an attacker who is already inside uses, was never seen at all. Both of the C2s used
+      while testing this project were LAN hosts. It is a separate policy rather than a
+      second selector because severity, enforce and the message are per-policy
+      annotations: one file cannot say "critical, kill" about the internet and "high,
+      report" about the LAN.
+    moat.omarchy/expected: >-
+      More often than the internet-facing rule, which is why this one never kills. Hand-run
+      port checks are the whole false-positive surface: `bash -c ": < /dev/tcp/192.168.1.1/80"`
+      as a wait-for-service loop, `nc -z` scans against a LAN host, `nc`/`socat` used
+      deliberately to poke at a NAS, a printer, a router or a container host, and
+      wait-for-it.sh style scripts in a Makefile. Rate-limited to one event per process per
+      60 s so a port scan is one alert rather than a thousand. Loopback and link-local are
+      excluded: a shell talking to 127.0.0.1 is a local test harness and is covered by
+      moat-shell-stdio-socket instead.
+    moat.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  - call: "tcp_connect"
+    syscall: false
+    message: "Shell or netcat connected to a private address"
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    # The positive complement of moat-shell-reverse-shell-connect's NotDAddr
+    # list, minus loopback and link-local: DAddr is available on `sock` args
+    # (NOTES §2, per-type operator table) and address values are map-backed, so
+    # the CIDR count is not capped at four. fc00::/7 is here because IPv6 ULA is
+    # the v6 private range and the critical rule excludes it too - without this
+    # line a v6-only LAN pivot would be invisible to both policies.
+    - matchBinaries:
+      - operator: "Postfix"
+        values:
+        - "/bash"
+        - "/sh"
+        - "/dash"
+        - "/zsh"
+        - "/fish"
+        - "/busybox"
+        - "/nc"
+        - "/ncat"
+        - "/netcat"
+        - "/nc.openbsd"
+        - "/nc.traditional"
+        - "/socat"
+        - "/telnet"
+      matchArgs:
+      - index: 0
+        operator: "Family"
+        values: ["AF_INET", "AF_INET6"]
+      - index: 0
+        operator: "DAddr"
+        values:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+        - "fc00::/7"
+      matchActions:
+      # Post, never Sigkill. A port check against your own router is a normal
+      # thing for a person to type, and killing the shell that ran it is a
+      # worse outcome than the alert it saves.
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

@@ -15,6 +15,10 @@ metadata:
       makepkg builds run from /tmp, AppImage extraction, and installer scripts you piped
       to a shell yourself.
     moat.omarchy/fp-hint: "exe"
+    # BASELINE 4: a building block, not a detection. Weak alone: every build writes and
+    # runs binaries in /tmp. It exists to be a chain step - and inside a package install
+    # the context matrix makes it a detection again, which is the case it was written for.
+    moat.omarchy/tier: "signal"
 spec:
   options:
   - name: "policy-mode"

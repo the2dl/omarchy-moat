@@ -209,6 +209,14 @@ var COPY = {
     title: "A command prompt was opened to somewhere on the internet",
     stake: "Someone else would be typing into this machine."
   },
+  "moat-shell-lan-connect": {
+    title: "A command prompt reached out to another machine on your network",
+    stake: "The same trick as over the internet, from something already inside."
+  },
+  "moat-shell-stdio-socket": {
+    title: "A command prompt was wired straight to a network connection",
+    stake: "Whatever is on the other end is typing, and reading what comes back."
+  },
 
   // --- Moat talking about itself -------------------------------------------
   "moat-x-noisy-rule": {

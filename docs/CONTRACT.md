@@ -121,12 +121,28 @@ metadata:
       Backup tools, IDE git integrations, and custom scripts that call ssh libraries.
     moat.omarchy/fp-hint: "exe"              # best ignore scope for a false positive:
                                                  #   exe | exe+file | rule | parent
+    moat.omarchy/tier: "signal"              # signal | detection, OPTIONAL, default
+                                                 #   detection (BASELINE §4a). `signal` =
+                                                 #   a building block: recorded in full, a
+                                                 #   full chain trigger, never on the badge
+                                                 #   on its own. May not carry enforce
+                                                 #   kill|deny. Carry a one-line WHY beside
+                                                 #   it saying why the rule is weak alone.
 spec: ...
 ```
 
 Families: `cred`, `pkg` (package-manager process trees), `persist`, `shell`
 (reverse shells), `rootkit`, `priv` (suid/setcap/ptrace), `ai` (AI CLI abuse),
 `net` (suspicious egress), `exec` (new binaries in $HOME,/tmp,/dev/shm).
+
+The `shell` family is three rules, because one policy cannot carry two
+severities (`severity`, `enforce` and `message` are per-policy, not per-selector,
+even though selectors may each carry their own `matchActions`):
+`moat-shell-reverse-shell-connect` (critical, Sigkill) for a shell or netcat
+connecting to a public address, `moat-shell-lan-connect` (high, report-only,
+rate-limited per process) for the same thing to 10/8, 172.16/12, 192.168/16 or
+`fc00::/7`, and the userland `moat-shell-stdio-socket` for the shapes where the
+shell never connects at all (§6.4).
 
 Tetragon events carry `policy_name` on `process_kprobe`, `process_lsm`,
 `process_tracepoint`, `process_uprobe`. moatd reads
@@ -210,6 +226,18 @@ One JSON object per line, UTF-8, no pretty printing. Fields:
   "actions": ["kill", "quarantine", "ignore"],
   "acked": false,
   "mode": "monitor",                           // mode at time of alert
+
+  // BASELINE §4a. The RULE's declaration about itself, copied onto every alert
+  // it raises. Absent means "detection", so an older record and a rule that
+  // says nothing both read as a detection — silence is never the failure mode
+  // of a missing field. A `signal` row is recorded in full, is a full chain
+  // trigger, and carries "surface": "timeline" unless one of the two
+  // exceptions below applies.
+  "tier": "detection",                         // detection|signal
+  // The §2b context matrix put this at high/critical BECAUSE it was inside a
+  // package install. The one outcome that neither the `signal` tier nor a
+  // noise-guard demotion may move to the timeline.
+  "pkg_install_escalation": false,
 
   // Absent until auto-triage has looked at this alert, and absent forever when
   // [analysis] auto_triage = "off" (LEARNING §2c).
@@ -423,6 +451,17 @@ Requests:
 ```
 Responses: `{"ok":true,...}` or `{"ok":false,"error":"..."}`.
 
+`EACCES` on the socket has four causes and they need four different answers: no
+`moat` group (the package is not fully installed), not a member (`usermod`),
+a member whose login session predates the `usermod` (re-login or `newgrp`, and
+telling them to `usermod` again sends them round a loop that cannot terminate)
+— and, since 2026-09-05, **the daemon simply not being up yet**. A member
+hitting `EACCES` while `systemctl is-active moatd` reads `activating` (or the
+socket is under five seconds old), or getting `ECONNREFUSED` at all, is told to
+wait a few seconds. It is not told the socket's permissions are wrong and to
+restart moatd: that message named the operation that was *causing* the symptom,
+and the socket was 0660 root:moat seconds later.
+
 **Actions reference alert ids, never raw pids or paths.** That is what makes the
 socket safe to expose to the user's group: a malicious user-level process cannot
 use moatd to kill or move something the sensor did not already flag.
@@ -431,12 +470,31 @@ use moatd to kill or move something the sensor did not already flag.
 ```json
 {"ok":true,"version":"0.1.0","mode":"monitor","tetragon":"running","policies":32,
  "sensors_loaded":32,"sensor_unhealthy":false,"enforcing_rules":[],
+ "enforcing_verified":[],"enforcing_unverified":[],"enforcement_unhealthy":false,
+ "arming_pending":false,
  "policies_failed":[],"feeds":{"updated":"...","hashes":123456,"domains":5432},
  "unacked":{"critical":0,"high":2,"medium":5,"low":11},"sandbox":false,
+ "ledger":{"needs_you":2,"recorded":4812,"suppressed":1193,"signal":3904},
  "chains_open":0,"chains_formed":0,
  "telemetry":{"classes":["alerts"],"written":0,"filtered":0,"file":null},
  "socket_group":"moat"}
 ```
+
+`ledger` splits `alerts.jsonl` into the three populations a person actually
+distinguishes, because one word over three of them is how "unacked 1,854" came
+to sit next to a badge of 13 (BASELINE §8). **`needs_you`** is the badge —
+surfaced, unacked, unsuppressed — and is `unacked` summed, so the two can never
+disagree. **`recorded`** is timeline rows: seen, written down, never asked
+about. **`suppressed`** is rows an allowlist entry matched. **`signal`** is the
+part of `recorded` that came from a `signal`-tier rule (BASELINE §4a).
+`unacked` is unchanged and remains the badge per severity. `moatctl status`
+prints the three words; so does the weekly digest.
+
+`triage_pending` is exactly the badge (surfaced, unacked, unsuppressed, no
+verdict yet) and is the same set `{"cmd":"triage","action":"pending"}` offers.
+`{"cmd":"ack","all":true}` and `{"cmd":"ack","rule":...}` answer only badge rows
+and return `skipped`, the number of recorded or suppressed rows they left alone:
+those were never asked about, so there is nothing to answer.
 
 `telemetry.classes` is which record streams moatd is keeping (section 12), and
 it belongs beside `sensor_unhealthy` for the same reason: a reader that sees a
@@ -455,6 +513,29 @@ kernel is running, as opposed to `policies`, which is what is on disk.
 `sensors_loaded` is `null` when moatd cannot read bpffs, which is "cannot
 tell" and not "none"; that is the `unverified` state, and it must not be
 rendered as an outage.
+
+`enforcing_rules` is what the RECORD says is armed, restored from `state.json`;
+`enforcing_verified` and `enforcing_unverified` are that same set split by what
+the KERNEL says, read once a minute from `tetra tracingpolicy list -o json`
+(the `mode` field of `TracingPolicyStatus` — NOTES §7). `enforcement_unhealthy`
+is `enforcing_unverified` being non-empty, and is the direct analogue of
+`sensor_unhealthy`: one boolean a consumer can key on. `arming_pending` is true
+while moatd is still waiting for the sensor to finish loading before it arms
+anything (`[thresholds] arm_wait_secs`), which is a normal state for the first
+few seconds after a boot and must not be rendered as a failure.
+
+**`enforcing_rules` stays the field the panel binds to** — it is what the user
+asked for, and it is still the right thing to show in a toggle. But a consumer
+that prints it without `enforcing_unverified` is repeating the 2026-09-05 bug:
+seven rules listed as enforcing all day while all seven sat in `monitor` in the
+kernel, because the post-start re-arm ran 2 s in and tetragon needed 16 s to
+load 44 policies (NOTES §7.1). `moatctl status` prints the unverified set on the
+`enforcing` line itself, in the same shape as the `*** NOT PROTECTED ***`
+marker. Empty `enforcing_verified` **and** empty `enforcing_unverified` next to
+a non-empty `enforcing_rules` means moatd could not ask the kernel, not that
+the kernel agreed — "cannot tell" is never rendered as "confirmed", in either
+direction. None of the three survive a restart: agreement observed before a
+restart is not evidence about the kernel after one.
 
 Consumers must treat `sensor_unhealthy` as outranking the alert counts. A
 sensor that is not loaded raises nothing, so `unacked` all-zero next to an
@@ -525,6 +606,19 @@ sudoers rule.
    - `moat-x-mass-read`: one process reads > N (default 40) distinct files
      under $HOME dotdirs within 10 s (TruffleHog pattern). Requires the policies
      agent to emit read events for those dirs; coordinate via the `cred` family.
+   - `moat-shell-stdio-socket` (family `shell`): a shell (`bash sh dash zsh fish
+     busybox ash ksh mksh tcsh csh`) whose fds 0/1/2 are a network socket, read
+     from `/proc/<pid>/fd` at exec time and resolved through
+     `/proc/net/{tcp,tcp6,udp,udp6}` — no hook carries file descriptors, so this
+     cannot be a policy. Critical for an off-machine peer (LAN **included**;
+     the kernel rule excludes RFC1918 in-kernel), medium for a loopback peer,
+     and critical-but-not-killed when the fd is a socket whose inode no longer
+     resolves. Inodes that resolve in `/proc/net/unix` never fire: systemd gives
+     every service journald's stdout socket. Rung 2, same rule id, at high: the
+     shell's stdio is a pty and the **parent's** stdio is a socket — the
+     `pty.spawn` / `script /dev/null` upgrade. Deliberately not "the parent
+     holds a socket somewhere", which is every IDE on the machine. See
+     policies/README.md "Reverse shells" for the three shapes and the residual.
    Since the first live run the four package-manager rules (`moat-pkg-subtree-interpreter-spawn`,
    `moat-pkg-subtree-downloader`, `moat-pkg-subtree-netcat-exec`, `moat-ai-cli-in-pkg-subtree`)
    are userland rules built on the daemon's exec_id ancestry and argv (rules/pkgtree.rs),
@@ -543,11 +637,61 @@ sudoers rule.
    back onto every member as an `update` line. The correlator holds a fixed
    amount of memory: 128 candidate alerts, 32 live chains, 12 steps each, all
    aged out at the window.
-5. Enforcement: in `enforce` mode Tetragon kills; the one userland exception is
-   `moat-pkg-subtree-netcat-exec`, where moatd itself SIGKILLs after verifying pid start
-   time and exe. moatd records
+5. Enforcement: in `enforce` mode Tetragon kills; the userland exceptions are
+   `moat-pkg-subtree-netcat-exec` and `moat-shell-stdio-socket` (its `critical`
+   rung only — never the loopback `medium` or the pty `high`), where moatd
+   itself SIGKILLs after verifying pid start time and exe. moatd records
    `action_taken: killed` when the event carries the action. In monitor mode
    moatd never kills unless asked over the socket.
+
+   **Per-rule arming covers the userland rules too.** A userland rule that can
+   kill declares `enforce: "kill"` in its own meta, appears in `enforceable()`
+   with `"by": "moatd"` (a kernel policy carries `"by": "kernel"`), and is armed
+   and disarmed by `moatctl set mode enforce|monitor --rule NAME` like any
+   policy. `maybe_enforce` gates on `mode_for(rule)`, not on the daemon-wide
+   mode, and the rule itself asks `RuleCtx::enforcing(id)`. Nothing is pushed
+   into the kernel for one — there is no policy to `tetra tp set-mode`, so the
+   arming applies immediately and cannot fail — and it round-trips a restart
+   through `enforcing_rules` in `state.json` exactly as a kernel rule does.
+   `enforcement_to_apply()` therefore stays kernel-only on purpose: calling
+   `set-mode` on a name the kernel has never heard of would fail and be
+   reported as enforcement that did not take.
+
+   This mattered because the two rules that act on their own were the two the
+   per-rule switch could not reach: `enforceable()` listed policies only,
+   `set mode --rule` refused the name, and `maybe_enforce` read `self.mode`. The
+   only way to arm either was to arm every rule on the machine — the
+   all-or-nothing that per-rule enforcement exists to avoid.
+
+   **Arming a kernel policy is a request, not a fact, until the kernel is read
+   back.** `tetra tp set-mode` changes a LIVE policy and that change dies with
+   the sensor, so the armed set has to be pushed into the kernel again on every
+   start — and pushing it is not the same as it having taken. moatd therefore:
+
+   - **waits.** `arm_tick` does not call `set-mode` until the sensor reports the
+     policies loaded (the pin count under `[paths] tetragon_bpf_dir` against the
+     rendered count, or `tetra tp list` naming the wanted policies when bpffs is
+     unreadable), bounded by `[thresholds] arm_wait_secs` (120 s) and retried on
+     a backoff inside that window. It runs on the periodic tick, never on the
+     event path. tetragon.service also runs `moatd wait-sensor` as an
+     `ExecStartPost` so `After=tetragon.service` orders against a loaded sensor;
+     the daemon-side wait stays because a tetragon that reloads policies later
+     is not a boot-order problem.
+   - **verifies, and keeps verifying.** `verify_enforcement` reads `mode` per
+     policy from `tetra tracingpolicy list -o json` once a minute, re-arms
+     anything the kernel has in `monitor`, reads the kernel back rather than
+     trusting the `set-mode` exit status, and publishes `enforcing_verified` /
+     `enforcing_unverified` / `enforcement_unhealthy` in `status` (section 5).
+   - **says so.** A gap raises exactly one `moat-x-protection-changed` alert
+     (high, `NEVER_SILENCE`) naming the policies and what to run — deduped on
+     the unverified set, so a failure that persists for a week is one alert and
+     a policy coming back clears it. Being unable to *ask* is never reported as
+     a gap.
+
+   All of which exists because on 2026-09-05 none of it did: the post-start
+   re-arm ran 2 s in, tetragon needed 16 s to load 44 policies, all seven
+   `set-mode` calls failed, nothing retried or checked, and every surface went
+   on saying ARMED for the rest of the day (NOTES §7.1).
 6. Serve the control socket. Write `state.json` every 5 s.
 7. `moat-feeds` (separate binary or subcommand, run by the timer): fetch
    abuse.ch MalwareBazaar recent sha256 list, ThreatFox recent IOCs (domains,

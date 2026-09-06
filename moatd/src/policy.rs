@@ -30,6 +30,26 @@ pub struct PolicyMeta {
     pub fp_hint: String,
     /// `spec.options[policy-mode]`, i.e. the mode before `tetra tp set-mode`.
     pub mode_default: String,
+    /// `detection` (the default) or `signal` — BASELINE §4.
+    ///
+    /// A `signal` rule is a building block: it is right about what it saw and
+    /// weak about what it means, and it exists so that `chain.rs` has something
+    /// to correlate on. It is recorded, it is a full chain trigger, and it
+    /// never reaches the badge on its own. Absent means `detection`, so a
+    /// policy that says nothing is a detection — the safe default, since a
+    /// missing annotation must never quieten a rule.
+    pub tier: String,
+}
+
+/// The two values of `moat.omarchy/tier` (BASELINE §4).
+pub const TIER_DETECTION: &str = "detection";
+pub const TIER_SIGNAL: &str = "signal";
+
+impl PolicyMeta {
+    /// Is this rule a building block rather than a conclusion?
+    pub fn is_signal(&self) -> bool {
+        self.tier == TIER_SIGNAL
+    }
 }
 
 impl PolicyMeta {
@@ -49,6 +69,7 @@ impl PolicyMeta {
             expected: "Unknown: the policy does not declare when it fires legitimately.".into(),
             fp_hint: "exe".into(),
             mode_default: "monitor".into(),
+            tier: TIER_DETECTION.into(),
         }
     }
 }
@@ -202,6 +223,22 @@ fn parse(text: String) -> Result<(PolicyMeta, SelectorSet), String> {
     if let Some(v) = ann("fp-hint") {
         meta.fp_hint = v;
     }
+    // An unknown value falls back to `detection` rather than failing the file.
+    // The value decides whether a rule can reach the badge, so the failure mode
+    // of a typo has to be "keeps asking" and never "goes quiet"; `check.py`
+    // rejects anything but the two words at build time, which is where a typo
+    // should be caught.
+    if let Some(v) = ann("tier") {
+        match v.as_str() {
+            TIER_SIGNAL | TIER_DETECTION => meta.tier = v,
+            other => log::warn!(
+                "policy {}: moat.omarchy/tier {:?} is not signal|detection; treating it as \
+                 detection",
+                name,
+                other
+            ),
+        }
+    }
     if !meta.actions.iter().any(|a| a == "ignore") {
         meta.actions.push("ignore".into());
     }
@@ -259,7 +296,44 @@ spec:
         assert_eq!(m.actions, vec!["kill", "quarantine", "ignore"]);
         assert_eq!(m.why, "Private keys are the first thing stealers read.");
         assert_eq!(m.mode_default, "monitor");
+        assert_eq!(m.tier, TIER_DETECTION, "no annotation means detection");
         assert!(set.failed.is_empty());
+    }
+
+    /// BASELINE §4: `signal` is a declaration that a rule is a building block.
+    /// A missing annotation, and a misspelt one, both mean `detection` —
+    /// silence must never be the failure mode of a typo.
+    #[test]
+    fn the_tier_annotation_is_read_and_a_typo_stays_a_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = |name: &str, tier: &str| {
+            format!(
+                r#"apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: {}
+  annotations:
+    moat.omarchy/severity: low
+    moat.omarchy/title: "t"
+    moat.omarchy/tier: "{}"
+spec:
+  options:
+  - name: policy-mode
+    value: monitor
+"#,
+                name, tier
+            )
+        };
+        std::fs::write(dir.path().join("a.yaml"), policy("moat-net-first-contact", "signal")).unwrap();
+        std::fs::write(dir.path().join("b.yaml"), policy("moat-cred-etc-shadow-read", "sginal")).unwrap();
+        let set = PolicySet::load(dir.path());
+        let signal = set.get("moat-net-first-contact").unwrap();
+        assert_eq!(signal.tier, TIER_SIGNAL);
+        assert!(signal.is_signal());
+        let typo = set.get("moat-cred-etc-shadow-read").unwrap();
+        assert_eq!(typo.tier, TIER_DETECTION, "a typo must not quieten a rule");
+        assert!(!typo.is_signal());
+        assert!(set.failed.is_empty(), "a bad tier is not a broken file");
     }
 
     #[test]
@@ -273,10 +347,73 @@ spec:
 
     #[test]
     fn fallback_is_still_usable() {
-        let m = PolicyMeta::fallback("moat-net-reverse-shell");
+        // A real policy name: `moat-net-reverse-shell` stood here for months
+        // and no such policy has ever existed, which made the fixture look like
+        // a rule anyone could grep for (2026-09-05).
+        let m = PolicyMeta::fallback("moat-net-suspicious-port-egress");
         assert_eq!(m.family, "net");
         assert_eq!(m.severity, "medium");
         assert!(m.actions.contains(&"ignore".to_string()));
+    }
+
+    /// The `signal` set is a claim the docs make (BASELINE §4a,
+    /// policies/README.md), so it is pinned rather than left to drift.
+    ///
+    /// It is also not an arbitrary list: it is exactly what the noise guard's
+    /// (now removed) rule-wide fan-out demotion had discovered on this machine,
+    /// once a day, through a circuit breaker that forgets. Adding a rule here
+    /// takes it off the badge for good; that should be a decision somebody
+    /// makes on purpose and a test they had to update.
+    #[test]
+    fn the_shipped_signal_rules_are_the_seven_the_docs_name() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().map(|p| p.join("policies"));
+        // Building from a source tarball that ships only moatd/.
+        let Some(dir) = dir.filter(|d| d.is_dir()) else { return };
+        let set = PolicySet::load(&dir);
+        assert!(!set.is_empty(), "no policies loaded from {}", dir.display());
+        let mut signal: Vec<&str> = set
+            .policies
+            .values()
+            .filter(|m| m.is_signal())
+            .map(|m| m.name.as_str())
+            .collect();
+        signal.sort_unstable();
+        assert_eq!(
+            signal,
+            vec![
+                "moat-exec-untrusted-home",
+                "moat-exec-untrusted-tmpfs",
+                "moat-net-first-contact",
+                "moat-persist-desktop-entry-write",
+                "moat-persist-omarchy-menu-extension-write",
+                "moat-persist-omarchy-plugin-write",
+            ],
+            "the seventh, moat-pkg-subtree-interpreter-spawn, is a userland rule"
+        );
+        // A building block must not be able to end a process on evidence it has
+        // declared too weak for the badge. `check.py` says the same at build
+        // time; this says it at test time, over the rendered set.
+        for m in set.policies.values().filter(|m| m.is_signal()) {
+            assert_eq!(m.enforce, "none", "{} is a signal rule and must not enforce", m.name);
+        }
+    }
+
+    /// The userland half of the same claim.
+    #[test]
+    fn the_userland_signal_rules_are_the_two_the_docs_name() {
+        let mut signal: Vec<String> = crate::rules::all()
+            .iter()
+            .map(|r| r.meta())
+            .filter(|m| m.is_signal())
+            .map(|m| m.name)
+            .collect();
+        signal.sort();
+        assert_eq!(
+            signal,
+            vec!["moat-net-first-contact", "moat-pkg-subtree-interpreter-spawn"],
+            "moat-net-first-contact is both a policy and a userland rule, and both halves \
+             have to agree or the tier depends on which one fired"
+        );
     }
 
     #[test]

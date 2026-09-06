@@ -45,20 +45,66 @@ pub struct ProcInfo {
     /// Claude pane under it was session 11314. Reading it is what lets
     /// `chain.rs` ask what a process IS instead of what it is CALLED.
     pub sid: Option<u32>,
+    /// The controlling terminal (`tty_nr`), read from the SAME /proc line as
+    /// `sid` at exec time. `None` = /proc was unreadable (the process had
+    /// already gone); `Some(0)` = there is no controlling terminal.
+    ///
+    /// This is the general answer to "is a person at the other end of this?",
+    /// and `context.rs` asks it before it asks anything about names. On
+    /// 2026-09-05 nine of the thirteen alerts on the badge were the user's own
+    /// Claude sessions scored `service`, because they run as `systemd --user ->
+    /// herdr -> bash -> claude` and `herdr` — a session host written recently
+    /// enough that no list has heard of it — was in neither the interactive nor
+    /// the service name list, so the walk fell through to `systemd`. Adding
+    /// `herdr` to a list would have fixed that one host and nothing else; the
+    /// kernel had already recorded the answer for every host there will ever
+    /// be. Measured live that day: `claude` 11536 tty_nr 34821 (pts/5), `herdr`
+    /// 0, `quickshell` 0.
+    ///
+    /// Tetragon's process record carries neither field, hence /proc.
+    pub tty: Option<u32>,
 }
 
-/// Field 6 of /proc/<pid>/stat, the session id.
+/// Fields 6 and 7 of /proc/<pid>/stat — the session id and the controlling
+/// terminal — in ONE read, because they are on the same line and the second
+/// one was free.
 ///
 /// The comm field can contain spaces and parentheses, so the fields after it
 /// are found from the LAST ')' rather than by splitting the whole line.
-pub fn read_sid(pid: u32) -> Option<u32> {
+pub fn read_session(pid: u32) -> (Option<u32>, Option<u32>) {
     if pid == 0 {
-        return None;
+        return (None, None);
     }
-    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-    let rest = &stat[stat.rfind(')')? + 1..];
-    // After ')': state, ppid, pgrp, session -> the 4th field.
-    rest.split_whitespace().nth(3)?.parse().ok()
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", pid)) else {
+        return (None, None);
+    };
+    let Some(close) = stat.rfind(')') else {
+        return (None, None);
+    };
+    // After ')': state, ppid, pgrp, session, tty_nr.
+    let mut fields = stat[close + 1..].split_whitespace().skip(3);
+    let sid = fields.next().and_then(|f| f.parse().ok());
+    // tty_nr is printed signed; a negative value is not a device, it is "none".
+    let tty = fields
+        .next()
+        .and_then(|f| f.parse::<i32>().ok())
+        .map(|t| t.max(0) as u32);
+    (sid, tty)
+}
+
+/// What `observe` uses. In a test build it reads nothing: the fixture pids
+/// belong to whatever happens to be running on the machine under test, so a
+/// real /proc read would make `context.rs` and `ai_cli.rs` pass or fail
+/// depending on whether some unrelated process holds pid 41250 and a pty.
+/// Tests state the kernel's answer with [`ProcTable::set_session`].
+#[cfg(not(test))]
+fn observed_session(pid: u32) -> (Option<u32>, Option<u32>) {
+    read_session(pid)
+}
+
+#[cfg(test)]
+fn observed_session(_pid: u32) -> (Option<u32>, Option<u32>) {
+    (None, None)
 }
 
 impl ProcInfo {
@@ -95,6 +141,7 @@ impl ProcTable {
     /// before the daemon did (Tetragon backfills them from procfs).
     pub fn observe(&mut self, p: &Process) -> Option<String> {
         let exec_id = p.exec_id.clone()?;
+        let (sid, tty) = observed_session(p.pid.unwrap_or(0));
         let info = ProcInfo {
             exec_id: exec_id.clone(),
             pid: p.pid.unwrap_or(0),
@@ -107,7 +154,8 @@ impl ProcTable {
             exited_at: None,
             exit_signal: None,
             exe_note: None,
-            sid: read_sid(p.pid.unwrap_or(0)),
+            sid,
+            tty,
         };
         match self.map.get_mut(&exec_id) {
             Some(existing) => {
@@ -256,6 +304,21 @@ impl ProcTable {
             .cloned()
     }
 
+    /// Test-only: state what the kernel said about an already-observed process.
+    ///
+    /// In production `sid` and `tty` come from /proc at exec time. A test that
+    /// wants a specific chain shape cannot get one that way — the pids in the
+    /// fixtures either do not exist on the machine running the test or, worse,
+    /// belong to some unrelated process that DOES have a pty, which would make
+    /// every context test pass or fail depending on what else is running.
+    #[cfg(test)]
+    pub fn set_session(&mut self, exec_id: &str, sid: Option<u32>, tty: Option<u32>) {
+        if let Some(p) = self.map.get_mut(exec_id) {
+            p.sid = sid;
+            p.tty = tty;
+        }
+    }
+
     pub fn prune(&mut self, now: u64) {
         let cutoff = self.prune_secs;
         self.map
@@ -292,6 +355,10 @@ mod tests {
     }
 
     const NODE: &str = "bWFyczoxMjM0NTY3ODkwMTIzOjQxMjMz";
+    /// The `sh` the postinstall script runs in, and the process the sample
+    /// log's reverse-shell policy kills — the connect is made by the shell,
+    /// because that is what `moat-shell-reverse-shell-connect` matches on.
+    const SH: &str = "bWFyczoxMjM0NTY3MDAwMDAwOjQxMjMw";
 
     #[test]
     fn chain_is_built_from_parent_exec_ids() {
@@ -362,11 +429,11 @@ mod tests {
     #[test]
     fn exit_signal_is_kept_then_pruned() {
         let mut t = feed();
-        assert_eq!(t.get(NODE).unwrap().exit_signal.as_deref(), Some("SIGKILL"));
+        assert_eq!(t.get(SH).unwrap().exit_signal.as_deref(), Some("SIGKILL"));
         t.prune(1_030);
-        assert!(t.get(NODE).is_some(), "still inside the 60 s window");
+        assert!(t.get(SH).is_some(), "still inside the 60 s window");
         t.prune(1_100);
-        assert!(t.get(NODE).is_none(), "pruned after the window");
+        assert!(t.get(SH).is_none(), "pruned after the window");
     }
 
     #[test]
@@ -403,6 +470,20 @@ mod tests {
         });
         t.resolve_fd_binary("e-fd", Some("/home/dan/proj/payload"));
         assert_eq!(t.get("e-fd").unwrap().exe, "/home/dan/proj/payload");
+    }
+
+    /// One read of /proc/<pid>/stat yields both fields. Asked of our own
+    /// process, because that is the only pid a test can be sure about.
+    #[test]
+    fn the_session_id_and_the_controlling_terminal_come_from_one_read() {
+        let me = std::process::id();
+        let (sid, tty) = read_session(me);
+        assert!(sid.is_some(), "our own /proc/<pid>/stat must be readable");
+        assert!(tty.is_some(), "and it carries tty_nr on the same line");
+        // pid 0 is not a process, and a pid nothing owns reads as "unknown"
+        // rather than as "no terminal" -- the distinction context.rs relies on.
+        assert_eq!(read_session(0), (None, None));
+        assert_eq!(read_session(4_294_967_295), (None, None));
     }
 
     #[test]

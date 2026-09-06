@@ -260,6 +260,7 @@ mod tests {
             homes: &[],
             now: 100,
             mode: "monitor",
+            armed: &crate::rules::NO_RULES_ARMED,
         };
         rule.on_exec(ev, "e1", &ctx)
     }

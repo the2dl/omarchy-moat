@@ -144,7 +144,13 @@ REQUIRED_ANNOTATIONS = [
     "moat.omarchy/expected",
     "moat.omarchy/fp-hint",
 ]
-OPTIONAL_ANNOTATIONS = ["moat.omarchy/rotate", "moat.omarchy/telemetry-class"]
+OPTIONAL_ANNOTATIONS = ["moat.omarchy/rotate", "moat.omarchy/telemetry-class",
+                        "moat.omarchy/tier"]
+# BASELINE section 4. Absent means "detection": a policy that says nothing is a
+# detection, because the failure mode of a forgotten annotation must be "keeps
+# asking" and never "went quiet". moatd applies the same default, and rejects an
+# unknown value the same way -- this is where a typo should be caught.
+TIERS = {"detection", "signal"}
 TELEMETRY_CLASSES = {"process", "network", "file"}
 SEVERITIES = {"critical", "high", "medium", "low"}
 ENFORCE = {"kill", "deny", "none"}
@@ -374,6 +380,18 @@ def check_policy(path, text):
     enf = ann.get("moat.omarchy/enforce")
     if enf not in ENFORCE:
         p.add(path, "enforce %r not in %s" % (enf, sorted(ENFORCE)))
+    tier = ann.get("moat.omarchy/tier", "detection")
+    if tier not in TIERS:
+        p.add(path, "tier %r not in %s (omit it for a detection)" % (tier, sorted(TIERS)))
+    # A rule that ends a process is not a building block. `signal` says "weak
+    # alone, correlate on me"; an enforcing action says "act on me by yourself".
+    # A policy claiming both would kill on evidence it has declared too weak to
+    # put on the badge.
+    if tier == "signal" and ann.get("moat.omarchy/enforce") in ("kill", "deny"):
+        p.add(path, "tier signal with enforce %r: a building block must not act on its own"
+                    % (ann.get("moat.omarchy/enforce"),))
+    if family == TELEMETRY_FAMILY and tier != "detection":
+        p.add(path, "telemetry policy carries a tier; telemetry is not a detection at all")
     if ann.get("moat.omarchy/fp-hint") not in FP_HINTS:
         p.add(path, "fp-hint %r not in %s" % (ann.get("moat.omarchy/fp-hint"), sorted(FP_HINTS)))
     for a in str(ann.get("moat.omarchy/actions", "")).split(","):
@@ -427,6 +445,7 @@ def check_policy(path, text):
         "hook": ", ".join(sorted({h.get("call") or h.get("hook") or kind for kind, h in hooks})),
         "kind": ", ".join(sorted({kind for kind, _ in hooks})),
         "enforce": enf or "?",
+        "tier": tier,
         "sels": sum(len(h.get("selectors", [])) for _, h in hooks),
         "attaches": [(kind, h.get("call") or h.get("hook") or kind) for kind, h in hooks],
     }
@@ -466,15 +485,16 @@ def main():
     order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "?": 4}
     rows.sort(key=lambda r: (r["family"], order[r["severity"]], r["name"]))
     w = [max(len(r[k]) if isinstance(r[k], str) else 4 for r in rows + [{k: k}]) for k in
-         ("name", "severity", "kind", "hook", "enforce")]
-    hdr = "%-*s  %-*s  %-*s  %-*s  %-*s  %s" % (
-        w[0], "POLICY", w[1], "SEVERITY", w[2], "KIND", w[3], "HOOK", w[4], "ENFORCE", "SEL")
+         ("name", "severity", "kind", "hook", "enforce", "tier")]
+    hdr = "%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s" % (
+        w[0], "POLICY", w[1], "SEVERITY", w[2], "KIND", w[3], "HOOK", w[4], "ENFORCE",
+        w[5], "TIER", "SEL")
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
-        print("%-*s  %-*s  %-*s  %-*s  %-*s  %d" % (
+        print("%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %d" % (
             w[0], r["name"], w[1], r["severity"], w[2], r["kind"],
-            w[3], r["hook"], w[4], r["enforce"], r["sels"]))
+            w[3], r["hook"], w[4], r["enforce"], w[5], r["tier"], r["sels"]))
     print("-" * len(hdr))
     per_sev = {s: sum(1 for r in rows if r["severity"] == s) for s in ("critical", "high", "medium", "low")}
     print("%d policies: %s" % (len(rows), ", ".join("%s %d" % (k, v) for k, v in per_sev.items())))
@@ -485,6 +505,15 @@ def main():
         sum(1 for r in rows if r["enforce"] == "kill"),
         sum(1 for r in rows if r["enforce"] == "deny"),
         sum(1 for r in rows if r["enforce"] not in ("kill", "deny"))))
+    # BASELINE section 4. A signal policy is recorded, is a full chain step, and
+    # never reaches the badge on its own; a detection is what a person is asked
+    # about. Counted apart because "how many of these can interrupt me" is the
+    # first question anyone asks of a rule set this size.
+    alerting = [r for r in rows if r["family"] != TELEMETRY_FAMILY]
+    print("%d detection, %d signal (building blocks, timeline only), of %d alerting policies" % (
+        sum(1 for r in alerting if r["tier"] == "detection"),
+        sum(1 for r in alerting if r["tier"] == "signal"),
+        len(alerting)))
 
     if problems:
         print("\n%d problem(s):" % len(problems))

@@ -587,6 +587,15 @@ fn cmd_ack(d: &mut Daemon, req: &Value, id: &str) -> Value {
     let before = req["before"].as_str().unwrap_or("");
     let all = req["all"] == Value::Bool(true);
     if all || !rule.is_empty() || !before.is_empty() {
+        // A row that was never on the badge was never asked about, so there is
+        // nothing to answer. `--all` used to walk every unacked record: on
+        // 2026-09-05 that was 1,854 rows, 48% of them allowlist-suppressed and
+        // most of the rest timeline entries, and every one got an `acked: true`
+        // line appended to the log. That is a lot of writing to change nothing
+        // a person can see, and it made the audit record ("cleared N unanswered
+        // alerts") a number nobody could reconcile with the badge. Skipped rows
+        // are counted and reported rather than passed over silently.
+        let mut skipped = 0usize;
         let targets: Vec<String> = d
             .store
             .load()
@@ -595,6 +604,14 @@ fn cmd_ack(d: &mut Daemon, req: &Value, id: &str) -> Value {
             .filter(|a| rule.is_empty() || a.rule == rule)
             // Ids are monotonic, so an id comparison is a time comparison.
             .filter(|a| before.is_empty() || a.id.as_str() < before)
+            .filter(|a| {
+                if a.surface == "alerts" && !a.is_suppressed() {
+                    true
+                } else {
+                    skipped += 1;
+                    false
+                }
+            })
             .map(|a| a.id)
             .collect();
         let mut acked = 0usize;
@@ -616,9 +633,20 @@ fn cmd_ack(d: &mut Daemon, req: &Value, id: &str) -> Value {
                 if rule.is_empty() { String::new() } else { format!(" for {}", rule) }
             ),
             &peer_of(req),
-            vec![format!("{} matched, {} acked", targets.len(), acked)],
+            vec![format!(
+                "{} matched, {} acked, {} skipped (recorded or suppressed rows were never on the \
+                 badge, so there was nothing to answer)",
+                targets.len(),
+                acked,
+                skipped
+            )],
         );
-        return ok(json!({ "acked": acked, "matched": targets.len(), "failed": failed }));
+        return ok(json!({
+            "acked": acked,
+            "matched": targets.len(),
+            "skipped": skipped,
+            "failed": failed,
+        }));
     }
     let Some(alert) = d.find_alert(id) else {
         return err(format!("no alert {}", id));
@@ -728,6 +756,23 @@ fn cmd_triage(d: &mut Daemon, req: &Value, id: &str) -> Value {
             let mut ranked: Vec<(u8, u8, String, Value)> = Vec::new();
             for a in d.store.load().into_iter().rev() {
                 if a.surface != "alerts" || a.acked || a.triage.is_some() {
+                    continue;
+                }
+                // The queue IS the badge, and nothing else.
+                //
+                // A `signal`-tier row is on the timeline by construction
+                // (BASELINE §4), so declaring the seven building-block rules
+                // took 14,859 rows a day out of this queue without a line of
+                // code here -- which is the point: an agent call is real money
+                // and a timeline row is not a question. The two ways a signal
+                // row can appear on the badge -- the pkg-install matrix cell,
+                // or a chain that reached `high` -- are both moat concluding it
+                // IS a question, and a queue that then refused to read it would
+                // be putting a row in front of the user with no verdict beside
+                // it. A suppressed row is skipped explicitly: it is the user's
+                // own answer, and `surface` already agrees, but the two must
+                // never be able to drift.
+                if a.is_suppressed() {
                     continue;
                 }
                 if crate::util::secs_between(&a.ts, &now) < settle {
@@ -1594,21 +1639,42 @@ fn set_mode(d: &mut Daemon, value: &str, rule: &str, who: &str) -> Value {
     }
     let tetra = d.cfg.paths.tetra.clone();
     let all = d.policies.names();
+    // A userland rule that kills is armable exactly as a kernel policy is, and
+    // has no kernel policy to set the mode on: the killing happens in
+    // `engine::maybe_enforce`, in this process, gated on `mode_for`. Until
+    // 2026-09-05 this function refused the name outright ("no policy ..."), so
+    // the only two rules that act on their own were the only two the per-rule
+    // switch could not reach, and the only way to arm either of them was to arm
+    // every rule on the machine (CONTRACT §6.5).
+    let userland: Vec<String> = d
+        .armable_userland_rules()
+        .into_iter()
+        .map(|m| m.name)
+        .collect();
     let names: Vec<String> = if rule.is_empty() {
-        all
+        all.clone()
     } else {
-        if !all.iter().any(|n| n == rule) {
+        if !all.iter().any(|n| n == rule) && !userland.iter().any(|n| n == rule) {
             return err(format!(
-                "no policy {:?}; `moatctl status` lists how many are loaded",
+                "no rule {:?} can be armed; `moatctl status` lists the ones that can, under \
+                 `enforceable`",
                 rule
             ));
         }
         vec![rule.to_string()]
     };
+    let in_kernel = |name: &String| all.contains(name);
 
     let mut applied = Vec::new();
     let mut failed = Vec::new();
-    for name in &names {
+    // A userland rule has nothing to push: `tetra tp set-mode` on a name the
+    // kernel has never heard of fails, and a failure here is reported as
+    // enforcement that did not take. Its arming is `enforcing_rules` below,
+    // which `write_state` persists and `persisted_enforcing_rules` reads back
+    // on the next start -- the same round trip a kernel rule gets, minus the
+    // kernel.
+    applied.extend(names.iter().filter(|n| !in_kernel(n)).cloned());
+    for name in names.iter().filter(|n| in_kernel(n)) {
         match std::process::Command::new(&tetra)
             .args(["tp", "set-mode", name, value])
             .output()
@@ -1641,6 +1707,10 @@ fn set_mode(d: &mut Daemon, value: &str, rule: &str, who: &str) -> Value {
             format!("{} of {} policies applied", applied.len(), names.len()),
         ]);
     }
+    // The armed set just moved, so the verified/unverified split describes the
+    // old one. Re-check on the next tick rather than here: `verify_enforcement`
+    // is a gRPC round trip and this is a user-facing command.
+    d.invalidate_verification();
     d.write_state();
     log::info!(
         "mode {} for {} ({} applied, {} failed)",
@@ -1676,6 +1746,12 @@ fn set_mode(d: &mut Daemon, value: &str, rule: &str, who: &str) -> Value {
         "policies": names.len(),
         "failed": failed,
         "tetra": tetra.display().to_string(),
+        // Did anything reach the kernel? False for a userland rule, which kills
+        // from moatd and has no policy to set a mode on. Two different
+        // promises, and a caller printing "armed in the kernel" for a rule that
+        // is not in the kernel is the kind of small lie this daemon keeps
+        // finding in itself.
+        "tetra_applied": names.iter().any(in_kernel),
     }))
 }
 
@@ -1918,6 +1994,51 @@ pub fn permission_denied_help(sock: &str, state: GroupState) -> String {
     }
 }
 
+/// Is the daemon simply not up yet?
+///
+/// EACCES on the control socket during a restart window looks exactly like a
+/// misconfigured socket, and on 2026-09-05 `moatctl` told the user twice that
+/// "the socket's own permissions are wrong" while moatd was mid-restart — the
+/// socket was 0660 root:moat seconds later. Sending someone to `ls -l` and
+/// `systemctl restart moatd` over a two-second race is worse than useless: the
+/// restart they are told to run is the thing that was already happening.
+///
+/// Pure so it can be tested: `activation` is `systemctl is-active moatd`,
+/// `sock_age_secs` the socket's age. Either is enough on its own — the unit may
+/// be settling with no socket yet, and the socket may be seconds old while
+/// `systemctl` is unavailable (a container, a $PATH without it).
+pub fn daemon_is_settling(activation: Option<&str>, sock_age_secs: Option<u64>) -> bool {
+    if matches!(activation, Some("activating" | "deactivating" | "reloading")) {
+        return true;
+    }
+    // Five seconds: moatd recreates the socket on every start, so one this
+    // young means the start we raced is still finishing.
+    matches!(sock_age_secs, Some(age) if age <= 5)
+}
+
+/// What to say instead. No `ls -l`, no `systemctl restart`: the only correct
+/// action is to wait.
+pub fn starting_up_help(sock: &str) -> String {
+    format!(
+        "moatd is starting or restarting, so {sock} is not answering yet.\nTry again in a \
+         few seconds. If it does not come back:\n  systemctl status moatd\n  journalctl -u \
+         moatd -n 50"
+    )
+}
+
+fn systemctl_is_active(unit: &str) -> Option<String> {
+    let out = std::process::Command::new("systemctl")
+        .args(["is-active", unit])
+        .output()
+        .ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn socket_age_secs(sock: &Path) -> Option<u64> {
+    let m = std::fs::metadata(sock).ok()?;
+    m.modified().ok()?.elapsed().ok().map(|d| d.as_secs())
+}
+
 /// `moat:x:960:dan,other` -> `(960, ["dan", "other"])`.
 fn moat_group(group_file: &Path) -> Option<(u32, Vec<String>)> {
     let text = std::fs::read_to_string(group_file).ok()?;
@@ -1975,14 +2096,30 @@ fn current_gids() -> Vec<u32> {
 /// Client half, shared by `moatctl` and the integration tests.
 pub fn request(socket: &Path, req: &Value) -> Result<Value, String> {
     let mut stream = UnixStream::connect(socket).map_err(|e| match e.kind() {
-        std::io::ErrorKind::PermissionDenied => permission_denied_help(
-            &socket.display().to_string(),
-            group_state(
+        std::io::ErrorKind::PermissionDenied => {
+            let state = group_state(
                 moat_group(Path::new("/etc/group")),
                 &current_user(Path::new("/etc/passwd")),
                 &current_gids(),
-            ),
-        ),
+            );
+            // Only for a member: the other three states are real configuration
+            // problems that a restart window does not explain and waiting does
+            // not fix, so they keep their own advice.
+            if state == GroupState::Member
+                && daemon_is_settling(
+                    systemctl_is_active("moatd").as_deref(),
+                    socket_age_secs(socket),
+                )
+            {
+                starting_up_help(&socket.display().to_string())
+            } else {
+                permission_denied_help(&socket.display().to_string(), state)
+            }
+        }
+        // The socket file is there and nothing is listening on it: moatd is
+        // between `unlink` and `bind`, or it has died. Never a permissions
+        // story.
+        std::io::ErrorKind::ConnectionRefused => starting_up_help(&socket.display().to_string()),
         std::io::ErrorKind::NotFound => format!(
             "{} does not exist. Is moatd running? Try: systemctl status moatd",
             socket.display()
@@ -2045,6 +2182,43 @@ mod tests {
 
         // No group at all: the package is not installed properly.
         assert_eq!(group_state(None, "dan", &[1000]), GroupState::NoSuchGroup);
+    }
+
+    /// A restart window is not a permissions problem.
+    ///
+    /// On 2026-09-05 `moatctl` told the user twice that "the socket's own
+    /// permissions are wrong" and to run `systemctl restart moatd`, while the
+    /// restart it was racing was already in flight; the socket was 0660
+    /// root:moat seconds later. The advice was not just useless, it named the
+    /// operation that was causing the symptom.
+    #[test]
+    fn a_daemon_that_is_still_starting_is_not_a_broken_socket() {
+        // systemd knows.
+        assert!(daemon_is_settling(Some("activating"), None));
+        assert!(daemon_is_settling(Some("deactivating"), None));
+        assert!(daemon_is_settling(Some("reloading"), None));
+        // Or the socket does: moatd recreates it on every start.
+        assert!(daemon_is_settling(Some("active"), Some(1)));
+        assert!(daemon_is_settling(None, Some(0)));
+
+        // A running daemon with a socket that has been there for an hour is a
+        // real problem, and keeps the real advice.
+        assert!(!daemon_is_settling(Some("active"), Some(3_600)));
+        assert!(!daemon_is_settling(Some("failed"), None));
+        assert!(!daemon_is_settling(None, None));
+
+        let msg = starting_up_help("/run/moat/control.sock");
+        assert!(msg.contains("Try again in a few seconds"), "{}", msg);
+        assert!(
+            !msg.contains("permissions are wrong") && !msg.contains("usermod"),
+            "a race must not be reported as a misconfiguration: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("systemctl restart moatd"),
+            "telling someone to restart the thing that is already restarting: {}",
+            msg
+        );
     }
 
     // ------------------------------------------------------------- triage
@@ -3218,6 +3392,106 @@ mod tests {
         assert_eq!(d.mode, "enforce", "but the mode is still persisted");
     }
 
+    /// The same switch, for the two rules that kill from userland.
+    ///
+    /// `moat-pkg-subtree-netcat-exec` and `moat-shell-stdio-socket` were the
+    /// only rules that act on their own and the only ones this command refused
+    /// ("no policy ..."), because it checked the name against the loaded
+    /// POLICIES. So the two rules whose false-positive surface a user is most
+    /// likely to have measured were the two they could not arm alone.
+    ///
+    /// Unlike a kernel rule, arming one applies immediately and cannot fail:
+    /// there is no `tetra tp set-mode` to run, because the kill happens in this
+    /// process (`engine::maybe_enforce`).
+    #[test]
+    fn a_userland_rule_that_kills_can_be_armed_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let rule = "moat-pkg-subtree-netcat-exec";
+        assert!(
+            !d.policies.names().iter().any(|n| n == rule),
+            "precondition: there is no kernel policy behind it"
+        );
+
+        let r = dispatch(
+            &mut d,
+            &json!({"cmd":"set","key":"mode","value":"enforce","rule":rule}),
+        );
+        assert_eq!(r["ok"], true, "nothing to push, so nothing can fail: {:?}", r);
+        assert_eq!(r["applied"], 1);
+        assert!(d.enforcing_rules.contains(rule));
+        assert_eq!(d.mode, "monitor", "and the daemon is still not enforcing");
+        assert_eq!(d.mode_for(rule), "enforce");
+
+        // Disarming works the same way.
+        let r = dispatch(
+            &mut d,
+            &json!({"cmd":"set","key":"mode","value":"monitor","rule":rule}),
+        );
+        assert_eq!(r["ok"], true);
+        assert!(d.enforcing_rules.is_empty());
+
+        // A userland rule that does NOT kill is still not armable: offering a
+        // switch that does nothing is worse than not offering one.
+        let r = dispatch(
+            &mut d,
+            &json!({"cmd":"set","key":"mode","value":"enforce","rule":"moat-net-first-contact"}),
+        );
+        assert_eq!(r["ok"], false);
+        assert!(d.enforcing_rules.is_empty());
+    }
+
+    /// A bulk ack answers the badge, and says what it left alone.
+    ///
+    /// "unacked 1,854" on 2026-09-05 was 48% allowlist-suppressed records plus
+    /// timeline rows -- neither of which was ever a question -- and `ack --all`
+    /// walked every one of them, appending an `acked: true` line each time and
+    /// then reporting a number nobody could reconcile with a badge of 13.
+    #[test]
+    fn a_bulk_ack_skips_rows_that_were_never_on_the_badge_and_says_how_many() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let mut put = |id: &str, surface: &str, suppressed: Option<&str>| {
+            let mut a = crate::alert::tests_support::demo_alert(id);
+            a.surface = surface.into();
+            a.suppressed_by = suppressed.map(|s| s.to_string());
+            d.store.append_alert(&a).unwrap();
+        };
+        put("01AK0000000000000000000001", "alerts", None);
+        put("01AK0000000000000000000002", "timeline", None);
+        put("01AK0000000000000000000003", "timeline", Some("user.toml#1"));
+
+        // The fixture daemon has replayed the sample log, so count what a bulk
+        // ack SHOULD touch rather than asserting an absolute number.
+        let badge = d
+            .store
+            .load()
+            .iter()
+            .filter(|a| !a.acked && a.surface == "alerts" && !a.is_suppressed())
+            .count() as u64;
+        let quiet = d
+            .store
+            .load()
+            .iter()
+            .filter(|a| !a.acked && (a.surface != "alerts" || a.is_suppressed()))
+            .count() as u64;
+        assert!(quiet >= 2, "precondition: there are rows nobody was asked about");
+
+        let r = dispatch(&mut d, &json!({"cmd":"ack","all":true,"_peer":"tester"}));
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["acked"], badge, "only the badge rows were questions");
+        assert_eq!(r["skipped"], quiet, "and the rest are reported, not passed over: {:?}", r);
+
+        // The two skipped rows are untouched, not acked.
+        for id in ["01AK0000000000000000000002", "01AK0000000000000000000003"] {
+            assert!(!d.find_alert(id).unwrap().acked, "{} was never asked about", id);
+        }
+        assert!(
+            d.find_alert("01AK0000000000000000000001").unwrap().acked,
+            "the badge row is answered"
+        );
+    }
+
     /// Demotions outlive the noise that caused them by up to 24 h, and they
     /// silence whatever shares the board: a flood from unrelated rules demoted
     /// moat-cred-ssh-private-key-read on 2026-09-03.
@@ -3355,7 +3629,7 @@ mod tests {
     fn ignore_rejects_a_scope_the_alert_cannot_support() {
         let dir = tempfile::tempdir().unwrap();
         let mut d = daemon(dir.path());
-        let id = first_id(&d, "moat-net-reverse-shell");
+        let id = first_id(&d, "moat-shell-reverse-shell-connect");
         let r = dispatch(&mut d, &json!({"cmd":"ignore","id":id,"scope":"exe+file"}));
         assert_eq!(r["ok"], false);
         assert!(r["error"].as_str().unwrap().contains("no file"));

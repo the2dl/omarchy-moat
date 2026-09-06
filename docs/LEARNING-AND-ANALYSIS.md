@@ -418,10 +418,19 @@ snapshot keeps a copy for analysis either way.
 
 ## 5. Weekly digest
 
-Once a week, one normal-urgency notification: "moat: 0 incidents, 18 installs
-watched, 3 baseline proposals to review". It is the only scheduled notification
-moat ever sends and its purpose is to remind the user the thing is on and
-working without being noise. Off switch in settings.
+Once a week, one normal-urgency notification: "moat: 0 needed you, 4812
+recorded, 1193 suppressed, 18 installs watched, 3 baseline proposals to review".
+It is the only scheduled notification moat ever sends and its purpose is to
+remind the user the thing is on and working without being noise. Off switch in
+settings.
+
+The first three words are the three populations of BASELINE §8, in the past
+tense and in the same order `moatctl status` prints them: **needed you** is the
+badge (high/critical, unsuppressed, and never a `signal`-tier building block),
+**recorded** is timeline rows, **suppressed** is rows an allowlist entry
+matched. It said "0 incidents" for a long time while the status screen said
+"unacked 1,854" and the badge said 13 — three answers to one question, from one
+file, because one word was doing three jobs.
 
 ## 6. Config additions
 

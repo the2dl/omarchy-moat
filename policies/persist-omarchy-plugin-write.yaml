@@ -17,6 +17,9 @@ metadata:
       first live run, 190 of them git); git and git-remote-http are allowlisted, and the
       omarchy-* helpers are suppressed in-kernel by the first selector.
     moat.omarchy/fp-hint: "exe"
+    # BASELINE 4: a building block, not a detection. Weak alone: plugins arrive and update
+    # through git, hundreds of writes at a time. It exists to be a chain step.
+    moat.omarchy/tier: "signal"
 spec:
   options:
   - name: "policy-mode"

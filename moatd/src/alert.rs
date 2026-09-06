@@ -120,6 +120,20 @@ pub struct Alert {
     /// `timeline` without being suppressed.
     #[serde(default = "default_surface")]
     pub surface: String,
+    /// `detection` (the default) or `signal` — the rule's own declaration
+    /// (BASELINE §4). A `signal` row is a building block: recorded in full, a
+    /// full chain trigger, never on the badge on its own. Absent means
+    /// `detection`, so an old record and a rule that says nothing both read as
+    /// a detection.
+    #[serde(default = "default_tier")]
+    pub tier: String,
+    /// The context matrix put this at high/critical *because it was inside a
+    /// package install* (BASELINE §2b). The one outcome neither the `signal`
+    /// tier nor a noise-guard demotion may quieten, which is why it is on the
+    /// record and not re-derived: the noise guard reaches back over alerts
+    /// already written (`engine::quieten_backlog`).
+    #[serde(default)]
+    pub pkg_install_escalation: bool,
     /// `null`, or the allowlist entry that suppressed it: `"user.toml#1"`,
     /// `"baseline.toml#3"`. Demoted rules are **not** suppressed.
     #[serde(default)]
@@ -171,6 +185,10 @@ fn default_surface() -> String {
     "alerts".to_string()
 }
 
+fn default_tier() -> String {
+    crate::policy::TIER_DETECTION.to_string()
+}
+
 impl Alert {
     pub fn severity_rank(&self) -> u8 {
         severity_rank(&self.severity)
@@ -181,6 +199,22 @@ impl Alert {
     /// out of the badge by its `surface` instead.
     pub fn is_suppressed(&self) -> bool {
         self.suppressed_by.is_some()
+    }
+
+    /// Is this row a **building block rather than a detection** (BASELINE §4)?
+    ///
+    /// A `signal` rule declares that it is right about what it saw and weak
+    /// about what it means. The one exception is the cell the whole product is
+    /// about: the context matrix calling the same event high or critical
+    /// *because it happened inside a package install*. There the row is a
+    /// detection like any other — it is on the badge, it takes a snapshot, and
+    /// it is queued for triage.
+    ///
+    /// Everything that asks "should a person be asked about this row" asks this
+    /// one question, so the badge, the snapshot, the triage queue and the noise
+    /// guard cannot drift apart.
+    pub fn is_building_block(&self) -> bool {
+        self.tier == crate::policy::TIER_SIGNAL && !self.pkg_install_escalation
     }
 
     /// The baseline's tuple for this alert: (rule, actor exe, parent exe, file
@@ -395,6 +429,8 @@ pub mod tests_support {
             severity_base: "high".into(),
             severity_reason: "stays high: package install: never downgraded".into(),
             surface: "alerts".into(),
+            tier: crate::policy::TIER_DETECTION.into(),
+            pkg_install_escalation: false,
             suppressed_by: None,
             rarity: crate::rarity::Rarity::FirstSeen,
             rarity_text: "first time /usr/bin/node has read /home/dan/.ssh on this machine".into(),

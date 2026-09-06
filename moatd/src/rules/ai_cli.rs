@@ -3,8 +3,11 @@
 //! Fills NOTES gap 1: a policy can only see one level of parent, and there is
 //! no selector for "is there a terminal in this chain". Two shapes fire:
 //!
-//! * **headless** — an AI CLI whose whole ancestry contains no terminal, no
-//!   tmux/ssh session and no editor. A human did not type this;
+//! * **headless** — an AI CLI with no **controlling terminal** on itself or
+//!   any ancestor, and (as a fallback for a chain we could not read /proc for)
+//!   no terminal, tmux/ssh session or editor by name either. A human did not
+//!   type this. The pty comes first because a name list cannot enumerate every
+//!   session host: see the note in `context.rs` about `herdr`, 2026-09-05;
 //! * **auto-approved** — permission-skipping flags (`--dangerously-skip-permissions`,
 //!   `--yolo`, …) while the parent is an interpreter inside a package-manager
 //!   subtree. That is a postinstall script driving an agent with your keys.
@@ -152,12 +155,26 @@ impl UserRule for AiCliHeadless {
             .cloned();
         let pkg = pkgtree::pkg_root_for(ctx.table, exec_id).cloned();
 
+        // "Is a human at the terminal" is a question the kernel already
+        // answers: a controlling terminal on the agent or any ancestor means
+        // somebody opened a pty. Ask that FIRST.
+        //
+        // The name list below is the fallback for a chain whose /proc was
+        // already gone, and it is a fallback rather than the rule for the
+        // reason `context.rs` gives at length: on 2026-09-05 the user's own
+        // Claude sessions ran under `herdr`, a session host on nobody's list,
+        // and every name-based test in this daemon read them as unattended.
+        // A list of terminal names cannot be finished; `tty_nr` needs no list.
+        let tty = std::iter::once(proc)
+            .chain(chain.iter().copied())
+            .find(|p| p.tty.is_some_and(|t| t != 0));
         // A terminal, tmux/ssh session or editor means a human is there. A bare
         // shell counts too — but only outside a package-manager subtree, since
         // npm spawns `sh` for every lifecycle script.
         let terminal = chain.iter().find(|p| INTERACTIVE.contains(&p.comm()));
         let shell = chain.iter().find(|p| LOGIN_SHELLS.contains(&p.comm()));
-        let headless = terminal.is_none() && !(shell.is_some() && pkg.is_none());
+        let headless =
+            tty.is_none() && terminal.is_none() && !(shell.is_some() && pkg.is_none());
         let auto_approved = flag.is_some() && parent_interp.is_some() && pkg.is_some();
 
         if !headless && !auto_approved {
@@ -193,7 +210,8 @@ impl UserRule for AiCliHeadless {
                 comm
             );
             evidence.push(format!(
-                "no terminal, tmux/ssh session, editor or interactive shell in the {} ancestor(s) examined",
+                "no controlling terminal on the process or any of the {} ancestor(s) examined, and \
+                 no terminal, tmux/ssh session, editor or interactive shell among them",
                 chain.len()
             ));
             if let Some(p) = pkg.as_ref() {
@@ -240,6 +258,7 @@ mod tests {
             homes: &homes,
             now: 100,
             mode: "monitor",
+            armed: &crate::rules::NO_RULES_ARMED,
         };
         AiCliHeadless.on_exec(&ExecEvent::default(), exec_id, &ctx)
     }
@@ -280,6 +299,54 @@ mod tests {
             .iter()
             .any(|e| e.contains("--dangerously-skip-permissions")));
         assert!(f[0].extra_evidence.iter().any(|e| e.contains("npm")));
+    }
+
+    /// The 2026-09-05 shape: `systemd --user -> <session host> -> bash(pts/5)
+    /// -> claude`. The host is on no list of terminal names and never will be,
+    /// but the shell under it holds a pty, so a person is there.
+    #[test]
+    fn an_agent_under_an_unknown_session_host_with_a_pty_is_not_headless() {
+        for host in ["/usr/bin/herdr", "/usr/bin/some-session-host-written-last-week"] {
+            let mut t = ProcTable::new(8, 60);
+            t.observe(&proc("e-sd", 1457, "/usr/lib/systemd/systemd", "--user", None));
+            t.observe(&proc("e-host", 10618, host, "server", Some("e-sd")));
+            t.observe(&proc("e-bash", 11311, "/usr/bin/bash", "", Some("e-host")));
+            t.observe(&proc("e-cli", 11536, "/usr/bin/claude", "", Some("e-bash")));
+            t.set_session("e-sd", Some(1457), Some(0));
+            t.set_session("e-host", Some(10618), Some(0));
+            t.set_session("e-bash", Some(10618), Some(34821));
+            t.set_session("e-cli", Some(10618), Some(34821));
+            assert!(run(&t, "e-cli").is_empty(), "{} -> bash(pts/5) -> claude is a human", host);
+        }
+    }
+
+    /// The same question with the pty as the only variable, on a chain with no
+    /// shell in it for the name fallback to catch: a wrapper under a session
+    /// host, with and without a terminal.
+    #[test]
+    fn the_controlling_terminal_is_what_decides_headless_not_the_names() {
+        let build = |tty: Option<u32>| {
+            let mut t = ProcTable::new(8, 60);
+            t.observe(&proc("e-sd", 1457, "/usr/lib/systemd/systemd", "--user", None));
+            // A host name INTERACTIVE has never heard of, so the pty is the
+            // only thing that can answer.
+            t.observe(&proc("e-host", 10618, "/usr/bin/hostd", "server", Some("e-sd")));
+            t.observe(&proc("e-wrap", 11311, "/usr/bin/node", "wrap.js", Some("e-host")));
+            t.observe(&proc("e-cli", 11536, "/usr/bin/claude", "", Some("e-wrap")));
+            t.set_session("e-sd", Some(1457), Some(0));
+            t.set_session("e-host", Some(10618), Some(0));
+            t.set_session("e-wrap", Some(10618), tty);
+            t.set_session("e-cli", Some(10618), tty);
+            t
+        };
+        assert!(run(&build(Some(34821)), "e-cli").is_empty(), "a pty is a person");
+
+        let f = run(&build(Some(0)), "e-cli");
+        assert_eq!(f.len(), 1, "the identical chain with no pty is headless");
+        assert!(f[0]
+            .extra_evidence
+            .iter()
+            .any(|e| e.contains("no controlling terminal")));
     }
 
     #[test]
