@@ -87,9 +87,9 @@ Item {
                         text: "Just tell me"
                         selected: !root.enforcing
                         onClicked: {
-                            if (root.service) {
+                            if (root.service)
                                 root.service.setMode("monitor");
-                            }
+
                         }
                     }
 
@@ -101,9 +101,9 @@ Item {
                         // it is the option whose worst case the user cannot see from here.
                         dim: !root.enforcing
                         onClicked: {
-                            if (root.service) {
+                            if (root.service)
                                 root.service.setMode("enforce");
-                            }
+
                         }
                     }
 
@@ -205,9 +205,9 @@ Item {
                         accent: root.t ? root.t.accent : "orange"
                         trackHeight: root.t ? root.t.s(23) : 18
                         onToggled: {
-                            if (root.service) {
+                            if (root.service)
                                 root.service.setContain(!root.service.containEnabled());
-                            }
+
                         }
                     }
 
@@ -245,9 +245,9 @@ Item {
                         text: "Nothing"
                         selected: !!root.service && root.service.containKill() === "off"
                         onClicked: {
-                            if (root.service) {
+                            if (root.service)
                                 root.service.setKill("off");
-                            }
+
                         }
                     }
 
@@ -256,9 +256,9 @@ Item {
                         text: "Write down what it would end"
                         selected: !!root.service && root.service.containKill() === "log"
                         onClicked: {
-                            if (root.service) {
+                            if (root.service)
                                 root.service.setKill("log");
-                            }
+
                         }
                     }
 
@@ -271,9 +271,9 @@ Item {
                         // should never be the brightest thing on it.
                         dim: !(!!root.service && root.service.containKill() === "kill")
                         onClicked: {
-                            if (root.service) {
+                            if (root.service)
                                 root.service.setKill("kill");
-                            }
+
                         }
                     }
 
@@ -308,9 +308,9 @@ Item {
                         accent: root.t ? root.t.accent : "orange"
                         trackHeight: root.t ? root.t.s(23) : 18
                         onToggled: {
-                            if (root.service) {
+                            if (root.service)
                                 root.service.setSandbox(!root.service.status.sandbox);
-                            }
+
                         }
                     }
 
@@ -345,9 +345,9 @@ Item {
                         accent: root.t ? root.t.accent : "orange"
                         trackHeight: root.t ? root.t.s(23) : 18
                         onToggled: {
-                            if (root.service) {
+                            if (root.service)
                                 root.weeklyDigestRequested(!root.service.weeklyDigest);
-                            }
+
                         }
                     }
 
@@ -446,9 +446,9 @@ Item {
                             accent: root.t ? root.t.accent : "orange"
                             trackHeight: root.t ? root.t.s(23) : 18
                             onToggled: {
-                                if (root.service) {
+                                if (root.service)
                                     root.rawDetailRequested(!root.service.rawDetail);
-                                }
+
                             }
                         }
 
@@ -481,9 +481,9 @@ Item {
                             accent: root.t ? root.t.accent : "orange"
                             trackHeight: root.t ? root.t.s(23) : 18
                             onToggled: {
-                                if (root.service) {
+                                if (root.service)
                                     root.showSuppressedRequested(!root.service.showSuppressed);
-                                }
+
                             }
                         }
 

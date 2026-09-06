@@ -745,13 +745,13 @@ Item {
     }
 
     Connections {
-        function onActionFinished(command, ok, message) {
-            // A read, not an action. "Quarantine-list done." is the daemon's own
-            // vocabulary reporting that a list refreshed, which is neither news nor
-            // English.
-            // setWeeklyDigest already wrote the notice, and it says more than this
-            // would (whether the setting was persisted). Leave it alone.
+        // A read, not an action. "Quarantine-list done." is the daemon's own
+        // vocabulary reporting that a list refreshed, which is neither news nor
+        // English.
+        // setWeeklyDigest already wrote the notice, and it says more than this
+        // would (whether the setting was persisted). Leave it alone.
 
+        function onActionFinished(command, ok, message) {
             if (!ok) {
                 root.notice = "Failed: " + command + (message ? " — " + message : "");
             } else if (command === "ignore") {

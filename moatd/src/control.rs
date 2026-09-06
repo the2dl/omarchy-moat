@@ -331,18 +331,39 @@ pub fn dispatch(d: &mut Daemon, req: &Value) -> Value {
 fn cmd_feed(d: &Daemon, req: &Value) -> Value {
     // Bounded by default. The panel renders a window, not the whole history,
     // and an unbounded feed would swap one unbounded read for another.
+    //
+    // R0: the window is `protected ∪ tail(limit)`, NOT the last `limit` rows by
+    // position. A burst of ~500 trivial timeline rows in under a minute used to
+    // push a CONTAINED, critical exfil chain out of a by-position window while
+    // it was still in the store — the panel replaces its whole list every poll,
+    // so the important row simply vanished with zero rotation involved.
+    // Retention follows importance: `is_protected()` rows are always carried in
+    // the window, and the position tail keeps the recent timeline.
     let limit = req.get("limit").and_then(|v| v.as_u64()).unwrap_or(500) as usize;
-    let mut alerts = d.store.load();
-    if alerts.len() > limit {
-        alerts = alerts.split_off(alerts.len() - limit);
+    // `load()` is every alert, updates folded, oldest first — ULIDs sort
+    // chronologically, so this is already id-order. One load, one pass.
+    let all = d.store.load();
+    let tail_start = all.len().saturating_sub(limit);
+    let mut alerts: Vec<crate::alert::Alert> = Vec::with_capacity(all.len().min(limit + 64));
+    // Honest `truncated`: set only when a NON-protected row was dropped, so the
+    // panel can still tell "you have the whole history" from "you have a window
+    // of it". A protected row pulled in from before the tail is never a drop.
+    let mut dropped_unprotected = false;
+    for (i, a) in all.into_iter().enumerate() {
+        if i >= tail_start || a.is_protected() {
+            // Single ascending pass over an id-sorted Vec: the tail is a
+            // contiguous suffix and protected rows are only pulled from before
+            // it, so the result stays id-sorted with no duplicate to dedupe.
+            alerts.push(a);
+        } else {
+            dropped_unprotected = true;
+        }
     }
     let receipts = d.receipt_list(50);
     ok(json!({
         "alerts": alerts,
         "receipts": receipts,
-        // So the panel can tell "you have the whole history" from "you have a
-        // window of it" without counting.
-        "truncated": d.store.load().len() > limit,
+        "truncated": dropped_unprotected,
     }))
 }
 
@@ -858,21 +879,43 @@ fn cmd_triage(d: &mut Daemon, req: &Value, id: &str) -> Value {
                 &cfg.triage_demote_max_severity,
                 &result,
             );
-            let record = crate::triage::record(
+            let mut record = crate::triage::record(
                 &agent,
                 &crate::util::now_rfc3339(),
                 result,
                 &action,
                 withheld.as_deref(),
             );
+            // A raise records what it is overwriting, so `undo` is exact. The
+            // agent may only push an alert UP, and only to `high`; it can never
+            // pull one down through this path (that is `demote`, separately
+            // fenced), so a raise cannot be used to hide anything.
+            if action == crate::triage::Action::Raise {
+                record.restore_severity = Some(alert.severity.clone());
+                record.restore_surface = Some(alert.surface.clone());
+            }
             let outcome = record.outcome.clone();
             if let Err(e) = d.mark(id, "triage", serde_json::to_value(&record).unwrap_or(Value::Null)) {
                 return err(e);
             }
-            if action == crate::triage::Action::Demote {
-                if let Err(e) = d.mark(id, "surface", Value::String("timeline".into())) {
-                    return err(e);
+            match action {
+                crate::triage::Action::Demote => {
+                    if let Err(e) = d.mark(id, "surface", Value::String("timeline".into())) {
+                        return err(e);
+                    }
                 }
+                crate::triage::Action::Raise => {
+                    // Severity to high, and onto the badge. The daemon is the
+                    // authority: the panel reads this back, it does not decide
+                    // it, so a raise cannot be re-overridden client-side.
+                    if let Err(e) = d.mark(id, "severity", Value::String("high".into())) {
+                        return err(e);
+                    }
+                    if let Err(e) = d.mark(id, "surface", Value::String("alerts".into())) {
+                        return err(e);
+                    }
+                }
+                crate::triage::Action::Annotate => {}
             }
             ok(json!({ "id": id, "outcome": outcome }))
         }
@@ -893,6 +936,19 @@ fn cmd_triage(d: &mut Daemon, req: &Value, id: &str) -> Value {
             if was.as_deref() == Some("demoted") {
                 if let Err(e) = d.mark(id, "surface", Value::String("alerts".into())) {
                     return err(e);
+                }
+            }
+            // A raise is reversed exactly, from what it recorded overwriting.
+            if was.as_deref() == Some("raised") {
+                if let Some(sev) = alert.triage.as_ref().and_then(|t| t.restore_severity.clone()) {
+                    if let Err(e) = d.mark(id, "severity", Value::String(sev)) {
+                        return err(e);
+                    }
+                }
+                if let Some(surf) = alert.triage.as_ref().and_then(|t| t.restore_surface.clone()) {
+                    if let Err(e) = d.mark(id, "surface", Value::String(surf)) {
+                        return err(e);
+                    }
                 }
             }
             ok(json!({ "id": id, "undone": was }))
@@ -3044,7 +3100,7 @@ mod tests {
         d.rarity.observe(&keep, now);
         d.rarity.observe(&lab, now);
         d.rarity.observe(&lab2, now);
-        assert!(d.rarity.has_seen(&lab) && d.rarity.has_seen(&keep));
+        assert!(d.rarity.has_counter(&lab) && d.rarity.has_counter(&keep));
 
         // A non-root caller is refused, and the attempt is recorded.
         let mut as_user = json!({"cmd":"forget","dst":"192.168.44.122"});
@@ -3052,16 +3108,16 @@ mod tests {
         as_user["_peer_uid"] = json!(1000);
         let r = dispatch(&mut d, &as_user);
         assert_eq!(r["ok"], false, "forgetting a host must need root");
-        assert!(d.rarity.has_seen(&lab), "and must not have taken effect");
+        assert!(d.rarity.has_counter(&lab), "and must not have taken effect");
 
         let mut as_root = json!({"cmd":"forget","dst":"192.168.44.122"});
         as_root["_peer_uid"] = json!(0);
         let r = dispatch(&mut d, &as_root);
         assert_eq!(r["ok"], true, "{:?}", r);
         assert_eq!(r["forgotten"], 2, "every exe and port for that host");
-        assert!(!d.rarity.has_seen(&lab));
-        assert!(!d.rarity.has_seen(&lab2));
-        assert!(d.rarity.has_seen(&keep), "and nothing else is touched");
+        assert!(!d.rarity.has_counter(&lab));
+        assert!(!d.rarity.has_counter(&lab2));
+        assert!(d.rarity.has_counter(&keep), "and nothing else is touched");
 
         assert!(
             d.store.load().iter().any(|a| a.rule == "moat-x-protection-changed"
@@ -3796,6 +3852,69 @@ mod tests {
         assert_eq!(r["ok"], false);
         assert!(r["error"].as_str().unwrap().contains("outside"));
         assert!(Path::new("/usr/bin/ls").exists());
+    }
+
+    /// R0: the feed window is `protected ∪ tail(limit)`, so a burst of trivial
+    /// timeline rows can no longer push an important row out of the window while
+    /// it is still in the store.
+    #[test]
+    fn feed_carries_a_protected_row_beyond_the_position_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+
+        // Two OLD rows (they sort before everything the sample log added and
+        // before the fillers): one protected (surfaced/high/unacked), one not.
+        let prot = crate::alert::tests_support::demo_alert("01A00000000000000000000001");
+        let mut plain = crate::alert::tests_support::demo_alert("01A00000000000000000000000");
+        plain.surface = "timeline".into();
+        plain.severity = "low".into();
+        plain.acked = true;
+        plain.action_taken = "none".into();
+        plain.chain = None;
+        plain.incident = None;
+        plain.rule = "moat-fs-ordinary".into();
+        assert!(prot.is_protected());
+        assert!(!plain.is_protected());
+        d.store.append_alert(&prot).unwrap();
+        d.store.append_alert(&plain).unwrap();
+
+        // A burst of recent timeline rows (latest ids) fills the window.
+        for i in 0..40 {
+            let mut f = crate::alert::tests_support::demo_alert(&format!("01Z{:023}", i));
+            f.surface = "timeline".into();
+            f.severity = "low".into();
+            f.acked = true;
+            d.store.append_alert(&f).unwrap();
+        }
+
+        let r = cmd_feed(&d, &json!({"limit": 5}));
+        let ids: std::collections::HashSet<String> = r["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            ids.contains("01A00000000000000000000001"),
+            "the protected row is carried into the window despite the burst"
+        );
+        assert!(
+            !ids.contains("01A00000000000000000000000"),
+            "the old unprotected row is correctly outside the window"
+        );
+        assert_eq!(r["truncated"], true, "a non-protected row was dropped");
+
+        // The result is id-sorted with no duplicates (single ascending pass).
+        let order: Vec<String> = r["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap().to_string())
+            .collect();
+        let mut sorted = order.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(order, sorted, "feed stays id-sorted and deduplicated");
     }
 
     #[test]

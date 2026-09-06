@@ -438,6 +438,7 @@ mod tests {
             now: 1_000,
             mode,
             armed: &crate::rules::NO_RULES_ARMED,
+            cred_read_sessions: &crate::rules::NO_CRED_SESSIONS,
         };
         rule.on_exec(&ExecEvent::default(), exec_id, &ctx)
     }

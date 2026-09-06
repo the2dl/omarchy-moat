@@ -131,6 +131,18 @@ pub struct Daemon {
     /// notified, never counted (BASELINE §8).
     pub alerts_suppressed: u64,
     dedupe: HashMap<String, Dedupe>,
+    /// When a process last read a credential file, keyed by SESSION id.
+    ///
+    /// The exfil-context signal: `net_first_contact` normally goes quiet once a
+    /// destination's /24 is familiar (a CDN affordability choice). But a
+    /// connection to a familiar /24 from a session that JUST read a credential
+    /// is the exact exfil-to-reputable-infra case that /24 familiarity hides --
+    /// so the net step fires anyway and the cred->net chain can form. Keyed by
+    /// session, not pid, because the read and the connect may be sibling
+    /// processes of one task (run.py reads, exporter.py connects). Only set by
+    /// non-suppressed cred findings, which the policy exclusions have already
+    /// filtered to the reads worth noticing.
+    cred_read_sessions: HashMap<u32, u64>,
     /// exec_id -> alert id, for kill confirmation (NOTES §7).
     pending_kill: HashMap<String, String>,
 
@@ -242,6 +254,8 @@ impl Daemon {
             &cfg.paths.alerts(),
             &cfg.paths.alerts_rotated(),
             cfg.thresholds.alerts_max_bytes,
+            cfg.thresholds.alerts_carry_max_bytes,
+            cfg.thresholds.alerts_carry_max,
             &cfg.group,
         )?;
         let policies = PolicySet::load(&cfg.paths.policies_dir);
@@ -335,6 +349,7 @@ impl Daemon {
             alerts_emitted: 0,
             alerts_suppressed: 0,
             dedupe: HashMap::new(),
+            cred_read_sessions: HashMap::new(),
             pending_kill: HashMap::new(),
             provenance,
             rarity,
@@ -468,6 +483,19 @@ impl Daemon {
             // and then we leave.
             if crate::telemetry::is_telemetry_policy(hook.policy_name()) {
                 self.note_hook_telemetry(&hook, &exec_id, ev.time.as_deref(), now);
+                return;
+            }
+
+            // moatd's OWN containment firing again. The contained process tried
+            // its refused connection once more and the kernel denied it -- the
+            // containment working, not a new thing to detect. Running it back
+            // through `policy_finding` built an alert with destination
+            // `0.0.0.0:0`, because a REFUSED `sockaddr` connect carries no
+            // usable address, so the record read "python may not reach
+            // 0.0.0.0" and looked like a false positive on a benign run. Record
+            // it against what the containment actually names and stop.
+            if crate::contain::is_contain_policy(hook.policy_name()) {
+                self.note_contain_enforced(hook.policy_name(), &exec_id, now);
                 return;
             }
 
@@ -713,6 +741,7 @@ impl Daemon {
             now,
             mode: &self.mode,
             armed: &self.enforcing_rules,
+            cred_read_sessions: &self.cred_read_sessions,
         }
     }
 
@@ -1096,6 +1125,32 @@ impl Daemon {
     /// and `chain.rs` has established that it happened inside a sequence worth
     /// interrupting for. So the decision is made here and the enforcement is
     /// handed back to the kernel, scoped to one binary and one address.
+    /// A containment policy denied a connection: the thing being contained is
+    /// still trying, and the kernel refused it again. Feedback, not a finding.
+    ///
+    /// Attributed to what the containment RECORD says -- the real binary and
+    /// destination it was built from -- never to the refused event's own
+    /// sockaddr, which is `0.0.0.0`. No alert is emitted: the containment is
+    /// already visible in `moatctl contain` and on the Now page (its trigger
+    /// members carry `action_taken: contained`). This only notes that it bit.
+    fn note_contain_enforced(&mut self, policy: &str, exec_id: &str, now: u64) {
+        let dest = self
+            .contain
+            .live()
+            .iter()
+            .find(|c| c.policy == policy)
+            .map(|c| c.dests.join(", "))
+            .unwrap_or_default();
+        let who = self.table.get(exec_id).map(|p| p.exe.clone()).unwrap_or_default();
+        log::info!(
+            "containment {} held: {} was refused {} again ({})",
+            policy,
+            if who.is_empty() { "a contained process" } else { &who },
+            if dest.is_empty() { "its destination" } else { &dest },
+            crate::util::rfc3339_of(now)
+        );
+    }
+
     fn maybe_contain(&mut self, c: &crate::chain::Chain, now: u64) {
         if !self.cfg.contain.enabled {
             return;
@@ -1166,10 +1221,30 @@ impl Daemon {
                 }
             }
             for d in ds {
+                // NEVER contain an unspecified address. 0.0.0.0 / :: are not a
+                // destination -- they are "any", and a containment naming them
+                // is at best meaningless and at worst a policy that refuses the
+                // binary's connections wholesale. A garbage dest should never
+                // reach here now that moatd stops re-parsing its own deny
+                // events, but a containment is a policy moatd writes and arms
+                // ON ITS OWN JUDGEMENT, so the guard is absolute rather than
+                // trusting of its inputs.
+                if is_unspecified_dest(&d) {
+                    log::warn!("containment: refusing to contain the unspecified address {:?}", d);
+                    continue;
+                }
                 if !dests.contains(&d) {
                     dests.push(d);
                 }
             }
+        }
+        // If filtering left nothing real to refuse, there is nothing to
+        // contain -- and a containment with no destination must never be
+        // written, because an empty SAddr list is exactly the wholesale block
+        // the guard above exists to prevent.
+        if dests.is_empty() {
+            log::warn!("containment: no usable destination for chain {}, not containing", c.id);
+            return;
         }
 
         // Pick the slot BEFORE writing anything: `tp add` fails if a policy
@@ -1213,6 +1288,25 @@ impl Daemon {
         for dropped in self.contain.insert(record, self.cfg.contain.max) {
             self.release_contain(&dropped);
         }
+
+        // Stamp the chain's members `action_taken: "contained"`.
+        //
+        // Kill stamps "killed", quarantine stamps "quarantined", and until
+        // 2026-09-06 containment -- the third response action, and the one that
+        // fires most -- stamped nothing. So the panel could not tell a
+        // contained alert from an ordinary one: `alertState` only reads
+        // "contained" from `action_taken`, `blockedIncidents`/
+        // `stoppedIncidents` feed the Now page's blocked card from the same
+        // field, and a containment therefore appeared in History and nowhere
+        // in Now. Moat acting on its own is exactly what Now exists to show.
+        //
+        // The trigger members carry the story (an allowlisted context step is
+        // not what was contained); a truncated chain's `steps` is a floor, but
+        // the members it does hold are enough to surface the incident.
+        for step in c.steps.iter().filter(|s| s.is_trigger()) {
+            let _ = self.mark(&step.alert, "action_taken", Value::from("contained"));
+        }
+
         self.write_state();
     }
 
@@ -2216,6 +2310,19 @@ impl Daemon {
     pub fn emit(&mut self, mut f: Finding) -> Option<String> {
         let now = util::unix_secs();
 
+        // Record a credential read against its session, for the exfil-context
+        // gate in `net_first_contact` (see `cred_read_sessions`). A suppressed
+        // read is the user's own tool doing its job and does not count.
+        if f.meta.family == "cred" && f.suppressed_by.is_none() {
+            if let Some(sid) = self.table.get(&f.exec_id).and_then(|p| p.sid) {
+                // Drop entries older than the window the gate cares about, so
+                // the map is bounded by live sessions rather than uptime.
+                self.cred_read_sessions
+                    .retain(|_, t| now.saturating_sub(*t) <= 120);
+                self.cred_read_sessions.insert(sid, now);
+            }
+        }
+
         // --- 0. the mode that governed THIS rule ---------------------------
         // Stamped here, once, for every finding whatever path built it. The
         // policy path already did this; the userland rules (`RuleCtx::finding`)
@@ -2721,6 +2828,17 @@ impl Daemon {
             if a.acked || a.triage.is_some() || a.surface != "alerts" {
                 continue;
             }
+            // A tuple that was benign ALONE is a different question when it is a
+            // step in a correlated sequence. On 2026-09-06 the reportkit exfil's
+            // credential reads were individually benign (the user's own drill),
+            // and a fresh run inherited that benign verdict onto the SAME reads
+            // even though they now formed a high/critical exfil chain -- caching
+            // an answer to a question the chain had changed. A chain member is
+            // never cheap enough to skip: it goes to the agent (or stays for the
+            // user), it does not inherit.
+            if a.chain.as_ref().map(|c| crate::alert::severity_rank(&c.severity) >= crate::alert::severity_rank("high")).unwrap_or(false) {
+                continue;
+            }
             let Some((src, prior)) = source.get(&a.tuple_key()) else { continue };
             if src.id == a.id {
                 continue;
@@ -3000,13 +3118,18 @@ impl Daemon {
         });
         // Retention is cheapest right after a capture, and it means the cap is
         // enforced even on a machine that never restarts the daemon.
-        // Which incidents still want a human. An alert that has been acked, or
-        // that the daemon never surfaced, is answered; those go first.
+        // Which incidents to pin. This is the SAME `is_protected()` predicate
+        // the feed window and carry-forward rotation use, so the incident
+        // keep-set cannot drift from what survives in `alerts.jsonl`: a row that
+        // is retained keeps its incident pinned, and a row that rotates out lets
+        // its snapshot be pruned. (Every incident-bearing row is protected by P4
+        // by construction, so an on-disk snapshot is pinned as long as its alert
+        // row lives — which is the whole point of the fix.)
         let keep: std::collections::HashSet<String> = self
             .store
             .load()
             .iter()
-            .filter(|a| !a.acked && a.surface == "alerts")
+            .filter(|a| a.is_protected())
             // `dir` is the incident directory; its last component is the id
             // that `prune` works in.
             .filter_map(|a| {
@@ -4212,6 +4335,28 @@ fn setuid_grants_nothing(f: &crate::explain::Finding, path: &str) -> Option<Stri
     })
 }
 
+/// Is this destination string the unspecified address ("any"), not a host?
+///
+/// `0.0.0.0`, `::`, their CIDR forms, and an empty string. A containment naming
+/// one of these does not refuse a beacon -- it refuses the binary's traffic
+/// wholesale, or nothing at all, and either way is never what containment
+/// means. Guarded absolutely because containment is a policy moatd writes and
+/// arms without asking.
+fn is_unspecified_dest(d: &str) -> bool {
+    let d = d.trim();
+    if d.is_empty() {
+        return true;
+    }
+    // Strip a CIDR suffix before comparing the address.
+    let addr = d.split('/').next().unwrap_or(d);
+    match addr.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_unspecified(),
+        // Not parseable as an address at all is not a destination we can
+        // safely refuse either.
+        Err(_) => true,
+    }
+}
+
 fn persisted_contain(state: &Option<Value>) -> Option<bool> {
     state.as_ref()?.get("contain_enabled")?.as_bool()
 }
@@ -4425,6 +4570,24 @@ pub fn run(daemon: Arc<Mutex<Daemon>>, opts: RunOptions) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_unspecified_address_is_never_a_containment_destination() {
+        // 0.0.0.0 / :: are "any", not a host. A containment naming one refuses
+        // the binary's traffic wholesale or nothing at all -- the 2026-09-06
+        // report where a benign run showed "python may not reach 0.0.0.0".
+        assert!(is_unspecified_dest("0.0.0.0"));
+        assert!(is_unspecified_dest("0.0.0.0/0"));
+        assert!(is_unspecified_dest("::"));
+        assert!(is_unspecified_dest(""));
+        assert!(is_unspecified_dest("   "));
+        assert!(is_unspecified_dest("not-an-address"));
+        // A real host is fine.
+        assert!(!is_unspecified_dest("192.168.44.122"));
+        assert!(!is_unspecified_dest("52.86.29.70"));
+        assert!(!is_unspecified_dest("2600:1901::1"));
+    }
+
     use super::*;
 
     fn dev_daemon(dir: &Path) -> (Daemon, Config) {

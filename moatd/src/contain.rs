@@ -123,6 +123,18 @@ fn yaml_scalar(s: &str) -> String {
 /// Slots are bounded by `[contain] max`, which is also the cap that already
 /// evicts the oldest containment, so reserving `max` names in the allowlist
 /// costs nothing and covers every containment that can exist at once.
+/// Is this the name of one of moatd's own containment policies?
+///
+/// These fire when a process moatd has contained tries its refused connection
+/// again. That is moat's OWN enforcement confirming it works -- not a fresh
+/// detection -- so the engine must not run it back through `policy_finding`,
+/// which built an alert whose destination came out `0.0.0.0:0`: a `sockaddr`
+/// LSM arg on a REFUSED connect does not carry a usable address, and inventing
+/// one made the containment look broken while it was in fact working.
+pub fn is_contain_policy(name: &str) -> bool {
+    name.starts_with("moat-contain-")
+}
+
 pub fn policy_name(slot: usize) -> String {
     format!("moat-contain-{}", slot)
 }

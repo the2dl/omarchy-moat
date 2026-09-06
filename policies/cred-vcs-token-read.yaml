@@ -44,14 +44,19 @@ spec:
         - "/hub"
         - "/lazygit"
       matchArgs:
+      # Postfix, not Equal against {{HOME}}: a credential file read from a
+      # non-canonical path (a copy, a backup, a bind mount, a bundled decoy)
+      # is the same signal as one read from home. See cred-cloud-credentials-read
+      # for the 2026-09-06 exfil test that made this concrete. Monitor-only, so
+      # this only widens a low chain step; the tool exclusions still apply.
       - index: 0
-        operator: "Equal"
+        operator: "Postfix"
         values:
-        - "{{HOME}}/.git-credentials"
-        - "{{HOME}}/.netrc"
-        - "{{HOME}}/.config/gh/hosts.yml"
-        - "{{HOME}}/.config/glab-cli/config.yml"
-        - "{{HOME}}/.config/git/credentials"
+        - "/.git-credentials"
+        - "/.netrc"
+        - "/.config/gh/hosts.yml"
+        - "/.config/glab-cli/config.yml"
+        - "/.config/git/credentials"
       - index: 1
         operator: "Mask"
         values: ["4"]

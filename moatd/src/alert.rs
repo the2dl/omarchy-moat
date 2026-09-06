@@ -74,6 +74,43 @@ pub struct Explain {
     pub next: Vec<String>,
 }
 
+/// Tamper-evidence stamp for carry-forward rotation (`store::rotate`).
+///
+/// Append-only is a security property: `alerts.jsonl` is never rewritten in
+/// place. Rotation, however, carries the *protected* rows forward into the
+/// fresh generation by writing them again as folded Full lines — so a carried
+/// line is a second, moatd-authored copy of a row whose original now lives in
+/// `alerts.1.jsonl`. Stamping it says so out loud: a re-serialised carried row
+/// is distinguishable from the original write, and a reader can tell how many
+/// rotations a row has survived. Absent on every original write; old readers
+/// ignore the unknown key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Carried {
+    /// RFC3339 time of the rotation that carried this row forward.
+    pub at: String,
+    /// How many times this row has been carried across a rotation (1 on the
+    /// first carry, incremented each time it survives another).
+    pub generation: u64,
+}
+
+/// The rules whose meta-alerts are always retention-protected (P5).
+///
+/// These are moat telling on *itself* — protection was turned off, the sensor
+/// disagrees with policy or is throttled, moat was not running, nobody is
+/// watching, a baseline was revoked, a rule went noisy. They are exactly the
+/// rows a flood would want to bury, so they never rotate or evict on volume.
+/// An EXPLICIT list, not a `moat-x-` prefix match: `moat-x-mass-read` and the
+/// other detection rules in that namespace are ordinary detections.
+pub const PROTECTED_META_RULES: &[&str] = &[
+    "moat-x-protection-changed",
+    "moat-x-sensor-mismatch",
+    "moat-x-sensor-throttled",
+    "moat-x-was-not-running",
+    "moat-x-nobody-is-watching",
+    "moat-x-baseline-revoked",
+    "moat-x-noisy-rule",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Alert {
     pub v: u32,
@@ -187,6 +224,12 @@ pub struct Alert {
     /// written. Purely descriptive: nothing in here changes `severity`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content: Vec<crate::content::FileAnalysis>,
+    /// Set only when `store::rotate` carried this row forward into a fresh
+    /// generation of `alerts.jsonl`; tamper-evidence that this Full line is a
+    /// re-serialised copy, not the original write. Absent on every original
+    /// write, and never set by an update line — see `Carried`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried: Option<Carried>,
     /// Not serialised: only the live daemon uses it, to tie a later
     /// `process_exit` back to the alert that predicted the kill.
     #[serde(skip)]
@@ -227,6 +270,58 @@ impl Alert {
     /// guard cannot drift apart.
     pub fn is_building_block(&self) -> bool {
         self.tier == crate::policy::TIER_SIGNAL && !self.pkg_install_escalation
+    }
+
+    /// **Retention follows importance, not arrival order.** A protected row is
+    /// one that must survive a flood: it is neither dropped from the feed
+    /// window (`cmd_feed`), rotated out on volume (`store::rotate` carries it
+    /// forward), nor allowed to let its incident snapshot be pruned
+    /// (`engine`'s incident keep-set). One predicate for all three, so they
+    /// cannot drift.
+    ///
+    /// Protected iff ANY of:
+    /// * **P1 badge** — surfaced, unacked, not suppressed. This is exactly the
+    ///   `unacked` predicate in `store.rs`: the thing a person still has to
+    ///   answer.
+    /// * **P2 acted** — something was done (`killed`/`quarantined`/…), acked or
+    ///   not: the record of a response must outlive the noise around it.
+    /// * **P3 story** — a step in a chain that reached `high` or above.
+    /// * **P4 indexed** — it has an incident snapshot on disk; the row is what
+    ///   pins that evidence.
+    /// * **P5 meta** — one of the self-health rules in `PROTECTED_META_RULES`.
+    /// * **P6 answered-but-grave** — surfaced and `high`+ severity, even once
+    ///   acked: a critical that was looked at is still the last thing to lose.
+    pub fn is_protected(&self) -> bool {
+        let high = severity_rank("high");
+        // P1: on the badge, unacked, not suppressed (mirrors `AlertStore::unacked`).
+        if self.surface == "alerts" && !self.acked && !self.is_suppressed() {
+            return true;
+        }
+        // P2: a response was taken.
+        if self.action_taken != "none" {
+            return true;
+        }
+        // P3: a member of a high+ chain.
+        if self
+            .chain
+            .as_ref()
+            .is_some_and(|c| severity_rank(&c.severity) >= high)
+        {
+            return true;
+        }
+        // P4: it holds an incident snapshot.
+        if self.incident.is_some() {
+            return true;
+        }
+        // P5: a self-health / protection meta alert.
+        if PROTECTED_META_RULES.contains(&self.rule.as_str()) {
+            return true;
+        }
+        // P6: surfaced and grave, even if answered.
+        if self.surface == "alerts" && self.severity_rank() >= high {
+            return true;
+        }
+        false
     }
 
     /// The baseline's tuple for this alert: (rule, actor exe, parent exe, file
@@ -452,6 +547,7 @@ pub mod tests_support {
             incident: None,
             chain: None,
             content: Vec::new(),
+            carried: None,
             exec_id: "abc".into(),
         }
     }
@@ -644,5 +740,128 @@ mod tests {
         assert!(severity_rank("critical") > severity_rank("high"));
         assert!(severity_rank("high") > severity_rank("medium"));
         assert!(severity_rank("medium") > severity_rank("low"));
+    }
+
+    /// A plain, answered, low timeline row is protected by nothing.
+    fn unprotected() -> Alert {
+        let mut a = demo();
+        a.surface = "timeline".into();
+        a.severity = "low".into();
+        a.acked = true;
+        a.action_taken = "none".into();
+        a.rule = "moat-fs-something-ordinary".into();
+        a.chain = None;
+        a.incident = None;
+        assert!(!a.is_protected(), "baseline fixture must be unprotected");
+        a
+    }
+
+    #[test]
+    fn p1_badge_unacked_surfaced_unsuppressed_is_protected() {
+        let mut a = unprotected();
+        a.surface = "alerts".into();
+        a.acked = false;
+        a.suppressed_by = None;
+        assert!(a.is_protected());
+        // Suppressing it takes it off the badge, so P1 no longer applies.
+        a.suppressed_by = Some("user.toml#1".into());
+        assert!(!a.is_protected(), "a suppressed row is not on the badge");
+        // Acking it drops P1 too (it is low, so P6 does not save it).
+        a.suppressed_by = None;
+        a.acked = true;
+        assert!(!a.is_protected());
+    }
+
+    #[test]
+    fn p2_acted_is_protected_even_when_acked() {
+        let mut a = unprotected();
+        a.action_taken = "killed".into();
+        assert!(a.is_protected(), "a response outlives the noise, acked or not");
+        a.action_taken = "quarantined".into();
+        assert!(a.is_protected());
+        a.action_taken = "none".into();
+        assert!(!a.is_protected());
+    }
+
+    #[test]
+    fn p3_high_chain_is_protected_but_a_low_chain_is_not() {
+        let chain_of = |severity: &str| -> crate::chain::Chain {
+            serde_json::from_value(serde_json::json!({
+                "v": 1, "id": "01A",
+                "ancestor": {"pid": 1, "exe": "/usr/bin/npm"},
+                "families": ["cred"],
+                "severity": severity, "severity_base": severity,
+                "severity_reason": "r",
+                "first_ts": "t", "last_ts": "t", "span_secs": 1,
+                "steps": [], "steps_total": 0, "truncated": false, "summary": "s",
+            }))
+            .unwrap()
+        };
+        let mut a = unprotected();
+        a.chain = Some(chain_of("medium"));
+        assert!(!a.is_protected(), "a medium chain is not a P3 story");
+        a.chain = Some(chain_of("high"));
+        assert!(a.is_protected());
+        a.chain = Some(chain_of("critical"));
+        assert!(a.is_protected());
+    }
+
+    #[test]
+    fn p4_incident_is_protected() {
+        let mut a = unprotected();
+        a.incident = Some(crate::incident::Incident {
+            dir: "/var/lib/moat/incidents/01J".into(),
+            files: Vec::new(),
+        });
+        assert!(a.is_protected());
+    }
+
+    #[test]
+    fn p5_meta_rules_are_protected_and_the_list_is_explicit() {
+        for rule in PROTECTED_META_RULES {
+            let mut a = unprotected();
+            a.rule = (*rule).into();
+            assert!(a.is_protected(), "{} must be protected", rule);
+        }
+        // Not a prefix match: an ordinary detection in the moat-x- namespace
+        // is not protected on its rule name alone.
+        let mut a = unprotected();
+        a.rule = "moat-x-mass-read".into();
+        assert!(!a.is_protected(), "moat-x-mass-read is a detection, not meta");
+    }
+
+    #[test]
+    fn p6_answered_but_grave_is_protected() {
+        let mut a = unprotected();
+        a.surface = "alerts".into();
+        a.acked = true;
+        a.severity = "high".into();
+        assert!(a.is_protected(), "a looked-at high is still the last to lose");
+        a.severity = "critical".into();
+        assert!(a.is_protected());
+        // A medium on the badge, once acked, is neither P1 nor P6.
+        a.severity = "medium".into();
+        assert!(!a.is_protected());
+        // And P6 needs the badge surface: a grave *timeline* row is not P6.
+        a.severity = "high".into();
+        a.surface = "timeline".into();
+        assert!(!a.is_protected());
+    }
+
+    #[test]
+    fn a_carried_stamp_round_trips_and_is_absent_by_default() {
+        let a = demo();
+        let line = serde_json::to_string(&a).unwrap();
+        assert!(!line.contains("carried"), "an original write carries no stamp");
+        let mut c = demo();
+        c.carried = Some(Carried { at: "2026-09-06T00:00:00Z".into(), generation: 2 });
+        let line = serde_json::to_string(&c).unwrap();
+        assert!(line.contains("\"carried\""));
+        match parse_record(&line).unwrap() {
+            Record::Full(b) => {
+                assert_eq!(b.carried, Some(Carried { at: "2026-09-06T00:00:00Z".into(), generation: 2 }));
+            }
+            _ => panic!("should parse as a full alert"),
+        }
     }
 }

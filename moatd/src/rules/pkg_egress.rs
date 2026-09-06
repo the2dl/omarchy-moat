@@ -25,12 +25,15 @@ pub const ID: &str = "moat-x-pkg-egress";
 
 /// Has this machine never talked to this destination from this binary before?
 ///
-/// The whole discrimination in one predicate. An internal registry is contacted
-/// on every install and is `common` within days; a beacon to a host nobody has
-/// seen is not, and gets exactly one alert.
+/// The whole discrimination in one predicate, and it is
+/// `RarityStore::knows_destination` -- the same one `moat-net-first-contact`
+/// asks, because it is the same question. This used to be `has_seen`, which is
+/// true after ONE sighting, so inside an install a payload's own first packet
+/// silenced every connection that followed it to that /24. An internal registry
+/// is contacted repeatedly over hours and goes quiet; a burst inside one install
+/// cannot buy that.
 fn first_contact(ctx: &RuleCtx, exe: &str, ip: &str, port: u16) -> bool {
-    !ctx.rarity
-        .has_seen(&crate::rarity::Tuple::net(exe, ip, port, None))
+    !ctx.rarity.knows_destination(exe, ip, port, ctx.now)
 }
 
 #[derive(Default)]
@@ -187,6 +190,7 @@ mod tests {
             now: 100,
             mode: "monitor",
             armed: &crate::rules::NO_RULES_ARMED,
+            cred_read_sessions: &crate::rules::NO_CRED_SESSIONS,
         };
         let h = HookHit {
             kind: HookKind::Kprobe,
@@ -233,6 +237,7 @@ mod tests {
             now: 100,
             mode: "monitor",
             armed: &crate::rules::NO_RULES_ARMED,
+            cred_read_sessions: &crate::rules::NO_CRED_SESSIONS,
         };
         let h = HookHit {
             kind: HookKind::Kprobe,
@@ -263,19 +268,22 @@ mod tests {
         assert_eq!(run(&t, &cfg(), &sock_event("192.168.44.122", 4873), "e-node").len(), 1);
 
         // The other half, and the reason the exclusion stays: a LAN host this
-        // machine HAS talked to before is your internal registry, and it must
-        // stay silent without anyone configuring anything. One alert on first
+        // machine genuinely KNOWS is your internal registry, and it must stay
+        // silent without anyone configuring anything. One alert on first
         // contact, then quiet forever.
+        //
+        // "Knows" is `knows_destination`, not "there is a counter": an internal
+        // registry is contacted repeatedly across hours, which is what earns it.
         let mut known = cfg();
         let mut store = crate::rarity::RarityStore::default();
-        store.observe(
-            &crate::rarity::Tuple::net("/usr/bin/node", "192.168.44.122", 4873, None),
-            1_700_000_000,
-        );
+        let dst = crate::rarity::Tuple::net("/usr/bin/node", "192.168.44.122", 4873, None);
+        for i in 0..8u64 {
+            store.observe(&dst, 1_000 + i * 1_800);
+        }
         assert!(
             run_with_rarity(&t, &known, &store, &sock_event("192.168.44.122", 4873), "e-node")
                 .is_empty(),
-            "an internal registry seen before is not reported again"
+            "an internal registry the machine knows is not reported again"
         );
         known.net.allow_private = true;
 
@@ -283,6 +291,42 @@ mod tests {
         let mut named = cfg();
         named.net.registry_cidrs.push("192.168.44.0/24".into());
         assert!(run(&t, &named, &sock_event("192.168.44.122", 4873), "e-node").is_empty());
+    }
+
+    /// One sighting is not knowledge, here either.
+    ///
+    /// This rule asked `has_seen` long after `moat-net-first-contact` stopped:
+    /// one question, two predicates, and the weaker one had no comment saying
+    /// why it was weaker. Inside an install with `allow_private` on, a payload's
+    /// own first connection to its C2 silenced every connection that followed
+    /// it -- no privilege needed, and the attacker trained the detector with the
+    /// attack. Both call sites now go through `knows_destination`.
+    #[test]
+    fn one_sighting_does_not_buy_silence_inside_an_install() {
+        let t = table_with_install();
+        let mut c = cfg();
+        c.net.allow_private = true;
+        let dst = crate::rarity::Tuple::net("/usr/bin/node", "192.168.44.122", 4873, None);
+
+        let mut once = crate::rarity::RarityStore::default();
+        once.observe(&dst, 1);
+        assert_eq!(
+            run_with_rarity(&t, &c, &once, &sock_event("192.168.44.122", 4873), "e-node").len(),
+            1,
+            "one prior connection must not silence the rule"
+        );
+
+        // Nor a burst: eight connections in eight seconds is what a payload
+        // does inside one install, not what an internal registry looks like.
+        let mut burst = crate::rarity::RarityStore::default();
+        for i in 0..8u64 {
+            burst.observe(&dst, 100 + i);
+        }
+        assert_eq!(
+            run_with_rarity(&t, &c, &burst, &sock_event("192.168.44.122", 4873), "e-node").len(),
+            1,
+            "a burst inside one install cannot manufacture familiarity"
+        );
     }
 
     #[test]

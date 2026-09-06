@@ -212,6 +212,14 @@ pub struct Thresholds {
     pub ancestry_max: usize,
     /// alerts.jsonl rotation size.
     pub alerts_max_bytes: u64,
+    /// Carry-forward byte cap for rotation (`store::rotate`). At rotation the
+    /// protected rows are carried into the fresh generation; when they exceed
+    /// this many bytes they are evicted in importance order. Well under
+    /// `alerts_max_bytes` so a rotation cannot loop.
+    pub alerts_carry_max_bytes: u64,
+    /// Carry-forward row cap for rotation, the count companion to
+    /// `alerts_carry_max_bytes`.
+    pub alerts_carry_max: usize,
     /// state.json write interval.
     pub state_interval_secs: u64,
     /// Feed file mtime poll interval.
@@ -255,6 +263,8 @@ impl Default for Thresholds {
             // for the folded feed), so its size is a retention question again
             // rather than a UI latency budget. See moat.toml.
             alerts_max_bytes: 20 * 1024 * 1024,
+            alerts_carry_max_bytes: 5 * 1024 * 1024,
+            alerts_carry_max: 1000,
             state_interval_secs: 5,
             feeds_poll_secs: 60,
             arm_wait_secs: 120,

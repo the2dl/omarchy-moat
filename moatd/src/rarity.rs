@@ -404,12 +404,33 @@ pub struct RarityStore {
 }
 
 impl RarityStore {
-    /// Has this exact tuple ever been counted? Read-only, for rules that need
-    /// "first contact" without the mutation `observe` performs.
+    /// **Does this machine know this destination?** The one answer, for every
+    /// rule that asks.
+    ///
+    /// There is exactly one predicate because there was once more than one, and
+    /// the weaker of the two was the hole. `moat-net-first-contact` was fixed to
+    /// ask [`is_familiar`](Self::is_familiar); `moat-x-pkg-egress` went on
+    /// asking "is there a counter" for another two months, so inside a package
+    /// install a payload's own first connection still bought silence for every
+    /// connection that followed it. Two call sites, one question, two answers --
+    /// and the comment explaining why only sat at one of them.
+    ///
+    /// So the reasoning lives here, at the predicate, and the predicate that
+    /// answered it wrongly is gone from the crate's surface: `has_counter` is
+    /// `#[cfg(test)]` and named after what it actually returns. A third caller
+    /// asking this question cannot reach the weak answer by accident.
+    ///
+    /// Read-only: the engine owns `observe`, so at rule-evaluation time the
+    /// current connection has NOT been counted yet and "do we know it" means
+    /// exactly that.
+    pub fn knows_destination(&self, exe: &str, ip: &str, port: u16, now: u64) -> bool {
+        self.is_familiar(&Tuple::net(exe, ip, port, None), now)
+    }
+
     /// Is this destination genuinely familiar, or merely touched once?
     ///
-    /// `has_seen` answers "is there a counter", which a single connection
-    /// creates -- and `moat-net-first-contact` used that as its whole filter,
+    /// "Is there a counter" is what a single connection creates -- and
+    /// `moat-net-first-contact` used that as its whole filter,
     /// so ONE connection to a C2 silenced every later beacon to that /24
     /// forever. No root, no CLI, no privilege: the attacker's own first packet
     /// bought permanent silence for the rest.
@@ -465,7 +486,16 @@ impl RarityStore {
         hits
     }
 
-    pub fn has_seen(&self, t: &Tuple) -> bool {
+    /// Is there a counter for this exact tuple?
+    ///
+    /// **Test-only, and named for what it returns.** It is not an answer to "do
+    /// we know this destination" -- one connection creates a counter, which is
+    /// why it was a hole at both call sites that used it for that (see
+    /// [`knows_destination`](Self::knows_destination)). It survives because
+    /// `forget_dst` and the eviction cap need to assert on the presence of a
+    /// key, which is a different question and a legitimate one.
+    #[cfg(test)]
+    pub fn has_counter(&self, t: &Tuple) -> bool {
         self.counters.contains_key(&t.key())
     }
 }
@@ -1069,7 +1099,7 @@ mod cap_tests {
         for i in 0..5_000 {
             s.observe(&Tuple::net("/tmp/x/beacon", &format!("172.16.{}.{}", i / 256, i % 256), 443, None), now);
         }
-        assert!(s.has_seen(&hot), "the coldest go first, not the busiest");
+        assert!(s.has_counter(&hot), "the coldest go first, not the busiest");
     }
 }
 

@@ -256,8 +256,47 @@ enum BaselineCmd {
     },
 }
 
+/// Verbs that change what moat does or hides an alert. An agent may run
+/// moatctl to READ (status, list, explain, chain, decisions) but never to act:
+/// the auto-triage ceiling is "explain and at most demote", and an agent that
+/// reached a shell must not be able to ack, allowlist, disarm or release from
+/// it. `MOAT_AGENT_CONTEXT` is set by every path that launches an agent over
+/// moat's own evidence; the user's own shell never has it. The sandbox already
+/// masks the socket, so this is the second lock, for the paths that run an
+/// agent unconfined (a machine without moat-sandbox, a `--dry-run` a human
+/// pasted). Bypassable by a shell that unsets its own env -- which is why the
+/// sandbox, not this, is the boundary -- but it stops the ordinary case where
+/// an agent runs the `moatctl ack` it found in a recommendation list.
+fn agent_may_not_run(cmd: &Cmd) -> bool {
+    if std::env::var("MOAT_AGENT_CONTEXT").ok().as_deref() != Some("1") {
+        return false;
+    }
+    matches!(
+        cmd,
+        Cmd::Ack { .. }
+            | Cmd::Ignore { .. }
+            | Cmd::Unignore { .. }
+            | Cmd::Set { .. }
+            | Cmd::Kill { .. }
+            | Cmd::Quarantine { .. }
+            | Cmd::Forget { .. }
+            | Cmd::Contain { .. }
+            | Cmd::Baseline { .. }
+    )
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    if agent_may_not_run(&cli.cmd) {
+        eprintln!(
+            "moatctl: refusing a state-changing command from inside an agent context. \
+             An agent analysing moat's evidence may read, and may propose commands for \
+             you to run -- it may not run them itself."
+        );
+        return ExitCode::FAILURE;
+    }
+
     let socket = cli.socket.clone().unwrap_or_else(|| {
         let p = cli.config.clone().unwrap_or_else(Config::default_path);
         Config::load(&p).unwrap_or_default().paths.socket
@@ -410,13 +449,27 @@ fn run_triage(resp: &Value, socket: &std::path::Path, dry_run: bool, json_out: b
     if let Some(note) = triage::agent_args_ignored(&agent, &cfg) {
         eprintln!("moatctl triage: {}", note);
     }
-    let sandbox = moatd::analysis::sandbox_bin();
-    if sandbox.is_none() {
-        eprintln!(
-            "moatctl triage: moat-sandbox is not available, so {} will run unconfined over              content that is under suspicion. Auto-triage is the unattended path; consider              `[analysis] auto_triage = \"off\"` until the sandbox is installed.",
-            agent
-        );
-    }
+    // FAIL CLOSED. moat-sandbox is what masks the control socket (and the
+    // credential stores) from the agent; without it the agent runs with the
+    // user's full authority over content that is under suspicion by
+    // definition, and on 2026-09-06 an unconfined agent reached
+    // `moatctl ack` and cleared its own findings off the badge. An unattended
+    // pass that cannot be confined must not run at all -- warning and running
+    // anyway was fail-open, which is the wrong default for the path with
+    // nobody watching.
+    let sandbox = match moatd::analysis::sandbox_bin() {
+        Some(bin) => bin,
+        None => {
+            eprintln!(
+                "moatctl triage: moat-sandbox is not available. The agent will NOT run \
+                 unconfined over content under suspicion -- it could reach the control \
+                 socket and act on its own findings. Install moat-sandbox, or set \
+                 `[analysis] auto_triage = \"off\"`."
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let sandbox = Some(sandbox);
     let timeout = resp["timeout_secs"].as_u64().unwrap_or(180);
 
     // Two passes must not overlap. systemd will not start a second
@@ -625,6 +678,9 @@ fn capture(argv: &[String], timeout_secs: u64) -> Result<AgentOutput, String> {
 
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
+        // The agent (and any moatctl it spawns) runs marked: it may read moat's
+        // evidence, never act on it. `agent_may_not_run` enforces the other end.
+        .env("MOAT_AGENT_CONTEXT", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -713,7 +769,7 @@ fn launch_agent(resp: &Value, dry_run: bool) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     println!("handing {} to {} …", path, agent);
-    let err = Command::new(&argv[0]).args(&argv[1..]).exec();
+    let err = Command::new(&argv[0]).args(&argv[1..]).env("MOAT_AGENT_CONTEXT", "1").exec();
     eprintln!(
         "moatctl analyze: could not run {}: {}\n  the bundle is ready at {}",
         argv[0], err, path
@@ -1817,6 +1873,28 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// An agent may read, never act. The marker is what the launchers set.
+    #[test]
+    fn an_agent_context_refuses_state_changes_but_not_reads() {
+        // Serialise the env mutation; other tests must not see it.
+        std::env::set_var("MOAT_AGENT_CONTEXT", "1");
+
+        assert!(agent_may_not_run(&Cmd::Ack { ids: vec!["01X".into()], all: false, rule: None, before: None, chain: false }));
+        assert!(agent_may_not_run(&Cmd::Forget { dst: "1.2.3.4".into() }));
+        assert!(agent_may_not_run(&Cmd::Set { key: "kill".into(), value: "kill".into(), rule: None }));
+
+        // Reading is always allowed -- the agent needs it to analyse.
+        assert!(!agent_may_not_run(&Cmd::Status));
+        assert!(!agent_may_not_run(&Cmd::List { since: None, limit: 20 }));
+        assert!(!agent_may_not_run(&Cmd::Explain { id: "01X".into() }));
+
+        std::env::remove_var("MOAT_AGENT_CONTEXT");
+        // Without the marker, a human shell, nothing is refused.
+        assert!(!agent_may_not_run(&Cmd::Ack { ids: vec!["01X".into()], all: false, rule: None, before: None, chain: false }));
+    }
+
+
     use super::*;
 
     /// `moatctl status` must not print a reassuring list of armed rules when

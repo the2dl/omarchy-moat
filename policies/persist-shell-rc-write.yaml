@@ -73,3 +73,40 @@ spec:
       - action: Post
         rateLimit: "60s"
         rateLimitScope: "process"
+    # A second selector for the auto-sourced DIRECTORIES, which `Equal` above
+    # cannot cover: fish sources every file in `conf.d/`, and every login shell
+    # sources every file in `/etc/profile.d/`. A write to
+    # `~/.config/fish/conf.d/evil.fish` or `/etc/profile.d/evil.sh` is
+    # persistence that the exact-path list missed entirely (found 2026-09-06).
+    - matchBinaries:
+      - operator: "NotPostfix"
+        values:
+        - "/nvim"
+        - "/vim"
+        - "/vi"
+        - "/gvim"
+        - "/nano"
+        - "/micro"
+        - "/emacs"
+        - "/emacsclient"
+        - "/code"
+        - "/code-insiders"
+        - "/zed"
+        - "/zeditor"
+        - "/hx"
+        - "/helix"
+        - "/kate"
+        - "/gedit"
+      matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "{{HOME}}/.config/fish/conf.d/"
+        - "/etc/profile.d/"
+      - index: 1
+        operator: "Mask"
+        values: ["2"]
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

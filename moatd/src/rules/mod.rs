@@ -102,6 +102,10 @@ pub const SKIP_PERMISSION_FLAGS: &[&str] = &[
 /// a borrow of the daemon's real set.
 pub static NO_RULES_ARMED: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
+/// An empty cred-session map, for tests that build a RuleCtx by hand.
+pub static NO_CRED_SESSIONS: std::sync::LazyLock<std::collections::HashMap<u32, u64>> =
+    std::sync::LazyLock::new(std::collections::HashMap::new);
+
 pub struct RuleCtx<'a> {
     pub cfg: &'a Config,
     pub table: &'a ProcTable,
@@ -120,6 +124,10 @@ pub struct RuleCtx<'a> {
     /// arm a switch that nothing consults — which is what it did until
     /// 2026-09-05.
     pub armed: &'a std::collections::BTreeSet<String>,
+    /// Session id -> when that session last read a credential file. Lets a net
+    /// rule ask "did the task I belong to just read a secret", which is the
+    /// exfil context that /24 familiarity would otherwise hide.
+    pub cred_read_sessions: &'a std::collections::HashMap<u32, u64>,
 }
 
 impl RuleCtx<'_> {
@@ -127,6 +135,19 @@ impl RuleCtx<'_> {
     /// or this one rule armed on its own. Mirrors `Daemon::mode_for`.
     pub fn enforcing(&self, rule: &str) -> bool {
         self.mode == "enforce" || self.armed.contains(rule)
+    }
+
+    /// Did the session of `exec_id` read a credential within `window` seconds?
+    /// The exfil-context signal -- a connection right after a secret read is
+    /// worth reporting even to a host whose /24 is familiar.
+    pub fn session_read_cred_within(&self, exec_id: &str, window: u64) -> bool {
+        let Some(sid) = self.table.get(exec_id).and_then(|p| p.sid) else {
+            return false;
+        };
+        self.cred_read_sessions
+            .get(&sid)
+            .map(|t| self.now.saturating_sub(*t) <= window)
+            .unwrap_or(false)
     }
 }
 

@@ -36,6 +36,11 @@ use crate::rules::{signal_meta, RuleCtx, UserRule};
 
 pub const ID: &str = "moat-net-first-contact";
 
+/// How recently a credential read must precede a connection for it to count as
+/// the exfil context -- short enough that an unrelated read earlier in the same
+/// terminal session does not couple to every later connection.
+const EXFIL_WINDOW_SECS: u64 = 60;
+
 #[derive(Default)]
 pub struct NetFirstContact {
     compiled: Option<(Vec<String>, Vec<Cidr>)>,
@@ -90,14 +95,22 @@ impl UserRule for NetFirstContact {
         // owns `observe`, so by the time this runs the tuple has NOT yet been
         // recorded for this event, and "have we seen it before" means exactly
         // that.
-        let tuple = crate::rarity::Tuple::net(&proc.exe, &ip_s, port, None);
-        // FAMILIAR, not merely seen. `has_seen` is true after one connection,
-        // so a payload's own first packet used to silence every beacon that
-        // followed it -- the cheapest possible defeat of this rule, available
-        // to any unprivileged process. `is_familiar` additionally wants the
-        // sightings spread over real time, which an attacker who has just
-        // arrived cannot manufacture.
-        if ctx.rarity.is_familiar(&tuple, ctx.now) {
+        // FAMILIAR, not merely seen -- and asked through the one shared
+        // predicate, which `moat-x-pkg-egress` also calls. The reasoning lives
+        // at `RarityStore::knows_destination`; duplicating it here is what let
+        // the other call site keep the weak answer for two months.
+        // Familiar /24 -> normally silent. BUT `knows_destination` answers at
+        // /24 granularity (a CDN affordability choice), which means an exfil to
+        // a brand-new host in a block this machine already talks to -- the
+        // reputable-infra exfil, the realistic case -- is hidden. So a familiar
+        // /24 only silences this when the session did NOT just read a
+        // credential. A connection moments after a secret read is the exfil
+        // context, and it fires even to a familiar block so the cred->net chain
+        // can form. Bounded to the exfil case: an ordinary CDN contact with no
+        // preceding cred read stays silent, so this adds no general noise.
+        if ctx.rarity.knows_destination(&proc.exe, &ip_s, port, ctx.now)
+            && !ctx.session_read_cred_within(exec_id, EXFIL_WINDOW_SECS)
+        {
             return Vec::new();
         }
 
@@ -173,6 +186,7 @@ mod tests {
             now: 100,
             mode: "monitor",
             armed: &crate::rules::NO_RULES_ARMED,
+            cred_read_sessions: &crate::rules::NO_CRED_SESSIONS,
         };
         let ev = HookEvent {
             function_name: Some("tcp_connect".into()),
@@ -243,6 +257,67 @@ mod tests {
         assert!(
             seen.is_familiar(&t, now),
             "used repeatedly across hours, this is a host the machine knows"
+        );
+    }
+
+    #[test]
+    fn a_familiar_destination_still_fires_right_after_a_credential_read() {
+        // The /24-familiarity exfil gap: a connection to a host the machine
+        // already knows, moments after the same session read a secret, is the
+        // reputable-infra exfil case and must still produce the net step so the
+        // cred->net chain can form. 2026-09-06.
+        use std::collections::HashMap;
+        let cfg = Config::default();
+
+        // A destination whose /24 is thoroughly familiar.
+        let mut seen = RarityStore::default();
+        let tup = Tuple::net("/usr/bin/node", "192.168.44.122", 4873, None);
+        for i in 0..8u64 {
+            seen.observe(&tup, 1_000 + i * 1_800);
+        }
+        let now = 1_000 + 7 * 1_800;
+        assert!(seen.is_familiar(&tup, now), "precondition: the /24 is familiar");
+
+        let mut t = ProcTable::new(8, 60);
+        t.observe(&proc("e-node", 41201, "/usr/bin/node", "-e x", None));
+        t.set_session("e-node", Some(77), Some(0));
+        let feeds = Feeds::default();
+
+        let ev = HookEvent {
+            function_name: Some("tcp_connect".into()),
+            args: vec![serde_json::json!({"sock_arg":{
+                "family":"AF_INET","daddr":"192.168.44.122","dport":4873,
+                "saddr":"192.168.1.20","sport":51234
+            }})],
+            policy_name: Some(ID.into()),
+            ..Default::default()
+        };
+        let h = HookHit { kind: HookKind::Kprobe, ev: &ev };
+
+        // No cred read in the session: familiar -> silent.
+        let none: HashMap<u32, u64> = HashMap::new();
+        let quiet = RuleCtx {
+            rarity: &seen, cfg: &cfg, table: &t, feeds: &feeds, homes: &[],
+            now, mode: "monitor",
+            armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &none,
+        };
+        assert!(
+            NetFirstContact::default().on_hook(&h, "e-node", &quiet).is_empty(),
+            "familiar and no recent cred read: silent"
+        );
+
+        // Same session read a credential 10s ago: the exfil override fires it.
+        let mut creds: HashMap<u32, u64> = HashMap::new();
+        creds.insert(77u32, now - 10);
+        let after_read = RuleCtx {
+            rarity: &seen, cfg: &cfg, table: &t, feeds: &feeds, homes: &[],
+            now, mode: "monitor",
+            armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &creds,
+        };
+        assert_eq!(
+            NetFirstContact::default().on_hook(&h, "e-node", &after_read).len(),
+            1,
+            "familiar, but a secret was just read in this session: fire for the chain"
         );
     }
 

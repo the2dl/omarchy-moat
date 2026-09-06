@@ -1,21 +1,25 @@
-//! Auto-triage: the agent annotates an alert, it never decides what you see.
+//! Auto-triage: the agent annotates an alert, and may move it -- it never hides.
 //!
 //! `moatctl analyze` (LEARNING §2) is a button a user presses and then watches.
 //! Auto-triage is the same evidence handed to the same agent on a timer, with
 //! nobody watching — which changes the threat model, so the ceiling on what the
 //! answer may do is enforced here, in code and under test, and not in a prompt.
 //!
-//! **The rule: the model may explain, propose, and at most demote. It may never
-//! hide.** An alert that surfaced still exists, still appears in the panel, is
-//! still in the store and is still ackable, whatever the agent said about it.
-//! The worst a successful prompt injection buys is a wrong paragraph attached to
-//! evidence the user can still read, and — in `demote` mode — a move from the
-//! badge to the timeline, recorded and one command from being undone.
+//! **The rule: the model may explain, propose, move an alert's surface, and
+//! RAISE its severity — but never HIDE.** An alert that surfaced still exists,
+//! still appears in the panel, is still in the store and is still ackable,
+//! whatever the agent said about it. In `demote` mode a confident `benign` may
+//! move it from the badge to the timeline (recorded, one command from undone),
+//! and a confident `malicious` may raise it the other way, onto the badge at
+//! `high`. Both directions are the same authority -- "the agent may move an
+//! alert" -- and raising is the SAFE half: the worst a prompt injection buys
+//! with it is noise the user is shown, not evidence taken away.
 //!
 //! Concretely, the things `apply` will not do no matter what comes back:
-//! ack an alert, delete one, raise its severity, write an allowlist file, run a
-//! command, or demote past the configured ceiling. `proposed_allowlist` is
-//! stored as text for the user to accept; nothing here writes it.
+//! ack an alert, delete one, raise past `high` (critical is the ladder's to
+//! assert, not a verdict's), write an allowlist file, run a command, or demote
+//! past the configured ceiling. `proposed_allowlist` is stored as text for the
+//! user to accept; nothing here writes it.
 //!
 //! ## Why this does not go through `omarchy-agent`
 //!
@@ -45,6 +49,11 @@ pub enum TriageMode {
     Off,
     /// Attach the verdict. `surface` is never touched.
     Annotate,
+    /// Attach the verdict; let a confident benign one move the alert to the
+    /// timeline AND a confident malicious one raise it onto the badge. Both
+    /// directions, because the mode means "the agent may move an alert", and
+    /// raising -- the safe direction -- was missing until 2026-09-06.
+    /// (Original one-line summary below.)
     /// Attach the verdict, and let a confident benign one move the alert from
     /// the badge to the timeline.
     #[default]
@@ -109,9 +118,16 @@ pub struct Triage {
     pub at: String,
     #[serde(flatten)]
     pub result: TriageResult,
-    /// `annotated` | `demoted` | `withheld: <reason>`. Always present, so the
-    /// panel can say why a benign verdict did not move the alert.
+    /// `annotated` | `demoted` | `raised` | `withheld: <reason>`. Always
+    /// present, so the panel can say what the verdict did or did not do.
     pub outcome: String,
+    /// The severity the alert had before a `raised` outcome, so `undo` can put
+    /// it back. Only set on a raise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_severity: Option<String>,
+    /// The surface the alert had before a `raised` outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_surface: Option<String>,
 }
 
 /// What `apply` decided to do with a result.
@@ -121,12 +137,24 @@ pub enum Action {
     Annotate,
     /// Attach it and move the alert to the timeline.
     Demote,
+    /// Attach it and RAISE the alert: severity to `high`, onto the badge.
+    ///
+    /// The safe direction. Demote can hide something; raise can only make the
+    /// user look at something they otherwise would not -- so where demote is
+    /// fenced by a first-seen ceiling, a NEVER_DEMOTE list and a confidence
+    /// bar, raise needs only a confident `malicious` verdict. The worst an
+    /// injected agent can do with it is push noise onto the badge, which is
+    /// annoying, not concealing, and is reversible with `triage --undo`.
+    /// Capped at `high`: `critical` stays a structural conclusion of the
+    /// correlation ladder, not something a single verdict can assert.
+    Raise,
 }
 
 impl Action {
     fn outcome(&self, withheld: Option<&str>) -> String {
         match (self, withheld) {
             (Action::Demote, _) => "demoted".into(),
+            (Action::Raise, _) => "raised".into(),
             (Action::Annotate, Some(r)) => format!("withheld: {r}"),
             (Action::Annotate, None) => "annotated".into(),
         }
@@ -177,6 +205,17 @@ pub fn decide(
     result: &TriageResult,
 ) -> (Action, Option<String>) {
     if mode != TriageMode::Demote {
+        return (Action::Annotate, None);
+    }
+    // Raise, the safe direction: a confident `malicious` verdict may push an
+    // under-scored alert onto the badge. "How is it still LOW when the agent
+    // saw it was doing bad" -- 2026-09-06. Only ever upward, and only up to
+    // `high`; an alert already at high or critical has nowhere to go and is
+    // merely annotated.
+    if result.verdict == Verdict::Malicious && result.confidence == Confidence::High {
+        if crate::alert::severity_rank(severity) < crate::alert::severity_rank("high") {
+            return (Action::Raise, None);
+        }
         return (Action::Annotate, None);
     }
     if result.verdict != Verdict::Benign {
@@ -309,6 +348,8 @@ pub fn record_inherited(prior: &Triage, source_id: &str, at: &str) -> Triage {
         at: at.to_string(),
         result: prior.result.clone(),
         outcome: format!("inherited: same pattern as {source_id}"),
+        restore_severity: None,
+        restore_surface: None,
     }
 }
 
@@ -319,6 +360,8 @@ pub fn record(agent: &str, at: &str, result: TriageResult, action: &Action, with
         at: at.to_string(),
         result,
         outcome: action.outcome(withheld),
+        restore_severity: None,
+        restore_surface: None,
     }
 }
 
@@ -374,8 +417,12 @@ no code fence. The schema, exactly:\n\n\
 \"recommend\": [\"moatctl commands you suggest the user run\"]\n}}\n\n\
 Any other key makes the answer unusable and the alert is left alone.\n\n\
 Your answer cannot suppress, acknowledge or delete this alert; the user sees it \
-either way. `benign` with `high` confidence is the one combination that acts: it \
-moves the alert from the notification badge to the timeline, and nothing more.\n\n\
+either way. Two combinations act, and only these two. `benign` with `high` \
+confidence moves the alert from the notification badge to the timeline. \
+`malicious` with `high` confidence does the reverse: it raises the alert onto \
+the badge, at `high` severity, so the user is interrupted -- use it when the \
+bundle shows the mechanism doing something the developer did not intend, not \
+merely something unusual. Everything else annotates and changes nothing.\n\n\
 Confidence is about the evidence, not about how careful you feel. Use:\n\
 - `high` when the bundle accounts for the whole mechanism end to end — you can \
 name what ran, what launched it, and why this is the expected behaviour of that \
@@ -534,6 +581,53 @@ mod tests {
             proposed_allowlist: None,
             recommend: vec![],
         }
+    }
+
+    fn verdict(v: Verdict, c: Confidence) -> TriageResult {
+        let mut r = benign(c);
+        r.verdict = v;
+        r
+    }
+
+    /// The safe direction: a confident malicious verdict raises an under-scored
+    /// alert onto the badge. "How is it still LOW when the agent saw it was
+    /// doing bad" -- 2026-09-06.
+    #[test]
+    fn a_confident_malicious_verdict_raises_a_low_alert() {
+        // low -> Raise
+        let (a, _) = decide(
+            TriageMode::Demote, "moat-net-first-contact", "net", "low", "common", "high",
+            &verdict(Verdict::Malicious, Confidence::High),
+        );
+        assert_eq!(a, Action::Raise);
+
+        // medium confidence does not raise -- same bar shape as demote.
+        let (a, _) = decide(
+            TriageMode::Demote, "moat-net-first-contact", "net", "low", "common", "high",
+            &verdict(Verdict::Malicious, Confidence::Medium),
+        );
+        assert_eq!(a, Action::Annotate);
+
+        // Already high: nothing to raise, so it only annotates -- never beyond.
+        let (a, _) = decide(
+            TriageMode::Demote, "moat-x", "exec", "high", "common", "high",
+            &verdict(Verdict::Malicious, Confidence::High),
+        );
+        assert_eq!(a, Action::Annotate);
+
+        // Suspicious is not malicious: it does not raise.
+        let (a, _) = decide(
+            TriageMode::Demote, "moat-x", "exec", "low", "common", "high",
+            &verdict(Verdict::Suspicious, Confidence::High),
+        );
+        assert_eq!(a, Action::Annotate);
+
+        // Annotate mode never moves anything, either direction.
+        let (a, _) = decide(
+            TriageMode::Annotate, "moat-x", "exec", "low", "common", "high",
+            &verdict(Verdict::Malicious, Confidence::High),
+        );
+        assert_eq!(a, Action::Annotate);
     }
 
     // ------------------------------------------------------------- the ceiling
@@ -700,6 +794,8 @@ mod tests {
                 recommend: vec![],
             },
             outcome: outcome.into(),
+            restore_severity: None,
+            restore_surface: None,
         }
     }
 

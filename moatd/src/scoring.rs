@@ -182,6 +182,19 @@ pub const NEVER_LOWERED: &[&str] = &[
     "moat-pkg-subtree-netcat-exec",
     "moat-x-baseline-revoked",
     "moat-x-noisy-rule",
+    // A credential HARVEST keeps its severity whatever the context.
+    //
+    // `moat-x-mass-read` is one process reading many DISTINCT credential files
+    // in seconds -- the stealer/TruffleHog signature, and a conclusion in its
+    // own right, not a chain step. The interactive-context softening exists so
+    // that a human doing ordinary work at a terminal is quieter; but the human
+    // who was tricked into running a downloaded `exporter.py` is AT a terminal
+    // too, and softening the harvest to the timeline is exactly how it reached
+    // History and never Now (2026-09-06 reportkit). A harvest is a harvest
+    // whether or not somebody is at the keyboard. Backup tools that legitimately
+    // sweep credentials are a small, nameable set and are an allowlist entry,
+    // not a reason to soften the signal for everything.
+    "moat-x-mass-read",
 ];
 
 /// Per-rule provenance deltas for the userland (`moat-x-*`) and `pkg` rules,

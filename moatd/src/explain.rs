@@ -163,11 +163,41 @@ impl Finding {
         if self.meta.family == "cred" {
             return format!("{}|{}|pid:{}", self.rule, self.proc.exe, self.proc.pid);
         }
+        // A network finding keys on WHERE it went and WHICH process went there.
+        //
+        // Without the destination and the pid, the key was `(rule, exe, "-")`:
+        // every `net-first-contact` from `/usr/bin/python3` folded into one
+        // row, whatever the address and whatever the process tree. On
+        // 2026-09-06 a benign run's POST and an exfil run's POST to the same
+        // C2, seconds apart, collapsed into a single alert -- and because a
+        // fold returns before `note_chain`, the exfil run's connection never
+        // reached correlation, so its credential-read-then-connect sequence
+        // never formed a chain. Different tree, different destination: keep
+        // them apart. Same process to the same host still folds, which is the
+        // repeat this exists to collapse.
+        if let Some(net) = self.net.as_ref() {
+            return format!(
+                "{}|{}|{}:{}|pid:{}",
+                self.rule, self.proc.exe, net.dst_ip, net.dst_port, self.proc.pid
+            );
+        }
+        // pid, like the `cred` and `net` branches above.
+        //
+        // Without it the key was `(rule, exe, file)` and two DIFFERENT process
+        // trees writing the same well-known path -- `~/.bashrc`,
+        // `~/.ssh/authorized_keys`, a `.desktop` autostart -- folded into one
+        // row, and a fold returns before `note_chain` (engine::emit), so the
+        // second tree's persist/priv/rootkit step never reached correlation.
+        // The fold exists to collapse ONE process rewriting one file in a loop,
+        // which pid preserves; two distinct executions were never one event.
+        // The test `a_second_unrelated_install_is_a_second_chain` documented
+        // this collapse by disabling dedupe to work around it.
         format!(
-            "{}|{}|{}",
+            "{}|{}|{}|pid:{}",
             self.rule,
             self.proc.exe,
-            self.file.as_ref().map(|f| f.path.as_str()).unwrap_or("-")
+            self.file.as_ref().map(|f| f.path.as_str()).unwrap_or("-"),
+            self.proc.pid
         )
     }
 }
@@ -270,6 +300,9 @@ pub fn build_alert(f: &Finding, id: &str, ts: &str, allowlist_file: &str, allowl
         // Content analysis only ever runs on a file a chain implicated, which
         // needs a chain, which needs a second event (`content.rs`).
         content: Vec::new(),
+        // An original write is never a carried row; only `store::rotate` sets
+        // this, when it carries the row into a fresh generation.
+        carried: None,
         exec_id: f.exec_id.clone(),
     }
 }
@@ -1065,6 +1098,34 @@ mod tests {
         assert!(!scopes.contains(&"exe+file"));
         assert!(a.explain.what.contains("185.220.101.55:4444"));
         assert!(a.explain.next.iter().any(|n| n.contains("ss -tanp")));
+    }
+
+    #[test]
+    fn net_alerts_to_different_hosts_or_processes_do_not_fold() {
+        // The 2026-09-06 exfil miss: a benign run's POST and an exfil run's
+        // POST to the same C2 folded into one row, and the exfil run's
+        // connection never reached chain correlation.
+        let base = |exe: &str, pid: u32, ip: &str, port: u16| {
+            let mut f = finding();
+            f.rule = "moat-net-first-contact".into();
+            f.meta.family = "net".into();
+            f.file = None;
+            f.proc.exe = exe.into();
+            f.proc.pid = pid;
+            f.net = Some(NetRef { dst_ip: ip.into(), dst_port: port, domain: None });
+            f
+        };
+        let a = base("/usr/bin/python3", 100, "192.168.44.122", 4873);
+        let same = base("/usr/bin/python3", 100, "192.168.44.122", 4873);
+        assert_eq!(a.dedupe_key(), same.dedupe_key(), "same process, same host folds");
+
+        // Different process (a different tree) to the same host: kept apart.
+        let other_proc = base("/usr/bin/python3", 200, "192.168.44.122", 4873);
+        assert_ne!(a.dedupe_key(), other_proc.dedupe_key(), "different tree must not fold");
+
+        // Same process, different host: kept apart.
+        let other_host = base("/usr/bin/python3", 100, "10.0.0.5", 4873);
+        assert_ne!(a.dedupe_key(), other_host.dedupe_key(), "different host must not fold");
     }
 
     #[test]

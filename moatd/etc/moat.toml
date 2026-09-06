@@ -213,6 +213,23 @@ ancestry_max = 8
 # "as much as is reasonable".
 alerts_max_bytes = 20971520
 
+# Carry-forward caps for rotation.
+#
+# Retention follows IMPORTANCE, not the 20 MiB clock. When alerts.jsonl rotates,
+# the protected rows -- the badge, anything acted on, a high+ chain, a row with
+# an incident snapshot, the self-health meta alerts, and answered-but-grave
+# criticals -- are carried into the fresh generation instead of being dropped.
+# A flood of trivial timeline rows can no longer rotate a contained exfil chain
+# (or its pinned incident snapshot) permanently out of the log.
+#
+# The caps bound that carry set. When the protected rows exceed either, the
+# least important are evicted first (answered-but-grave, then the meta alerts,
+# then acted/story/indexed, and the unacked badge only last), and moatd logs
+# once per rotation how many rows that still wanted a human it had to drop. Both
+# caps sit well under alerts_max_bytes so a rotation can never loop.
+alerts_carry_max_bytes = 5242880
+alerts_carry_max = 1000
+
 # How long moatd will wait for the sensor to finish loading before it gives up
 # on re-arming the policies the user armed.
 #

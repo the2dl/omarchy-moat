@@ -586,6 +586,7 @@ mod tests {
             now: 1_000,
             mode,
             armed: &crate::rules::NO_RULES_ARMED,
+            cred_read_sessions: &crate::rules::NO_CRED_SESSIONS,
         };
         let mut r = ShellStdioSocket {
             proc_root: root.to_path_buf(),

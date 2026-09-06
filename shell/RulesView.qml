@@ -178,9 +178,9 @@ Item {
                             fontSize: root.t ? root.t.fSecondary : 12
                             enabled: !!root.service && !root.service.busy
                             onClicked: {
-                                if (root.service) {
+                                if (root.service)
                                     root.service.watchAgain(exRow.modelData.rule, exRow.modelData.exe);
-                                }
+
                             }
                         }
 
@@ -252,9 +252,9 @@ Item {
                             fontSize: root.t ? root.t.fSecondary : 12
                             enabled: !!root.service && !root.service.busy
                             onClicked: {
-                                if (root.service) {
+                                if (root.service)
                                     root.service.releaseContainment(cRow.modelData.chain);
-                                }
+
                             }
                         }
 

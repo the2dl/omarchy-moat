@@ -26,6 +26,7 @@ Rectangle {
     // every append to alerts.jsonl. Resetting on the object changing therefore
     // closed the evidence drawer under the user a few seconds after they opened
     // it, on every refresh, forever.
+    // Closed, in both modes.
 
     id: root
 
@@ -112,8 +113,6 @@ Rectangle {
     }
 
     onIncidentChanged: {
-        // Closed, in both modes.
-
         var key = root.incident ? String(root.incident.key) : "";
         if (key === root._openFor)
             return ;

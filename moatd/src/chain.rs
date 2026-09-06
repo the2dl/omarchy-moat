@@ -388,11 +388,127 @@ pub fn tree_key(lineage: &[LineageNode]) -> Option<(String, Ancestor)> {
     ))
 }
 
-/// The severity of a sequence, and the sentence that justifies it.
+/// What escalation actually reads. **Not** the step list.
 ///
-/// `steps` must be in time order. Only trigger steps are read: a step the user
-/// allowlisted cannot raise a severity, or an allowlist entry would become a
-/// way to make moat shout louder.
+/// [`Chain::steps`] is the STORY, and it is capped at [`MAX_STEPS`] because the
+/// whole chain record is copied onto every member alert: an uncapped list on a
+/// busy tree writes an enormous record, many times over. Correlation is a
+/// different job with a different bound. It has to see EVERY observation, or the
+/// thirteenth thing that happens in a tree cannot change what moat concluded
+/// about the first twelve.
+///
+/// Running [`escalate`] over `steps` conflated the two, and a display limit
+/// ended up governing detection: a chain that formed early out of ordinary build
+/// noise filled its twelve slots and then took a credential read as step 13 —
+/// which never appeared in `families`, never fired the `cred -> net` rung, and
+/// left the severity where the build noise had put it.
+///
+/// So this holds the *answers* rather than the evidence, and every field is a
+/// fixed size whatever the tree does: at most eight families (there are eight),
+/// one rank each, a count, a last family, and three booleans of ordered
+/// progress. It is folded on every trigger observation, whether or not the story
+/// had room for that step.
+///
+/// Only triggers are offered to it. A step the user allowlisted cannot raise a
+/// severity, or an allowlist entry would become a way to make moat shout louder.
+#[derive(Debug, Clone, Default)]
+pub struct Escalation {
+    /// Trigger families in first-seen order — this is `Chain::families`.
+    families: Vec<String>,
+    /// The highest severity rank any trigger of that family reached, aligned
+    /// with `families`. This is what `rung_is_real` asks.
+    family_rank: Vec<u8>,
+    /// The highest severity rank any single trigger reached: `severity_base`.
+    max_rank: u8,
+    /// Triggers seen, ever. The `anything -> persist` rung wants two.
+    triggers: usize,
+    /// The family of the most recent trigger, for the same rung.
+    last: Option<String>,
+    /// Greedy subsequence progress for the two ORDERED rungs, folded forward
+    /// instead of re-scanned. Keeping the full family sequence would be the
+    /// unbounded thing all over again; these three booleans answer exactly what
+    /// `cred -> net` and `cred -> net -> persist` used to be scanned for, and
+    /// they answer it identically because the scan was greedy too.
+    cred: bool,
+    cred_then_net: bool,
+    cred_then_net_then_persist: bool,
+    /// At least one trigger was `first_seen` or `rare` (LEARNING §1).
+    ///
+    /// `qualifies()` requires this to FORM a chain and no rung reads it today;
+    /// it is tracked here because it is part of the same question — what is true
+    /// of this sequence — and because deriving it from a capped list later would
+    /// be the identical bug.
+    novel: bool,
+}
+
+impl Escalation {
+    /// Fold in one trigger. `family` and `severity` are the step's own.
+    pub fn observe(&mut self, family: &str, severity: &str, novel: bool) {
+        let rank = severity_rank(severity);
+        self.triggers += 1;
+        self.max_rank = self.max_rank.max(rank);
+        self.novel |= novel;
+        match self.families.iter().position(|f| f == family) {
+            Some(i) => self.family_rank[i] = self.family_rank[i].max(rank),
+            None => {
+                self.families.push(family.to_string());
+                self.family_rank.push(rank);
+            }
+        }
+        self.last = Some(family.to_string());
+        match family {
+            "cred" => self.cred = true,
+            "net" if self.cred => self.cred_then_net = true,
+            "persist" if self.cred_then_net => self.cred_then_net_then_persist = true,
+            _ => {}
+        }
+    }
+
+    /// Families crossed by the triggers, in the order they were first seen.
+    pub fn families(&self) -> &[String] {
+        &self.families
+    }
+
+    /// Was any trigger new on this machine?
+    pub fn has_novel_trigger(&self) -> bool {
+        self.novel
+    }
+
+    fn has(&self, f: &str) -> bool {
+        self.families.iter().any(|x| x == f)
+    }
+
+    /// Is the step that would carry a rung worth a rung?
+    ///
+    /// A combination rung says "this family, beside others, is worse than either
+    /// alone". That only holds if the step itself was worth reporting: a `low`
+    /// finding is one moat has already decided is barely news, and letting it
+    /// raise a whole chain's severity means the chain says something none of its
+    /// members do.
+    fn rung_is_real(&self, families: &[&str]) -> bool {
+        self.families
+            .iter()
+            .zip(self.family_rank.iter())
+            .any(|(f, r)| families.contains(&f.as_str()) && *r >= severity_rank("medium"))
+    }
+
+    /// The state a list of steps implies. The formation path has the
+    /// observations themselves and folds those instead; this is for callers
+    /// that only hold the steps, and for the tests that drive the ladder
+    /// directly.
+    ///
+    /// Novelty is not carried on a [`Step`], and no rung reads it, so it is
+    /// `false` here. A live chain folds the real answer in.
+    fn from_steps(steps: &[Step]) -> Escalation {
+        let mut e = Escalation::default();
+        for s in steps.iter().filter(|s| s.is_trigger()) {
+            e.observe(&s.family, &s.severity, false);
+        }
+        e
+    }
+}
+
+/// The severity of a sequence, and the sentence that justifies it.
 ///
 /// The ladder, strongest first. Each rung is a shape that means something
 /// specific, not a count of alerts:
@@ -407,33 +523,17 @@ pub fn tree_key(lineage: &[LineageNode]) -> Option<(String, Ancestor)> {
 ///
 /// Nothing here can raise a chain by more than one step except the first rung,
 /// which is the full theft shape and is `critical` by definition.
-/// Is the step that would carry a rung worth a rung?
-///
-/// A combination rung says "this family, beside others, is worse than either
-/// alone". That only holds if the step itself was worth reporting: a `low`
-/// finding is one moat has already decided is barely news, and letting it
-/// raise a whole chain's severity means the chain says something none of its
-/// members do.
-fn rung_is_real(triggers: &[&Step], families: &[&str]) -> bool {
-    triggers
-        .iter()
-        .filter(|s| families.contains(&s.family.as_str()))
-        .any(|s| severity_rank(&s.severity) >= severity_rank("medium"))
-}
-
-pub fn escalate(steps: &[Step]) -> (String, String, String) {
-    let triggers: Vec<&Step> = steps.iter().filter(|s| s.is_trigger()).collect();
-    let base = triggers.iter().map(|s| severity_rank(&s.severity)).max().unwrap_or(0);
+pub fn escalate_state(e: &Escalation) -> (String, String, String) {
+    let base = e.max_rank;
     let base_name = severity_name(base).to_string();
 
-    let order: Vec<&str> = triggers.iter().map(|s| s.family.as_str()).collect();
-    let families = ordered_families(&triggers);
-    let has = |f: &str| order.contains(&f);
+    let families = e.families();
+    let has = |f: &str| e.has(f);
 
     // `matched` says a named shape fired, which is a different fact from
     // "the rank went up": a chain whose worst member is already critical
     // cannot go up, and the shape is still the finding.
-    let (rank, why, matched) = if in_order(&order, &["cred", "net", "persist"]) {
+    let (rank, why, matched) = if e.cred_then_net_then_persist {
         (
             3,
             "a credential was read, this tree then connected out, and then it \
@@ -441,7 +541,7 @@ pub fn escalate(steps: &[Step]) -> (String, String, String) {
                 .to_string(),
             true,
         )
-    } else if in_order(&order, &["cred", "net"]) {
+    } else if e.cred_then_net {
         (
             base.saturating_add(1).max(2),
             "a credential was read and the same process tree then connected out".to_string(),
@@ -457,19 +557,19 @@ pub fn escalate(steps: &[Step]) -> (String, String, String) {
     // produces. This does not touch the ORDERED rungs below `cred -> net`: a
     // sequence is meaningful even when each step is ordinary, and that is the
     // whole reason chains exist.
-    } else if (has("rootkit") || has("priv")) && families.len() >= 2 && rung_is_real(&triggers, &["rootkit", "priv"]) {
+    } else if (has("rootkit") || has("priv")) && families.len() >= 2 && e.rung_is_real(&["rootkit", "priv"]) {
         (
             base.saturating_add(1),
             format!(
                 "{} in the same tree as {}",
                 if has("rootkit") { "a rootkit signal" } else { "a privilege signal" },
-                other_families(&families, if has("rootkit") { "rootkit" } else { "priv" })
+                other_families(families, if has("rootkit") { "rootkit" } else { "priv" })
             ),
             true,
         )
-    } else if order.len() >= 2
-        && order.last() == Some(&"persist")
-        && rung_is_real(&triggers, &["persist"])
+    } else if e.triggers >= 2
+        && e.last.as_deref() == Some("persist")
+        && e.rung_is_real(&["persist"])
     {
         (
             base.saturating_add(1),
@@ -487,7 +587,7 @@ pub fn escalate(steps: &[Step]) -> (String, String, String) {
             base,
             format!(
                 "{} in one process tree, no escalating sequence",
-                list(&families)
+                list(families)
             ),
             false,
         )
@@ -508,25 +608,13 @@ pub fn escalate(steps: &[Step]) -> (String, String, String) {
     (name, base_name, reason)
 }
 
-/// Does `wanted` appear in `order` as a subsequence — each family after the
-/// previous one, at any distance? "cred then net" is a different fact from
-/// "cred and net": something read a key *and then* talked to the network is the
-/// theft shape, while the reverse order is a download that later touched a
-/// config file.
-fn in_order(order: &[&str], wanted: &[&str]) -> bool {
-    let mut it = order.iter();
-    wanted.iter().all(|w| it.any(|f| f == w))
-}
-
-/// Families in the order they were first seen, deduplicated.
-fn ordered_families(steps: &[&Step]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for s in steps {
-        if !out.iter().any(|f| f == &s.family) {
-            out.push(s.family.clone());
-        }
-    }
-    out
+/// [`escalate_state`] over a list of steps, in time order.
+///
+/// A convenience for callers holding only the story — the tests below, mostly.
+/// A LIVE chain must never come through here: `steps` is capped, and reading a
+/// capped list is the bug [`Escalation`] exists to close.
+pub fn escalate(steps: &[Step]) -> (String, String, String) {
+    escalate_state(&Escalation::from_steps(steps))
 }
 
 fn other_families(families: &[String], except: &str) -> String {
@@ -556,15 +644,19 @@ pub fn human_span(secs: u64) -> String {
 }
 
 /// The chain's own sentence: what happened, over how long, under what.
+///
+/// `families` is passed in rather than derived from the steps, for the same
+/// reason the counts are: on a truncated chain the step list is twelve of a
+/// hundred and twenty-eight, and a sentence that says "crossing net and exec"
+/// beside a `families` array that says `cred` too is a record disagreeing with
+/// itself. See [`Escalation`].
 fn summarise(
-    steps: &[Step],
+    families: &[String],
     ancestor: &Ancestor,
     span: u64,
     total: usize,
     triggers_total: usize,
 ) -> String {
-    let triggers: Vec<&Step> = steps.iter().filter(|s| s.is_trigger()).collect();
-    let families = ordered_families(&triggers);
     // From the durable counters, not from the capped step list: on a truncated
     // chain `steps` holds twelve of a hundred and twenty-eight, and counting
     // it would understate both halves.
@@ -589,7 +681,7 @@ fn summarise(
         human_span(span),
         basename(&ancestor.exe),
         ancestor.pid,
-        list(&families),
+        list(families),
     );
     if silenced > 0 {
         // `steps` is capped at MAX_STEPS while `total` is not, so on a
@@ -629,6 +721,10 @@ struct Live {
     tree: String,
     first_at: u64,
     last_at: u64,
+    /// Correlation state, folded on EVERY observation. `chain.steps` stops at
+    /// [`MAX_STEPS`]; this does not, which is why severity and families are
+    /// read from here and never from the step list. See [`Escalation`].
+    state: Escalation,
 }
 
 /// The correlator. Bounded in every direction; see the module comment.
@@ -692,6 +788,7 @@ impl ChainStore {
             let step = obs.step(!obs.silenced);
             let at = obs.at;
             let ts = step.ts.clone();
+            let novel = obs.is_novel();
             self.push_recent(Recent { obs, tree, chained: true });
             let c = &mut self.live[i];
             let was_severity = c.chain.severity.clone();
@@ -700,6 +797,10 @@ impl ChainStore {
             c.chain.steps_total += 1;
             if step.is_trigger() {
                 c.chain.triggers_total += 1;
+                // BEFORE the cap, and regardless of it. This is the whole fix:
+                // the thirteenth observation still gets to change the verdict
+                // even though the story has no room to show it.
+                c.state.observe(&step.family, &step.severity, novel);
             }
             // The member is recorded whether or not the story has room for it.
             if !c.chain.members.contains(&step.alert) {
@@ -713,20 +814,22 @@ impl ChainStore {
             }
             c.chain.last_ts = ts;
             c.chain.span_secs = c.last_at.saturating_sub(c.first_at);
-            let (sev, base, reason) = escalate(&c.chain.steps);
+            // From the correlation state, never from `c.chain.steps`: the step
+            // list is a capped presentation of the story and answering "what did
+            // this tree do" out of it made MAX_STEPS a detection threshold.
+            let (sev, base, reason) = escalate_state(&c.state);
             c.chain.severity = sev;
             c.chain.severity_base = base;
             c.chain.severity_reason = reason;
-            c.chain.families = ordered_families(
-                &c.chain.steps.iter().filter(|s| s.is_trigger()).collect::<Vec<_>>(),
-            );
+            let families = c.state.families().to_vec();
             c.chain.summary = summarise(
-                &c.chain.steps,
+                &families,
                 &c.chain.ancestor,
                 c.chain.span_secs,
                 c.chain.steps_total,
                 c.chain.triggers_total,
             );
+            c.chain.families = families;
             // Republishing costs one update line per member, so a tree that
             // trips a hundred distinct detections would otherwise write twelve
             // hundred lines and rotate `alerts.jsonl` inside one incident.
@@ -796,14 +899,20 @@ impl ChainStore {
         let formation_truncated = false;
         let first_at = candidate.first().map(|o| o.at).unwrap_or(at);
         let span = at.saturating_sub(first_at);
-        let (severity, severity_base, severity_reason) = escalate(&steps);
+        // Folded from the OBSERVATIONS, in time order, so the live chain starts
+        // with the real novelty answer rather than the one a `Step` can carry.
+        // `candidate` is not capped, so this and `escalate(&steps)` agree here;
+        // they stop agreeing the moment the chain grows, which is the point.
+        let mut state = Escalation::default();
+        for o in candidate.iter().filter(|o| !o.silenced) {
+            state.observe(&o.family, &o.severity, o.is_novel());
+        }
+        let (severity, severity_base, severity_reason) = escalate_state(&state);
+        let families = state.families().to_vec();
         let chain = Chain {
             v: CHAIN_V,
             id: steps[0].alert.clone(),
             ancestor: ancestor.clone(),
-            families: ordered_families(
-                &steps.iter().filter(|s| s.is_trigger()).collect::<Vec<_>>(),
-            ),
             severity,
             severity_base,
             severity_reason,
@@ -811,12 +920,13 @@ impl ChainStore {
             last_ts: steps[steps.len() - 1].ts.clone(),
             span_secs: span,
             summary: summarise(
-                &steps,
+                &families,
                 &ancestor,
                 span,
                 total,
                 steps.iter().filter(|x| x.is_trigger()).count(),
             ),
+            families,
             members: steps.iter().map(|x| x.alert.clone()).collect(),
             triggers_total: steps.iter().filter(|x| x.is_trigger()).count(),
             steps,
@@ -838,6 +948,7 @@ impl ChainStore {
             }
         }
         self.live.push(Live {
+            state,
             chain: chain.clone(),
             tree,
             first_at,
@@ -871,10 +982,30 @@ fn qualifies(obs: &[Observation]) -> bool {
     if !triggers.iter().any(|o| o.rank() >= severity_rank("medium")) {
         return false;
     }
-    if !triggers.iter().any(|o| o.is_novel()) {
+    // Novelty is required so a machine doing the SAME benign thing every day
+    // does not chain -- a build that runs one shape each afternoon is not a
+    // sequence worth raising. But some triggers are conclusions that repetition
+    // does not launder: a credential HARVEST (one process reading many
+    // distinct secret files in seconds) is exfil-shaped whether it is the first
+    // time or the fiftieth, and requiring it to also be "new on this machine"
+    // meant a repeated attack to a familiar host stopped chaining once the
+    // rarity settled. So a novelty-exempt trigger satisfies condition 4 on its
+    // own. This is not scenario-specific: it keys on the general harvest
+    // detector, not on any one payload.
+    if !triggers.iter().any(|o| o.is_novel() || is_novelty_exempt(&o.rule)) {
         return false;
     }
     true
+}
+
+/// Triggers whose mere presence is enough to correlate, novel or not: a
+/// conclusion that repeating does not make benign. Kept deliberately small.
+fn is_novelty_exempt(rule: &str) -> bool {
+    matches!(
+        rule,
+        // A credential harvest -- N distinct secret files read in seconds.
+        "moat-x-mass-read"
+    )
 }
 
 #[cfg(test)]
@@ -1243,6 +1374,39 @@ mod tests {
     /// $HOME (exec) and that binary opens a socket (net) — two families, one
     /// tree, every single time. It is `common` on this machine, and that is
     /// what keeps it out.
+    /// A credential harvest chains even when everything is `common`.
+    ///
+    /// Repeated testing (or a patient attacker) makes the reads and the exfil
+    /// destination familiar; requiring novelty then meant the harvest+exfil
+    /// stopped correlating. A harvest is exfil-shaped whatever its rarity.
+    #[test]
+    fn a_harvest_chains_even_when_nothing_is_novel() {
+        let mut s = ChainStore::new();
+        let tree = || typed_at_a_shell(41233);
+
+        let mut harvest = obs("01A", 1_000, "cred", "high", tree());
+        harvest.rule = "moat-x-mass-read".into();
+        harvest.rarity = Rarity::Common;
+        assert!(s.note(harvest).is_none(), "one step is not a chain");
+
+        let mut exfil = obs("01B", 1_002, "net", "low", tree());
+        exfil.rarity = Rarity::Common;
+        assert!(
+            s.note(exfil).is_some(),
+            "harvest + egress is a chain even when both are common"
+        );
+
+        // Control: two ORDINARY common triggers still do not chain -- the
+        // waiver is scoped to the harvest, not a hole in the novelty gate.
+        let mut s2 = ChainStore::new();
+        let mut a = obs("02A", 1_000, "exec", "high", tree());
+        a.rarity = Rarity::Common;
+        let mut b = obs("02B", 1_002, "net", "low", tree());
+        b.rarity = Rarity::Common;
+        assert!(s2.note(a).is_none());
+        assert!(s2.note(b).is_none(), "ordinary common activity still needs novelty");
+    }
+
     #[test]
     fn cargo_run_is_not_a_chain() {
         let mut s = ChainStore::new();
@@ -1401,6 +1565,171 @@ mod tests {
         // And it stopped rewriting itself onto its members once the story on
         // disk stopped changing: 42 steps must not mean 42 republishes.
         assert!(published < 20, "republished {} times for 40 steps", published);
+    }
+
+    /// A display limit must not govern detection.
+    ///
+    /// `steps` is capped at `MAX_STEPS` because the whole chain record is copied
+    /// onto every member alert, and that cap is right. Escalation used to be
+    /// computed from that capped list, which is not: a chain that formed early
+    /// out of ordinary build noise filled its twelve slots, and the credential
+    /// read that arrived as observation thirteen never reached `families`, never
+    /// moved the severity, and never fired a rung. The attack was told to come
+    /// back later.
+    ///
+    /// Twelve is a number about how much of a story fits on a screen. It was
+    /// deciding what moat detected.
+    #[test]
+    fn an_observation_past_the_step_cap_still_changes_the_verdict() {
+        let mut s = ChainStore::new();
+        let tree = || typed_at_a_shell(41233);
+        // Every trigger, in order, as a Step -- the list the correlator WOULD
+        // have had if `steps` were uncapped. The reference for "escalates
+        // exactly as it would have without the cap".
+        let mut uncapped: Vec<Step> = Vec::new();
+        let mut last = None;
+
+        // Ordinary build noise: alternating exec/net, one medium and one novel
+        // so a chain forms at all, everything after it routine. Twelve
+        // observations fill the story exactly.
+        for i in 0..MAX_STEPS {
+            let fam = if i % 2 == 0 { "exec" } else { "net" };
+            let sev = if i == 0 { "medium" } else { "low" };
+            let mut o = obs(&format!("01ID{:03}", i), 1_000 + i as u64, fam, sev, tree());
+            o.rarity = if i == 0 { Rarity::FirstSeen } else { Rarity::Common };
+            uncapped.push(o.step(true));
+            if let Some(c) = s.note(o) {
+                last = Some(c);
+            }
+        }
+        let before = last.clone().expect("build noise forms a chain");
+        assert_eq!(before.steps.len(), MAX_STEPS, "the story is full");
+        assert_eq!(before.severity, "medium");
+        assert!(!before.families.contains(&"cred".to_string()));
+
+        // Observation thirteen: a credential read. There is no room for it in
+        // the story, and that must not be the same thing as not having seen it.
+        let mut cred = obs("01ID012", 1_012, "cred", "high", tree());
+        cred.rarity = Rarity::FirstSeen;
+        uncapped.push(cred.step(true));
+        let c = s
+            .note(cred)
+            .expect("gaining a family and a severity is a change worth republishing");
+
+        // (a) the family arrives,
+        assert!(
+            c.families.contains(&"cred".to_string()),
+            "step 13 must reach `families`: {:?}",
+            c.families
+        );
+        assert!(
+            c.summary.contains("cred"),
+            "and the sentence must agree with the array: {}",
+            c.summary
+        );
+        // (b) the severity is what an uncapped list would have produced,
+        assert_eq!(
+            (
+                c.severity.clone(),
+                c.severity_base.clone(),
+                c.severity_reason.clone()
+            ),
+            escalate(&uncapped),
+            "escalation must not depend on how many steps the story could hold"
+        );
+        assert_eq!(c.severity, "high", "the cred read is the worst member now");
+        // (c) and the story is still capped, and still says so.
+        assert_eq!(c.steps.len(), MAX_STEPS);
+        assert!(c.truncated);
+        assert_eq!(c.steps_total, MAX_STEPS + 1);
+        assert!(
+            !c.steps.iter().any(|st| st.alert == "01ID012"),
+            "the cap is unchanged: the thirteenth step is not in the story"
+        );
+        assert!(
+            c.member_ids().contains(&"01ID012".to_string()),
+            "but it is a member, so a chain ack still covers it"
+        );
+
+        // And the rungs keep working past the cap: the connection out AFTER the
+        // credential read is `cred -> net`, which is the shape the whole module
+        // exists to catch. Two more observations, neither of them in the story.
+        let mut out = obs("01ID013", 1_013, "net", "medium", tree());
+        out.rarity = Rarity::FirstSeen;
+        uncapped.push(out.step(true));
+        let c = s.note(out).expect("a severity move republishes");
+        assert_eq!(
+            (
+                c.severity.clone(),
+                c.severity_base.clone(),
+                c.severity_reason.clone()
+            ),
+            escalate(&uncapped)
+        );
+        assert_eq!(c.severity, "critical");
+        assert!(
+            c.severity_reason.contains("a credential was read and the same process tree then connected out"),
+            "{}",
+            c.severity_reason
+        );
+        assert_eq!(c.steps.len(), MAX_STEPS, "still capped");
+    }
+
+    /// The formation path is untouched by the split.
+    ///
+    /// Formation folds the observations rather than the steps, so that the live
+    /// chain starts with the real novelty answer. It must still agree with the
+    /// step list it publishes, at any size -- including the large formations
+    /// that are deliberately not capped.
+    #[test]
+    fn formation_still_escalates_from_its_whole_candidate_list() {
+        let mut s = ChainStore::new();
+        let tree = || typed_at_a_shell(41233);
+        let mut steps: Vec<Step> = Vec::new();
+        let mut last = None;
+        // More than MAX_STEPS candidates before anything qualifies -- one
+        // family crosses nothing, so they all sit in the ring -- and context
+        // steps mixed in so "allowlisted steps never escalate" is exercised too.
+        // The `net` at the end is what completes the second family.
+        let n = MAX_STEPS + 4;
+        for i in 0..n {
+            let fam = if i + 1 == n { "net" } else { "exec" };
+            let sev = if i == 0 { "high" } else { "low" };
+            let mut o = obs(&format!("01ID{:03}", i), 1_000, fam, sev, tree());
+            o.rarity = if i == 0 { Rarity::FirstSeen } else { Rarity::Common };
+            o.silenced = i > 0 && i % 5 == 0 && i + 1 < n;
+            steps.push(o.step(!o.silenced));
+            if let Some(c) = s.note(o) {
+                last = Some(c);
+            }
+        }
+        let c = last.expect("a chain forms");
+        assert!(c.steps.len() > MAX_STEPS, "formation is not capped");
+        assert!(!c.truncated);
+        assert_eq!(
+            (
+                c.severity.clone(),
+                c.severity_base.clone(),
+                c.severity_reason.clone()
+            ),
+            escalate(&c.steps),
+            "the state-driven answer is the step-driven answer at formation"
+        );
+        // Families are the trigger families, first-seen order, context excluded.
+        let want: Vec<String> = {
+            let mut out: Vec<String> = Vec::new();
+            for st in c.steps.iter().filter(|st| st.is_trigger()) {
+                if !out.contains(&st.family) {
+                    out.push(st.family.clone());
+                }
+            }
+            out
+        };
+        assert_eq!(c.families, want);
+        assert!(
+            c.steps.iter().any(|st| !st.is_trigger()),
+            "the fixture must contain a context step"
+        );
     }
 
     #[test]

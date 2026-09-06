@@ -81,6 +81,10 @@ pub struct AlertStore {
     path: PathBuf,
     rotated: PathBuf,
     max_bytes: u64,
+    /// Carry-forward caps for rotation. `carry_max_bytes` is well under
+    /// `max_bytes` so the carried set can never itself trip a rotation.
+    carry_max_bytes: u64,
+    carry_max: usize,
     group: String,
     file: Option<File>,
     size: u64,
@@ -88,18 +92,66 @@ pub struct AlertStore {
 }
 
 impl AlertStore {
-    pub fn open(path: &Path, rotated: &Path, max_bytes: u64, group: &str) -> std::io::Result<AlertStore> {
+    pub fn open(
+        path: &Path,
+        rotated: &Path,
+        max_bytes: u64,
+        carry_max_bytes: u64,
+        carry_max: usize,
+        group: &str,
+    ) -> std::io::Result<AlertStore> {
         let mut s = AlertStore {
             path: path.to_path_buf(),
             rotated: rotated.to_path_buf(),
             max_bytes,
+            carry_max_bytes,
+            carry_max,
             group: group.to_string(),
             file: None,
             size: 0,
             cache: Mutex::new(None),
         };
+        // Complete or discard a carry-forward rotation that a crash interrupted,
+        // BEFORE opening the live file for append.
+        s.reconcile_staging()?;
         s.reopen()?;
         Ok(s)
+    }
+
+    /// Where rotation stages the carried rows before the two renames.
+    fn staging(&self) -> PathBuf {
+        self.path.with_extension("new")
+    }
+
+    /// Crash recovery for carry-forward rotation. `rotate` does two renames:
+    /// `alerts.jsonl -> alerts.1.jsonl`, then `alerts.new -> alerts.jsonl`. If
+    /// `alerts.new` survives a restart, a crash landed between writing it and
+    /// finishing:
+    ///   * live still present  -> the first rename had not happened, so the
+    ///     staged file is stale scaffolding; discard it (live is authoritative).
+    ///   * live missing        -> the crash was between the two renames; finish
+    ///     the second one so no data is lost.
+    fn reconcile_staging(&self) -> std::io::Result<()> {
+        let staging = self.staging();
+        if !staging.exists() {
+            return Ok(());
+        }
+        if self.path.exists() {
+            log::warn!(
+                "discarding stale {} (live log intact)",
+                staging.display()
+            );
+            std::fs::remove_file(&staging)?;
+        } else {
+            log::warn!(
+                "completing interrupted rotation: {} -> {}",
+                staging.display(),
+                self.path.display()
+            );
+            std::fs::rename(&staging, &self.path)?;
+            let _ = crate::util::secure_path(&self.path, &self.group, 0o640);
+        }
+        Ok(())
     }
 
     fn reopen(&mut self) -> std::io::Result<()> {
@@ -138,6 +190,18 @@ impl AlertStore {
         Ok(())
     }
 
+    /// Rotate, carrying the protected rows forward (R1).
+    ///
+    /// Plain rename-over-`.1` rotation dropped importance on the floor: a flood
+    /// that filled 20 MiB permanently rotated a contained, critical exfil chain
+    /// out of the log — and, because the incident keep-set is derived from the
+    /// alert rows, rotating the row let its snapshot be pruned too. Carry-
+    /// forward writes the `is_protected()` rows into the fresh generation as
+    /// folded Full lines (stamped `carried`, so they stay tamper-evident), so
+    /// retention follows importance rather than the 20 MiB clock.
+    ///
+    /// Append-only is preserved: this never rewrites `alerts.1.jsonl`; it writes
+    /// NEW lines into a fresh live file and renames the old one aside untouched.
     fn rotate(&mut self) -> std::io::Result<()> {
         log::info!(
             "rotating {} at {} bytes -> {}",
@@ -145,12 +209,118 @@ impl AlertStore {
             self.size,
             self.rotated.display()
         );
+
+        // Built from the current (up-to-date) fold, before anything is renamed.
+        let (carried, evicted_wanted) = self.protected_carry_set();
+        if evicted_wanted > 0 {
+            // ONE line per rotation; never an alert row (that would be one more
+            // line in the very flood this guards against).
+            log::warn!(
+                "alerts carry-forward at rotation: over cap, evicted {} row(s) that still wanted a human",
+                evicted_wanted
+            );
+        }
+        let staging = self.staging();
+        self.write_carried(&staging, &carried)?;
+
         self.file = None;
-        // The old rotated file is gone with this rename, and so are its
-        // alerts; the fold has to be rebuilt from what is left.
+        // The fold is dropped so the next read refolds from disk: after the two
+        // renames, alerts.1.jsonl is the former live file and alerts.jsonl holds
+        // the carried rows (whose Full lines re-fold to the same ids).
         *self.cache_lock() = None;
-        std::fs::rename(&self.path, &self.rotated)?;
+        std::fs::rename(&self.path, &self.rotated)?; // crash point A
+        std::fs::rename(&staging, &self.path)?; // crash point B
         self.reopen()
+    }
+
+    /// The protected rows to carry across a rotation, id-ordered, stamped
+    /// `carried`, and capped. Returns the rows plus how many still-wanted-a-
+    /// human rows the caps had to evict.
+    fn protected_carry_set(&self) -> (Vec<Alert>, usize) {
+        let now = crate::util::now_rfc3339();
+        let mut rows: Vec<Alert> = self.with_fold(|c| {
+            c.map
+                .values()
+                .filter(|a| a.is_protected())
+                .cloned()
+                .collect()
+        });
+        // Stamp BEFORE capping so the byte cap accounts for what is actually
+        // written. `generation` grows each time a row survives another rotation.
+        for a in &mut rows {
+            let generation = a.carried.as_ref().map(|c| c.generation).unwrap_or(0) + 1;
+            a.carried = Some(crate::alert::Carried {
+                at: now.clone(),
+                generation,
+            });
+        }
+        let evicted_wanted = self.apply_carry_caps(&mut rows);
+        (rows, evicted_wanted)
+    }
+
+    /// Evict least-important-then-oldest until `rows` is within both caps.
+    /// Returns how many evicted rows still wanted a human (P1: surfaced,
+    /// unacked, unsuppressed) — the honest cost of the eviction.
+    fn apply_carry_caps(&self, rows: &mut Vec<Alert>) -> usize {
+        let bytes = |r: &[Alert]| -> u64 { r.iter().map(line_len).sum() };
+        if rows.len() <= self.carry_max && bytes(rows) <= self.carry_max_bytes {
+            return 0;
+        }
+        // Eviction order mirrors incident.rs prune: least important first, and
+        // oldest first within a tier. `rows` is already id-ascending (oldest
+        // first), so a stable sort by ascending priority puts the first victim
+        // at the front.
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        order.sort_by(|&x, &y| {
+            carry_priority(&rows[x])
+                .cmp(&carry_priority(&rows[y]))
+                .then(x.cmp(&y))
+        });
+
+        let mut kept_count = rows.len();
+        let mut kept_bytes = bytes(rows);
+        let mut evict = std::collections::HashSet::new();
+        let mut evicted_wanted = 0usize;
+        for &victim in &order {
+            if kept_count <= self.carry_max && kept_bytes <= self.carry_max_bytes {
+                break;
+            }
+            evict.insert(victim);
+            kept_count -= 1;
+            kept_bytes = kept_bytes.saturating_sub(line_len(&rows[victim]));
+            if still_wanted_a_human(&rows[victim]) {
+                evicted_wanted += 1;
+            }
+        }
+        let mut i = 0;
+        rows.retain(|_| {
+            let keep = !evict.contains(&i);
+            i += 1;
+            keep
+        });
+        evicted_wanted
+    }
+
+    /// Write carried rows into the staging file as folded Full lines and fsync.
+    ///
+    /// A RAW write loop on purpose: it must NOT go through `write_line`, whose
+    /// size-check would recurse straight back into `rotate`.
+    fn write_carried(&self, staging: &Path, carried: &[Alert]) -> std::io::Result<()> {
+        let mut buf = String::new();
+        for a in carried {
+            buf.push_str(&serde_json::to_string(a)?);
+            buf.push('\n');
+        }
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(staging)?;
+        f.write_all(buf.as_bytes())?;
+        f.flush()?;
+        f.sync_all()?;
+        let _ = crate::util::secure_path(staging, &self.group, 0o640);
+        Ok(())
     }
 
     pub fn append_alert(&mut self, a: &Alert) -> std::io::Result<()> {
@@ -298,6 +468,44 @@ impl AlertStore {
     }
 }
 
+/// Serialized on-disk size of one carried row, including its newline.
+fn line_len(a: &Alert) -> u64 {
+    serde_json::to_string(a).map(|s| s.len() as u64 + 1).unwrap_or(0)
+}
+
+/// A carried row's importance tier for eviction: HIGHER survives longer, so the
+/// caps evict the lowest first. Mirrors the order in the plan and incident.rs
+/// prune: P6-only (0) < P5 (1) < P4/P3/P2 (2) < P1 (3). A row is classed by its
+/// STRONGEST protecting reason, so it is evicted only as its best claim allows.
+fn carry_priority(a: &Alert) -> u8 {
+    use crate::alert::{severity_rank, PROTECTED_META_RULES};
+    // P1: on the badge, unacked, unsuppressed — the thing still to be answered.
+    if a.surface == "alerts" && !a.acked && !a.is_suppressed() {
+        return 3;
+    }
+    // P2/P3/P4: acted on, a high+ story, or a snapshot on disk.
+    if a.action_taken != "none"
+        || a.incident.is_some()
+        || a.chain
+            .as_ref()
+            .is_some_and(|c| severity_rank(&c.severity) >= severity_rank("high"))
+    {
+        return 2;
+    }
+    // P5: a self-health / protection meta alert.
+    if PROTECTED_META_RULES.contains(&a.rule.as_str()) {
+        return 1;
+    }
+    // P6-only: surfaced and grave, but already answered.
+    0
+}
+
+/// Did this evicted row still want a human? Same predicate as the badge (P1),
+/// so the warning counts exactly the rows a person had not yet answered.
+fn still_wanted_a_human(a: &Alert) -> bool {
+    a.surface == "alerts" && !a.acked && !a.is_suppressed()
+}
+
 /// What is in `alerts.jsonl`, split by what it asks of a person
 /// (`AlertStore::ledger`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -315,10 +523,26 @@ mod tests {
     use serde_json::Value;
 
     fn store(dir: &Path, max: u64) -> AlertStore {
+        // Generous carry caps: the carry-forward tests that exercise the caps
+        // set their own store with tight ones.
         AlertStore::open(
             &dir.join("alerts.jsonl"),
             &dir.join("alerts.1.jsonl"),
             max,
+            u64::MAX,
+            usize::MAX,
+            "moat",
+        )
+        .unwrap()
+    }
+
+    fn store_caps(dir: &Path, max: u64, carry_max_bytes: u64, carry_max: usize) -> AlertStore {
+        AlertStore::open(
+            &dir.join("alerts.jsonl"),
+            &dir.join("alerts.1.jsonl"),
+            max,
+            carry_max_bytes,
+            carry_max,
             "moat",
         )
         .unwrap()
@@ -360,6 +584,142 @@ mod tests {
         assert!(dir.path().join("alerts.1.jsonl").exists(), "should have rotated");
         // Rotated + current are both read back.
         assert_eq!(s.load().len(), 5);
+    }
+
+    // ---- carry-forward rotation (R1) ------------------------------------
+
+    /// A plain timeline row: surfaced nowhere, low, answered — protected by
+    /// nothing, so rotation is free to drop it.
+    fn timeline_row(id: &str) -> Alert {
+        let mut a = demo_alert(id);
+        a.surface = "timeline".into();
+        a.severity = "low".into();
+        a.acked = true;
+        a.action_taken = "none".into();
+        a.chain = None;
+        a.incident = None;
+        a.rule = "moat-fs-ordinary".into();
+        assert!(!a.is_protected(), "timeline_row must be unprotected");
+        a
+    }
+
+    #[test]
+    fn rotation_carries_a_protected_row_across_two_rotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = serde_json::to_string(&timeline_row("01T00000000000000000000000")).unwrap();
+        // Small enough to rotate several times over the run.
+        let mut s = store(dir.path(), (line.len() as u64 + 1) * 4);
+
+        // demo_alert is surfaced+high+unacked => P1/P6 protected.
+        let prot = demo_alert("01P00000000000000000000001");
+        s.append_alert(&prot).unwrap();
+        for i in 0..20 {
+            s.append_alert(&timeline_row(&format!("01T{:023}", i))).unwrap();
+        }
+        assert!(dir.path().join("alerts.1.jsonl").exists(), "should have rotated");
+
+        // The live file holds the carried protected row, tamper-stamped.
+        let live = std::fs::read_to_string(dir.path().join("alerts.jsonl")).unwrap();
+        assert!(live.contains("01P00000000000000000000001"), "protected row is in live");
+        assert!(live.contains("\"carried\""), "carried rows are stamped");
+
+        // It survives across the rotations; the earliest timeline row does not.
+        let ids: std::collections::HashSet<String> =
+            s.load().into_iter().map(|a| a.id).collect();
+        assert!(ids.contains("01P00000000000000000000001"), "protected row survived");
+        assert!(!ids.contains("01T00000000000000000000000"), "oldest timeline row rotated out");
+        // And the folded protected row shows the carry stamp with a grown gen.
+        let got = s.find("01P00000000000000000000001").unwrap();
+        let c = got.carried.expect("carried stamp present after rotation");
+        assert!(c.generation >= 1);
+    }
+
+    #[test]
+    fn an_update_line_still_folds_onto_a_carried_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = serde_json::to_string(&timeline_row("01T00000000000000000000000")).unwrap();
+        let mut s = store(dir.path(), (line.len() as u64 + 1) * 4);
+
+        let prot = demo_alert("01P00000000000000000000001");
+        s.append_alert(&prot).unwrap();
+        for i in 0..8 {
+            s.append_alert(&timeline_row(&format!("01T{:023}", i))).unwrap();
+        }
+        assert!(dir.path().join("alerts.1.jsonl").exists());
+        // An update lands on the id AFTER it has been carried forward.
+        s.append_update(&UpdateLine::new(&prot.id).set("count", Value::from(5u64)))
+            .unwrap();
+        let got = s.find(&prot.id).unwrap();
+        assert_eq!(got.count, Some(5), "update folds onto the carried Full line");
+        assert!(got.carried.is_some(), "and the carry stamp is preserved");
+    }
+
+    #[test]
+    fn carry_caps_evict_least_important_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = serde_json::to_string(&timeline_row("01T00000000000000000000000")).unwrap();
+        // carry_max = 2 rows; max small enough to rotate.
+        let mut s = store_caps(dir.path(), (line.len() as u64 + 1) * 6, u64::MAX, 2);
+
+        // P1: surfaced, unacked, high.
+        let p1 = demo_alert("01A00000000000000000000001");
+        // P5: a meta rule, otherwise unremarkable.
+        let mut p5 = timeline_row("01B00000000000000000000002");
+        p5.rule = "moat-x-noisy-rule".into();
+        assert!(p5.is_protected());
+        // P6-only: surfaced + high but already answered.
+        let mut p6 = demo_alert("01C00000000000000000000003");
+        p6.acked = true;
+        assert!(p6.is_protected());
+        assert_eq!(carry_priority(&p6), 0, "P6-only is the lowest tier");
+
+        s.append_alert(&p1).unwrap();
+        s.append_alert(&p5).unwrap();
+        s.append_alert(&p6).unwrap();
+        // Filler timeline to cross the rotation size.
+        for i in 0..10 {
+            s.append_alert(&timeline_row(&format!("01T{:023}", i))).unwrap();
+        }
+        assert!(dir.path().join("alerts.1.jsonl").exists(), "should have rotated");
+
+        // The live file carried only the two most important; the P6-only went.
+        let live = std::fs::read_to_string(dir.path().join("alerts.jsonl")).unwrap();
+        assert!(live.contains("01A00000000000000000000001"), "P1 kept");
+        assert!(live.contains("01B00000000000000000000002"), "P5 kept");
+        assert!(!live.contains("01C00000000000000000000003"), "P6-only evicted first");
+    }
+
+    #[test]
+    fn a_crash_between_the_two_renames_is_completed_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        // Crash point: staging written, live already renamed aside (missing).
+        std::fs::write(dir.path().join("alerts.new"), "carried-line\n").unwrap();
+        // open() reconciles before it appends.
+        let s = store(dir.path(), 1 << 20);
+        assert!(dir.path().join("alerts.jsonl").exists(), "second rename completed");
+        assert!(!dir.path().join("alerts.new").exists(), "staging consumed");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("alerts.jsonl")).unwrap(),
+            "carried-line\n"
+        );
+        drop(s);
+    }
+
+    #[test]
+    fn a_stale_staging_file_is_discarded_when_the_live_log_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        // Crash point: staging written, but the first rename had not run, so the
+        // live log is intact and authoritative.
+        std::fs::write(dir.path().join("alerts.jsonl"), "real\n").unwrap();
+        std::fs::write(dir.path().join("alerts.new"), "stale\n").unwrap();
+        let s = store(dir.path(), 1 << 20);
+        assert!(!dir.path().join("alerts.new").exists(), "stale staging discarded");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("alerts.jsonl")).unwrap(),
+            "real\n",
+            "live log untouched"
+        );
+        drop(s);
     }
 
     #[test]
@@ -515,7 +875,7 @@ mod tests {
     fn bench_load() {
         let Ok(dir) = std::env::var("MOAT_BENCH_DIR") else { return };
         let dir = std::path::PathBuf::from(dir);
-        let s = AlertStore::open(&dir.join("alerts.jsonl"), &dir.join("alerts.1.jsonl"), u64::MAX, "moat").unwrap();
+        let s = AlertStore::open(&dir.join("alerts.jsonl"), &dir.join("alerts.1.jsonl"), u64::MAX, u64::MAX, usize::MAX, "moat").unwrap();
         for _ in 0..3 {
             let t = std::time::Instant::now();
             let n = s.load().len();

@@ -1441,6 +1441,14 @@ TestCase {
     compare(alert.demoted, false)
     compare(Model.triageChip(alert), "malicious · high")
     compare(Model.triageOutcomeText(alert), "Recorded against this alert. Nothing was changed.")
+
+    // A raised outcome must say it raised, not "nothing changed" -- the agent
+    // pushed it onto the badge (the safe direction of demote).
+    var raised = triagedAlert({
+      verdict: "malicious", confidence: "high", summary: "s", reasoning: "r",
+      outcome: "raised"
+    })
+    verify(Model.triageOutcomeText(raised).indexOf("Raised to the badge") === 0)
   }
 
   // The verdict came from a language model that had just read hostile input,
@@ -2981,6 +2989,27 @@ TestCase {
             "quiet")
   }
 
+  function test_a_contained_alert_reaches_now_in_monitor_mode() {
+    // Containment is moatd acting on its own -- a narrow network cut -- and it
+    // happens in MONITOR mode, not enforce. A contained alert is "contained"
+    // by alertState (so not needsYou) and must still be "stopped" (so it
+    // reaches the Now blocked card). It used to be neither, so a critical
+    // contained chain showed in History and nowhere in Now. 2026-09-06.
+    var contained = incAlert({
+      id: "01C", rule: "moat-cred-cloud-credentials-read", severity: "medium",
+      surface: "alerts", mode: "monitor", action_taken: "contained" })
+    var incidents = Model.buildIncidents(Model.foldText(JSON.stringify(contained) + "\n"), {})
+    compare(Model.stoppedIncidents(incidents).length, 1, "a contained alert is stopped even in monitor")
+    compare(Model.blockedIncidents(incidents).length, 1, "and reaches the Now blocked card")
+    var v = Model.verdict(incidents, { ok: true, sensorUnhealthy: false, sensorsLoaded: 43 })
+    compare(v.state, "stopped")
+
+    // Acknowledged, it stops being news, like every other stopped thing.
+    contained.acked = true
+    var done = Model.buildIncidents(Model.foldText(JSON.stringify(contained) + "\n"), {})
+    compare(Model.stoppedIncidents(done).length, 0)
+  }
+
   function test_the_apology_card_and_the_headline_never_disagree() {
     // They were two functions answering "is this still outstanding" and only
     // one of them looked at `acked`: after allowing a killed program the
@@ -3283,6 +3312,19 @@ TestCase {
     compare(acted[1].status.tone, "accent")
     compare(acted[0].status.label, "you had allowed this",
             "an allowed step is still an allowed step once it is acked")
+
+    // The concrete detail: the program and the file it read or the host it
+    // reached, from the member alert. "python3 read ~/.aws/credentials", not
+    // just "a credential file was read".
+    var detailed = Model.chainStory(chain, { alerts: [
+      { id: "01S1", file: { path: "/home/dan/.aws/credentials" } },
+      { id: "01S2", net: { dst_ip: "192.168.44.122", dst_port: 4873 } }
+    ] })
+    // The program comes from the step's own exe (node here); the concrete
+    // object comes from the member alert -- the file read, the host reached.
+    verify(detailed[0].detail.indexOf("node") >= 0)
+    verify(detailed[0].detail.indexOf(".aws/credentials") >= 0)
+    verify(detailed[1].detail.indexOf("192.168.44.122:4873") >= 0)
   }
 
   function test_a_member_alert_says_it_is_part_of_a_sequence() {

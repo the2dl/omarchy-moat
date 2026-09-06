@@ -340,6 +340,10 @@ function triageOutcomeText(alert) {
   var t = alert && alert.triage
   if (!t) return ""
   if (t.demoted) return "Moved to the timeline; it is no longer in the badge count."
+  // The safe-direction counterpart of demote: the agent judged this worse than
+  // it was scored and pushed it onto the badge. Without this it hit the
+  // catch-all and read "Nothing was changed" -- the opposite of the truth.
+  if (t.outcome === "raised") return "Raised to the badge: the agent judged this needs you."
   if (t.withheld) return "Left in the badge count: " + t.withheld + "."
   return "Recorded against this alert. Nothing was changed."
 }
@@ -773,6 +777,9 @@ function incidentKey(alert) {
 function alertState(alert, demotedRules) {
   if (!alert) return "closed"
   if (alert.acked) return "closed"
+  // A restored quarantine is the user UNDOING an action, not moat acting -- it
+  // reads as reviewed/closed, never "you stopped it".
+  if (alert.action_taken === "restored") return "closed"
   if (alert.action_taken && alert.action_taken !== "none") return "contained"
   // Suppression is a per-alert fact the daemon wrote. The rule-wide demotion
   // list is NOT consulted here: `alertSurface` below is the one place that
@@ -1040,6 +1047,15 @@ function stoppedIncidents(incidents) {
 /// "any member says yes" and nothing else.
 function alertStopped(alert) {
   if (!alert || alert.acked) return false
+  // Containment is its OWN mechanism, independent of enforce mode: moatd
+  // writes a narrow deny policy and refuses the connection on its own
+  // judgement even while the daemon is in monitor. So a contained alert is
+  // "stopped" regardless of `mode` -- and it MUST be, or it falls through
+  // every Now list: `alertState` calls it "contained" (so it is not
+  // "needsYou") and this used to not recognise it (so it was not "stopped"
+  // either), leaving a critical contained chain visible in History and
+  // nowhere in Now. 2026-09-06.
+  if (alert.action_taken === "contained") return true
   // `mode` is the mode THIS rule was raised under, so a kill the user asked
   // for with `moatctl kill` is not news and does not get an apology.
   if (alert.mode !== "enforce") return false
@@ -2205,7 +2221,18 @@ function shouldNotify(alert, minSeverity, initialLoad, options) {
   // and after the demotion checks so the cautious answers still win.
   if (alertState(alert, options && options.demotedRules) !== "needsYou") return false
 
-  return severityAtLeast(alert.severity, minSeverity)
+  // Effective severity is the max of the alert's OWN severity and the
+  // severity of the chain it belongs to. A cred read (medium) and a first
+  // contact (low) that together form a high exfil chain each stay quiet on
+  // their own account -- but the sequence they make is high, and the whole
+  // point of a chain is that the sequence is the thing worth interrupting for.
+  // Gating only on the member severity meant moat detected the exfil, put a
+  // high chain on the badge, and never told the user (2026-09-06 reportkit
+  // test). `notifyDecision` collapses the members to one toast per chain.
+  var eff = alert.severity
+  if (alert.chain && severityRank(alert.chain.severity) > severityRank(eff))
+    eff = alert.chain.severity
+  return severityAtLeast(eff, minSeverity)
 }
 
 // ------------------------------------------------- cooldown, burst collapse
@@ -2304,6 +2331,20 @@ function notifyDecision(store, alert, nowMs, options) {
   // guarantees "once"), and it is the alert that explains why a rule just went
   // quiet — collapsing it into "N more" would hide the explanation.
   if (rule === NOISY_RULE_ALERT) return { toast: true, collapsed: 0, reason: "noisy-rule" }
+
+  // One toast per chain, not one per member. The members of a high chain are
+  // eligible via the effective-severity rule in `shouldNotify`; without this a
+  // two-member exfil chain would toast twice (once for the cred rule, once for
+  // the net rule). Keyed on the chain id in the store's seen-set, so a chain
+  // that grows and republishes still interrupts exactly once.
+  var chainId = alert.chain && alert.chain.id ? String(alert.chain.id) : ""
+  if (chainId && severityRank(alert.chain.severity) > severityRank(alert.severity)) {
+    if (!store.notifiedChains) store.notifiedChains = {}
+    if (store.notifiedChains[chainId])
+      return { toast: false, collapsed: 0, reason: "chain-already-toasted" }
+    store.notifiedChains[chainId] = true
+    return { toast: true, collapsed: 0, reason: "chain" }
+  }
 
   var window = store.notifyWindows[rule]
   var reset = false
@@ -3914,6 +3955,22 @@ function chainStepStatus(step, member) {
 /// a fact joined from the member alert. A step whose alert this reader has not
 /// folded yet still renders -- the chain is the authority on what happened, and
 /// waiting for the log to catch up would show a shorter story than moatd has.
+/// The concrete one-liner for a chain step: the acting program and the file it
+/// touched or the host it reached. Built from the member alert when present
+/// (it carries the path and the destination); falls back to the step's own exe.
+function chainStepDetail(step, member) {
+  var exe = basename(String((step && step.exe) || (member && member.process && member.process.exe) || ""))
+  if (!exe) return ""
+  var m = member || {}
+  if (m.file && m.file.path) return exe + "  \u00b7  " + shortenHome(String(m.file.path))
+  if (m.net && m.net.dst_ip) {
+    var port = m.net.dst_port ? ":" + m.net.dst_port : ""
+    return exe + "  \u00b7  \u2192 " + m.net.dst_ip + port
+  }
+  var args = m.process && m.process.args ? String(m.process.args) : ""
+  return args ? exe + "  \u00b7  " + args : exe
+}
+
 function chainStory(chain, options) {
   var c = chain || {}
   var steps = Array.isArray(c.steps) ? c.steps : []
@@ -3950,7 +4007,13 @@ function chainStory(chain, options) {
       status: chainStepStatus(s, member),
       role: s.role,
       isContext: s.role === "context",
-      isCurrent: current !== "" && s.alert === current
+      isCurrent: current !== "" && s.alert === current,
+      // The concrete thing this step DID: which program, and the file it read
+      // or the host it reached. The step alone carries only the rule title; the
+      // member alert carries the specifics, and a contained chain is exactly
+      // where the user wants "python3 read ~/.aws/credentials", not just
+      // "a credential file was read".
+      detail: chainStepDetail(s, member)
     })
   }
   return rows
@@ -4123,10 +4186,16 @@ function blockTranscript(alert) {
   // a refusal never reaches the shell at all -- the program stayed up and got
   // EPERM from connect(), so inventing a "Killed" line here would be a lie
   // about something the user can scroll back and check.
-  var denied = alert && alert.action_taken === "blocked"
+  // A kill shows the shell's "Killed"; a refusal never reaches the shell --
+  // the program stayed up and got EPERM from connect(). Both `blocked` (a
+  // kernel deny in enforce mode) and `contained` (moatd's own network cut for
+  // a correlated sequence) are refusals, not kills, so neither may claim a
+  // "Killed" line the user could scroll back and disprove.
+  var act = alert ? alert.action_taken : ""
+  var refused = act === "blocked" || act === "contained"
   return {
     command: "$ " + (command || basename(process.exe)),
-    killed: denied ? "connect: Permission denied" : "Killed",
+    killed: refused ? "connect: Permission denied" : "Killed",
     cwd: shortenHome(String(process.cwd || ""))
   }
 }
