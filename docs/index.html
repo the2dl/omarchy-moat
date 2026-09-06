@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Documentation for omarchy-moat: architecture, the panel, the privilege model, learning and tuning, and the complete moatctl reference.">
+<title>Moat Handbook</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:ital,wght@0,400;0,500;1,400&display=swap">
+<style>
+  :root {
+    --ink:#10161c; --ink-soft:#3d4a52; --ink-faint:#6b7a83;
+    --paper:#f6f8f9; --card:#ffffff; --rule:#dbe3e6; --rule-soft:#e8eef0;
+    --accent:#17656d; --accent-ink:#0d4348; --accent-wash:#e3f0f0;
+    --crit:#9f1c2c; --warn:#8a5a00; --clear:#2f6b3f;
+    --term-bg:#101a1e; --term-fg:#cfe0e2; --term-dim:#7d949a;
+    --sans:"IBM Plex Sans",ui-sans-serif,system-ui,sans-serif;
+    --serif:"IBM Plex Serif",Georgia,serif;
+    --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ink:#e6edef; --ink-soft:#a8b8bf; --ink-faint:#75878f;
+      --paper:#0d1417; --card:#131d21; --rule:#26353b; --rule-soft:#1c282d;
+      --accent:#5fb3ad; --accent-ink:#8fd0c9; --accent-wash:#152c2e;
+      --crit:#e0707c; --warn:#d3a04a; --clear:#74b585;
+      --term-bg:#080f12; --term-fg:#cfe0e2; --term-dim:#6d848a;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ink:#e6edef; --ink-soft:#a8b8bf; --ink-faint:#75878f;
+    --paper:#0d1417; --card:#131d21; --rule:#26353b; --rule-soft:#1c282d;
+    --accent:#5fb3ad; --accent-ink:#8fd0c9; --accent-wash:#152c2e;
+    --crit:#e0707c; --warn:#d3a04a; --clear:#74b585;
+    --term-bg:#080f12; --term-fg:#cfe0e2; --term-dim:#6d848a;
+  }
+
+  * { box-sizing:border-box; }
+  body { background:var(--paper); color:var(--ink); font-family:var(--serif); font-size:16px; line-height:1.65; margin:0; }
+  .wrap { display:grid; grid-template-columns:222px minmax(0,1fr); gap:52px; max-width:1180px; margin:0 auto; padding:0 32px 96px; }
+  @media (max-width:900px) {
+    .wrap { grid-template-columns:minmax(0,1fr); gap:0; padding:0 20px 72px; }
+    .rail { position:static !important; border-right:0 !important; padding:0 0 24px !important; margin-bottom:24px; border-bottom:1px solid var(--rule); max-height:none !important; }
+  }
+
+  header.top { border-bottom:1px solid var(--rule); background:var(--card); }
+  .top-inner { max-width:1180px; margin:0 auto; padding:44px 32px 36px; }
+  h1 { font-family:var(--sans); font-size:34px; font-weight:700; letter-spacing:-0.02em; margin:0 0 8px; text-wrap:balance; }
+  .tagline { font-family:var(--sans); font-size:16.5px; color:var(--ink-soft); margin:0; max-width:66ch; }
+  .kicker { font-family:var(--sans); font-size:11px; font-weight:600; letter-spacing:.14em; text-transform:uppercase; color:var(--accent); margin:0 0 12px; }
+
+  .rail { position:sticky; top:0; align-self:start; padding:32px 0 40px; border-right:1px solid var(--rule-soft); max-height:100vh; overflow-y:auto; }
+  .rail h2 { font-family:var(--sans); font-size:10.5px; font-weight:600; letter-spacing:.13em; text-transform:uppercase; color:var(--ink-faint); margin:20px 0 7px; }
+  .rail h2:first-child { margin-top:0; }
+  .rail a { display:block; font-family:var(--sans); font-size:13.5px; color:var(--ink-soft); text-decoration:none; padding:3px 0; }
+  .rail a.mono { font-family:var(--mono); font-size:12.5px; }
+  .rail a:hover { color:var(--accent); }
+  .rail a:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+
+  main { padding-top:32px; min-width:0; }
+  section { margin-bottom:56px; scroll-margin-top:18px; }
+  h2.group { font-family:var(--sans); font-size:13px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:var(--accent); margin:0 0 4px; padding-bottom:10px; border-bottom:2px solid var(--accent); }
+  .group-note { font-family:var(--sans); font-size:14.5px; color:var(--ink-faint); margin:12px 0 28px; max-width:68ch; }
+  p { max-width:68ch; }
+  h3 { font-family:var(--sans); font-size:19px; font-weight:600; margin:32px 0 6px; scroll-margin-top:18px; text-wrap:balance; }
+  h3.cmd { font-family:var(--mono); font-size:16.5px; display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; margin-bottom:2px; }
+  h4 { font-family:var(--sans); font-size:15px; font-weight:600; margin:22px 0 4px; color:var(--ink); }
+  .purpose { font-family:var(--sans); font-size:14.5px; color:var(--ink-soft); margin:0 0 14px; max-width:68ch; }
+  code { font-family:var(--mono); font-size:.88em; background:var(--rule-soft); padding:1px 5px; border-radius:3px; }
+
+  .chip { font-family:var(--sans); font-size:10px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; padding:2px 7px; border-radius:3px; white-space:nowrap; background:var(--crit); color:var(--paper); }
+  .chip.free { background:transparent; color:var(--ink-faint); border:1px solid var(--rule); }
+
+  table.t { width:100%; border-collapse:collapse; margin:8px 0 4px; font-family:var(--sans); font-size:14px; }
+  table.t td { padding:8px 14px 8px 0; vertical-align:top; border-top:1px solid var(--rule-soft); }
+  table.t tr:first-child td { border-top:0; }
+  table.t td:first-child { font-family:var(--mono); font-size:12.5px; color:var(--accent-ink); white-space:nowrap; width:1%; }
+  :root[data-theme="dark"] table.t td:first-child { color:var(--accent); }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) table.t td:first-child { color:var(--accent); } }
+  .scroll { overflow-x:auto; }
+
+  pre.term { background:var(--term-bg); color:var(--term-fg); font-family:var(--mono); font-size:12.5px; line-height:1.6; padding:16px 18px; border-radius:5px; overflow-x:auto; margin:14px 0 18px; }
+  pre.term .dim { color:var(--term-dim); }
+  pre.term .hi { color:#7fd0c8; }
+  pre.term .bad { color:#e88b93; }
+
+  .note { border-left:3px solid var(--accent); background:var(--accent-wash); padding:12px 16px; margin:16px 0; border-radius:0 4px 4px 0; font-family:var(--sans); font-size:14.5px; max-width:68ch; }
+  .warnbox { border-left-color:var(--crit); background:transparent; border:1px solid var(--rule); border-left:3px solid var(--crit); }
+
+  /* the diagram keeps one light ground in both themes so it always reads */
+  .diagram { background:#fbfcfc; border:1px solid var(--rule); border-radius:6px; padding:20px 16px; margin:20px 0 8px; overflow-x:auto; }
+  .caption { font-family:var(--sans); font-size:12.5px; color:var(--ink-faint); margin:0 0 24px; max-width:68ch; }
+
+  ol.ladder { list-style:none; counter-reset:step; padding:0; margin:20px 0 0; max-width:68ch; }
+  ol.ladder li { counter-increment:step; position:relative; padding:0 0 20px 46px; border-left:1px solid var(--rule); margin-left:13px; }
+  ol.ladder li:last-child { border-left-color:transparent; padding-bottom:0; }
+  ol.ladder li::before { content:counter(step); position:absolute; left:-13px; top:0; width:26px; height:26px; border-radius:50%; background:var(--card); border:1px solid var(--rule); color:var(--ink-faint); font-family:var(--mono); font-size:12px; display:grid; place-items:center; }
+  ol.ladder b { font-family:var(--sans); font-size:15px; display:block; margin-bottom:2px; }
+
+  footer { border-top:1px solid var(--rule); margin-top:20px; padding-top:22px; font-family:var(--sans); font-size:13px; color:var(--ink-faint); max-width:68ch; }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="top-inner">
+    <p class="kicker">omarchy-moat · handbook</p>
+    <h1>Moat Handbook</h1>
+    <p class="tagline">A supply-chain sensor for an Omarchy workstation. It watches what package installs, editors and agents actually do — and tells you the few things that need you.</p>
+  </div>
+</header>
+
+<div class="wrap">
+  <nav class="rail">
+    <h2>Understanding</h2>
+    <a href="#what">What it is</a>
+    <a href="#arch">How it works</a>
+    <a href="#privilege">What needs sudo</a>
+    <h2>The panel</h2>
+    <a href="#now">Now</a>
+    <a href="#history">History</a>
+    <a href="#rules-tab">Rules</a>
+    <a href="#settings">Settings</a>
+    <h2>Behaviour</h2>
+    <a href="#learning">How learning works</a>
+    <a href="#tuning">Tuning</a>
+    <a href="#ladder">Turning it on</a>
+    <h2>moatctl</h2>
+    <a href="#cli-rules">Two rules</a>
+    <a class="mono" href="#status">status</a>
+    <a class="mono" href="#looking">list · explain · chain</a>
+    <a class="mono" href="#decisions">decisions · contain</a>
+    <a class="mono" href="#ack">ack</a>
+    <a class="mono" href="#ignore">ignore · unignore</a>
+    <a class="mono" href="#set">set</a>
+    <a class="mono" href="#baseline">baseline</a>
+    <a class="mono" href="#agent">bundle · analyze · triage</a>
+    <h2>System</h2>
+    <a href="#daemon">The daemon</a>
+    <a href="#files">Files &amp; services</a>
+  </nav>
+
+  <main>
+    <!-- ------------------------------------------------------ what it is -->
+    <section id="what">
+      <h2 class="group">What it is</h2>
+      <p><strong>The threat model is a hijacked package.</strong> An npm postinstall, a PyPI wheel, an AUR PKGBUILD, an editor extension — running as you, with your permissions, reading credentials out of <code>$HOME</code> and arranging to run again after a reboot. It does not need an exploit; you invited it.</p>
+      <p>Moat is not a rootkit hunter and not a server EDR. It watches the handful of things that shape of attack must do, correlates them, and asks you about the sequence rather than the steps.</p>
+      <div class="note"><strong>It ships watching, not blocking.</strong> Monitor mode, containment off, killing off. A wrong guess on day one should be noisy, not expensive — and everything that changes that is root-gated and recorded.</div>
+    </section>
+
+    <!-- ---------------------------------------------------- architecture -->
+    <section id="arch">
+      <h2 class="group">How it works</h2>
+      <p class="group-note">Four moving parts. The sensor is upstream Tetragon and is never forked — Moat ships policies for it and makes sense of what comes back.</p>
+
+      <div class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph K["kernel"]
+    EBPF["eBPF programs<br/>LSM hooks · kprobes"]
+  end
+  subgraph S["sensor — upstream Tetragon"]
+    TG["tetragon"]
+    POL["/run/moat/policies<br/>44 rendered policies"]
+    LOG[("/var/log/moat/tetragon.log<br/>JSON export")]
+  end
+  subgraph D["moatd — root daemon"]
+    RULES["rules + scoring<br/>provenance · context · rarity"]
+    CHAIN["chain correlation"]
+    BASE["baseline + noise guard"]
+    GATE["kill / containment gate"]
+  end
+  subgraph U["yours"]
+    STORE[("/var/lib/moat/alerts.jsonl<br/>append-only")]
+    CTL["moatctl"]
+    PANEL["shell panel"]
+  end
+  SHIM["sandbox shims<br/>npm · pip · cargo · go · makepkg"]
+  SCAN["scanners<br/>read, never execute"]
+
+  EBPF --> TG
+  POL --> TG
+  TG --> LOG
+  LOG --> RULES
+  RULES --> CHAIN
+  CHAIN --> BASE
+  BASE --> STORE
+  CHAIN --> GATE
+  GATE -.->|"writes a narrow deny policy"| POL
+  STORE --> CTL
+  STORE --> PANEL
+  CTL -.->|"control socket 0660 root:moat"| D
+  PANEL -.-> CTL
+  SHIM --> SCAN
+  SHIM -.->|"runs the real tool"| EBPF
+</pre>
+      </div>
+      <p class="caption">Solid arrows carry events; dotted arrows carry decisions. Note the loop at the gate: when a correlated sequence is confident enough, moatd writes a new policy naming one binary and one address, and Tetragon enforces it in the kernel — no userspace round trip on the blocking path.</p>
+
+      <h4>Why the split matters</h4>
+      <p>Anything the kernel can decide alone is <strong>instant</strong>: a policy that denies an operation returns <code>EPERM</code> at the hook, before the syscall completes. Anything needing correlation is <strong>after the fact</strong> — moatd learns about an event by tailing an export file, measured at roughly 340 ms from event to action. That is fast enough to cut a second connection and kill a scanner mid-sweep; it is not fast enough to beat a single exfiltration POST, and no userspace agent is.</p>
+    </section>
+
+    <!-- ------------------------------------------------------- privilege -->
+    <section id="privilege">
+      <h2 class="group">What needs sudo</h2>
+      <p class="group-note">One rule: <strong>reading never needs root; weakening protection always does.</strong> Evidence behind a password prompt does not get read, and a prompt for trivia teaches people to wave through the prompt that matters.</p>
+      <div class="scroll"><table class="t">
+        <tr><td>free</td><td><strong>Everything that looks.</strong> <code>status</code>, <code>list</code>, <code>explain</code>, <code>chain</code>, <code>decisions</code>, <code>baseline list</code>, <code>allowlist</code>, <code>contain</code>, <code>receipts</code>, <code>incidents</code>.</td></tr>
+        <tr><td>free</td><td><strong>Acking.</strong> The commonest action there is. It deletes nothing — the log is append-only — so the defence is attribution: every ack records who asked, and clearing more than 64 at once raises a protection-change alert.</td></tr>
+        <tr><td>free</td><td><strong>Dismissing a proposal</strong>, and <strong>restoring</strong> a rule or a watched binary. Refusing an offer and putting protection back weaken nothing.</td></tr>
+        <tr><td>sudo</td><td><strong>Allowlisting</strong> — <code>ignore</code>, <code>unignore</code>, <code>baseline accept</code>. All three write the same kind of entry, and it stops future detection.</td></tr>
+        <tr><td>sudo</td><td><strong>The switches</strong> — <code>set mode</code>, <code>set contain</code>, <code>set kill</code>, <code>set sandbox</code>. Gated in <em>both</em> directions: arming SIGKILL is as consequential as disarming it.</td></tr>
+        <tr><td>sudo</td><td><strong>Forgetting a destination</strong>. The cheapest way to make Moat stop mentioning a host, so it is gated and recorded.</td></tr>
+        <tr><td>free</td><td><strong><code>set digest</code></strong> — the one switch that is not. A weekly summary is a preference, not a protection.</td></tr>
+      </table></div>
+      <p>In the panel these are the same gates. A toggle that needs root opens Omarchy's own polkit dialog; cancelling it is a perfectly ordinary answer and the control snaps back with an explanation rather than silently failing.</p>
+      <div class="note">The attacker in this model <em>is</em> in your <code>moat</code> group, because they are running as you. That is why the gates sit at "changes what Moat does next" rather than at "touches Moat at all".</div>
+    </section>
+
+    <!-- ----------------------------------------------------------- panel -->
+    <section id="now">
+      <h2 class="group">The panel · Now</h2>
+      <p class="group-note">Three tabs and a gear. Now is where ~95% of visits end, and on a quiet day it should read like a sentence, not a console.</p>
+
+      <h4>The verdict block</h4>
+      <p>A single coloured dot and one line — <em>“Nothing needs you.”</em> — with a sub-line saying what was looked at and what happened to it. The dot is the only colour on a quiet page.</p>
+
+      <h4>What it watched today</h4>
+      <p>Four or five rows, each a category in plain words, what actually happened, and a <strong>state word</strong>: <code>expected</code>, <code>explained</code>, <code>contained</code>, <code>needs you</code>. The state word carries the only other colour, and only when it is asking for something — reassurance that shouts is noise.</p>
+
+      <h4>An incident card</h4>
+      <p>When something does need you, it opens as a card rather than a row: what happened, the process ancestry, the evidence, and — if a credential was readable — <strong>what that program could read</strong>, phrased as a fact with the rotation advice conditioned on your judgement, not shouted as an order.</p>
+      <p>Actions on a card:</p>
+      <div class="scroll"><table class="t">
+        <tr><td>This was me</td><td>The answer nine times in ten. Offers a scope: this binary, this binary and directory, this parent, or the whole rule. Writes the allowlist entry and closes the incident. <span class="chip">sudo</span></td></tr>
+        <tr><td>Close it</td><td>Acks every member of the card, in one request. It does not allowlist anything, and the same thing will ask again.</td></tr>
+        <tr><td>Only warn me</td><td>Demote this one rule to the timeline. Scoped to the rule, not the machine.</td></tr>
+        <tr><td>Copy as text</td><td>The whole incident as plain text, for pasting into a ticket or an agent.</td></tr>
+        <tr><td>Ask Moat</td><td>Bundles the incident and hands it to your default agent for a plain-language verdict.</td></tr>
+      </table></div>
+      <div class="note"><strong>A blocked card is different.</strong> When Moat has actually stopped something, the card says what was refused and offers to undo it — because a block you cannot reverse is a block you will resent.</div>
+
+      <h4>The footer strip</h4>
+      <p>The two facts that change what Moat <em>does</em> are sentences — “Watching, not blocking”, “Still learning your machine — 7 days left”. Machine counters sit far right in the dimmest colour. There is deliberately no backlog counter: a number of unread alerts is a to-do list you never asked for.</p>
+    </section>
+
+    <section id="history">
+      <h2 class="group">The panel · History</h2>
+      <p class="group-note">Scanning the past without a page of red pills.</p>
+      <p>Filter chips across the top — <strong>Everything</strong>, <strong>Needed you</strong>, <strong>Silenced by a rule</strong> — then day groups, each headed with a one-line summary (“1 needed you · 3 explained · 41 covered by a rule”, or simply “nothing needed you”).</p>
+      <p>Severity is a <strong>3px tick and text brightness</strong>, not a badge: a full page of history carries at most one red mark. Repeat counts and the covering rule are appended inline and dimmed — “· 68 times”, “· covered by: your SSH tools”.</p>
+      <p>Opening a row gives the same detail as an incident card, plus <strong>what led here</strong> — the chain, in order, with times, and which steps were triggers versus context you had already allowed.</p>
+    </section>
+
+    <section id="rules-tab">
+      <h2 class="group">The panel · Rules</h2>
+      <p class="group-note">Everything Moat has been told, and everything it is doing on its own judgement.</p>
+      <div class="scroll"><table class="t">
+        <tr><td>Yours</td><td>Deliberately first. Each entry says when you added it, after how many alerts, and — the column that matters — <strong>how many it has silenced since</strong>. That number is the only way to tell whether a rule you wrote was a good idea. <code>Undo</code> on every one.</td></tr>
+        <tr><td>Waiting for you</td><td>Baseline proposals. A proposal carrying a <strong>NOTE</strong> is one Moat is <em>not</em> vouching for — the noise guard has quietened that pattern repeatedly and is offering to make it permanent. The block looks identical either way, so the note is the difference. <span class="chip">sudo</span> to accept, free to dismiss.</td></tr>
+        <tr><td>Refusing now</td><td>Live containments: which binary may not reach which address, and until when. Release any of them here.</td></tr>
+        <tr><td>Allowed to stop</td><td>Which rules are armed to block rather than report, with a per-rule switch. <span class="chip">sudo</span></td></tr>
+        <tr><td>Holding</td><td>Quarantined files, with where each came from and a restore.</td></tr>
+        <tr><td>Came with Moat</td><td>The shipped rules, grouped into recognisable names — “Your SSH tools”, “Your package manager”, “Browsers” — rather than 40 near-identical cards. Replaced on upgrade, and the caveat is stated once.</td></tr>
+      </table></div>
+    </section>
+
+    <section id="settings">
+      <h2 class="group">The panel · Settings</h2>
+      <p class="group-note">Daemon options rewritten as questions. Everything here except notifications needs root.</p>
+      <div class="scroll"><table class="t">
+        <tr><td>Stop things?</td><td><em>“Should Moat stop things, or just tell you?”</em> — <strong>Just tell me</strong> / <strong>Stop things</strong>. The help text says plainly that a wrong guess kills a real program mid-write, and to stay on telling-you until Rules has been quiet for a week. <span class="chip">sudo</span></td></tr>
+        <tr><td>Cut a sequence</td><td><em>“Cut off a sequence Moat is sure about”</em> — the network cut. One binary, one address, ten minutes, auto-released. Nothing is killed. <span class="chip">sudo</span></td></tr>
+        <tr><td>And the programs?</td><td>Appears only when the above is on: <strong>Nothing</strong> / <strong>Write down what it would end</strong> / <strong>End them</strong>. “End them” is deliberately the dull chip — it is the option whose worst case you cannot see from this screen. <span class="chip">sudo</span></td></tr>
+        <tr><td>Hide your keys</td><td>The bubblewrap shims: package installs run without your credentials in reach. Needs a new login shell. <span class="chip">sudo</span></td></tr>
+        <tr><td>Interrupt me</td><td><strong>Anything odd</strong> / <strong>Only if it needs me</strong> / <strong>Never</strong>, with the cooldown stated underneath as a fact rather than a second control.</td></tr>
+        <tr><td>Weekly note</td><td>The digest. A preference, so no root.</td></tr>
+        <tr><td>Advanced</td><td>Collapsed: show rule-covered events, raw severities, policy paths. Implementation details, kept out of the way.</td></tr>
+      </table></div>
+    </section>
+
+    <!-- -------------------------------------------------------- learning -->
+    <section id="learning">
+      <h2 class="group">How learning works</h2>
+      <p class="group-note">Four mechanisms, deliberately separate, because they answer different questions. None of them grants trust for repetition alone.</p>
+
+      <h4>1 · Rarity — “has this happened here before?”</h4>
+      <p>Per-tuple counters with a 30-day half-life: <code>first_seen</code>, <code>rare</code>, <code>common</code>. Rarity is <strong>evidence, never a severity change on its own</strong>. Familiarity also has to be earned across time, not in a burst — sightings must be spread over at least an hour, because a payload that connects four times in ten seconds is not a host you know.</p>
+
+      <h4>2 · Provenance — “where did this program come from?”</h4>
+      <p>A binary owned by a signed repo (<code>core</code>, <code>extra</code>, <code>multilib</code>, <code>omarchy</code>) is <em>official</em> and earns one step of softening on <code>persist</code>, <code>priv</code>, <code>exec</code> and <code>net</code>. Never on <code>cred</code>, <code>rootkit</code> or <code>shell</code> — an official binary reading your SSH key is still worth a look. AUR is deliberately excluded: “pacman owns it” is not trust.</p>
+
+      <h4>3 · The noise guard — the circuit breaker</h4>
+      <p>A single <em>(rule, actor, parent, directory)</em> pattern firing more than 20 times in 24 hours is demoted to the timeline. Not the rule — the pattern, so a shape nobody has ever seen stays on the badge. It clears itself after a quiet day, and it forgets on purpose. When the same pattern has been quietened three times, Moat offers it as a proposal rather than repeating the cycle forever.</p>
+
+      <h4>4 · The baseline — the seven-day window</h4>
+      <p>A pattern that is <strong>medium or low</strong>, from an <strong>official</strong> actor, recurring on <strong>three distinct days</strong>, with rarity <code>common</code>, is written straight into <code>baseline.toml</code> during the first week. After the window it becomes a proposal you approve instead.</p>
+      <div class="note warnbox"><strong>Nothing else auto-learns, and that is the point.</strong> A payload that runs every day for three days would otherwise allowlist itself. Repetition is exactly what an attacker can manufacture, so everything that is not from a signed repo needs a human decision.</div>
+
+      <h4>Tiers, and what reaches you</h4>
+      <p>Rules are <code>detection</code> or <code>signal</code>. A <strong>signal</strong> rule keeps its severity and still feeds chains, rarity and the baseline — it simply never asks you a question on its own. “A binary ran from /tmp” is a signal; the same event inside a correlated sequence is a detection. That is why the status line separates <em>needs you</em> from <em>recorded</em>.</p>
+
+      <h4>Chains</h4>
+      <p>A chain forms when one process tree produces <strong>two or more non-allowlisted findings, crossing two or more families, at least one medium or worse, at least one new on this machine.</strong> An allowlisted step joins as <em>context</em> — visible in the story, unable to raise the alarm, because your allowlist is consent.</p>
+    </section>
+
+    <!-- ---------------------------------------------------------- tuning -->
+    <section id="tuning">
+      <h2 class="group">Tuning</h2>
+      <p class="group-note">The first day is the loudest: rarity knows nothing and the baseline has not learned. Most of it settles without you.</p>
+
+      <h4>Start by reading the ledger, not the list</h4>
+      <p><code>needs you 7 (recorded 1115, of which 162 signal; suppressed 3425)</code> — only the first number is asking. A large <em>recorded</em> count is the sensor working; a large <em>needs you</em> count is what to tune.</p>
+
+      <h4>Then find the shape, not the alerts</h4>
+      <pre class="term">moatctl --json list --limit 500 | \
+  jq -r '.alerts[] | select(.acked | not) | "\(.rule)\t\(.process.exe)"' | \
+  sort | uniq -c | sort -rn | head</pre>
+      <p>Almost always a handful of tuples account for nearly everything. Tune those; ignore the tail.</p>
+
+      <h4>Choose the narrowest thing that works</h4>
+      <div class="scroll"><table class="t">
+        <tr><td>exe+file</td><td>This rule, this binary, this directory. Start here.</td></tr>
+        <tr><td>exe</td><td>This rule, this binary, anywhere. The usual answer.</td></tr>
+        <tr><td>parent</td><td>Anything launched by this parent — a build tool, a test runner.</td></tr>
+        <tr><td>rule</td><td>The whole rule. Rarely right; you are turning a detection off.</td></tr>
+      </table></div>
+
+      <h4>Let the machinery do the boring part</h4>
+      <p>Recurring desktop noise will be demoted within minutes and proposed after the third cycle. Signed-repo tooling is learned in the first week. What is left after that is genuinely yours to decide.</p>
+
+      <h4>When a rule is wrong rather than noisy</h4>
+      <p>If a rule fires on things that are never interesting <em>on this machine</em>, that is a rule problem, not an allowlist problem. <code>moatctl baseline propose &lt;rule&gt;</code> turns its top tuples into reviewable entries in one go.</p>
+
+      <div class="note"><strong>Building this project from source is not a tuning problem.</strong> Its own test suite executes fixtures out of random <code>/tmp</code> paths, which is exactly what a dropper looks like. Those alerts are covered by a shipped allowlist scoped to the test runner's ancestry — not by trusting <code>/tmp</code>, which is where droppers land.</div>
+    </section>
+
+    <section id="ladder">
+      <h2 class="group">Turning it on</h2>
+      <p class="group-note">Each step is reversible, root-gated and recorded.</p>
+      <ol class="ladder">
+        <li><b>Watch for a few days</b>Let the noise guard and the baseline do their work. Read <code>moatctl status</code> once a day; you are looking at <em>needs you</em>, not the totals.</li>
+        <li><b>moatctl set contain on</b>The narrow network cut. One binary, one address, ten minutes, auto-released, visible in <code>moatctl contain</code>. Nothing is killed, and its worst case is one program failing to reach one host.</li>
+        <li><b>Arm one rule at a time</b><code>moatctl set mode enforce --rule &lt;name&gt;</code> — for a rule whose false-positive surface you have already measured in History.</li>
+        <li><b>Only then consider set kill kill</b>After a week of <code>moatctl decisions</code> in which you agree with every line. Two candidate gates were scored against nine real chains on the author's machine: one would have killed an ordinary system update, the other a running coding agent. This is not a switch to flip on faith.</li>
+      </ol>
+    </section>
+
+    <!-- ------------------------------------------------------------- CLI -->
+    <section id="cli-rules">
+      <h2 class="group">moatctl · two rules</h2>
+      <p><strong>Every action names an alert id, never a pid or a path.</strong> You act on something Moat observed and recorded. The id is a ULID like <code>01M1S9DPBMBYHX5T7S3M0CGCXM</code>.</p>
+      <p><strong>Every command takes <code>--json</code></strong>, and the shapes are fixed by the contract doc — the panel and the CLI read the same responses.</p>
+      <pre class="term">sudo usermod -aG moat $USER   <span class="dim"># then log out and back in</span></pre>
+      <p class="caption">The group is what lets you read the alert log and write to the control socket. A new group only applies to a fresh login session.</p>
+    </section>
+
+    <section id="status">
+      <h2 class="group">moatctl status</h2>
+      <p class="purpose">Is this working, and does it want anything from me.</p>
+<pre class="term">moatd  0.1.0   mode monitor
+<span class="hi">enforcing</span>  moat-cred-etc-shadow-read, moat-cred-ssh-private-key-read, …
+tetragon   running
+<span class="hi">policies   44   (44 loaded in the kernel)</span>
+feeds      0 hashes, 0 domains, updated never
+<span class="hi">needs you  7</span>   <span class="dim">(recorded 1115, of which 162 signal; suppressed 3425)</span>
+unacked    critical 0  high 5  medium 0  low 2
+sandbox    off
+socket     group moat   uptime 9s   162 events, 0 alerts
+baseline   learning until 2026-09-10   0 proposal(s), 30 learned
+demoted    moat-exec-untrusted-home, …   <span class="dim">(timeline only)</span></pre>
+      <div class="scroll"><table class="t">
+        <tr><td>policies</td><td><strong>The two numbers must match.</strong> The first is what was rendered to disk, the second what the kernel has pinned. A gap is a silent sensor outage — one cost 25 minutes of blindness while every other surface read “running”.</td></tr>
+        <tr><td>enforcing</td><td>Rules armed to block. <code>*** NOT ARMED IN KERNEL ***</code> means Moat asked the kernel and the kernel disagreed; it re-arms once a minute and says so until it clears.</td></tr>
+        <tr><td>needs you</td><td>The only number asking for something.</td></tr>
+        <tr><td>INERT</td><td>A rule that is enabled and <em>structurally cannot fire</em> — reading a sensor field the sensor is not configured to send, for instance. Silence that reads as coverage is worse than a rule that is off, so it is named with the fix.</td></tr>
+      </table></div>
+    </section>
+
+    <section id="looking">
+      <h2 class="group">Looking</h2>
+      <h3 class="cmd" id="list">moatctl list <span class="chip free">no root</span></h3>
+      <p class="purpose">Recent alerts, newest last, so the interesting one is at the bottom of your terminal. <code>--limit N</code> (default 20), <code>--since ID</code> — ids are monotonic, so an id comparison is a time comparison.</p>
+
+      <h3 class="cmd">moatctl explain &lt;ID&gt;</h3>
+      <p class="purpose">The full record: what happened, why the rule exists, what a normal cause looks like, the ancestry, the evidence, and what to rotate if a credential was read.</p>
+
+      <h3 class="cmd" id="chain">moatctl chain [ID]</h3>
+      <p class="purpose">The sequence an alert belongs to — every step in order, with times, marked trigger or context. With no id, the chains on record. The headline counts triggers only; allowed steps are reported separately.</p>
+
+      <h3 class="cmd">moatctl rarity &lt;ID&gt;</h3>
+      <p class="purpose">How unusual this tuple is here, with counts and dates.</p>
+
+      <h3 class="cmd">moatctl receipts · incidents · allowlist · quarantine</h3>
+      <p class="purpose"><code>receipts</code>: what each package install actually did. <code>incidents</code>: snapshots taken <em>before</em> anything is killed. <code>allowlist</code>: every merged rule with the index <code>unignore</code> takes. <code>quarantine --list | --restore</code>: files held at mode 000, nothing ever deleted.</p>
+    </section>
+
+    <section id="decisions">
+      <h3 class="cmd">moatctl decisions</h3>
+      <p class="purpose">Every decision the kill gate has made: spared, would-have-killed, killed — with the chain, its families, the reason and the targets.</p>
+      <div class="note"><strong>This is the evidence for whether <code>set kill kill</code> is safe here. Read it before arming, not after.</strong> Deliberately unprivileged, and stored in <code>/var/lib/moat/decisions.jsonl</code> rather than the journal — journald is sized by a share of the disk and evicts oldest-first, which is not a retention guarantee you can plan a week of review around.</div>
+
+      <h3 class="cmd">moatctl contain <span class="chip free">--release CHAIN</span></h3>
+      <p class="purpose">What Moat is refusing right now on its own judgement, and how to stop it.</p>
+
+      <h3 class="cmd">moatctl exclusions <span class="chip free">--remove rule:binary</span></h3>
+      <p class="purpose">Binaries a rule has been told to stop watching <em>in the kernel</em>. This is what “allow this program” means for an armed rule — a userspace entry cannot help there, because the process dies before Moat sees the event.</p>
+    </section>
+
+    <section id="ack">
+      <h3 class="cmd">moatctl ack [IDS]… <span class="chip free">no root</span></h3>
+      <p class="purpose">Mark alerts as seen. Several ids are answered in one request.</p>
+      <div class="scroll"><table class="t">
+        <tr><td>&lt;id&gt; &lt;id&gt;…</td><td>Several, one round trip — how the panel closes a card.</td></tr>
+        <tr><td>--chain</td><td>Every alert in the same chain. One decision about a sequence should not leave its other four steps on the badge.</td></tr>
+        <tr><td>--all</td><td>Every unacked alert.</td></tr>
+        <tr><td>--rule &lt;R&gt;</td><td>Everything from one rule — after a retune, when the old alerts are about rules that no longer exist.</td></tr>
+        <tr><td>--before &lt;ID&gt;</td><td>Everything older than that alert.</td></tr>
+      </table></div>
+      <div class="note"><strong>Acking deletes nothing.</strong> The log is append-only; an ack adds a line saying it was answered. What changes is whether you are asked again — so every ack records who asked, and clearing more than 64 in one request raises a protection-change alert whichever form was used.</div>
+    </section>
+
+    <section id="ignore">
+      <h3 class="cmd">moatctl ignore &lt;ID&gt; <span class="chip">sudo</span></h3>
+      <p class="purpose">Stop alerting on this pattern; writes a <code>[[rule]]</code> block into <code>allowlist.d/user.toml</code> and acks the alert. <code>--scope exe | exe+file | parent | rule</code>, <code>--comment TEXT</code>.</p>
+      <p>The block is printed before it is written. An allowlisted finding is still recorded and still appears in chains as context.</p>
+
+      <h3 class="cmd">moatctl unignore &lt;RULE&gt; <span class="chip">sudo</span></h3>
+      <p class="purpose">Remove the n-th rule from an allowlist file; the index comes from <code>allowlist</code>. <code>--file baseline.toml</code> drops a learned entry.</p>
+
+      <h3 class="cmd">moatctl kill &lt;ID&gt;</h3>
+      <p class="purpose">SIGKILL the process tree the alert recorded. Manual and deliberate, separate from the automatic gate.</p>
+
+      <h3 class="cmd">moatctl forget &lt;DST&gt; <span class="chip">sudo</span></h3>
+      <p class="purpose">Forget what Moat learned about one destination, so the next connection there is a first contact again. Rarity stores IPv4 as a <strong>/24</strong>, so this clears the whole block and says how many counters went.</p>
+    </section>
+
+    <section id="set">
+      <h3 class="cmd">moatctl set &lt;KEY&gt; &lt;VALUE&gt; <span class="chip">sudo</span></h3>
+      <div class="scroll"><table class="t">
+        <tr><td>mode</td><td><code>monitor</code> | <code>enforce</code></td></tr>
+        <tr><td>contain</td><td><code>on</code> | <code>off</code> — may Moat cut the network for a sequence it is sure about.</td></tr>
+        <tr><td>kill</td><td><code>off</code> | <code>log</code> | <code>kill</code> — what containment does to the processes. Ships as <code>log</code>.</td></tr>
+        <tr><td>sandbox</td><td><code>on</code> | <code>off</code> — the bubblewrap shims. Needs a new login shell.</td></tr>
+        <tr><td>digest</td><td><code>on</code> | <code>off</code> — <strong>the one key needing no root.</strong></td></tr>
+        <tr><td>--rule &lt;R&gt;</td><td>Arm one rule, leaving the daemon-wide mode alone. <code>status --json</code> lists what can be armed under <code>enforceable</code>.</td></tr>
+      </table></div>
+    </section>
+
+    <section id="baseline">
+      <h3 class="cmd">moatctl baseline &lt;SUBCOMMAND&gt;</h3>
+      <div class="scroll"><table class="t">
+        <tr><td>list</td><td>Learning state, proposals, learned entries, demoted rules. No root: this is the evidence.</td></tr>
+        <tr><td>accept &lt;ID&gt;</td><td><span class="chip">sudo</span> Writes the same entry <code>ignore</code> does, by another route.</td></tr>
+        <tr><td>dismiss &lt;ID&gt;</td><td>Refusing an offer weakens nothing.</td></tr>
+        <tr><td>relearn</td><td><span class="chip">sudo</span> Restart the window after a new toolchain or job.</td></tr>
+        <tr><td>export</td><td>Dump every tuple for review.</td></tr>
+        <tr><td>propose &lt;RULE&gt;</td><td>Turn a noisy rule's top tuples into reviewable entries.</td></tr>
+        <tr><td>undemote [RULE]</td><td>Go back to watching a rule the noise guard quietened.</td></tr>
+      </table></div>
+    </section>
+
+    <section id="agent">
+      <h3 class="cmd">moatctl bundle · analyze · triage</h3>
+      <p class="purpose"><code>bundle &lt;ID&gt;</code> writes the incident as one markdown document. <code>analyze &lt;ID&gt;</code> hands it to your default agent. <code>triage --run</code> is the unattended pass the user timer runs.</p>
+      <p>Every process-derived string in a bundle sits inside a fenced <code>DATA</code> block. Not cosmetic: those strings came out of a file believed hostile, and a string constant in a dropper is itself an attack on whatever reads the bundle.</p>
+      <div class="note">The agent may <strong>explain</strong>, may <strong>propose</strong> an allowlist block for you to accept, and at most may <strong>demote</strong> an alert to the timeline on a confident benign verdict. It can never hide, acknowledge, delete or re-severity one. <code>triage --undo &lt;ID&gt;</code> reverses a demotion. The daemon never launches an agent — it runs as root with no session; <code>moatctl</code> does, from yours.</div>
+    </section>
+
+    <!-- ---------------------------------------------------------- system -->
+    <section id="daemon">
+      <h2 class="group">The daemon</h2>
+      <div class="scroll"><table class="t">
+        <tr><td>moatd config</td><td>Print the effective configuration and exit.</td></tr>
+        <tr><td>render-policies</td><td>Expand <code>{{HOME}}</code>, write <code>/run/moat/policies</code>, regenerate the export allowlist.</td></tr>
+        <tr><td>telemetry</td><td>Show the selectable telemetry classes and what each costs.</td></tr>
+        <tr><td>telemetry --apply</td><td><strong>The correct way to restart after a policy change.</strong> Validates, renders, re-runs the checker, restarts tetragon <em>then</em> moatd in that order, and verifies the kernel came back by counting what it pinned.</td></tr>
+        <tr><td>wait-sensor</td><td>Block until Tetragon has actually loaded the policies — wired as <code>ExecStartPost=</code> so <code>After=tetragon.service</code> means “after it loaded”, not “after it forked”.</td></tr>
+      </table></div>
+      <div class="note warnbox"><strong>Do not restart by hand after changing policies.</strong> Tetragon reads its policies once, at startup, and has no hot-reload. Restarting moatd first leaves it reading a log the old Tetragon is still writing under the old policy set; restarting tetragon alone leaves moatd holding annotations for policies that no longer exist.</div>
+    </section>
+
+    <section id="files">
+      <h2 class="group">Files &amp; services</h2>
+      <div class="scroll"><table class="t">
+        <tr><td>/etc/moat/moat.toml</td><td>Configuration: <code>paths</code>, <code>rules</code>, <code>ai</code>, <code>thresholds</code>, <code>net</code>, <code>baseline</code>, <code>context</code>, <code>learning</code>, <code>analysis</code>, <code>incidents</code>, <code>content</code>, <code>digest</code>, <code>telemetry</code>, <code>contain</code>.</td></tr>
+        <tr><td>allowlist.d/user.toml</td><td>Your decisions, written by <code>ignore</code>.</td></tr>
+        <tr><td>allowlist.d/baseline.toml</td><td>What the baseline learned or you accepted.</td></tr>
+        <tr><td>tetragon.conf.d/</td><td>One flag per file. <code>enable-process-cred</code> is <strong>required</strong> for the fileless-execution and privilege-raised detections; without it they are live, configured and permanently silent — which is why <code>status</code> reports them as INERT.</td></tr>
+        <tr><td>alerts.jsonl</td><td>The alert log, append-only, under <code>/var/lib/moat</code>.</td></tr>
+        <tr><td>decisions.jsonl</td><td>Kill-gate decisions.</td></tr>
+        <tr><td>quarantine/</td><td>Held files at mode 000, with metadata.</td></tr>
+        <tr><td>control.sock</td><td><code>/run/moat</code>, <code>0660 root:moat</code>.</td></tr>
+      </table></div>
+      <pre class="term">sudo systemctl enable --now tetragon moatd moat-feeds.timer
+systemctl --user enable --now moat-digest.timer moat-triage.timer</pre>
+      <p class="caption">The user timers are yours, not root's: desktop notifications belong to your session. <code>moat-ship</code> is optional and forwards alerts to an HTTPS collector or syslog.</p>
+      <p><strong>Scanners</strong> — <code>moat-scan-pkgbuild</code>, <code>-npm</code>, <code>-cargo</code>, <code>-pip</code>, <code>-go</code> — run before an install via the sandbox shims, never by you directly. They read; they never execute what they read.</p>
+    </section>
+
+    <footer>
+      Sensor is upstream Tetragon v1.7.1, never forked. Threat model is a hijacked package running as you — not a kernel rootkit, not a server fleet. Everything that changes what Moat does is root-gated and leaves a record, including turning protection up.
+    </footer>
+  </main>
+</div>
+
+<!-- The artifact host renders ```mermaid natively; a static page has to do it
+     itself. Pinned, and loaded after the markup it converts. The diagram sits
+     on its own light ground in both themes, so the default theme always reads. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: "neutral",
+    securityLevel: "strict",
+    flowchart: { curve: "basis", htmlLabels: true },
+    fontFamily: '"IBM Plex Sans", ui-sans-serif, system-ui, sans-serif'
+  });
+</script>
+</body>
+</html>

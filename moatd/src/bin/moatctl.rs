@@ -52,7 +52,6 @@ enum Cmd {
     },
     /// The full explanation for one alert.
     Explain { id: String },
-    /// Mark an alert as seen.
     /// Everything the panel needs, already folded: alerts and receipts in one
     /// response. Not meant to be read by a person; `list` is.
     Feed {
