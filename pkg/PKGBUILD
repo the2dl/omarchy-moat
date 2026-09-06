@@ -14,7 +14,7 @@
 
 pkgname=omarchy-moat
 pkgver=0.1.0
-pkgrel=79
+pkgrel=80
 _tetragonver=1.7.1
 pkgdesc='eBPF supply-chain sensor for Omarchy: Tetragon policies, an alert daemon, a bubblewrap sandbox and pre-execution scanners for PKGBUILD, npm, cargo, pip and go'
 arch=('x86_64')
@@ -121,6 +121,7 @@ prepare() {
 		"${repo}/sandbox" \
 		"${repo}/scanner" \
 		"${repo}/docs" \
+		"${repo}/assets" \
 		"${repo}/README.md" \
 		"${srcdir}/${_tree}/"
 
@@ -328,4 +329,18 @@ package() {
 	# and the [telemetry] block of moat.toml both cite it by section.
 	install -Dm644 "${tree}/docs/SHIPPING.md" \
 		"${pkgdir}/usr/share/doc/${pkgname}/SHIPPING.md"
+	install -Dm644 "${tree}/docs/CLI.md" \
+		"${pkgdir}/usr/share/doc/${pkgname}/CLI.md"
+
+	# The mark, in the hicolor set, so anything that shows an icon for this
+	# package (a .desktop entry, a notification, a tray) finds one by name
+	# rather than falling back to a generic cog. Scalable plus the two raster
+	# sizes a 16px tray actually uses -- the handoff is explicit that 16 is a
+	# separate drawing, never a downscale of 32.
+	install -Dm644 "${tree}/assets/svg/mark-accent.svg" \
+		"${pkgdir}/usr/share/icons/hicolor/scalable/apps/omarchy-moat.svg"
+	for _px in 16 24 32 64 128 256; do
+		install -Dm644 "${tree}/assets/png/mark-${_px}.png" \
+			"${pkgdir}/usr/share/icons/hicolor/${_px}x${_px}/apps/omarchy-moat.png"
+	done
 }

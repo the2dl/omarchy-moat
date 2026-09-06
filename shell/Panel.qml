@@ -746,6 +746,12 @@ Item {
 
     Connections {
         function onActionFinished(command, ok, message) {
+            // A read, not an action. "Quarantine-list done." is the daemon's own
+            // vocabulary reporting that a list refreshed, which is neither news nor
+            // English.
+            // setWeeklyDigest already wrote the notice, and it says more than this
+            // would (whether the setting was persisted). Leave it alone.
+
             if (!ok) {
                 root.notice = "Failed: " + command + (message ? " — " + message : "");
             } else if (command === "ignore") {
@@ -785,13 +791,8 @@ Item {
             else if (command === "mode")
                 root.notice = root.enforcing ? "Moat will stop things now. It shows you what it stopped, afterwards." : "Moat is back to telling you and not stopping anything.";
             else if (command === "quarantine-list")
-                // A read, not an action. "Quarantine-list done." is the daemon's own
-                // vocabulary reporting that a list refreshed, which is neither news nor
-                // English.
                 return ;
             else if (command === "digest")
-                // setWeeklyDigest already wrote the notice, and it says more than this
-                // would (whether the setting was persisted). Leave it alone.
                 return ;
             else
                 root.notice = command.charAt(0).toUpperCase() + command.slice(1) + " done.";
@@ -893,9 +894,9 @@ Item {
             anchors.fill: parent
             focus: true
             onWindowActiveChanged: {
-                if (windowActive) {
+                if (windowActive)
                     keys.forceActiveFocus();
-                }
+
             }
 
             PanelKeyCatcher {
@@ -950,12 +951,17 @@ Item {
                         anchors.verticalCenter: parent.verticalCenter
                         spacing: moatTokens.s(10)
 
-                        // The shield IS the panel's state indicator, and it takes the same
-                        // three colours as the bar glyph and the verdict dot.
-                        Text {
+                        // The mark, and it carries the panel's state the same way the
+                        // bar does: the M in the heading colour, the water in the
+                        // verdict tone. Same rule in both places, so the two cannot
+                        // disagree about what colour "something needs you" is -- which
+                        // they did, when each switched on the state string separately.
+                        MoatMark {
                             anchors.verticalCenter: parent.verticalCenter
-                            text: root.service ? root.service.barState.glyph : "󰒃"
-                            color: {
+                            implicitWidth: moatTokens.s(20)
+                            implicitHeight: moatTokens.s(20)
+                            markColor: moatTokens.primary
+                            waterColor: {
                                 if (!root.service)
                                     return moatTokens.fainter;
 
@@ -968,8 +974,6 @@ Item {
                                     return moatTokens.calm;
                                 }
                             }
-                            font.family: moatTokens.family
-                            font.pixelSize: moatTokens.s(18)
                         }
 
                         Text {
@@ -1174,9 +1178,9 @@ Item {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
                             onClicked: {
-                                if (root.service) {
+                                if (root.service)
                                     root.service.lastError = "";
-                                }
+
                             }
                         }
 
@@ -1194,9 +1198,9 @@ Item {
                         needsPackage: !!root.service && !root.service.available
                         needsGroup: !!root.service && !root.service.groupOk
                         onRecheckRequested: {
-                            if (root.service) {
+                            if (root.service)
                                 root.service.probe();
-                            }
+
                         }
                     }
 

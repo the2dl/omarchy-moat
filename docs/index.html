@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="favicon-16.png">
 <meta name="description" content="Documentation for omarchy-moat: architecture, the panel, the privilege model, learning and tuning, and the complete moatctl reference.">
 <title>Moat Handbook</title>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -44,6 +46,11 @@
   }
 
   header.top { border-bottom:1px solid var(--rule); background:var(--card); }
+  /* 12 grid units of clear space around the mark, per the brand handoff. */
+  .brand { display:flex; align-items:center; gap:18px; }
+  .brand img { flex:none; }
+  .brand h1 { margin:0; }
+  .brand .kicker { margin:0 0 4px; }
   .top-inner { max-width:1180px; margin:0 auto; padding:44px 32px 36px; }
   h1 { font-family:var(--sans); font-size:34px; font-weight:700; letter-spacing:-0.02em; margin:0 0 8px; text-wrap:balance; }
   .tagline { font-family:var(--sans); font-size:16.5px; color:var(--ink-soft); margin:0; max-width:66ch; }
@@ -104,8 +111,13 @@
 
 <header class="top">
   <div class="top-inner">
-    <p class="kicker">omarchy-moat · handbook</p>
-    <h1>Moat Handbook</h1>
+    <div class="brand">
+      <img src="mark.svg" alt="" width="44" height="44">
+      <div>
+        <p class="kicker">omarchy-moat · handbook</p>
+        <h1>Moat Handbook</h1>
+      </div>
+    </div>
     <p class="tagline">A supply-chain sensor for an Omarchy workstation. It watches what package installs, editors and agents actually do — and tells you the few things that need you.</p>
   </div>
 </header>
