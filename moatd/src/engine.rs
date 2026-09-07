@@ -2467,6 +2467,9 @@ impl Daemon {
             exe: &f.proc.exe,
             file: f.file.as_ref().map(|x| x.path.as_str()),
             parents,
+            // What the interpreter was actually running, so an entry can name
+            // `gcloud.py` instead of blessing `python3`.
+            script: f.actor.script.as_deref(),
         };
         if let Some(hit) = self.allowlist.find(&cand) {
             let by = format!(

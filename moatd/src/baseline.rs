@@ -110,6 +110,10 @@ impl TupleStat {
             exe: (!self.exe.is_empty()).then(|| self.exe.clone()),
             file: (!self.dir.is_empty()).then(|| format!("{}/*", self.dir.trim_end_matches('/'))),
             parent: (!self.parent.is_empty()).then(|| self.parent.clone()),
+            // A learned proposal never names a script: it is built from what
+            // was observed, and the interpreter case wants a hand-written
+            // entry that says which script, not a guess.
+            script: None,
         }
     }
 
@@ -558,6 +562,7 @@ impl Baseline {
             exe: (!exe.is_empty()).then(|| exe.clone()),
             file: (!dir.is_empty()).then(|| format!("{}/*", dir.trim_end_matches('/'))),
             parent: (!parent.is_empty()).then(|| parent.clone()),
+            script: None,
         };
         let id = ulid::Ulid::new().to_string();
         self.state.proposals.push(Proposal {

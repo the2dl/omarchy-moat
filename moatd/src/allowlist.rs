@@ -29,6 +29,23 @@ pub struct RuleSpec {
     pub exe: Option<String>,
     pub file: Option<String>,
     pub parent: Option<String>,
+    /// The SCRIPT an interpreter was handed, when `exe` is an interpreter.
+    ///
+    /// 2026-09-07: `gcloud iam service-accounts list` reads its own
+    /// `~/.config/gcloud/credentials.db` and then calls Google -- cred read
+    /// followed by egress, which is the exfil shape exactly, so the chain went
+    /// high and moat CONTAINED it mid-command. There was no way to allow it:
+    /// gcloud is a python script, so `exe` is `/usr/bin/python3.14`, and
+    /// allowing THAT would let any python script on the machine read your cloud
+    /// credentials. The kernel cannot help either -- `matchBinaries` sees the
+    /// interpreter too (see `util::interpreter_of`).
+    ///
+    /// moatd already resolves this: the alert prints "an interpreter takes the
+    /// provenance of its script, /opt/google-cloud-cli/lib/gcloud.py" and
+    /// `Actor::script` carries it. The allowlist simply could not match on it.
+    /// Now it can, so the entry says the true thing -- *gcloud* reading
+    /// *gcloud's own store* -- rather than blessing an interpreter.
+    pub script: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +66,7 @@ pub struct Rule {
     exe_m: Option<GlobMatcher>,
     file_m: Option<GlobMatcher>,
     parent_m: Option<GlobMatcher>,
+    script_m: Option<GlobMatcher>,
 }
 
 /// What an event offers the allowlist.
@@ -58,6 +76,8 @@ pub struct Candidate<'a> {
     pub exe: &'a str,
     pub file: Option<&'a str>,
     pub parents: Vec<String>,
+    /// `Actor::script`: what the interpreter was actually running.
+    pub script: Option<&'a str>,
 }
 
 #[derive(Debug, Default)]
@@ -116,6 +136,7 @@ impl Allowlist {
                 exe_m: spec.exe.as_deref().map(compile).transpose()?,
                 file_m: spec.file.as_deref().map(compile).transpose()?,
                 parent_m: spec.parent.as_deref().map(compile).transpose()?,
+                script_m: spec.script.as_deref().map(compile).transpose()?,
                 spec,
                 comment,
                 source: source.to_path_buf(),
@@ -161,6 +182,15 @@ impl Rule {
                 return false;
             }
         }
+        if let Some(m) = &self.script_m {
+            match c.script {
+                Some(s) if m.is_match(s) => {}
+                // A rule that names a script cannot match an event that was not
+                // an interpreter running one. This is what keeps the entry from
+                // widening into "any python".
+                _ => return false,
+            }
+        }
         true
     }
 
@@ -184,6 +214,9 @@ pub fn render_block(spec: &RuleSpec) -> String {
     }
     if let Some(v) = &spec.parent {
         s.push_str(&format!("parent = {}\n", toml_str(v)));
+    }
+    if let Some(v) = &spec.script {
+        s.push_str(&format!("script = {}\n", toml_str(v)));
     }
     s
 }
@@ -429,7 +462,8 @@ exe = "/usr/bin/gnome-keyring-daemon"
             exe: "/usr/bin/restic",
             file: Some("/home/dan/.ssh/id_rsa"),
             parents: vec![],
-        });
+                script: None,
+            });
         assert!(hit.is_some());
 
         let miss = a.find(&Candidate {
@@ -437,7 +471,8 @@ exe = "/usr/bin/gnome-keyring-daemon"
             exe: "/usr/bin/node",
             file: None,
             parents: vec![],
-        });
+                script: None,
+            });
         assert!(miss.is_none(), "exe must match");
     }
 
@@ -450,6 +485,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 exe: "/usr/bin/gnome-keyring-daemon",
                 file: None,
                 parents: vec![],
+                script: None,
             })
             .is_some());
         // A rule id that EXISTS and is outside the glob's family. It read
@@ -462,6 +498,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 exe: "/usr/bin/gnome-keyring-daemon",
                 file: None,
                 parents: vec![],
+                script: None,
             })
             .is_none());
     }
@@ -475,6 +512,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 exe: "/x",
                 file: Some("/home/dan/.ssh/id_rsa"),
                 parents: vec![],
+                script: None,
             })
             .is_some());
         assert!(a
@@ -483,6 +521,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 exe: "/x",
                 file: None,
                 parents: vec![],
+                script: None,
             })
             .is_none());
     }
@@ -496,6 +535,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 exe: "/usr/bin/sh",
                 file: None,
                 parents: vec!["/usr/bin/sh".into(), "/usr/bin/restic".into()],
+                script: None,
             })
             .is_some());
         assert!(a
@@ -504,6 +544,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 exe: "/usr/bin/sh",
                 file: None,
                 parents: vec!["/usr/bin/npm".into()],
+                script: None,
             })
             .is_none());
     }
@@ -519,6 +560,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 exe: "/home/dan/.local/share/mise/installs/node/26.5.0/bin/node",
                 file: None,
                 parents: vec![],
+                script: None,
             })
             .is_some());
     }
@@ -624,6 +666,59 @@ exe = "/usr/bin/gnome-keyring-daemon"
         assert_eq!(find_index(&p, &RuleSpec { name: "nope".into(), ..Default::default() }), None);
     }
 
+    /// An interpreter's SCRIPT is what an allowlist entry may name, so a grant
+    /// can be "gcloud reading gcloud's own store" rather than "python may read
+    /// your cloud credentials".
+    ///
+    /// 2026-09-07, live: gcloud was CONTAINED mid-command because there was no
+    /// way to express the narrow grant.
+    #[test]
+    fn an_entry_may_name_the_script_an_interpreter_was_handed() {
+        let toml = r#"
+# gcloud, reading its own store.
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "*/google-cloud-cli/lib/gcloud.py"
+file   = "*/.config/gcloud/*"
+"#;
+        let rules = Allowlist::parse(toml, Path::new("t.toml")).expect("parses");
+        let a = Allowlist { rules, failed: vec![] };
+
+        let gcloud = Candidate {
+            rule: "moat-cred-cloud-credentials-read",
+            exe: "/usr/bin/python3.14",
+            file: Some("/home/dan/.config/gcloud/credentials.db"),
+            parents: vec![],
+            script: Some("/usr/bin/../../opt/google-cloud-cli/lib/gcloud.py"),
+        };
+        assert!(a.find(&gcloud).is_some(), "gcloud reading its own store is allowed");
+
+        // The whole point: the grant does NOT extend to any other python.
+        let other = Candidate {
+            script: Some("/tmp/steal.py"),
+            ..gcloud.clone()
+        };
+        assert!(
+            a.find(&other).is_none(),
+            "a different script must still fire -- otherwise this is just allowing python"
+        );
+
+        // Nor to a process that is not an interpreter running a script at all.
+        let no_script = Candidate { script: None, ..gcloud.clone() };
+        assert!(
+            a.find(&no_script).is_none(),
+            "a rule that names a script cannot match an event without one"
+        );
+
+        // And it round-trips through the TOML writer, or `moatctl ignore`
+        // would silently drop the field that makes it narrow.
+        assert!(
+            render_block(&a.rules[0].spec).contains("script = "),
+            "render_block must write the script back: {}",
+            render_block(&a.rules[0].spec)
+        );
+    }
+
     #[test]
     fn shipped_defaults_parse() {
         for name in ["default.toml", "omarchy-default.toml"] {
@@ -678,7 +773,8 @@ exe = "/usr/bin/gnome-keyring-daemon"
                     exe,
                     file: Some(plugin),
                     parents: under_shell.clone(),
-                })
+                script: None,
+            })
                 .is_some(),
                 "{} running a plugin helper under the shell",
                 exe
@@ -698,7 +794,8 @@ exe = "/usr/bin/gnome-keyring-daemon"
                     exe: "/usr/bin/python3.14",
                     file: Some(file),
                     parents,
-                })
+                script: None,
+            })
                 .is_none(),
                 "must still alert: executing {}",
                 file
@@ -712,6 +809,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 exe: "/usr/share/omarchy/bin/omarchy-agent-usage-claude",
                 file: Some("/home/dan/.claude/.credentials.json"),
                 parents: under_shell.clone(),
+                script: None,
             })
             .is_some()
         );
@@ -727,7 +825,8 @@ exe = "/usr/bin/gnome-keyring-daemon"
                     exe,
                     file: Some(file),
                     parents: under_shell.clone(),
-                })
+                script: None,
+            })
                 .is_none(),
                 "must still alert: {} reading {}",
                 exe,
@@ -745,7 +844,8 @@ exe = "/usr/bin/gnome-keyring-daemon"
                     exe,
                     file: None,
                     parents: vec![parent.to_string()],
-                })
+                script: None,
+            })
                 .is_some(),
                 "moat-pkg-subtree-netcat-exec {} is the test suite",
                 exe
@@ -760,7 +860,8 @@ exe = "/usr/bin/gnome-keyring-daemon"
                     exe: parent,
                     file: Some(file),
                     parents: vec![parent.to_string()],
-                })
+                script: None,
+            })
                 .is_some(),
                 "moat-exec-untrusted-tmpfs {} is the test suite",
                 file
@@ -781,7 +882,8 @@ exe = "/usr/bin/gnome-keyring-daemon"
                     exe: parent,
                     file: Some(exe),
                     parents: parents.iter().map(|s| s.to_string()).collect(),
-                })
+                script: None,
+            })
                 .is_none(),
                 "{} {} must still alert",
                 rule,
@@ -819,6 +921,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 exe: runner,
                 file: Some("/tmp/.tmpFIBj5s/nc"),
                 parents: vec![runner.into(), "/usr/bin/cargo".into(), "/usr/bin/bash".into()],
+                script: None,
             })
             .is_some(),
             "the cargo tempdir nc case"
@@ -842,7 +945,8 @@ exe = "/usr/bin/gnome-keyring-daemon"
                         "/usr/bin/python3".into(),
                         "/usr/bin/makepkg".into(),
                     ],
-                })
+                script: None,
+            })
                 .is_some(),
                 "the shim-suite case: {}",
                 file
@@ -858,6 +962,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 exe: runner,
                 file: Some("/tmp/.tmpgdwbQe/incidents/01M1SR6NRX4JVX1R993SAX2XYX/.pkg.json.663928.tmp"),
                 parents: vec!["/usr/bin/cargo".into(), "/usr/bin/bash".into()],
+                script: None,
             })
             .is_some(),
             "the setuid case"
@@ -876,7 +981,8 @@ exe = "/usr/bin/gnome-keyring-daemon"
                     exe: "/usr/bin/bash",
                     file: Some("/tmp/x/payload"),
                     parents: vec!["/usr/bin/makepkg".into(), "/usr/bin/bash".into()],
-                })
+                script: None,
+            })
                 .is_none(),
                 "a dropper must still alert: {}",
                 rule

@@ -1651,6 +1651,7 @@ fn baseline_accept(d: &mut Daemon, id: &str, who: &str) -> Value {
         exe: (!p.exe.is_empty()).then(|| p.exe.clone()),
         file: (!p.dir.is_empty()).then(|| format!("{}/*", p.dir.trim_end_matches('/'))),
         parent: (!p.parent.is_empty()).then(|| p.parent.clone()),
+        script: None,
     };
     let block = match crate::allowlist::append_rule(&path, &comment, &spec) {
         Ok(b) => b,

@@ -79,3 +79,46 @@ parent = "/usr/bin/pacman"
 # [[rule]]
 # name   = "moat-x-ai-cli-headless"
 # parent = "/usr/lib/systemd/systemd"
+
+# ---------------------------------------------------------------- cloud CLIs
+#
+# A program reading ITS OWN credential store is not an exfil. `ssh` reading
+# ~/.ssh is excluded in the kernel by the cred-* policies; the cloud CLIs
+# cannot be, because they are scripts and `matchBinaries` only ever sees the
+# interpreter (see `util::interpreter_of`).
+#
+# 2026-09-07, live: `gcloud iam service-accounts list --project=...` read
+# ~/.config/gcloud/credentials.db and then called Google -- a credential read
+# followed by egress, which is the exfil shape exactly. The chain went high and
+# moat CONTAINED it mid-command. There was no way to allow it: `exe` was
+# /usr/bin/python3.14, and allowing THAT would let any python script on the
+# machine read your cloud credentials.
+#
+# `script` is what makes these entries honest. They say "gcloud, reading
+# gcloud's own store" -- not "python may read anything". A python script that
+# is not gcloud still fires, which is the whole point.
+#
+# Delete any of these if you do not use that CLI. Each one is a real, if
+# narrow, grant: it trusts that the named script is the one on disk.
+
+# gcloud, reading gcloud's own store. Arch's google-cloud-cli layout.
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "*/google-cloud-cli/lib/gcloud.py"
+file   = "*/.config/gcloud/*"
+
+# The same CLI installed from Google's own tarball, which uses google-cloud-sdk.
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "*/google-cloud-sdk/lib/gcloud.py"
+file   = "*/.config/gcloud/*"
+
+# The AWS CLI v2 ships its own interpreter, so `exe` is usable there and this
+# is an `exe` rule rather than a `script` one -- named here beside the others
+# so the set reads as one decision.
+# The AWS CLI reading ~/.aws. v2 ships its own interpreter, so `exe` is the
+# honest matcher here rather than `script`.
+[[rule]]
+name = "moat-cred-cloud-credentials-read"
+exe  = "/usr/bin/aws"
+file = "*/.aws/*"
