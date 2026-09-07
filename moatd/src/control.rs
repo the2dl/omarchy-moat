@@ -3552,6 +3552,46 @@ mod tests {
     /// KERNEL ***`, and a `moat-x-protection-changed` alert saying a protection
     /// had been WEAKENED, which NEVER_SILENCE meant could not be dismissed. The
     /// rule was armed correctly the whole time, in the daemon.
+    /// An exclusion the kernel can never honour must be refused, not recorded.
+    ///
+    /// 2026-09-07: the panel offered "allow /usr/bin/ssh-copy-id", moat wrote
+    /// it, re-rendered, reloaded, re-armed, verified -- and the read went on
+    /// being refused, because ssh-copy-id is `#!/bin/sh` and matchBinaries only
+    /// ever sees the interpreter. Worse, the alert stopped (a selector
+    /// contradiction is suppressed), so the user was told it was allowed, kept
+    /// the denial, and lost the record that explained it.
+    #[test]
+    fn a_script_cannot_be_excluded_and_is_told_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        // A rule that actually enforces, or the earlier guard fires first.
+        let Some(rule) = d
+            .policies
+            .names()
+            .into_iter()
+            .find(|n| d.policies.get(n).map(|m| m.enforce != "none").unwrap_or(false))
+        else {
+            return; // built without policies/
+        };
+
+        let script = dir.path().join("looks-like-a-tool");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        let err = d
+            .exclude_binary(&rule, script.to_str().unwrap())
+            .expect_err("a script exclusion must be refused");
+        assert!(err.contains("is a script"), "{}", err);
+        assert!(err.contains("/bin/sh"), "it must name the interpreter: {}", err);
+        assert!(
+            err.contains("set mode monitor"),
+            "and offer the way that does work: {}",
+            err
+        );
+        assert!(
+            !d.kernel_exclusions.get(&rule).map(|l| l.iter().any(|b| b == script.to_str().unwrap())).unwrap_or(false),
+            "a refused exclusion must not be recorded"
+        );
+    }
+
     /// The kill path must not refuse over a symlink.
     ///
     /// 2026-09-05 fixed this for CONTAINMENT (`contain::binary_aliases`);

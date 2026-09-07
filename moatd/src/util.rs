@@ -629,3 +629,67 @@ pub fn proc_cgroup(pid: u32) -> Option<String> {
     let text = fs::read_to_string(format!("/proc/{}/cgroup", pid)).ok()?;
     Some(text.lines().next()?.to_string())
 }
+
+/// What the KERNEL will match when this path is executed, when that is not the
+/// path itself. `None` means the path IS the binary the kernel loads.
+///
+/// `matchBinaries` compares the binary the kernel loaded, and for a `#!` script
+/// that is the INTERPRETER: `/proc/<pid>/exe` of a running shell script reads
+/// `/usr/bin/bash`, never the script. Tetragon's userspace process cache still
+/// reports the script path, so the two disagree -- which is how, on 2026-09-07,
+/// `moatctl exclusions` accepted `/usr/bin/ssh-copy-id` (a `#!/bin/sh` script),
+/// recorded it, re-rendered and reloaded the policy, verified the re-arm, and
+/// changed nothing at all: the kernel went on matching bash and refusing the
+/// read, while moatd suppressed the alert because the name it was given was one
+/// its own selectors exclude. Allowed in the panel, still denied on disk, and
+/// no alert left to say why.
+///
+/// So this is the question to ask before writing an exclusion, and when
+/// explaining a selector that contradicts itself.
+pub fn interpreter_of(path: &str) -> Option<String> {
+    use std::io::Read;
+    let mut buf = [0u8; 256];
+    let mut f = std::fs::File::open(path).ok()?;
+    let n = f.read(&mut buf).ok()?;
+    let head = &buf[..n];
+    // The one case where the path is what the kernel matches.
+    if head.starts_with(b"\x7fELF") {
+        return None;
+    }
+    if head.starts_with(b"#!") {
+        let line = head[2..].split(|b| *b == b'\n').next()?;
+        let text = String::from_utf8_lossy(line);
+        if let Some(interp) = text.trim().split_whitespace().next() {
+            if interp.starts_with('/') {
+                return Some(interp.to_string());
+            }
+        }
+    }
+    // Executable, not ELF, no usable shebang: still not what the kernel loads.
+    Some("the interpreter that runs it".to_string())
+}
+
+#[cfg(test)]
+mod interpreter_tests {
+    use super::*;
+
+    #[test]
+    fn a_real_binary_is_what_the_kernel_matches() {
+        assert_eq!(interpreter_of("/usr/bin/cat"), None, "an ELF binary is itself");
+    }
+
+    #[test]
+    fn a_shebang_script_names_its_interpreter() {
+        // ssh-copy-id is the case this was written for; skip where it is absent.
+        if std::path::Path::new("/usr/bin/ssh-copy-id").exists() {
+            let i = interpreter_of("/usr/bin/ssh-copy-id").expect("a script is not its own binary");
+            assert!(i.starts_with('/'), "{}", i);
+            assert!(i.contains("sh"), "{}", i);
+        }
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_read_is_not_claimed_to_be_a_script() {
+        assert_eq!(interpreter_of("/nonexistent/moat/probe"), None);
+    }
+}

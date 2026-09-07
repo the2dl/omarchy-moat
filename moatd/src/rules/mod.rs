@@ -284,8 +284,11 @@ pub fn sensor_mismatch_meta(why: &str) -> PolicyMeta {
         why,
         "A Tetragon upgrade that changes argument order or hook semantics, a policy edited \
          while it was loaded, and hooks whose arguments moatd re-validates only partially. \
-         It is never caused by the program named in the alert, so ignoring it by exe is the \
-         wrong move — ignore it by rule, or fix the policy.",
+         There is one common cause that is NOT a sensor fault: the name reported is a \
+         script, so the kernel matched its interpreter — which the selector does not \
+         exclude -- and the two never disagreed. The record says so when that is what \
+         happened. Otherwise it is never caused by the program named in the alert, so \
+         ignoring it by exe is the wrong move -- ignore it by rule, or fix the policy.",
         &[],
         &["ignore"],
         "rule",

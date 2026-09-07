@@ -1817,6 +1817,26 @@ impl Daemon {
         if self.policies.meta_or_fallback(rule).enforce == "none" {
             return Err(format!("{} does not enforce, so there is nothing to exclude", rule));
         }
+        // A script cannot be excluded by name, and saying so is the whole point.
+        //
+        // 2026-09-07: the panel offered "allow /usr/bin/ssh-copy-id", this
+        // accepted it, re-rendered, reloaded, re-armed and verified -- and
+        // nothing changed, because ssh-copy-id is `#!/bin/sh` and matchBinaries
+        // only ever sees the interpreter. The read went on being refused while
+        // the alert stopped (moatd suppressed it as a selector contradiction),
+        // so the user was told it was allowed, kept the denial, and lost the
+        // one record that explained it. An exclusion that is recorded and inert
+        // is worse than one that is refused.
+        if let Some(interp) = crate::util::interpreter_of(exe) {
+            return Err(format!(
+                "{exe} is a script, not a binary: the kernel runs it as {interp}, and a policy \
+                 can only exclude what the kernel matches -- so this would be recorded and do \
+                 nothing, while {exe} went on being refused. Excluding {interp} instead would \
+                 let every script on this machine past {rule}. Turn the rule off for as long as \
+                 you need it (`sudo moatctl set mode monitor --rule {rule}`) and arm it again \
+                 after, or use a way in that does not touch what {rule} guards."
+            ));
+        }
         let list = self.kernel_exclusions.entry(rule.to_string()).or_default();
         if !list.iter().any(|b| b == exe) {
             list.push(exe.to_string());
@@ -2295,6 +2315,31 @@ impl Daemon {
              misbehaving sensor is visible rather than silent"
                 .to_string(),
         ];
+        // The usual cause is a sensor fault. THIS cause is not, and saying
+        // "the sensor misbehaved" sent a person looking in the wrong place for
+        // an hour on 2026-09-07: the reported name is a SCRIPT, so the kernel
+        // matched its interpreter -- which the selector does not exclude -- and
+        // the selector and the match never disagreed at all.
+        if let Some(interp) = crate::util::interpreter_of(&m.reported) {
+            f.extra_evidence.push(format!(
+                "{} is a script: the kernel matched {}, which the selector above does not \
+                 exclude, so the sensor and the selector do not actually disagree. An \
+                 exclusion naming a script can never take effect.",
+                m.reported, interp
+            ));
+            // And when the policy DENIES, the operation already failed. A
+            // suppressed alert then hides a block the user is living with --
+            // the one silence this daemon promises not to produce.
+            if would_be.enforce == "deny" {
+                f.meta.severity = "high".into();
+                f.extra_evidence.push(format!(
+                    "{} refuses this operation in the kernel, so it WAS refused -- suppressing \
+                     its alert would have left a denial with nothing to explain it. That is why \
+                     this record is not low.",
+                    m.policy
+                ));
+            }
+        }
         if let Some(p) = path {
             f.file = Some(crate::alert::FileRef {
                 path: p,
@@ -6881,7 +6926,7 @@ esac
 
         let line = |pid: u32| {
             format!(
-                r#"{{"process_kprobe":{{"process":{{"exec_id":"e-{pid}","pid":{pid},"uid":0,"binary":"/usr/bin/moatd","arguments":"run","cwd":"/","start_time":"2026-09-03T16:21:00.000000000Z"}},"function_name":"security_file_post_open","policy_name":"moat-cred-ssh-private-key-read","args":[{{"file_arg":{{"path":"/home/dan/.ssh/id_ed25519"}}}},{{"int_arg":4}}]}},"time":"2026-09-03T16:21:00.100Z"}}"#
+                r#"{{"process_kprobe":{{"process":{{"exec_id":"e-{pid}","pid":{pid},"uid":0,"binary":"/usr/bin/moatd","arguments":"run","cwd":"/","start_time":"2026-09-03T16:21:00.000000000Z"}},"function_name":"security_file_post_open","policy_name":"moat-cred-ssh-private-key-read","args":[{{"file_arg":{{"path":"/home/dan/.ssh/id_ed25519_moat_fixture"}}}},{{"int_arg":4}}]}},"time":"2026-09-03T16:21:00.100Z"}}"#
             )
         };
 
@@ -7002,9 +7047,32 @@ esac
     /// ~/.ssh/id_rsa meant `cargo test` read their private key on every run,
     /// and raised three real moat-cred-ssh-private-key-read alerts while doing
     /// it. Fixture paths must not exist.
+    /// 2026-09-07: this scanned `engine.rs` and nothing else, and the fixture
+    /// that actually drives the engine is not in `engine.rs` -- `replay()`
+    /// reads `testdata/sample.log` off disk. That file named the developer's
+    /// real `~/.ssh/id_ed25519`, so once such a key existed (created on this
+    /// machine at 08:28, with the suite green at 08:12) `cargo test` read it
+    /// and hashed it into an incident snapshot: the exact incident the comment
+    /// above describes, recurring in the one place this test could not see.
+    /// So the fixture DATA is scanned too, not only the code.
     #[test]
     fn no_test_fixture_names_a_path_that_exists_on_this_machine() {
-        let src = include_str!("engine.rs");
+        let mut src = include_str!("engine.rs").to_string();
+        let testdata = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata");
+        let mut fixtures = 0;
+        if let Ok(rd) = std::fs::read_dir(&testdata) {
+            for e in rd.flatten() {
+                if let Ok(text) = std::fs::read_to_string(e.path()) {
+                    // The scan below splits on '"', which JSON fixtures are
+                    // full of -- exactly the shape it wants.
+                    src.push('\n');
+                    src.push_str(&text);
+                    fixtures += 1;
+                }
+            }
+        }
+        assert!(fixtures > 0, "no fixture data was scanned; {:?} moved?", testdata);
+        let src = src.as_str();
         let mut bad = Vec::new();
         for cap in src.split('"').filter(|s| s.starts_with("/home/") || s.starts_with("/root/")) {
             let path = cap.split_whitespace().next().unwrap_or(cap);
@@ -7267,7 +7335,7 @@ esac
     fn a_path_the_policy_does_name_still_alerts_normally() {
         let dir = tempfile::tempdir().unwrap();
         let (mut d, _) = dev_daemon(dir.path());
-        let line = r#"{"process_lsm":{"process":{"exec_id":"zz2","pid":4243,"uid":1000,"binary":"/usr/bin/node","arguments":"x.js","cwd":"/home/dan","start_time":"2026-09-03T16:21:06.900000000Z"},"function_name":"file_post_open","policy_name":"moat-cred-ssh-private-key-read","args":[{"file_arg":{"path":"/home/dan/.ssh/id_ed25519"}},{"int_arg":4}]},"time":"2026-09-03T16:21:07.000Z"}"#;
+        let line = r#"{"process_lsm":{"process":{"exec_id":"zz2","pid":4243,"uid":1000,"binary":"/usr/bin/node","arguments":"x.js","cwd":"/home/dan","start_time":"2026-09-03T16:21:06.900000000Z"},"function_name":"file_post_open","policy_name":"moat-cred-ssh-private-key-read","args":[{"file_arg":{"path":"/home/dan/.ssh/id_ed25519_moat_fixture"}},{"int_arg":4}]},"time":"2026-09-03T16:21:07.000Z"}"#;
         d.handle_line(line);
         let rules: Vec<String> = d.store.load().into_iter().map(|a| a.rule).collect();
         assert_eq!(rules, vec!["moat-cred-ssh-private-key-read"]);
@@ -7657,7 +7725,7 @@ esac
             "/home/dan/proj/setup.sh",
             "e-term",
             "moat-cred-ssh-private-key-read",
-            "/home/dan/.ssh/id_ed25519",
+            "/home/dan/.ssh/id_ed25519_moat_fixture",
         ));
         let a = d
             .store
@@ -7690,7 +7758,7 @@ esac
                 "backup",
                 "e-term",
                 "moat-cred-ssh-private-key-read",
-                "/home/dan/.ssh/id_ed25519",
+                "/home/dan/.ssh/id_ed25519_moat_fixture",
             ));
         }
         // ULIDs minted in the same millisecond are not ordered among
@@ -7760,7 +7828,7 @@ esac
             f.hook = "file_post_open".into();
             f.hook_detail = Some("read".into());
             f.file = Some(crate::alert::FileRef {
-                path: "/home/dan/.ssh/id_ed25519".into(),
+                path: "/home/dan/.ssh/id_ed25519_moat_fixture".into(),
                 sha256: None,
             });
             f
@@ -7793,7 +7861,7 @@ esac
             "backup",
             "",
             "moat-cred-ssh-private-key-read",
-            "/home/dan/.ssh/id_ed25519",
+            "/home/dan/.ssh/id_ed25519_moat_fixture",
         ));
         assert!(d.alerts_suppressed > n, "the learned entry suppresses it");
         let last = d.store.load().into_iter().next_back().unwrap();
@@ -7923,7 +7991,7 @@ esac
         d.handle_line(&exec_line("e-sh", 1, "/usr/bin/bash", "", ""));
         // Two on the badge, one timelined by a triage demotion, one medium
         // (timeline by severity), one suppressed.
-        for (i, path) in ["/home/dan/.ssh/id_ed25519", "/home/dan/.ssh/id_rsa_moat_fixture"].iter().enumerate() {
+        for (i, path) in ["/home/dan/.ssh/id_ed25519_moat_fixture", "/home/dan/.ssh/id_rsa_moat_fixture"].iter().enumerate() {
             d.handle_line(&read_line(
                 &format!("e-k{}", i), 500 + i as u32, "/usr/bin/curl", "", "e-sh",
                 "moat-cred-ssh-private-key-read", path,
@@ -8153,7 +8221,7 @@ esac
             "backup",
             "",
             "moat-cred-ssh-private-key-read",
-            "/home/dan/.ssh/id_ed25519",
+            "/home/dan/.ssh/id_ed25519_moat_fixture",
         );
         for _ in 0..5 {
             d.handle_line(&line);
@@ -8171,7 +8239,7 @@ esac
         // Rarity kept learning through all five, suppressed or not.
         assert_eq!(
             d.rarity
-                .peek(&Tuple::file("/usr/bin/restic", "/home/dan/.ssh/id_ed25519", "read"), util::unix_secs())
+                .peek(&Tuple::file("/usr/bin/restic", "/home/dan/.ssh/id_ed25519_moat_fixture", "read"), util::unix_secs())
                 .total,
             5
         );
@@ -8347,7 +8415,7 @@ esac
         let md = std::fs::read_to_string(&path).unwrap();
         assert!(md.contains(&format!("# Moat alert {}", a.id)));
         assert!(md.contains("```DATA"));
-        assert!(md.contains("/home/dan/.ssh/id_ed25519"), "the alerted file is in the bundle");
+        assert!(md.contains("/home/dan/.ssh/id_ed25519_moat_fixture"), "the alerted file is in the bundle");
         assert!(md.contains("## Incident snapshot"), "the snapshot is linked");
         assert!(md.contains("process.json"));
         // The ancestry gets args and cwd back from the live table.
