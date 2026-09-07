@@ -21,7 +21,6 @@
 //! of the export-allowlist), so they keep working no matter which policies are
 //! loaded.
 
-use std::collections::HashMap;
 
 use crate::config::Config;
 use crate::event::ExecEvent;

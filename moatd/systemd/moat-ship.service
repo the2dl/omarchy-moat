@@ -7,17 +7,22 @@ Documentation=file:///usr/share/doc/omarchy-moat/SHIPPING.md
 # hold the daemon up, which is the whole reason it is a separate unit.
 After=network-online.target moatd.service
 Wants=network-online.target
+# A bad ship.toml exits 1 and stays exited rather than crash-looping against a
+# collector: `moat-ship check` is the way to find out why.
+#
+# These live in [Unit]. They were in [Service], where systemd ignores them and
+# logs `Unknown key 'StartLimitIntervalSec' in section [Service]` on every
+# start -- so the rate limit this comment describes was never actually in
+# force, and the journal said so three times per restart. Noticed 2026-09-07
+# while watching the shipper come up.
+StartLimitBurst=5
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/moat-ship run
 Restart=on-failure
 RestartSec=15s
-# A bad ship.toml exits 1 and stays exited rather than crash-looping against a
-# collector: `moat-ship check` is the way to find out why.
-StartLimitBurst=5
-StartLimitIntervalSec=300
-
 # NO PRIVILEGE AT ALL. This is the point of the separate binary: alerts.jsonl
 # and telemetry.jsonl are 0640 root:moat, so group membership is the entire
 # permission set, and moatd keeps its capabilities and its root to itself.
