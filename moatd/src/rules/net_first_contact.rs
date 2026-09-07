@@ -108,9 +108,24 @@ impl UserRule for NetFirstContact {
         // context, and it fires even to a familiar block so the cred->net chain
         // can form. Bounded to the exfil case: an ordinary CDN contact with no
         // preceding cred read stays silent, so this adds no general noise.
-        if ctx.rarity.knows_destination(&proc.exe, &ip_s, port, ctx.now)
-            && !ctx.session_read_cred_within(exec_id, EXFIL_WINDOW_SECS)
-        {
+        //
+        // 2026-09-07: the credential override does NOT apply to a private
+        // destination that is already familiar. A machine migration reads every
+        // credential in $HOME and rsyncs it to one LAN host, so EVERY
+        // connection is "moments after a secret read" -- 22 first-contact
+        // reports for one host this machine had spoken to 86 times, welded into
+        // a HIGH chain, and ssh contained mid-transfer.
+        //
+        // This is narrower than the 2026-09-04 mistake `netmatch::is_always_local`
+        // records, and deliberately so: a NEW private host still fires on
+        // novelty, which is what caught the 192.168.44.122 C2. What stops is
+        // only the re-reporting of a destination this machine already knows.
+        // Exfil to a familiar PUBLIC host after a credential read still fires,
+        // because that is the realistic reputable-infra case.
+        let familiar = ctx.rarity.knows_destination(&proc.exe, &ip_s, port, ctx.now);
+        let exfil_context = ctx.session_read_cred_within(exec_id, EXFIL_WINDOW_SECS);
+        let lan = crate::rules::netmatch::is_private(&ip);
+        if familiar && (lan || !exfil_context) {
             return Vec::new();
         }
 
@@ -128,9 +143,21 @@ impl UserRule for NetFirstContact {
         });
         f.extra_evidence = vec![
             format!("first connection from {} to {}:{} on this machine", proc.exe, ip_s, port),
-            "a destination is reported once and then never again; this is a step in a \
-             sequence rather than a finding on its own"
-                .to_string(),
+            // Saying "reported once and never again" while reporting a
+            // destination for the 22nd time is how a person concludes the rule
+            // is broken. It is only true of the novelty path.
+            if familiar {
+                format!(
+                    "{}:{} is NOT new to this machine -- this is reported because a credential \
+                     was read in the same session within {} s, which is the shape an exfil \
+                     takes. A familiar destination is otherwise reported once and never again.",
+                    ip_s, port, EXFIL_WINDOW_SECS
+                )
+            } else {
+                "a destination is reported once and then never again; this is a step in a \
+                 sequence rather than a finding on its own"
+                    .to_string()
+            },
         ];
         vec![f]
     }
@@ -261,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn a_familiar_destination_still_fires_right_after_a_credential_read() {
+    fn a_familiar_private_destination_is_quiet_even_after_a_credential_read() {
         // The /24-familiarity exfil gap: a connection to a host the machine
         // already knows, moments after the same session read a secret, is the
         // reputable-infra exfil case and must still produce the net step so the
@@ -314,10 +341,75 @@ mod tests {
             now, mode: "monitor",
             armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &creds,
         };
+        // 2026-09-07: a FAMILIAR PRIVATE destination no longer fires on the
+        // exfil override. This is the deliberate hole, and it is this shape:
+        // a machine migration reads every credential in $HOME and rsyncs to one
+        // LAN host, so every connection is "moments after a secret read" and
+        // the rule reported one known host 22 times, built a HIGH chain, and
+        // contained ssh mid-transfer. The cost is stated in the test below it.
+        assert!(
+            NetFirstContact::default().on_hook(&h, "e-node", &after_read).is_empty(),
+            "familiar AND private: the credential override does not apply"
+        );
+    }
+
+    /// What the 2026-09-07 change gives up, and what it keeps. Both halves are
+    /// asserted here so neither can be lost quietly.
+    #[test]
+    fn the_credential_override_still_covers_a_familiar_public_host() {
+        use std::collections::HashMap;
+        let cfg = Config::default();
+
+        // A public destination this machine talks to constantly -- the
+        // reputable-infra exfil case, which is the realistic one.
+        let mut seen = RarityStore::default();
+        let tup = Tuple::net("/usr/bin/node", "93.184.216.34", 443, None);
+        for i in 0..8u64 {
+            seen.observe(&tup, 1_000 + i * 1_800);
+        }
+        let now = 1_000 + 7 * 1_800;
+        assert!(seen.is_familiar(&tup, now), "precondition: familiar");
+
+        let mut t = ProcTable::new(8, 60);
+        t.observe(&proc("e-node", 41201, "/usr/bin/node", "-e x", None));
+        t.set_session("e-node", Some(77), Some(0));
+        let feeds = Feeds::default();
+        let ev = HookEvent {
+            function_name: Some("tcp_connect".into()),
+            args: vec![serde_json::json!({"sock_arg":{
+                "family":"AF_INET","daddr":"93.184.216.34","dport":443,
+                "saddr":"192.168.1.20","sport":51234
+            }})],
+            policy_name: Some(ID.into()),
+            ..Default::default()
+        };
+        let h = HookHit { kind: HookKind::Kprobe, ev: &ev };
+        let mut creds: HashMap<u32, u64> = HashMap::new();
+        creds.insert(77u32, now - 10);
+        let ctx = RuleCtx {
+            rarity: &seen, cfg: &cfg, table: &t, feeds: &feeds, homes: &[],
+            now, mode: "monitor",
+            armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &creds,
+        };
+        let out = NetFirstContact::default().on_hook(&h, "e-node", &ctx);
+        assert_eq!(out.len(), 1, "familiar but PUBLIC, after a cred read: still fires");
+        assert!(
+            out[0].extra_evidence[1].contains("NOT new to this machine"),
+            "and it says why it fired despite being familiar: {:?}",
+            out[0].extra_evidence
+        );
+    }
+
+    /// The 192.168.44.122 C2 is still caught: it was NEW, and novelty is
+    /// untouched by the 2026-09-07 change.
+    #[test]
+    fn a_new_lan_host_still_reports_even_though_it_is_private() {
+        let cfg = Config::default();
+        let empty = RarityStore::default();
         assert_eq!(
-            NetFirstContact::default().on_hook(&h, "e-node", &after_read).len(),
+            run(&empty, "192.168.44.122", 4873, &cfg).len(),
             1,
-            "familiar, but a secret was just read in this session: fire for the chain"
+            "a LAN host never seen before is still a first contact"
         );
     }
 
