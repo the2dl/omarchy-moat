@@ -809,6 +809,27 @@ enabled = false
 # journal. A week of that with nothing wrong in it is the argument for `kill`.
 # Requires `enabled = true` for the containment half; the log half runs anyway.
 kill = "log"
+# `log` | `block` -- what containment does about a PRIVATE (LAN, loopback,
+# link-local) destination. `log` by default, for the same reason `kill` is.
+#
+# Refusing a LAN address is where this mechanism's judgement costs the most. On
+# 2026-09-07 a machine migration -- rsync over ssh to the old box, which by its
+# nature reads every credential in $HOME and sends them to one host -- was
+# contained mid-transfer, and the tool that failed said only
+# `ssh: connect to host 192.168.44.105: Operation not permitted`. Nothing in
+# rsync's output could tell you moat did that.
+#
+# That is the failure that makes people switch protection off and leave it off.
+# A wrong alert costs attention; a wrong block costs the product. The static
+# deny policy beside this one already made the same call --
+# moat-net-tmpfs-binary-egress excludes RFC1918 in the kernel "because a
+# workstation talks to its LAN all day" -- and the dynamic, heuristic mechanism
+# should not be the braver of the two.
+#
+# `log` still ALERTS: the chain forms, the card is raised, and the journal
+# records what would have been refused. Only the refusal is withheld. Set
+# `block` if this machine has no LAN you care about reaching.
+private = "log"
 # Minutes, not hours: long enough to stop an exfil in progress, short enough
 # that a wrong call costs one failed connection and then fixes itself.
 ttl_secs = 600

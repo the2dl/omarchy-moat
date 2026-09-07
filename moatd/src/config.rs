@@ -807,6 +807,26 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct ContainConfig {
     pub enabled: bool,
+    /// `log` | `block`. What containment does about a PRIVATE destination.
+    ///
+    /// **`log` by default, for the same reason `kill` is.** A containment is a
+    /// refusal moatd writes on its own judgement, and refusing a LAN address is
+    /// where that judgement costs the most: on 2026-09-07 a machine migration
+    /// -- rsync over ssh to the old box, which by its nature reads every
+    /// credential in $HOME and sends it to one host -- was contained
+    /// mid-transfer, and the user saw `ssh: connect to host 192.168.44.105:
+    /// Operation not permitted` with no explanation in the tool that failed.
+    ///
+    /// That is the failure mode that makes people turn protection off and never
+    /// turn it back on. A wrong alert costs attention; a wrong block costs the
+    /// product. The static deny policy beside this one already made the same
+    /// call -- `moat-net-tmpfs-binary-egress` excludes RFC1918 in the kernel
+    /// "because a workstation talks to its LAN all day" -- and the dynamic,
+    /// heuristic mechanism should not be the braver of the two.
+    ///
+    /// `log` still ALERTS: the chain forms, the card is raised, and the journal
+    /// records what would have been refused. Only the refusal is withheld.
+    pub private: String,
     /// `off` | `log` | `kill`. Ending processes a chain implicates.
     ///
     /// **`log` by default, and that is the point.** A design review on
@@ -836,6 +856,7 @@ impl Default for ContainConfig {
         Self {
             enabled: false,
             kill: "log".into(),
+            private: "log".into(),
             ttl_secs: 600,
             max: 4,
         }

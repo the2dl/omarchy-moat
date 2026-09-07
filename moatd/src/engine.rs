@@ -1194,6 +1194,8 @@ impl Daemon {
         }
         let mut exes: Vec<String> = Vec::new();
         let mut dests: Vec<String> = Vec::new();
+        // Private destinations moat chose to alert on rather than refuse.
+        let mut declined_lan: Vec<String> = Vec::new();
         for (exe, ds) in targets {
             // BOTH the path tetragon reported and the path it resolves to.
             //
@@ -1233,6 +1235,29 @@ impl Daemon {
                     log::warn!("containment: refusing to contain the unspecified address {:?}", d);
                     continue;
                 }
+                // A LAN address is alerted on, not refused, unless the user
+                // asked for `contain.private = "block"`. See the long note on
+                // ContainConfig::private: refusing a private destination is
+                // where this mechanism's judgement costs the most, and a wrong
+                // block is what makes somebody turn protection off for good.
+                // The chain, the card and this line still happen; only the
+                // refusal is withheld.
+                if self.cfg.contain.private != "block" {
+                    if let Ok(ip) = d.parse::<std::net::IpAddr>() {
+                        if crate::rules::netmatch::is_private(&ip) {
+                            log::info!(
+                                "containment: WOULD HAVE REFUSED {} -> {} for chain {}, but it is \
+                                 a private address and contain.private is {:?}; alerting only",
+                                exes.first().map(|s| s.as_str()).unwrap_or("?"),
+                                d,
+                                c.id,
+                                self.cfg.contain.private
+                            );
+                            declined_lan.push(d.clone());
+                            continue;
+                        }
+                    }
+                }
                 if !dests.contains(&d) {
                     dests.push(d);
                 }
@@ -1243,6 +1268,18 @@ impl Daemon {
         // written, because an empty SAddr list is exactly the wholesale block
         // the guard above exists to prevent.
         if dests.is_empty() {
+            if !declined_lan.is_empty() {
+                // Say the true thing. "No usable destination" would read as a
+                // parsing failure when in fact moat decided not to refuse.
+                log::info!(
+                    "containment: chain {} names only private destination(s) ({}); alerted, not \
+                     contained (contain.private = {:?})",
+                    c.id,
+                    declined_lan.join(", "),
+                    self.cfg.contain.private
+                );
+                return;
+            }
             log::warn!("containment: no usable destination for chain {}, not containing", c.id);
             return;
         }
@@ -5442,6 +5479,87 @@ mod tests {
         assert!(
             d.contain.live().is_empty(),
             "a high chain must not contain anything while containment is off"
+        );
+    }
+
+    /// A LAN destination is alerted on, not refused.
+    ///
+    /// 2026-09-07: a machine migration -- rsync over ssh to the old box, which
+    /// by its nature reads every credential in $HOME and sends them to one host
+    /// -- built a HIGH chain and moat contained ssh mid-transfer. The tool that
+    /// failed said only "Operation not permitted"; nothing in rsync's output
+    /// could tell you moat had done it. That is the failure that makes somebody
+    /// switch protection off and leave it off, and it is why refusing a private
+    /// address is opt-in while alerting on one is not.
+    #[test]
+    fn a_private_destination_is_alerted_on_but_not_refused_by_default() {
+        assert_eq!(
+            Config::default().contain.private,
+            "log",
+            "refusing a LAN address must be opt-in"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.mode = "enforce".into();
+        d.cfg.contain.enabled = true;
+        d.cfg.thresholds.dedupe_secs = 0;
+        // Any attempt to actually load a policy would fail loudly here.
+        d.cfg.paths.tetra = dir.path().join("no-such-tetra");
+        let mkproc = |exec_id: &str, pid: u32, exe: &str| ProcInfo {
+            exec_id: exec_id.into(),
+            pid,
+            uid: 1000,
+            exe: exe.into(),
+            args: String::new(),
+            cwd: "/home/dan/pull".into(),
+            start_time: util::now_rfc3339(),
+            parent_exec_id: None,
+            exited_at: None,
+            exit_signal: None,
+            exe_note: None,
+            sid: None,
+            tty: None,
+        };
+        let actor = mkproc("e-ssh", 7200, "/usr/bin/ssh");
+        let root = mkproc("e-pull", 7000, "/home/dan/pull/no-such-pull.sh");
+        let mut mk = |rule: &str, family: &str, sev: &str, ip: Option<&str>| {
+            let mut f = Finding::new(rule, crate::policy::PolicyMeta::fallback(rule), actor.clone());
+            f.meta.family = family.into();
+            f.meta.severity = sev.into();
+            f.ancestry = vec![root.clone()];
+            if let Some(ip) = ip {
+                f.net = Some(crate::alert::NetRef { dst_ip: ip.into(), dst_port: 22, domain: None });
+            } else {
+                f.hook = "file_post_open".into();
+                f.file = Some(crate::alert::FileRef {
+                    path: "/home/dan/.npmrc".into(),
+                    sha256: None,
+                });
+            }
+            d.emit(f)
+        };
+        // The migration shape: a credential read, then out to the old machine.
+        mk("moat-cred-registry-token-read", "cred", "high", None);
+        mk("moat-net-first-contact", "net", "medium", Some("192.168.44.105"));
+
+        assert!(
+            d.contain.live().is_empty(),
+            "a LAN destination must be alerted on, not refused, while contain.private is log"
+        );
+
+        // NOT a vacuous pass. The chain DID form and DID reach high -- which
+        // is the condition that calls into containment -- so what stopped the
+        // refusal is the gate above and not a chain that never happened.
+        let high_chain = d
+            .store
+            .load()
+            .into_iter()
+            .any(|a| a.chain.as_ref().map(|c| c.severity == "high" || c.severity == "critical").unwrap_or(false));
+        assert!(
+            high_chain,
+            "the migration shape must still build a high chain and still alert; only the \
+             refusal is withheld"
         );
     }
 
