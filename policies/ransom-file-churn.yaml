@@ -110,6 +110,13 @@ spec:
         - "{{HOME}}/Videos/"
         - "{{HOME}}/Music/"
         - "{{HOME}}/Downloads/"
+        # 2026-09-07: the document dirs were never where this machine keeps
+        # what it would miss. A sweep confined to ~/Projects was invisible.
+        # These three are added one step at a time, as the incubating note
+        # asks -- NOT $HOME, whose cost is measured and refused there.
+        - "{{HOME}}/Projects/"
+        - "{{HOME}}/src/"
+        - "{{HOME}}/code/"
       - index: 1
         operator: "Mask"
         values: ["4"]            # MAY_READ (NOTES section 3)
@@ -162,6 +169,9 @@ spec:
         - "{{HOME}}/Videos"
         - "{{HOME}}/Music"
         - "{{HOME}}/Downloads"
+        - "{{HOME}}/Projects"
+        - "{{HOME}}/src"
+        - "{{HOME}}/code"
       matchActions:
       - action: Post
   # security_path_rename(old_dir, old_dentry, new_dir, new_dentry, flags). The
@@ -214,6 +224,9 @@ spec:
         - "{{HOME}}/Videos"
         - "{{HOME}}/Music"
         - "{{HOME}}/Downloads"
+        - "{{HOME}}/Projects"
+        - "{{HOME}}/src"
+        - "{{HOME}}/code"
       matchActions:
       - action: Post
   # Overwriting in place: read the plaintext, open the same file O_TRUNC, write
@@ -257,5 +270,12 @@ spec:
         - "{{HOME}}/Videos/"
         - "{{HOME}}/Music/"
         - "{{HOME}}/Downloads/"
+        # 2026-09-07: the document dirs were never where this machine keeps
+        # what it would miss. A sweep confined to ~/Projects was invisible.
+        # These three are added one step at a time, as the incubating note
+        # asks -- NOT $HOME, whose cost is measured and refused there.
+        - "{{HOME}}/Projects/"
+        - "{{HOME}}/src/"
+        - "{{HOME}}/code/"
       matchActions:
       - action: Post

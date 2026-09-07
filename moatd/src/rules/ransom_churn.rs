@@ -76,6 +76,21 @@ const BUILD_TREES: &[&str] = &[
     "/.cargo/registry/",
     "/dist/",
     "/build/",
+    // 2026-09-07, when ~/Projects, ~/src and ~/code came into scope. Every one
+    // of these is regenerable output that a build reads and rewrites in place,
+    // which is the read-then-destroy shape exactly. Excluding them costs
+    // nothing worth having: ransomware that encrypts only your `target/` has
+    // encrypted nothing you cannot rebuild.
+    "/.next/",
+    "/.nuxt/",
+    "/.gradle/",
+    "/.tox/",
+    "/.pytest_cache/",
+    "/.mypy_cache/",
+    "/.ruff_cache/",
+    "/vendor/",
+    "/.terraform/",
+    "/incremental/",
 ];
 
 /// Reads remembered per actor. A thumbnailer over a big photo folder reads
@@ -274,9 +289,13 @@ impl UserRule for RansomChurn {
              --write on a folder of markdown), or you renaming a folder of files to a new \
              suffix by hand. mv, rsync, tar and the sync and backup clients are excluded in \
              the kernel, and terminal editors that rename the original to `file~` on save \
-             (vim, nvim, emacs) are excluded too. It watches your document directories only \
-             -- Documents, Desktop, Pictures, Videos, Music, Downloads -- so a sweep that \
-             never reaches them is not seen here.",
+             (vim, nvim, emacs) are excluded too. It watches your document directories \
+             -- Documents, Desktop, Pictures, Videos, Music, Downloads -- and the source \
+             roots ~/Projects, ~/src and ~/code, so a sweep that reaches none of those is \
+             not seen here. Inside a source root, build output is skipped by path \
+             (node_modules, target, .git and the rest of BUILD_TREES): a build that \
+             rewrites what it just read there is the loudest false positive there is, and \
+             what it destroys is regenerable.",
             &[],
             &["kill", "ignore"],
             "exe",

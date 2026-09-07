@@ -168,8 +168,11 @@ shell_stdio_socket = true
 # the files losing their variety, not by a list of known ransomware suffixes.
 #
 # Fed by the kernel policy of the same name, moat-ransom-file-churn, which
-# watches ~/Documents, ~/Desktop, ~/Pictures, ~/Videos, ~/Music and ~/Downloads
-# and nothing else -- documents, not build trees. A $HOME-wide read watch would
+# watches ~/Documents, ~/Desktop, ~/Pictures, ~/Videos, ~/Music, ~/Downloads and
+# the source roots ~/Projects, ~/src and ~/code. Build output inside a source
+# root is skipped by path (node_modules, target, .git and the rest): a build
+# rewriting what it just read is the read-then-destroy shape exactly, and what
+# it destroys is regenerable. A $HOME-wide read watch would
 # sit in the band the telemetry file class measured under $HOME during an npm
 # install (19-42 events/s, and that was writes alone), which is the cost the
 # telemetry fork exists to avoid; that variant is in policies/incubating/ with

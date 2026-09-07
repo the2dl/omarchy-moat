@@ -75,7 +75,18 @@ folders: `npm update` reads a package's `package.json` and removes the package,
 `cargo` and `rustc` rewrite what they just read, test suites create and delete
 fixtures they wrote a moment ago.
 
-**What it needs before it ships: a measurement, not a design.** Load this
+**2026-09-07: the first widening was taken.** `~/Projects`, `~/src` and
+`~/code` were added to the shipped policy -- the "one directory at a time"
+step this note asks for, not the `$HOME` jump it refuses. What prompted it: a
+simulated sweep confined to a source tree was invisible, and on a developer's
+machine that is where the data worth losing lives. `NotPrefix` turns out to
+work on path arguments in v1.7.1 (`writePrefixStrings` is reached with no type
+restriction, so `check.py`'s PATH_OPS is more conservative than the sensor) --
+but it does not rescue this, because it is still a PREFIX and `node_modules`
+occurs at arbitrary depth. The build trees are therefore still cut in userland,
+after the kernel has posted them, exactly as this note predicted.
+
+**What the $HOME variant still needs: a measurement, not a design.** Load this
 variant on a machine for a working day with the shipped counter, read
 `moatctl status` for the sensor's event rate and the journal for
 `moat-x-sensor-throttled`, and count how many `moat-ransom-file-churn` findings
