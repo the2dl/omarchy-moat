@@ -428,11 +428,32 @@ impl UserRule for RansomChurn {
         if in_build_tree(&path) {
             return Vec::new();
         }
+        // An ATOMIC REPLACE promotes a hidden scratch name to a real one:
+        // `.tmpY85UXc -> lake-hot-tail.health.json`. That is the OTHER idiom --
+        // mkstemp in the target directory, then rename over the target -- and
+        // it defeats both earlier guards: the source is not the destination
+        // plus a suffix (so the prefix check misses it), and mkstemp opens
+        // O_RDWR, so the create is classified as a READ and `wrote_first` never
+        // learns the file was the actor's own.
+        //
+        // 2026-09-07, live, AFTER the write-tracking fix shipped:
+        // `lake_staged_tail_manage` did this eight times in three seconds and
+        // was reported critical. Ransomware does not rename `.tmpXXXX` INTO
+        // your documents; it renames your documents into something else. The
+        // direction is the whole tell.
+        let atomic_replace = matches!(kind, Destroy::Renamed)
+            && basename(&path).starts_with('.')
+            && new_path
+                .as_deref()
+                .map(|n| !basename(n).starts_with('.'))
+                .unwrap_or(false);
+
         // Read it before destroying it -- AND it was not the actor's own file.
         // `wrote_first` holds paths this actor wrote before it ever read them:
         // a pipeline's scratch. See its doc comment for why FIRST TOUCH is the
         // test and "did it ever write this" is not.
-        let read_first = actor.read_recently(&path) && !actor.wrote_first.contains(&path);
+        let read_first =
+            actor.read_recently(&path) && !actor.wrote_first.contains(&path) && !atomic_replace;
         actor.note_destroyed(Destroyed {
             at: now,
             path,
@@ -987,6 +1008,48 @@ mod tests {
             "a program destroying files it created is not encrypting yours: {:?}",
             out.first().map(|f| f.what_override.clone())
         );
+    }
+
+    /// The OTHER atomic-write idiom, which shipped past the first fix:
+    /// mkstemp a hidden name in the target directory, then rename it over the
+    /// target. `lake_staged_tail_manage` did this eight times in three seconds
+    /// and was reported critical AFTER write tracking landed -- mkstemp opens
+    /// O_RDWR, so the create looked like a read.
+    #[test]
+    fn an_atomic_replace_from_a_hidden_scratch_name_is_not_a_sweep() {
+        let t = table();
+        let c = cfg();
+        let mut rule = RansomChurn::default();
+        let mut out = Vec::new();
+        for i in 0..12 {
+            let tmp = format!("/home/dan/Documents/logs/.tmpY85UX{:02}", i);
+            let real = format!("/home/dan/Documents/logs/health-{:02}.json", i);
+            out.extend(fire(&mut rule, &t, &c, &read(&tmp), "e-node", 100));
+            out.extend(fire(&mut rule, &t, &c, &rename(&tmp, &real), "e-node", 100));
+        }
+        assert!(
+            out.is_empty(),
+            "promoting scratch to a real name is a write, not a destruction: {:?}",
+            out.first().map(|f| f.what_override.clone())
+        );
+    }
+
+    /// The direction is the tell, so the reverse must still fire: ransomware
+    /// renames YOUR file into something else, it does not rename scratch into
+    /// your documents.
+    #[test]
+    fn renaming_a_real_file_into_a_hidden_one_is_still_a_sweep() {
+        let t = table();
+        let c = cfg();
+        let mut rule = RansomChurn::default();
+        let mut out = Vec::new();
+        for i in 0..12 {
+            let real = format!("/home/dan/Documents/report-{:02}.pdf", i);
+            let hidden = format!("/home/dan/Documents/.enc-{:02}", i);
+            out.extend(fire(&mut rule, &t, &c, &read(&real), "e-node", 100));
+            out.extend(fire(&mut rule, &t, &c, &rename(&real, &hidden), "e-node", 100));
+        }
+        assert_eq!(out.len(), 1, "your file going somewhere hidden is still a sweep");
     }
 
     /// And the hole that a naive "did it ever write this" check would open:

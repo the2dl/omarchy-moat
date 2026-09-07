@@ -214,3 +214,38 @@ file = "*/.claude/plugins/marketplaces/*"
 [[rule]]
 name = "moat-persist-agent-config-write"
 file = "*/.npm/_cacache/*"
+
+# ------------------------------------------- moat's own test suite, on this box
+#
+# Building moat from source runs its tests, and its tests exec their own
+# fixtures out of /tmp and the source tree -- 62 rows from one afternoon, none
+# of them a finding about anything. Both matchers must hit: the actor is moat's
+# own test binary in a moat build tree, AND the file is the fixture it ships.
+# Neither half alone would be safe, and on a machine that never builds moat
+# these match nothing at all.
+[[rule]]
+name = "moat-exec-untrusted-home"
+exe  = "*/omarchy-moat/moatd/target/*/deps/moatd-*"
+file = "*/omarchy-moat/moatd/testdata/*"
+
+# The same suite exec'ing its fake sensor out of a temp directory.
+[[rule]]
+name = "moat-exec-untrusted-tmpfs"
+exe  = "*/omarchy-moat/moatd/target/*/deps/moatd-*"
+file = "/tmp/*/tetra"
+
+# --------------------------------- crate sources are extracted, not installed
+#
+# A crate tarball can ship anything, including files whose NAMES are the shapes
+# the persist rules look for: AGENTS.md, .vscode/tasks.json, a git hook. cargo
+# unpacking one into its registry cache is extraction; nothing will ever run it
+# from there. The git-hook half of this was covered already; the agent-config
+# half was not, and produced 17 rows.
+[[rule]]
+name = "moat-persist-agent-config-write"
+file = "*/.cargo/registry/src/*"
+
+# The same registry when cargo is installed system-wide.
+[[rule]]
+name = "moat-persist-agent-config-write"
+file = "/usr/local/cargo/registry/src/*"
