@@ -218,6 +218,47 @@ still recorded and still appears in chains as **context**; it simply stops
 asking you about it. That distinction matters: your allowlist is consent, and a
 consented step should not be able to raise an alarm on its own.
 
+### `moatctl allow --name RULE [--exe X] [--file F] [--parent P] [--script S] [--comment T] [--yes]`
+
+Write an allowlist entry **directly**, without waiting for an alert to fire.
+`ignore` needs an alert id and offers four canned scopes; this takes the
+matchers themselves — including `script`, which no scope can express.
+
+**It previews by default and writes nothing.** It prints the block it would
+write and, more importantly, *which alerts already on record it would have
+suppressed*, by rule and with a sample. `--yes` commits it, and **needs root**.
+Seeing the blast radius before granting is the point, so it is the default
+rather than a flag you have to remember.
+
+| Matcher | Matches |
+|---|---|
+| `--name` (required) | The rule, or a glob: `moat-cred-*`. |
+| `--exe` | The binary the *kernel loaded*. For a `#!` script that is the interpreter. |
+| `--file` | The file touched. |
+| `--parent` | Any ancestor's binary, up to the ancestry cap. |
+| `--script` | What an interpreter was actually running. |
+
+Every field is a glob and **every field present must match**.
+
+It refuses four shapes, all of which look narrow and are not:
+
+* a `--name` glob that reaches one of Moat's own self-health rules
+  (`moat-*` would reach all five at once — `ignore` only ever sees one exact
+  rule, so this is a refusal `ignore` never needed);
+* a rule that is **armed in the kernel** — suppression is userspace and the
+  kill is not, so the entry would hide the alert while the program went on
+  dying (the 2026-09-05 record). The refusal names the way out;
+* an `--exe` that is an interpreter with no `--script`. `--exe
+  /usr/bin/python3.14` reads as "allow gcloud" and means "allow every python
+  program on this machine";
+* a glob that does not compile. One unparseable entry makes the loader drop
+  **every other rule in the file**.
+
+An entry that matches nothing is *not* refused — pre-authorising something that
+has not happened yet is the reason the command exists — but the count is printed
+and written into the entry's own comment, because zero is also what a typo looks
+like.
+
 ### `moatctl unignore <RULE> [--file FILE]`
 
 Remove the n-th rule from an allowlist file — the index comes from
@@ -252,6 +293,7 @@ make Moat stop mentioning a host, which is why it is gated and audited.
 | `kill` | `off` \| `log` \| `kill` | yes | What containment does to the processes involved. |
 | `sandbox` | `on` \| `off` | yes | The bubblewrap shims. Needs a new login shell. |
 | `digest` | `on` \| `off` | no | The weekly summary. A preference, not a protection. |
+| `threshold.<NAME>` | a number, or `default` | yes | How much evidence a detection needs before it fires. |
 
 `--rule <RULE>` arms **one** rule and leaves the daemon-wide mode alone. This is
 the safe way to start enforcing: one rule whose false-positive surface you have
@@ -263,6 +305,34 @@ writes what it *would* have killed; `kill` acts. It ships as `log` and should
 stay there until you have read a week of `moatctl decisions` and agree with
 every line. Both directions are root-gated and both are recorded — arming
 SIGKILL is as consequential as disarming it.
+
+**On `threshold.<NAME>`:** retunes a detection without `sudoedit
+/etc/moat/moat.toml` and a service restart. It takes effect from the next event
+— `mass_read` and `ransom_churn` read the value per event — and it is stored in
+`state.json`, not written back into `moat.toml`, so a file you (or your config
+management) own is never rewritten. `default` puts it back to whatever the file
+says.
+
+| Name | Range | Shipped | Bigger means |
+|---|---|---|---|
+| `mass_read_files` | 2–25 | 3 | less caught |
+| `mass_read_window_secs` | 5–3600 | 30 | more caught |
+| `ransom_churn_files` | 3–500 | 8 | less caught |
+| `ransom_churn_window_secs` | 10–3600 | 60 | more caught |
+| `dedupe_secs` | 0–3600 | 60 | more folding |
+
+The rest of `[thresholds]` — rotation sizes, poll intervals, the arm timeout —
+is plumbing rather than tuning and is deliberately not reachable from the
+socket. The ranges are not decoration: every one of these has a value at which
+the rule stops existing while `moatctl status` goes on listing it as on, and a
+silently disabled detection is the failure this product is built against.
+`mass_read_files` shipped as **40** until 2026-09-04 and had never fired once.
+
+Root in **both** directions, unlike everything else here. Whether a number is a
+weakening depends on the number it replaces, which the privilege gate cannot
+see — and only one of the two possible mistakes is safe. Both directions are
+recorded, and `moatctl status --json` publishes `thresholds` (what is in force)
+alongside `threshold_overrides` (what you changed).
 
 ### `moatctl baseline <SUBCOMMAND>`
 

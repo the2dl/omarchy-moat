@@ -121,6 +121,7 @@ prepare() {
 		"${repo}/sandbox" \
 		"${repo}/scanner" \
 		"${repo}/docs" \
+		"${repo}/skills" \
 		"${repo}/assets" \
 		"${repo}/README.md" \
 		"${srcdir}/${_tree}/"
@@ -331,6 +332,28 @@ package() {
 		"${pkgdir}/usr/share/doc/${pkgname}/SHIPPING.md"
 	install -Dm644 "${tree}/docs/CLI.md" \
 		"${pkgdir}/usr/share/doc/${pkgname}/CLI.md"
+
+	# --- the agent skill ----------------------------------------------
+	# Omarchy's own convention: every directory under
+	# /usr/share/omarchy/default/agents/skills is a skill, and Omarchy links
+	# them into each agent's skill directory (~/.claude/skills,
+	# ~/.gemini/config/skills). We install into that directory rather than
+	# into a private /usr/share/omarchy-moat/skills, because a skill nothing
+	# links is a skill nobody loads -- and the linking convention is
+	# Omarchy's, not ours to reinvent.
+	#
+	# The directory is not owned by the omarchy package (pacman only
+	# conflicts on identical file paths), and the name is namespaced, so
+	# this cannot collide with a skill Omarchy ships.
+	#
+	# Omarchy links these from a one-shot migration, so an already-installed
+	# machine will not pick this up on its own; omarchy-moat.install prints
+	# the single `ln -s` for that case, the same way it prints the one
+	# command that enables the digest timer.
+	local _skills="${pkgdir}/usr/share/omarchy/default/agents/skills/moat-tuning"
+	install -Dm644 "${tree}/skills/moat-tuning/SKILL.md" "${_skills}/SKILL.md"
+	install -d "${_skills}/references"
+	install -m644 "${tree}/skills/moat-tuning/references/"*.md "${_skills}/references/"
 
 	# The mark, in the hicolor set, so anything that shows an icon for this
 	# package (a .desktop entry, a notification, a tray) finds one by name

@@ -165,6 +165,19 @@ pub struct Daemon {
     pub receipts: receipt::Tracker,
     /// LEARNING §5: `moatctl set digest on|off`, persisted in state.json.
     pub digest_enabled: bool,
+    /// `moatctl set threshold.<name> <value>`, persisted in state.json.
+    ///
+    /// Held separately from `cfg.thresholds` rather than being folded into it,
+    /// for two reasons. A SIGHUP re-reads moat.toml and would otherwise silently
+    /// revert every override the user set from the CLI — the single failure this
+    /// whole mechanism has to avoid, because the revert is invisible and moves
+    /// protection in an unannounced direction. And `status` has to be able to
+    /// say which numbers are the file's and which are the user's; a merged
+    /// struct cannot.
+    ///
+    /// Same reasoning as `contain_enabled` and `contain_kill`: a switch a person
+    /// flips is runtime state. moatd does not rewrite a file the user also owns.
+    pub threshold_overrides: std::collections::BTreeMap<String, u64>,
     /// Unix seconds of the last delivered digest, or 0.
     pub digest_last_sent: u64,
     /// Incident snapshots taken since start, for the log and for `status`.
@@ -318,7 +331,7 @@ impl Daemon {
         let digest_enabled = persisted_digest_enabled(&state).unwrap_or(cfg.digest.enabled);
         let digest_last_sent = persisted_u64(&state, "digest_summary", "last_sent_unix");
 
-        Ok(Daemon {
+        let mut d = Daemon {
             cfg,
             cfg_path: cfg_path.to_path_buf(),
             policies,
@@ -358,6 +371,7 @@ impl Daemon {
             in_meta_alert: false,
             receipts: receipt::Tracker::default(),
             digest_enabled,
+            threshold_overrides: persisted_threshold_overrides(&state),
             digest_last_sent,
             incidents_captured: 0,
             content,
@@ -372,7 +386,14 @@ impl Daemon {
             telemetry,
             telemetry_written: 0,
             telemetry_filtered: 0,
-        })
+        };
+        // moat.toml is the default for a fresh machine; what the user set from
+        // the CLI is the override, exactly as with `contain` and `kill`. Applied
+        // here rather than in the struct literal because it has to run again on
+        // every SIGHUP, and one code path for both is the only way the two
+        // cannot drift.
+        d.apply_threshold_overrides();
+        Ok(d)
     }
 
     /// SIGHUP: config, policy annotations and allowlist all come back from disk.
@@ -382,6 +403,12 @@ impl Daemon {
                 self.table.max_depth = c.thresholds.ancestry_max;
                 self.table.prune_secs = c.thresholds.process_prune_secs;
                 self.cfg = c;
+                // A SIGHUP must not quietly undo a decision the user made from
+                // the CLI. Without this the file wins on every `systemctl
+                // reload moatd`, and the direction it moves protection in is
+                // never announced -- the exact shape of "tuning that appears to
+                // work and does nothing", but in reverse.
+                self.apply_threshold_overrides();
             }
             Err(e) => log::warn!("reload: keeping old config: {}", e),
         }
@@ -4130,6 +4157,24 @@ impl Daemon {
                 "kernel_exclusions".into(),
                 serde_json::to_value(&self.kernel_exclusions).unwrap_or(Value::Null),
             );
+            // Persisted for the same reason `contain` is, and published for a
+            // second one: a retuned threshold is a change to what moat catches,
+            // and a change to what moat catches that nothing reports is
+            // indistinguishable from a detection that quietly stopped working.
+            o.insert(
+                "threshold_overrides".into(),
+                serde_json::to_value(&self.threshold_overrides).unwrap_or(Value::Null),
+            );
+            o.insert(
+                "thresholds".into(),
+                json!({
+                    "mass_read_files": self.cfg.thresholds.mass_read_files,
+                    "mass_read_window_secs": self.cfg.thresholds.mass_read_window_secs,
+                    "ransom_churn_files": self.cfg.thresholds.ransom_churn_files,
+                    "ransom_churn_window_secs": self.cfg.thresholds.ransom_churn_window_secs,
+                    "dedupe_secs": self.cfg.thresholds.dedupe_secs,
+                }),
+            );
             o.insert("contain_enabled".into(), Value::from(self.cfg.contain.enabled));
             o.insert("contain_kill".into(), Value::from(self.cfg.contain.kill.clone()));
             // Rules that are on but cannot fire. Empty on a healthy machine.
@@ -4146,6 +4191,122 @@ impl Daemon {
             o.insert("heartbeat".into(), Value::from(util::unix_secs()));
         }
         out
+    }
+
+    /// Put every recorded override back onto `cfg.thresholds`.
+    ///
+    /// Called after construction and after every SIGHUP. Unknown keys are
+    /// dropped rather than kept: a state file naming a threshold this build no
+    /// longer has must not survive as a number nothing reads.
+    pub fn apply_threshold_overrides(&mut self) {
+        self.threshold_overrides
+            .retain(|k, _| tunable_threshold(k).is_some());
+        let pairs: Vec<(String, u64)> = self
+            .threshold_overrides
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        for (k, v) in pairs {
+            self.write_threshold(&k, v);
+        }
+        self.table.max_depth = self.cfg.thresholds.ancestry_max;
+        self.table.prune_secs = self.cfg.thresholds.process_prune_secs;
+    }
+
+    fn write_threshold(&mut self, key: &str, value: u64) {
+        let t = &mut self.cfg.thresholds;
+        match key {
+            "dedupe_secs" => t.dedupe_secs = value,
+            "mass_read_files" => t.mass_read_files = value as usize,
+            "mass_read_window_secs" => t.mass_read_window_secs = value,
+            "ransom_churn_files" => t.ransom_churn_files = value as usize,
+            "ransom_churn_window_secs" => t.ransom_churn_window_secs = value,
+            _ => {}
+        }
+    }
+
+    /// The value a tunable threshold currently has, override or file.
+    pub fn threshold(&self, key: &str) -> Option<u64> {
+        let t = &self.cfg.thresholds;
+        Some(match key {
+            "dedupe_secs" => t.dedupe_secs,
+            "mass_read_files" => t.mass_read_files as u64,
+            "mass_read_window_secs" => t.mass_read_window_secs,
+            "ransom_churn_files" => t.ransom_churn_files as u64,
+            "ransom_churn_window_secs" => t.ransom_churn_window_secs,
+            _ => return None,
+        })
+    }
+
+    /// `moatctl set threshold.<name> <value>`: retune a detection without
+    /// hand-editing `/etc/moat/moat.toml` and restarting the daemon.
+    ///
+    /// Returns `(previous, new, direction)` where direction is `weaker`,
+    /// `stronger` or `same` — the caller records it, because which way a
+    /// threshold moved is the only part of this a person can act on later.
+    ///
+    /// Takes effect on the next event: `rules::mass_read` and
+    /// `rules::ransom_churn` both read `ctx.cfg.thresholds` per event rather
+    /// than caching it at construction, so there is nothing to restart.
+    pub fn set_threshold(&mut self, key: &str, value: u64) -> Result<(u64, u64, &'static str), String> {
+        let Some(t) = tunable_threshold(key) else {
+            let names: Vec<&str> = TUNABLE_THRESHOLDS.iter().map(|t| t.key).collect();
+            return Err(format!(
+                "{:?} is not a tunable threshold. These are: {}. The rest of [thresholds] in \
+                 moat.toml is plumbing (log rotation, poll intervals, the arm timeout) rather \
+                 than tuning, and is deliberately not reachable from the socket.",
+                key,
+                names.join(", ")
+            ));
+        };
+        if value < t.min || value > t.max {
+            return Err(format!(
+                "{} must be between {} and {}, got {}. {}",
+                t.key, t.min, t.max, value, t.why
+            ));
+        }
+        let had = self.threshold(key).unwrap_or(0);
+        self.threshold_overrides.insert(key.to_string(), value);
+        self.write_threshold(key, value);
+        self.table.max_depth = self.cfg.thresholds.ancestry_max;
+        self.table.prune_secs = self.cfg.thresholds.process_prune_secs;
+        self.write_state();
+        let direction = match value.cmp(&had) {
+            std::cmp::Ordering::Equal => "same",
+            // Bigger means the rule needs more evidence before it fires, for
+            // every threshold in the table -- including the two window lengths,
+            // where a longer window means MORE gets caught. `weakens_when` says
+            // which way round each one is, so this cannot be assumed.
+            o => {
+                let bigger = o == std::cmp::Ordering::Greater;
+                if bigger == t.bigger_is_weaker {
+                    "weaker"
+                } else {
+                    "stronger"
+                }
+            }
+        };
+        Ok((had, value, direction))
+    }
+
+    /// Drop an override and go back to whatever `/etc/moat/moat.toml` says.
+    ///
+    /// The way back is not optional, and it is the reason the overrides are
+    /// kept as a separate map: with them merged into `cfg` there would be no
+    /// record of what the file had said, so "reset" would mean "restart the
+    /// daemon and hope".
+    pub fn reset_threshold(&mut self, key: &str) -> Result<u64, String> {
+        if tunable_threshold(key).is_none() {
+            return Err(format!("{:?} is not a tunable threshold", key));
+        }
+        self.threshold_overrides.remove(key);
+        match Config::load(&self.cfg_path) {
+            Ok(c) => self.cfg.thresholds = c.thresholds,
+            Err(e) => return Err(format!("cannot re-read {}: {}", self.cfg_path.display(), e)),
+        }
+        self.apply_threshold_overrides();
+        self.write_state();
+        Ok(self.threshold(key).unwrap_or(0))
     }
 
     pub fn write_state(&self) {
@@ -4378,6 +4539,107 @@ fn collect_policy_modes(v: &Value, out: &mut std::collections::BTreeMap<String, 
         }
         _ => {}
     }
+}
+
+/// One retunable number, with the bounds and the sentence that explains them.
+pub struct TunableThreshold {
+    pub key: &'static str,
+    pub min: u64,
+    pub max: u64,
+    /// Does a LARGER value mean less gets caught? True for a count (more
+    /// evidence needed before the rule fires), false for a window (a longer
+    /// window catches a slower actor).
+    pub bigger_is_weaker: bool,
+    pub why: &'static str,
+}
+
+/// The thresholds `moatctl set threshold.<name>` may change, and nothing else.
+///
+/// Deliberately a short list. `[thresholds]` in moat.toml also holds log
+/// rotation sizes, poll intervals and the sensor arm timeout; those are
+/// plumbing, and exposing them over a socket the user's whole login group can
+/// reach is risk with no tuning value. What is here is exactly the set a person
+/// retunes because a detection is too loud or too quiet on THEIR machine.
+///
+/// The bounds are not decoration. Every one of these has a value at which the
+/// rule stops existing while `moatctl status` goes on listing it as on — a
+/// threshold of 10,000 files is off, not tuned — and a silently-disabled
+/// detection is the failure mode this product is built against. The floor
+/// matters just as much: `mass_read_files = 1` makes every credential read an
+/// alert, which is noise nobody reads, which is also off.
+pub const TUNABLE_THRESHOLDS: &[TunableThreshold] = &[
+    TunableThreshold {
+        key: "mass_read_files",
+        min: 2,
+        max: 25,
+        bigger_is_weaker: true,
+        why: "Below 2 there is no \"mass\" left: one credential read is a single-file event and \
+              the per-file rules already cover it. Above 25 the rule cannot fire -- a real \
+              stealer reads a dozen, and 40 was the shipped value until 2026-09-04 precisely \
+              because it had never fired once.",
+    },
+    TunableThreshold {
+        key: "mass_read_window_secs",
+        min: 5,
+        max: 3600,
+        bigger_is_weaker: false,
+        why: "A longer window catches a slower reader and costs a little more state; an hour \
+              is the point past which \"in one burst\" stops meaning anything.",
+    },
+    TunableThreshold {
+        key: "ransom_churn_files",
+        min: 3,
+        max: 500,
+        bigger_is_weaker: true,
+        why: "Below 3 this collides with ordinary `mv` across filesystems and scripts tidying a \
+              handful of files. Ransomware does hundreds a minute, so anything up to 500 still \
+              fires on the real thing -- but each step up is a step of unnoticed encryption.",
+    },
+    TunableThreshold {
+        key: "ransom_churn_window_secs",
+        min: 10,
+        max: 3600,
+        bigger_is_weaker: false,
+        why: "This is also how long a read counts as \"just before\" the destruction of the same \
+              path, so a very long window starts pairing up unrelated events.",
+    },
+    TunableThreshold {
+        key: "dedupe_secs",
+        min: 0,
+        max: 3600,
+        bigger_is_weaker: true,
+        why: "Folding, not suppression: a repeat inside the window becomes a `count` update on \
+              the alert already on the badge. 0 means every event gets its own alert, which is \
+              what the tests use and what a busy machine should not.",
+    },
+];
+
+pub fn tunable_threshold(key: &str) -> Option<&'static TunableThreshold> {
+    TUNABLE_THRESHOLDS.iter().find(|t| t.key == key)
+}
+
+/// The overrides as `status`/state.json carries them.
+fn persisted_threshold_overrides(state: &Option<Value>) -> std::collections::BTreeMap<String, u64> {
+    let mut out = std::collections::BTreeMap::new();
+    let Some(map) = state
+        .as_ref()
+        .and_then(|s| s.get("threshold_overrides"))
+        .and_then(|v| v.as_object())
+    else {
+        return out;
+    };
+    for (k, v) in map {
+        // Validated on the way back in, not only on the way out: a hand-edited
+        // or corrupt state.json must not be able to set a threshold the socket
+        // would have refused.
+        let (Some(n), Some(t)) = (v.as_u64(), tunable_threshold(k)) else {
+            continue;
+        };
+        if n >= t.min && n <= t.max {
+            out.insert(k.clone(), n);
+        }
+    }
+    out
 }
 
 /// Per-rule enforcement survives a restart the same way `mode` does: through
@@ -7830,6 +8092,44 @@ esac
         assert!(cfg.paths.state_file().exists());
         let d2 = Daemon::new(cfg.clone(), &dir.path().join("moat.toml")).unwrap();
         assert_eq!(d2.mode, "enforce");
+    }
+
+    /// A retuned threshold is runtime state, like `mode` and `contain`.
+    ///
+    /// It has to survive a restart from state.json rather than from moat.toml,
+    /// because moatd does not rewrite a file the user (or their config
+    /// management) also owns — and a tuning that quietly reverts on the next
+    /// boot is worse than one that was refused, since nothing announces it.
+    #[test]
+    fn a_retuned_threshold_survives_a_restart_and_a_corrupt_value_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, cfg) = dev_daemon(dir.path());
+        let shipped = d.cfg.thresholds.ransom_churn_files;
+        d.set_threshold("ransom_churn_files", 20).unwrap();
+
+        let d2 = Daemon::new(cfg.clone(), &dir.path().join("moat.toml")).unwrap();
+        assert_eq!(d2.cfg.thresholds.ransom_churn_files, 20);
+
+        // Validated on the way back IN, not only on the way out: a hand-edited
+        // or corrupt state.json must not be able to set a number the socket
+        // would have refused. 10_000 is "the rule is off" wearing a tuning's
+        // clothes, and `status` would go on listing the rule as on.
+        let mut state: Value =
+            serde_json::from_str(&std::fs::read_to_string(cfg.paths.state_file()).unwrap()).unwrap();
+        state["threshold_overrides"]["ransom_churn_files"] = json!(10_000);
+        state["threshold_overrides"]["no_such_threshold"] = json!(1);
+        std::fs::write(
+            cfg.paths.state_file(),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+
+        let d3 = Daemon::new(cfg.clone(), &dir.path().join("moat.toml")).unwrap();
+        assert_eq!(
+            d3.cfg.thresholds.ransom_churn_files, shipped,
+            "an out-of-bounds override is dropped, not honoured"
+        );
+        assert!(!d3.threshold_overrides.contains_key("no_such_threshold"));
     }
 
     // ================================================================

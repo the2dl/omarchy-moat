@@ -669,9 +669,99 @@ pub fn interpreter_of(path: &str) -> Option<String> {
     Some("the interpreter that runs it".to_string())
 }
 
+/// Is this path an interpreter — a binary whose identity is borrowed from
+/// whatever it was handed?
+///
+/// `interpreter_of` answers the other direction: given a *script*, what does
+/// the kernel load. This answers "is naming this as the actor a grant to every
+/// program it runs", which is the question `moatctl allow` and
+/// `engine::exclude_binary` have to refuse on. They are not the same test:
+/// `/usr/bin/python3.14` is a real ELF, so `interpreter_of` correctly returns
+/// `None` for it, and allowing it is still "any python program on this machine
+/// may read your cloud credentials" (2026-09-07, gcloud).
+///
+/// Matched on the file NAME, not on content: an interpreter is only recognisable
+/// by what it is, and the list is the set that actually ships on an Omarchy box
+/// and turns up as `exe` in this daemon's own records. A version suffix is
+/// stripped first, because the alert said `python3.14`, not `python`.
+pub fn is_interpreter_path(path: &str) -> bool {
+    let name = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    // python3.14 -> python3 -> python; node22 -> node; ruby3.3 -> ruby.
+    let stem: String = name
+        .trim_end_matches(|c: char| c.is_ascii_digit() || c == '.')
+        .to_string();
+    matches!(
+        stem.as_str(),
+        "sh" | "bash"
+            | "dash"
+            | "zsh"
+            | "fish"
+            | "ksh"
+            | "ash"
+            | "busybox"
+            | "python"
+            | "perl"
+            | "ruby"
+            | "node"
+            | "deno"
+            | "bun"
+            | "lua"
+            | "luajit"
+            | "php"
+            | "tclsh"
+            | "wish"
+            | "awk"
+            | "gawk"
+            | "mawk"
+            | "env"
+            | "java"
+            | "Rscript"
+            | "osascript"
+            | "pwsh"
+    )
+}
+
 #[cfg(test)]
 mod interpreter_tests {
     use super::*;
+
+    /// The 2026-09-07 gcloud lesson, in both directions.
+    ///
+    /// `interpreter_of` cannot answer this one: `/usr/bin/python3.14` is a real
+    /// ELF, so it is legitimately "what the kernel loads" — and an allowlist
+    /// entry naming it is still a grant to every python program on the machine.
+    #[test]
+    fn an_interpreter_is_recognised_even_though_it_is_a_real_binary() {
+        for p in [
+            "/usr/bin/python3.14",
+            "/usr/bin/python3",
+            "/bin/sh",
+            "/usr/bin/bash",
+            "/home/dan/.local/share/mise/installs/node/26.5.0/bin/node",
+            "/usr/bin/env",
+        ] {
+            assert!(is_interpreter_path(p), "{} is an interpreter", p);
+        }
+    }
+
+    /// A program that only *runs* things is not the same as one that is named
+    /// after one. These are ordinary binaries and allowing one grants only it.
+    #[test]
+    fn an_ordinary_binary_is_not_treated_as_an_interpreter() {
+        for p in [
+            "/usr/bin/cat",
+            "/usr/bin/restic",
+            "/usr/bin/ssh",
+            "/usr/bin/nodemon",
+            "/usr/bin/pythonize",
+            "",
+        ] {
+            assert!(!is_interpreter_path(p), "{} is not an interpreter", p);
+        }
+    }
 
     #[test]
     fn a_real_binary_is_what_the_kernel_matches() {

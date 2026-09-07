@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use crate::allowlist::{append_rule, remove_rule, split_blocks};
+use crate::allowlist::{append_rule, remove_rule, rule_from_spec, split_blocks, Candidate, RuleSpec};
 use crate::engine::Daemon;
 use crate::explain::scope_spec_from_alert;
 use crate::util;
@@ -220,17 +220,41 @@ const BULK_ACK_NOTICE: usize = 64;
 const ROOT_ONLY_ACTIONS: &[(&str, &str, &str)] = &[
     ("baseline", "accept", "writing an allowlist rule"),
     ("baseline", "relearn", "reopening the automatic learning window"),
+    // `allow` writes the same file `ignore` does, so it takes the same gate.
+    //
+    // Its `preview` action is deliberately NOT here. A preview writes nothing,
+    // and it is the one thing a person (or the agent drafting a rule for them)
+    // has to be able to run freely: putting the blast radius behind sudo is how
+    // the blast radius stops being looked at, exactly as with `baseline list`.
+    ("allow", "add", "writing an allowlist rule"),
 ];
+
+/// `set threshold.<name> <value>` is root, in BOTH directions.
+///
+/// Everywhere else in this daemon the rule is "weakening needs root, restoring
+/// does not", and a threshold breaks the symmetry that rule relies on: whether
+/// a change weakens depends on the CURRENT value, which `needs_root` cannot see
+/// (it is handed the request, not the daemon). Two ways out — plumb the daemon
+/// into the gate, or gate both directions — and only one of them can be wrong
+/// in the safe direction. Lowering `ransom_churn_files` is also not purely
+/// restorative: it is the cheapest way to make moat noisy enough that nobody
+/// reads it, which is the same end state as switching it off.
+fn is_threshold_key(key: &str) -> bool {
+    key.starts_with("threshold.")
+}
 
 /// `Some(reason)` when this request needs root and the caller is not root.
 fn needs_root(req: &Value) -> Option<String> {
     let cmd = req.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
     let what = if cmd == "set" {
         let key = req.get("key").and_then(|v| v.as_str()).unwrap_or("");
-        if !ROOT_ONLY_SET_KEYS.contains(&key) {
+        if is_threshold_key(key) {
+            "changing how many events a detection needs before it fires"
+        } else if ROOT_ONLY_SET_KEYS.contains(&key) {
+            "changing what Moat enforces"
+        } else {
             return None;
         }
-        "changing what Moat enforces"
     } else if let Some(hit) = ROOT_ONLY_ACTIONS.iter().find(|(c, a, _)| {
         *c == cmd && *a == req.get("action").and_then(|v| v.as_str()).unwrap_or("")
     }) {
@@ -292,6 +316,7 @@ pub fn dispatch(d: &mut Daemon, req: &Value) -> Value {
         "kill" => cmd_kill(d, &id()),
         "quarantine" => cmd_quarantine(d, req, &id()),
         "ignore" => cmd_ignore(d, req, &id()),
+        "allow" => cmd_allow(d, req),
         "unignore" => cmd_unignore(d, req),
         "allowlist" => cmd_allowlist(d),
         "set" => cmd_set(d, req),
@@ -1398,6 +1423,265 @@ fn cmd_ignore(d: &mut Daemon, req: &Value, id: &str) -> Value {
     }))
 }
 
+/// How many alerts a preview will name individually. The count is always the
+/// true one; this only bounds the sample, so a rule that would have swallowed
+/// 900 rows does not print 900 lines at somebody deciding whether to write it.
+const PREVIEW_SAMPLE: usize = 10;
+
+/// The `[[rule]]` a request describes, with empty strings read as absent.
+///
+/// `--exe ""` from a shell that expanded nothing must not become a glob that
+/// matches only the empty string: that is a rule which silently matches
+/// nothing, and a tuning knob whose failure mode is "did nothing, said it
+/// worked" is the failure this whole command exists to stop.
+fn spec_from_req(req: &Value) -> RuleSpec {
+    let f = |k: &str| {
+        req.get(k)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    RuleSpec {
+        name: f("name").unwrap_or_default(),
+        exe: f("exe"),
+        file: f("file"),
+        parent: f("parent"),
+        script: f("script"),
+    }
+}
+
+/// Every alert on record this rule WOULD have suppressed.
+///
+/// The blast radius, computed with the live evaluator (`Candidate` built
+/// exactly as `engine::emit` builds it) rather than a lookalike, so what the
+/// preview promises is what the daemon will do.
+fn would_match(d: &Daemon, rule: &crate::allowlist::Rule) -> Value {
+    let alerts = d.store.load();
+    let scanned = alerts.len();
+    let mut hits = Vec::new();
+    let mut rules: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for a in &alerts {
+        let parents: Vec<String> = a.process.ancestry.iter().map(|p| p.exe.clone()).collect();
+        let cand = Candidate {
+            rule: &a.rule,
+            exe: &a.process.exe,
+            file: a.file.as_ref().map(|x| x.path.as_str()),
+            parents,
+            script: a.actor.script.as_deref(),
+        };
+        if !rule.matches(&cand) {
+            continue;
+        }
+        *rules.entry(a.rule.clone()).or_default() += 1;
+        if hits.len() < PREVIEW_SAMPLE {
+            hits.push(json!({
+                "id": a.id,
+                "ts": a.ts,
+                "rule": a.rule,
+                "severity": a.severity,
+                "title": a.title,
+                "exe": a.process.exe,
+                "file": a.file.as_ref().map(|f| f.path.clone()),
+                "script": a.actor.script,
+                // Already answered by an existing entry: writing this one would
+                // not change the past, and probably not the future either.
+                "already_suppressed": a.suppressed_by,
+            }));
+        }
+    }
+    let total: u64 = rules.values().sum();
+    json!({
+        "scanned": scanned,
+        "matched": total,
+        "by_rule": rules,
+        "sample": hits,
+    })
+}
+
+/// `moatctl allow` — write an allowlist entry directly, without waiting for an
+/// alert to fire first.
+///
+/// 2026-09-07: until now the only way to add an entry was `ignore <alert-id>`,
+/// which meant a person who already knew what they wanted had to provoke the
+/// alert, find its id, and then accept whichever of four canned scopes came
+/// closest. Worse, none of those scopes could express the one shape that
+/// actually needed expressing — `script` — so the honest entry for `gcloud`
+/// could not be written by the CLI at all (see `allowlist::RuleSpec::script`).
+///
+/// Two actions, and only one of them writes:
+///
+/// * `preview` — what this rule WOULD have suppressed, over every alert on
+///   record. Needs no privilege; see `ROOT_ONLY_ACTIONS`.
+/// * `add` — append it to `user.toml`. Root, recorded, and it carries the same
+///   preview in the response, because the number that matters is the one you
+///   see at the moment you commit.
+///
+/// The refusals are the point. Each one is a way for a rule to look narrow and
+/// be wide, and each has been hit for real on this machine.
+fn cmd_allow(d: &mut Daemon, req: &Value) -> Value {
+    let action = req.get("action").and_then(|v| v.as_str()).unwrap_or("preview");
+    if action != "preview" && action != "add" {
+        return err(format!("unknown allow action {:?}; use preview or add", action));
+    }
+    let spec = spec_from_req(req);
+    if spec.name.is_empty() {
+        return err(
+            "an allowlist entry must name a rule (`--name moat-cred-ssh-private-key-read`, \
+             or a glob like `moat-cred-*`). `moatctl status --json` lists them; \
+             `moatctl allowlist` shows the entries you already have.",
+        );
+    }
+
+    // Compile first: a bad glob has to be a refusal, not a file that makes
+    // `Allowlist::load` drop every OTHER rule in user.toml alongside it.
+    let path = d.cfg.paths.user_allowlist();
+    let index = crate::allowlist::Allowlist::load_file(&path).map(|r| r.len() + 1).unwrap_or(1);
+    let rule = match rule_from_spec(spec.clone(), &path, index) {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+
+    // --- refusal 1: moat's own self-health rules -------------------------
+    //
+    // `ignore` refuses these by exact name because it starts from an alert.
+    // This one starts from a PATTERN, so `--name "moat-*"` would have reached
+    // every one of them at once -- the single most damaging entry it is
+    // possible to write, and the one an attacker would want.
+    let reached: Vec<&str> = crate::rules::NEVER_SILENCE
+        .iter()
+        .copied()
+        .filter(|n| rule.name_matches(n))
+        .collect();
+    if !reached.is_empty() {
+        return err(format!(
+            "{:?} reaches {} ({}), which report on Moat's own integrity and cannot be \
+             allowlisted: an entry that silences one does not quieten a noisy detection, it \
+             makes every FUTURE weakening invisible. Name the rule you actually mean.",
+            spec.name,
+            if reached.len() == 1 { "a rule" } else { "rules" },
+            reached.join(", ")
+        ));
+    }
+
+    // --- refusal 2: a rule armed in the kernel ---------------------------
+    //
+    // The 2026-09-05 record, generalised: suppression is userspace, the kill is
+    // the kernel's, so allowing an armed rule hides the alert and the program
+    // goes on dying. `cmd_ignore` learned this for one rule at a time; a
+    // pattern can reach several, so all of them are named.
+    let mut armed: Vec<String> = d
+        .policies
+        .names()
+        .into_iter()
+        .chain(d.armable_userland_rules().into_iter().map(|m| m.name))
+        .filter(|n| rule.name_matches(n) && d.mode_for(n) == "enforce")
+        .collect();
+    armed.sort();
+    armed.dedup();
+    if !armed.is_empty() {
+        return err(format!(
+            "{} armed in the kernel, and an allowlist entry cannot stop a kill: the process \
+             dies before moatd sees the event, so this would hide the alert and change \
+             nothing about the killing. Either put the rule back to monitor \
+             (`sudo moatctl set mode monitor --rule {}`) or take the binary out of the policy \
+             (`moatctl ignore <alert-id>` does that for an armed rule).",
+            if armed.len() == 1 {
+                format!("{} is", armed[0])
+            } else {
+                format!("{} are", armed.join(", "))
+            },
+            armed[0]
+        ));
+    }
+
+    // --- refusal 3: an interpreter with no script ------------------------
+    //
+    // The gcloud case, refused rather than written. `exe = /usr/bin/python3.14`
+    // reads as "allow gcloud" and means "allow every python program on this
+    // machine", and the difference only shows up the day it matters. The fix is
+    // already in the schema, so this can point straight at it.
+    if let Some(exe) = spec.exe.as_deref() {
+        if spec.script.is_none() && !exe.contains('*') && !exe.contains('?') {
+            if let Some(interp) = crate::util::interpreter_of(exe) {
+                return err(format!(
+                    "{exe} is a script, not a binary: it runs as {interp}, so that is what an \
+                     alert's `exe` says and what this entry would have to match -- which would \
+                     allow EVERY program {interp} runs, not {exe}. Name the script instead: \
+                     `--script {exe}` (add `--exe {interp}` too if you want both)."
+                ));
+            }
+            if crate::util::is_interpreter_path(exe) {
+                return err(format!(
+                    "{exe} is an interpreter. An entry whose only actor is {exe} allows every \
+                     script it ever runs -- on 2026-09-07 that would have been \"any python may \
+                     read your cloud credentials\". Add `--script <the program you mean>`, which \
+                     matches what moatd already resolved and prints in `explain`."
+                ));
+            }
+        }
+    }
+
+    // --- the blast radius, on both paths ---------------------------------
+    //
+    // A zero-match entry is deliberately NOT refused. Pre-authorising something
+    // that has not happened yet is the reason this command exists — the point
+    // was that a person who knows what they want should not have to provoke an
+    // alert first. But zero is exactly what a typo looks like too, so the count
+    // is reported on the way in rather than discovered a week later, and it is
+    // written into the entry's own comment where `moatctl allowlist` will keep
+    // showing it.
+    let preview = would_match(d, &rule);
+    let matched = preview["matched"].as_u64().unwrap_or(0);
+
+    if action == "preview" {
+        return ok(json!({
+            "action": "preview",
+            "block": crate::allowlist::render_block(&spec),
+            "file": path.display().to_string(),
+            "would": preview,
+            "note": "nothing was written; add `--yes` (sudo moatctl allow ... --yes) to commit it",
+        }));
+    }
+
+    let user_comment = req.get("comment").and_then(|v| v.as_str()).unwrap_or("");
+    let mut comment = format!(
+        "added {} by hand ({} of {} alerts on record match)",
+        chrono::Utc::now().format("%Y-%m-%d"),
+        matched,
+        preview["scanned"].as_u64().unwrap_or(0)
+    );
+    if !user_comment.is_empty() {
+        comment.push_str(&format!(" — {}", user_comment.replace('\n', " ")));
+    }
+    let block = match append_rule(&path, &comment, &spec) {
+        Ok(b) => b,
+        Err(e) => return err(format!("{}: {}", path.display(), e)),
+    };
+    d.reload_allowlist();
+    d.raise_protection_change(
+        &format!("allow {} by hand", spec.name),
+        &peer_of(req),
+        vec![
+            format!("written to {}", path.display()),
+            format!("rule written: {}", block.trim().replace('\n', " · ")),
+            format!(
+                "{} of {} alerts on record would have been suppressed by it",
+                matched,
+                preview["scanned"].as_u64().unwrap_or(0)
+            ),
+        ],
+    );
+    log::info!("allowlist: added {} by hand", block.trim().replace('\n', " · "));
+    ok(json!({
+        "action": "add",
+        "file": path.display().to_string(),
+        "index": index,
+        "block": block.trim_start_matches('\n'),
+        "would": preview,
+    }))
+}
+
 /// `{"cmd":"unignore","rule":N}` still means user.toml, for compatibility.
 /// `{"cmd":"unignore","file":"baseline.toml","index":N}` removes a learned
 /// entry the same way (BASELINE §8 "Resolved shapes"). Shipped files are
@@ -1456,6 +1740,12 @@ fn cmd_allowlist(d: &Daemon) -> Value {
                 "exe": r.spec.exe,
                 "path": r.spec.file,
                 "parent": r.spec.parent,
+                // 2026-09-07: `script` shipped as a matcher and was left out of
+                // this listing, so an entry that read as "allow python3.14" in
+                // `moatctl allowlist` was in fact "allow gcloud" -- the listing
+                // showing something WIDER than the rule, which is the one
+                // direction a review must never be misled in.
+                "script": r.spec.script,
                 "toml": r.to_toml(),
             })
         })
@@ -1696,9 +1986,11 @@ fn cmd_set(d: &mut Daemon, req: &Value) -> Value {
         "digest" => set_digest(d, value),
         "contain" => set_contain(d, value, &who),
         "kill" => set_kill(d, value, &who),
+        k if is_threshold_key(k) => set_threshold(d, &k["threshold.".len()..], value, &who),
         "" => err("missing `key`"),
         other => err(format!(
-            "unknown key {:?}; use mode, sandbox, digest, contain or kill",
+            "unknown key {:?}; use mode, sandbox, digest, contain, kill or \
+             threshold.<name> (an unknown threshold name lists the ones there are)",
             other
         )),
     }
@@ -1902,6 +2194,83 @@ fn set_mode(d: &mut Daemon, value: &str, rule: &str, who: &str) -> Value {
 ///
 /// Turning it OFF releases everything live: leaving policies loaded after the
 /// user said stop would be the switch lying about what it did.
+/// `moatctl set threshold.<name> <value|default>` — retune a detection without
+/// editing `/etc/moat/moat.toml` and restarting the daemon.
+///
+/// 2026-09-07: the only way to change `ransom_churn_files` was `sudoedit
+/// /etc/moat/moat.toml` + `systemctl reload moatd`, which is a text editor and
+/// a service verb standing between a person and "this rule is too loud on my
+/// machine". Every other switch on this daemon (`mode`, `sandbox`, `digest`,
+/// `contain`, `kill`) needed neither, and the one that did was the one people
+/// reach for first when a detection annoys them — so the realistic alternative
+/// to this command was not a careful edit, it was turning the rule off.
+///
+/// Recorded in BOTH directions, like `set kill`, and for the same reason: a
+/// threshold that moved is a change to what moat catches, and the person it
+/// protects should be able to find it afterwards. `moat-x-protection-changed`
+/// is in `NEVER_SILENCE`, so this record cannot be allowlisted away.
+fn set_threshold(d: &mut Daemon, name: &str, value: &str, who: &str) -> Value {
+    if matches!(value, "default" | "reset" | "auto") {
+        let was = d.threshold(name).unwrap_or(0);
+        return match d.reset_threshold(name) {
+            Ok(now) => {
+                // Going back to the shipped number is a restoration, so it is
+                // reported but not dressed as a weakening.
+                d.raise_protection_change(
+                    &format!("reset threshold {} to the value in moat.toml", name),
+                    who,
+                    vec![format!("was {}, now {}", was, now)],
+                );
+                ok(json!({"threshold": name, "value": now, "source": "moat.toml"}))
+            }
+            Err(e) => err(e),
+        };
+    }
+    let Ok(n) = value.parse::<u64>() else {
+        return err(format!(
+            "a threshold is a whole number (or `default` to go back to moat.toml), got {:?}",
+            value
+        ));
+    };
+    match d.set_threshold(name, n) {
+        Ok((had, now, direction)) => {
+            if direction != "same" {
+                let t = crate::engine::tunable_threshold(name);
+                d.raise_protection_change(
+                    &format!(
+                        "{} threshold {}: {} -> {}",
+                        if direction == "weaker" { "raise" } else { "lower" },
+                        name,
+                        had,
+                        now
+                    ),
+                    who,
+                    vec![
+                        match direction {
+                            "weaker" => format!(
+                                "the rule that uses {} now needs more before it fires; less will \
+                                 be caught",
+                                name
+                            ),
+                            _ => format!("{} now fires on less; more will be caught", name),
+                        },
+                        t.map(|t| t.why.to_string()).unwrap_or_default(),
+                        "in effect from the next event; nothing was restarted".to_string(),
+                    ],
+                );
+            }
+            ok(json!({
+                "threshold": name,
+                "was": had,
+                "value": now,
+                "direction": direction,
+                "source": "override",
+            }))
+        }
+        Err(e) => err(e),
+    }
+}
+
 fn set_contain(d: &mut Daemon, value: &str, who: &str) -> Value {
     let on = match value {
         "on" | "true" | "1" => true,
@@ -2605,6 +2974,13 @@ mod tests {
             // with a longer fuse.
             json!({"cmd":"baseline","action":"accept","id":"01X"}),
             json!({"cmd":"baseline","action":"relearn"}),
+            // `allow` writes the same file `ignore` does, by a different route.
+            json!({"cmd":"allow","action":"add","name":"moat-cred-*","exe":"/usr/bin/x"}),
+            // A threshold is gated in BOTH directions: whether a number is a
+            // weakening depends on the number it replaces, which the gate
+            // cannot see, and only one of the two possible mistakes is safe.
+            json!({"cmd":"set","key":"threshold.ransom_churn_files","value":"200"}),
+            json!({"cmd":"set","key":"threshold.ransom_churn_files","value":"3"}),
         ] {
             let r = dispatch(&mut d, &user(cmd.clone()));
             assert_eq!(r["ok"], false, "{:?} must be refused for a non-root caller", cmd);
@@ -2632,6 +3008,10 @@ mod tests {
             json!({"cmd":"status"}),
             json!({"cmd":"list"}),
             json!({"cmd":"baseline","action":"list"}),
+            // So is a preview. It writes nothing, and it is the blast radius a
+            // person is supposed to look at BEFORE deciding -- evidence behind
+            // sudo does not get read, exactly as with `baseline list`.
+            json!({"cmd":"allow","action":"preview","name":"moat-cred-ssh-private-key-read"}),
         ] {
             assert_eq!(dispatch(&mut d, &user(cmd.clone()))["ok"], true, "{:?}", cmd);
         }
@@ -4465,6 +4845,327 @@ mod tests {
         let sent = dispatch(&mut d, &json!({"cmd":"digest","action":"sent"}));
         assert!(sent["last_sent"].is_string());
         assert_eq!(dispatch(&mut d, &json!({"cmd":"digest","action":"wat"}))["ok"], false);
+    }
+
+    // ------------------------------------------------ moatctl allow
+
+    /// A person who already knows what they want should not have to provoke an
+    /// alert to say so.
+    ///
+    /// `ignore <alert-id>` was the only way in, which meant the workflow for
+    /// "restic reads my SSH key nightly, that is fine" was: wait for the
+    /// backup, find the alert, hope one of four canned scopes fits.
+    #[test]
+    fn an_allowlist_entry_can_be_written_without_an_alert_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let r = dispatch(&mut d, &json!({
+            "cmd": "allow", "action": "add", "_peer_uid": 0,
+            "name": "moat-cred-ssh-private-key-read",
+            "exe": "/usr/bin/_moat_fixture_restic",
+            "file": "/home/dan/.ssh/id_ed25519",
+            "comment": "nightly backup",
+        }));
+        assert_eq!(r["ok"], true, "{:?}", r["error"]);
+        let block = r["block"].as_str().unwrap();
+        assert!(block.contains("exe = \"/usr/bin/_moat_fixture_restic\""), "{}", block);
+        assert!(block.contains("nightly backup"), "the reason survives: {}", block);
+
+        // It is live immediately -- reloaded, not waiting on a restart.
+        let listed = dispatch(&mut d, &json!({"cmd": "allowlist"}));
+        assert!(
+            listed["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["exe"] == "/usr/bin/_moat_fixture_restic"),
+            "{:?}",
+            listed
+        );
+
+        // And it is on the record, because it suppresses.
+        assert!(
+            d.store
+                .load()
+                .iter()
+                .any(|a| a.rule == "moat-x-protection-changed" && a.title.contains("allow")),
+            "a hand-written grant is a protection change like any other"
+        );
+    }
+
+    /// `script`, the matcher that has no scope.
+    ///
+    /// 2026-09-07: `gcloud` is a python script, so its alerts say
+    /// `exe = /usr/bin/python3.14`. Every scope `ignore` offers would have
+    /// written that, which is "any python program may read your cloud
+    /// credentials". This is the one shape the CLI could not express at all.
+    #[test]
+    fn a_script_can_be_allowed_without_blessing_its_interpreter() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let r = dispatch(&mut d, &json!({
+            "cmd": "allow", "action": "add", "_peer_uid": 0,
+            "name": "moat-cred-cloud-credential-read",
+            "script": "/opt/_moat_fixture_gcloud/lib/gcloud.py",
+        }));
+        assert_eq!(r["ok"], true, "{:?}", r["error"]);
+        let block = r["block"].as_str().unwrap();
+        assert!(block.contains("script = "), "{}", block);
+        assert!(!block.contains("python"), "the interpreter is not in it: {}", block);
+        // And the listing shows it, or a review reads the entry as wider than
+        // it is.
+        let listed = dispatch(&mut d, &json!({"cmd": "allowlist"}));
+        assert!(
+            listed["rules"].as_array().unwrap().iter().any(|x| x["script"]
+                == "/opt/_moat_fixture_gcloud/lib/gcloud.py"),
+            "{:?}",
+            listed
+        );
+    }
+
+    /// The blast radius, before the grant.
+    ///
+    /// A preview that wrote something, or that needed sudo, would not get run.
+    #[test]
+    fn a_preview_names_what_it_would_have_hidden_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        // A real alert out of the sample log, so the preview is answering the
+        // same question the daemon answers: `Candidate` built the same way,
+        // matched by the same globs.
+        let a = d
+            .store
+            .load()
+            .into_iter()
+            .find(|a| !crate::rules::NEVER_SILENCE.contains(&a.rule.as_str()) && a.file.is_some())
+            .expect("the sample log raises at least one file-bearing alert");
+        let id = a.id.clone();
+        let before = std::fs::read_to_string(d.cfg.paths.user_allowlist()).unwrap_or_default();
+
+        let r = dispatch(&mut d, &json!({
+            "cmd": "allow", "action": "preview", "_peer_uid": 1000,
+            "name": a.rule,
+            // Not `exe`: the actor is often an interpreter, and naming one is
+            // refused on the preview path too. That refusal IS the answer to
+            // "what would this rule do", so it is not skipped just because
+            // nothing is about to be written.
+            "file": a.file.as_ref().unwrap().path,
+        }));
+        assert_eq!(r["ok"], true, "a preview needs no root: {:?}", r["error"]);
+        assert!(r["would"]["matched"].as_u64().unwrap() >= 1, "{:?}", r["would"]);
+        assert!(
+            r["would"]["sample"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["id"] == id.as_str()),
+            "the alert it would have swallowed is named: {:?}",
+            r["would"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.cfg.paths.user_allowlist()).unwrap_or_default(),
+            before,
+            "a preview writes nothing"
+        );
+
+        // A rule aimed somewhere else reports honestly rather than optimistically.
+        let miss = dispatch(&mut d, &json!({
+            "cmd": "allow", "action": "preview", "_peer_uid": 1000,
+            "name": a.rule,
+            "exe": "/usr/bin/no-such-binary-_moat_fixture",
+        }));
+        assert_eq!(miss["would"]["matched"], 0);
+    }
+
+    /// Every way an entry can look narrow and be wide.
+    ///
+    /// These are the refusals, and they are the reason the command exists in
+    /// this shape rather than as a thin wrapper over `append_rule`.
+    #[test]
+    fn allow_refuses_the_entries_that_look_narrow_and_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let root = |name: &str, extra: Value| -> Value {
+            let mut c = json!({"cmd":"allow","action":"add","_peer_uid":0,"name":name});
+            if let Some(o) = extra.as_object() {
+                for (k, v) in o {
+                    c[k] = v.clone();
+                }
+            }
+            c
+        };
+
+        // A glob reaching moat's own health rules. `ignore` refuses these by
+        // exact name because it starts from an alert; this starts from a
+        // pattern, so `moat-*` would have reached all five at once.
+        for pattern in ["*", "moat-*", "moat-x-*", "moat-x-protection-changed"] {
+            let r = dispatch(&mut d, &root(pattern, json!({})));
+            assert_eq!(r["ok"], false, "{:?} must be refused", pattern);
+            assert!(
+                r["error"].as_str().unwrap().contains("integrity"),
+                "{:?}: {:?}",
+                pattern,
+                r["error"]
+            );
+        }
+
+        // An interpreter as the only actor. /bin/sh is not a grant to sh, it is
+        // a grant to every shell script on the machine.
+        let r = dispatch(&mut d, &root(
+            "moat-cred-ssh-private-key-read",
+            json!({"exe": "/usr/bin/bash"}),
+        ));
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap().contains("--script"), "{:?}", r["error"]);
+
+        // With a script it is a real, narrow grant and goes through.
+        let r = dispatch(&mut d, &root(
+            "moat-cred-ssh-private-key-read",
+            json!({"exe": "/usr/bin/bash", "script": "/home/dan/no-such-backup.sh"}),
+        ));
+        assert_eq!(r["ok"], true, "{:?}", r["error"]);
+
+        // A glob that does not compile is refused rather than written: an
+        // unparseable user.toml makes `Allowlist::load` drop every OTHER rule
+        // in the file, so one bad entry silently empties the whole allowlist.
+        let r = dispatch(&mut d, &root(
+            "moat-cred-ssh-private-key-read",
+            json!({"exe": "/usr/bin/[unclosed"}),
+        ));
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap().contains("bad glob"), "{:?}", r["error"]);
+
+        // And a nameless entry, which would be "allow everything".
+        assert_eq!(dispatch(&mut d, &root("", json!({})))["ok"], false);
+    }
+
+    /// The 2026-09-05 record, generalised to a pattern.
+    ///
+    /// Suppression is userspace and the kill is the kernel's, so allowing an
+    /// armed rule hides the alert and the program goes on dying. `cmd_ignore`
+    /// learned this for the one rule an alert named; a glob can reach several.
+    #[test]
+    fn allowing_a_rule_that_is_armed_in_the_kernel_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        d.enforcing_rules.insert("moat-cred-ssh-private-key-read".into());
+
+        for pattern in ["moat-cred-ssh-private-key-read", "moat-cred-ssh-*"] {
+            let r = dispatch(&mut d, &json!({
+                "cmd": "allow", "action": "add", "_peer_uid": 0,
+                "name": pattern, "exe": "/usr/bin/_moat_fixture_restic",
+            }));
+            assert_eq!(r["ok"], false, "{:?}", pattern);
+            let e = r["error"].as_str().unwrap();
+            assert!(e.contains("cannot stop a kill"), "{}", e);
+            // The refusal has to name the way out, or it is just a wall.
+            assert!(e.contains("set mode monitor --rule"), "{}", e);
+        }
+
+        // A rule that is NOT armed is unaffected.
+        assert_eq!(
+            dispatch(&mut d, &json!({
+                "cmd": "allow", "action": "add", "_peer_uid": 0,
+                "name": "moat-priv-ptrace-attach", "exe": "/usr/bin/_moat_fixture_gdb",
+            }))["ok"],
+            true
+        );
+    }
+
+    // -------------------------------------------- moatctl set threshold.*
+
+    /// Retuning a detection without a text editor and a service restart.
+    ///
+    /// The realistic alternative to this command was not a careful `sudoedit`;
+    /// it was turning the rule off, which is what people do when a detection is
+    /// loud and the knob is three commands away.
+    #[test]
+    fn a_threshold_can_be_retuned_reset_and_survives_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let shipped = d.cfg.thresholds.ransom_churn_files;
+
+        let r = dispatch(&mut d, &json!({
+            "cmd": "set", "key": "threshold.ransom_churn_files", "value": "20",
+            "_peer_uid": 0,
+        }));
+        assert_eq!(r["ok"], true, "{:?}", r["error"]);
+        assert_eq!(r["was"], shipped as u64);
+        assert_eq!(r["value"], 20);
+        // 20 > 8: the rule needs more before it fires, so less is caught.
+        assert_eq!(r["direction"], "weaker");
+        assert_eq!(d.cfg.thresholds.ransom_churn_files, 20);
+
+        // A SIGHUP re-reads moat.toml. Without the override being re-applied
+        // the file would silently win, and the revert would be announced
+        // nowhere -- tuning that appears to work and does nothing, backwards.
+        d.reload();
+        assert_eq!(
+            d.cfg.thresholds.ransom_churn_files, 20,
+            "a reload must not quietly undo what the user set"
+        );
+
+        // Lowering it again is a strengthening, and says so.
+        let r = dispatch(&mut d, &json!({
+            "cmd": "set", "key": "threshold.ransom_churn_files", "value": "5",
+            "_peer_uid": 0,
+        }));
+        assert_eq!(r["direction"], "stronger", "{:?}", r);
+
+        // And there is a way back to the shipped number that is not "restart
+        // the daemon and hope".
+        let r = dispatch(&mut d, &json!({
+            "cmd": "set", "key": "threshold.ransom_churn_files", "value": "default",
+            "_peer_uid": 0,
+        }));
+        assert_eq!(r["ok"], true, "{:?}", r["error"]);
+        assert_eq!(r["value"], shipped as u64);
+        assert!(d.threshold_overrides.is_empty());
+
+        // status publishes both, because a retuned threshold changes what moat
+        // catches and a change nothing reports is indistinguishable from a
+        // detection that quietly stopped working.
+        dispatch(&mut d, &json!({
+            "cmd": "set", "key": "threshold.mass_read_files", "value": "6", "_peer_uid": 0,
+        }));
+        let s = dispatch(&mut d, &json!({"cmd": "status"}));
+        assert_eq!(s["thresholds"]["mass_read_files"], 6);
+        assert_eq!(s["threshold_overrides"]["mass_read_files"], 6);
+    }
+
+    /// The bounds, and the refusal to touch anything that is not tuning.
+    #[test]
+    fn a_threshold_outside_its_bounds_or_off_the_list_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let set = |d: &mut Daemon, k: &str, v: &str| {
+            dispatch(d, &json!({"cmd":"set","key":format!("threshold.{}",k),"value":v,"_peer_uid":0}))
+        };
+
+        // A number at which the rule stops existing while `status` goes on
+        // listing it as on. 40 is not a hypothetical: it was the shipped
+        // mass_read_files until 2026-09-04 and the rule had never fired once.
+        let r = set(&mut d, "mass_read_files", "40");
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap().contains("between 2 and 25"), "{:?}", r["error"]);
+        // And the floor: 1 makes every credential read an alert, which is noise
+        // nobody reads, which is also off.
+        assert_eq!(set(&mut d, "mass_read_files", "1")["ok"], false);
+
+        // Plumbing is not tuning. Log rotation, poll intervals and the arm
+        // timeout are in [thresholds] too and are deliberately unreachable.
+        for k in ["alerts_max_bytes", "arm_wait_secs", "state_interval_secs", "ancestry_max"] {
+            let r = set(&mut d, k, "1");
+            assert_eq!(r["ok"], false, "{} must not be settable from the socket", k);
+            assert!(
+                r["error"].as_str().unwrap().contains("tunable"),
+                "the refusal lists the ones that are: {:?}",
+                r["error"]
+            );
+        }
+
+        assert_eq!(set(&mut d, "mass_read_files", "not-a-number")["ok"], false);
+        assert_eq!(d.cfg.thresholds.mass_read_files, 3, "nothing was applied");
     }
 
     #[test]

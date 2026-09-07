@@ -443,8 +443,21 @@ Requests:
                                           block it wrote.
 {"cmd":"explain","id":"<alert id>"}       returns the alert with its full explain block
 {"cmd":"unignore","rule":"<n>"}           removes the n-th [[rule]] block from user.toml
+{"cmd":"allow","action":"preview","name":"...","exe":"...","file":"...","parent":"...","script":"..."}
+                                          what this [[rule]] WOULD suppress, over every
+                                          alert on record: {"matched":N,"by_rule":{},
+                                          "sample":[...]}. Writes nothing, needs no root.
+{"cmd":"allow","action":"add",...,"comment":"..."}
+                                          the same, then appends it to user.toml. Root.
+                                          Refuses: a name glob reaching NEVER_SILENCE, a
+                                          rule armed in the kernel, an interpreter `exe`
+                                          with no `script`, a glob that does not compile.
 {"cmd":"allowlist"}                       lists user.toml rules with their index and comment
 {"cmd":"set","key":"mode","value":"monitor|enforce"}
+{"cmd":"set","key":"threshold.<name>","value":"<n>|default"}
+                                          retunes one detection threshold; kept in
+                                          state.json, never written back to moat.toml.
+                                          Root in BOTH directions.
 {"cmd":"set","key":"sandbox","value":"on|off"}          touches/removes sandbox.enabled
 {"cmd":"list","since":"<ULID>","limit":100}
 {"cmd":"feeds","action":"refresh"}
@@ -560,7 +573,7 @@ and docs/LEARNING-AND-ANALYSIS.md section 9.
 reader showing 3a ("a chain, not four alerts") instead of 1b keys on it.
 `chains_formed` counts them since start.
 
-`moatctl` is a thin CLI over this socket: `moatctl status|kill|quarantine|ack|ignore|unignore|allowlist|explain|set|list|feeds|chain`.
+`moatctl` is a thin CLI over this socket: `moatctl status|kill|quarantine|ack|ignore|allow|unignore|allowlist|explain|set|list|feeds|chain`.
 `moatctl chain <id>` prints design 2b in a terminal: the sequence with times,
 which step was already allowed, and the one command that closes all of it.
 `moatctl explain <id>` prints the human-readable version: WHAT HAPPENED, WHY IT WAS
@@ -585,7 +598,13 @@ sudoers rule.
    exe    = "/home/dan/.local/share/mise/installs/node/*/bin/node"
    file   = "/home/dan/.ssh/id_rsa"                # exe+file scope adds this
    parent = "/usr/bin/restic"                      # parent scope: any exe under this parent
+   script = "/opt/google-cloud-cli/lib/gcloud.py"  # what an INTERPRETER was running
    ```
+   `script` exists because `exe` is what the *kernel* loaded: for a `#!` script that
+   is the interpreter, so an entry for `gcloud` would otherwise have to say
+   `exe = /usr/bin/python3.14` and would allow every python program on the machine.
+   A rule naming `script` cannot match an event that was not an interpreter running
+   one, which is what stops it widening back out.
    Every alert must carry an `explain` block (section 4): `what` is one plain sentence,
    `why` and `expected` come from the policy annotations (or the userland rule's
    table), `evidence` lists the concrete matched facts, `if_expected.options` contains

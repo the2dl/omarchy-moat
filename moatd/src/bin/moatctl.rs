@@ -116,6 +116,45 @@ enum Cmd {
         #[arg(long)]
         comment: Option<String>,
     },
+    /// Write an allowlist entry directly, without waiting for an alert.
+    ///
+    /// `ignore <alert-id>` needs an alert to have fired and offers four canned
+    /// scopes; this takes the matchers themselves, including `--script`, which
+    /// no scope can express. Every field is a glob and every field present must
+    /// match.
+    ///
+    /// It PREVIEWS by default: it prints which alerts on record the entry would
+    /// have suppressed and writes nothing. `--yes` (with sudo) commits it.
+    /// Seeing the blast radius before granting is the whole point of the
+    /// command, so it is the default rather than a flag.
+    Allow {
+        /// The rule to allow, or a glob: moat-cred-ssh-private-key-read,
+        /// moat-cred-*. Required.
+        #[arg(long)]
+        name: String,
+        /// The binary that acted. For a script this is the INTERPRETER, which
+        /// is why naming one here without --script is refused.
+        #[arg(long)]
+        exe: Option<String>,
+        /// The file that was touched.
+        #[arg(long)]
+        file: Option<String>,
+        /// Any ancestor's binary, up to the ancestry cap.
+        #[arg(long)]
+        parent: Option<String>,
+        /// What an interpreter was actually running, e.g.
+        /// /opt/google-cloud-cli/lib/gcloud.py. This is how you allow `gcloud`
+        /// without allowing every python program on the machine.
+        #[arg(long)]
+        script: Option<String>,
+        /// Appended to the generated comment. Say WHY; `moatctl allowlist`
+        /// will still be showing it in six months.
+        #[arg(long)]
+        comment: Option<String>,
+        /// Actually write it. Needs root, and is recorded.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Remove the n-th rule from an allowlist.d file (see `allowlist`).
     Unignore {
         rule: u64,
@@ -127,9 +166,14 @@ enum Cmd {
     /// List the merged allowlist rules with their index and comment.
     Allowlist,
     /// set mode monitor|enforce, sandbox on|off, digest on|off, contain on|off,
-    /// or kill off|log|kill (what containment does to the processes involved).
+    /// kill off|log|kill (what containment does to the processes involved), or
+    /// threshold.<NAME> <N|default> to retune a detection
+    /// (`threshold.ransom_churn_files 12`) without editing moat.toml or
+    /// restarting anything — an unknown name lists the ones there are.
     /// Everything but `digest` needs root: they are the switches that can
     /// weaken protection, and a hijacked package runs as you, not as root.
+    /// A threshold needs root in BOTH directions, because whether a number is
+    /// a weakening depends on the number it replaces.
     Set {
         key: String,
         value: String,
@@ -274,6 +318,10 @@ fn agent_may_not_run(cmd: &Cmd) -> bool {
     matches!(
         cmd,
         Cmd::Ack { .. }
+            // `allow --yes` writes; `allow` on its own only previews, and an
+            // agent drafting a rule for a person to run is exactly what the
+            // preview is for. The gate is on the commit, not on the thinking.
+            | Cmd::Allow { yes: true, .. }
             | Cmd::Ignore { .. }
             | Cmd::Unignore { .. }
             | Cmd::Set { .. }
@@ -335,6 +383,24 @@ fn main() -> ExitCode {
         Cmd::Unignore { rule, file } => {
             json!({"cmd": "unignore", "rule": rule, "index": rule, "file": file.clone().unwrap_or_default()})
         }
+        Cmd::Allow {
+            name,
+            exe,
+            file,
+            parent,
+            script,
+            comment,
+            yes,
+        } => json!({
+            "cmd": "allow",
+            "action": if *yes { "add" } else { "preview" },
+            "name": name,
+            "exe": exe.clone().unwrap_or_default(),
+            "file": file.clone().unwrap_or_default(),
+            "parent": parent.clone().unwrap_or_default(),
+            "script": script.clone().unwrap_or_default(),
+            "comment": comment.clone().unwrap_or_default(),
+        }),
         Cmd::Allowlist => json!({"cmd": "allowlist"}),
         Cmd::Set { key, value, rule } => json!({
             "cmd": "set", "key": key, "value": value,
@@ -1105,6 +1171,7 @@ fn print_human(cmd: &Cmd, r: &Value) {
             r["file"].as_str().unwrap_or(""),
             r["removed"].as_str().unwrap_or("")
         ),
+        Cmd::Allow { yes, .. } => print_allow(*yes, r),
         Cmd::Allowlist => print_allowlist(r),
         Cmd::Baseline { action } => print_baseline(action, r),
         Cmd::Set { key, .. } => print_set(key, r),
@@ -1585,6 +1652,77 @@ fn print_explain(a: &Alert) {
     }
 }
 
+/// The blast radius, printed the same way whether or not the entry was written.
+///
+/// The number that matters is "how much of what you have already seen would
+/// this have hidden", so it leads with that and only then shows the block. A
+/// preview that buried the count under the TOML would be a preview nobody read.
+fn print_allow(committed: bool, r: &Value) {
+    let would = &r["would"];
+    let matched = would["matched"].as_u64().unwrap_or(0);
+    let scanned = would["scanned"].as_u64().unwrap_or(0);
+
+    if committed {
+        println!("wrote to {}:\n", r["file"].as_str().unwrap_or(""));
+    } else {
+        println!("nothing was written. This entry would be:\n");
+    }
+    println!("{}", r["block"].as_str().unwrap_or(""));
+
+    println!(
+        "It matches {} of the {} alerts on record.",
+        matched, scanned
+    );
+    if let Some(by) = would["by_rule"].as_object() {
+        for (rule, n) in by {
+            println!("  {:>4}  {}", n, rule);
+        }
+    }
+    if let Some(sample) = would["sample"].as_array() {
+        if !sample.is_empty() {
+            println!();
+        }
+        for a in sample {
+            let already = match a["already_suppressed"].as_str() {
+                // Worth saying: an entry that only re-covers ground an existing
+                // one already covers is a grant with no effect, and the reason
+                // people end up with six overlapping rules they dare not touch.
+                Some(by) => format!("   (already suppressed by {})", by),
+                None => String::new(),
+            };
+            println!(
+                "  {}  {}  {}{}",
+                a["id"].as_str().unwrap_or(""),
+                a["severity"].as_str().unwrap_or(""),
+                a["title"].as_str().unwrap_or(""),
+                already
+            );
+            if let Some(s) = a["script"].as_str() {
+                println!("      script {}", s);
+            }
+        }
+        let shown = sample.len() as u64;
+        if matched > shown {
+            println!("  ... and {} more", matched - shown);
+        }
+    }
+    if matched == 0 {
+        println!(
+            "\nNothing on record matches it. That is fine if you are allowing something \
+             ahead of time -- and it is also what a typo looks like. Check the matchers \
+             against `moatctl explain <id>` before committing."
+        );
+    }
+    if committed {
+        println!(
+            "\nUndo with: moatctl allowlist, then moatctl unignore {}",
+            r["index"].as_u64().unwrap_or(0)
+        );
+    } else {
+        println!("\nCommit it with the same command plus `--yes`, under sudo.");
+    }
+}
+
 fn print_allowlist(r: &Value) {
     let empty = vec![];
     let rules = r["rules"].as_array().unwrap_or(&empty);
@@ -1609,7 +1747,15 @@ fn print_allowlist(r: &Value) {
         if let Some(c) = x["comment"].as_str().filter(|c| !c.is_empty()) {
             println!("     # {}", c);
         }
-        for (label, key) in [("exe", "exe"), ("file", "path"), ("parent", "parent")] {
+        for (label, key) in [
+            ("exe", "exe"),
+            ("file", "path"),
+            ("parent", "parent"),
+            // Printed since 2026-09-07. Without it an entry whose real actor is
+            // `gcloud.py` displayed as nothing but `exe = /usr/bin/python3.14`,
+            // so the review read WIDER than the rule actually was.
+            ("script", "script"),
+        ] {
             if let Some(v) = x[key].as_str() {
                 println!("     {} = {}", label, v);
             }
@@ -1841,6 +1987,32 @@ fn print_set(key: &str, r: &Value) {
             r["flag"].as_str().unwrap_or(""),
             r["note"].as_str().unwrap_or("")
         ),
+        k if k.starts_with("threshold.") => {
+            let name = r["threshold"].as_str().unwrap_or(&k["threshold.".len()..]);
+            match r["source"].as_str() {
+                Some("moat.toml") => println!(
+                    "{} is back to {}, the value in /etc/moat/moat.toml",
+                    name, r["value"]
+                ),
+                _ => {
+                    // The direction is said in words, not left to be inferred
+                    // from two numbers: "8 -> 20" reads as a tuning, "less will
+                    // be caught" reads as what it is.
+                    let d = r["direction"].as_str().unwrap_or("same");
+                    println!("{} is now {} (was {})", name, r["value"], r["was"]);
+                    match d {
+                        "weaker" => println!(
+                            "  this rule now needs MORE before it fires: less will be caught. \
+                             Recorded as a protection change."
+                        ),
+                        "stronger" => println!("  this rule now fires on less: more will be caught."),
+                        _ => println!("  unchanged."),
+                    }
+                    println!("  in effect from the next event; nothing was restarted.");
+                    println!("  undo with: sudo moatctl set threshold.{} default", name);
+                }
+            }
+        }
         _ => println!("{}", serde_json::to_string_pretty(r).unwrap_or_default()),
     }
 }

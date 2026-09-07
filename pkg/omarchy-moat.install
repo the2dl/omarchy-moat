@@ -38,6 +38,23 @@ post_install() {
   verdicts but stop the demotions, or `"off"` to stop it entirely; without a
   default agent (`omarchy default agent claude`) it does nothing.
 
+  OPTIONAL: tune moat by talking to your coding agent.
+
+    The package installs an agent skill at
+    /usr/share/omarchy/default/agents/skills/moat-tuning. Omarchy links the
+    skills in that directory into each agent's skill directory, but it does
+    so from a one-shot migration -- so on a machine that is already set up,
+    link it yourself, as you, once:
+
+      ln -sfn /usr/share/omarchy/default/agents/skills/moat-tuning \
+              ~/.claude/skills/moat-tuning
+
+    (or ~/.gemini/config/skills/ for Gemini). The skill teaches an agent
+    which tuning layer a change belongs in -- kernel policy, kernel
+    exclusion, userspace allowlist, threshold, or enforcement -- and why
+    naming a shell script in a kernel policy is recorded, reloaded, verified
+    and completely inert. It reads; it proposes; it does not act.
+
   Then check it:
 
     moatctl status

@@ -198,6 +198,43 @@ impl Rule {
     pub fn to_toml(&self) -> String {
         render_block(&self.spec)
     }
+
+    /// Does this rule's `name` glob cover `rule`?
+    ///
+    /// Split out because the *name* alone decides two refusals that have to be
+    /// answered before anything is written: a pattern that reaches a
+    /// `NEVER_SILENCE` rule, and a pattern that reaches a rule armed in the
+    /// kernel. `matches` cannot answer either — it needs an exe and a file it
+    /// does not have yet.
+    pub fn name_matches(&self, rule: &str) -> bool {
+        self.name_m.is_match(rule)
+    }
+}
+
+/// Compile a spec into a matchable `Rule` without writing a file first.
+///
+/// 2026-09-07: `moatctl allow` and its `--dry-run` both have to answer "what
+/// would this actually match" BEFORE the entry exists, and the only honest
+/// answer is the one the live evaluator gives. Going through the same
+/// `compile`/`matches` pair the loader uses means the preview cannot drift
+/// from the verdict — a second implementation of glob matching next to this
+/// one would eventually disagree, and the direction it disagrees in is
+/// "the preview said it was narrow".
+///
+/// `source` and `index` are the identity the entry WOULD have; nothing is
+/// written here.
+pub fn rule_from_spec(spec: RuleSpec, source: &Path, index: usize) -> Result<Rule, String> {
+    Ok(Rule {
+        name_m: compile(&spec.name)?,
+        exe_m: spec.exe.as_deref().map(compile).transpose()?,
+        file_m: spec.file.as_deref().map(compile).transpose()?,
+        parent_m: spec.parent.as_deref().map(compile).transpose()?,
+        script_m: spec.script.as_deref().map(compile).transpose()?,
+        spec,
+        comment: String::new(),
+        source: source.to_path_buf(),
+        index,
+    })
 }
 
 /// Render a `[[rule]]` block exactly the way `ignore` writes it. Kept in one

@@ -3045,7 +3045,12 @@ function normalizeAllowlistRule(value, fallbackIndex) {
   // all, so the source-file path can never be shown as a match target.
   var matchFile = r.path === undefined ? r.file : r.path
   var detail = []
-  var fields = [["exe", r.exe], ["file", matchFile], ["parent", r.parent],
+  // `script` is in this list since 2026-09-07. It is the matcher that says
+  // what an INTERPRETER was running, and an entry that has one and no `exe`
+  // (the shape `moatctl allow --script` writes) rendered as a rule with no
+  // matcher lines at all -- a grant the panel showed as covering everything.
+  var fields = [["exe", r.exe], ["script", r.script], ["file", matchFile],
+                ["parent", r.parent],
                 ["args", r.args], ["cwd", r.cwd], ["uid", r.uid]]
   for (var i = 0; i < fields.length; i++) {
     var v = fields[i][1]
@@ -3082,6 +3087,7 @@ function normalizeAllowlistRule(value, fallbackIndex) {
     exe: String(r.exe === undefined || r.exe === null ? "" : r.exe),
     path: String(matchFile === undefined || matchFile === null ? "" : matchFile),
     parent: String(r.parent === undefined || r.parent === null ? "" : r.parent),
+    script: String(r.script === undefined || r.script === null ? "" : r.script),
     scope: isIgnoreScope(r.scope) ? String(r.scope).toLowerCase() : "",
     // The exact TOML block, shown verbatim the same way explain does it.
     line: String(r.toml || r.line || ""),
@@ -3482,8 +3488,19 @@ function historyNote(incident) {
 // ==========================================================================
 
 /// The program a rule is about, as a person would name it.
+/// The program an allowlist entry actually grants.
+///
+/// `script` before `exe`, because for an entry written against an interpreter
+/// `exe` is `/usr/bin/python3.14` and the program the user meant is
+/// `gcloud.py`. A `script`-only entry (the shape `moatctl allow --script`
+/// writes) has no `exe` at all, and before 2026-09-07 rendered as an empty
+/// program name in the Rules tab -- a grant with nothing readable next to it.
 function ruleProgram(rule) {
   var r = rule || {}
+  var s = String(r.script || "").replace(/\*+$/, "")
+  if (s) {
+    return basename(s)
+  }
   return basename(String(r.exe || "").replace(/\*+$/, ""))
 }
 

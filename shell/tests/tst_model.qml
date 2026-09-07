@@ -2744,6 +2744,34 @@ TestCase {
     verify(rows[0].removable)
   }
 
+  function test_a_script_only_rule_names_the_script_not_an_empty_program() {
+    // 2026-09-07: `script` shipped as a matcher before the panel knew about it.
+    // An entry written by `moatctl allow --script` has no `exe` at all, so the
+    // Rules tab rendered it with an empty program name and no matcher lines --
+    // a grant displayed as though it covered everything. The whole point of
+    // `script` is that it says the true, narrow thing (gcloud, not python3.14),
+    // so the panel showing it as wider than it is defeats the feature.
+    var parsed = Model.parseAllowlist({ ok: true, rules: [{
+      index: 1, file: "/etc/moat/allowlist.d/user.toml", source: "user",
+      removable: true, name: "moat-cred-cloud-credential-read",
+      exe: null, path: null, parent: null,
+      script: "/opt/google-cloud-cli/lib/gcloud.py",
+      comment: "added 2026-09-07: gcloud reading gcloud's own store"
+    }] })
+    compare(parsed.rules[0].script, "/opt/google-cloud-cli/lib/gcloud.py")
+    verify(parsed.rules[0].detail.indexOf("script = /opt/google-cloud-cli/lib/gcloud.py") >= 0)
+    var rows = Model.userRuleRows(parsed.rules, [])
+    compare(rows[0].program, "gcloud.py")
+    verify(rows[0].label.indexOf("gcloud.py") === 0)
+
+    // And when both are present the script still wins: `exe` is the
+    // interpreter, and naming python3.14 on screen is the misreading this
+    // matcher exists to prevent.
+    compare(Model.ruleProgram({ exe: "/usr/bin/python3.14",
+                                script: "/opt/google-cloud-cli/lib/gcloud.py" }),
+            "gcloud.py")
+  }
+
   function test_an_untracked_rule_says_not_counted_rather_than_zero() {
     // "the daemon is not counting this one" and "it has silenced nothing" are
     // different answers, and a 0 in that column would be a lie about the second.
