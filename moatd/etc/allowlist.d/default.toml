@@ -122,3 +122,42 @@ file   = "*/.config/gcloud/*"
 name = "moat-cred-cloud-credentials-read"
 exe  = "/usr/bin/aws"
 file = "*/.aws/*"
+
+# The other script-based cloud CLIs. Same reasoning, same narrowness. These
+# were written from each project's stable layout rather than measured on this
+# machine -- only gcloud was -- so if one of them still alerts, the script path
+# is what to check first: `moatctl explain <id>` prints it on the actor line.
+# A wrong path here fails safe: the entry matches nothing and the alert stands.
+
+# The Azure CLI is a python package; __main__.py is stable across the distro
+# package, the installer and a pip install.
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "*/azure/cli/__main__.py"
+file   = "*/.azure/*"
+
+# AWS CLI v1 is a python script (v2 ships its own interpreter and is the `exe`
+# rule above). Anchored to the real install prefixes, not `*/bin/aws`, which
+# would match anything called aws anywhere.
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/usr/bin/aws"
+file   = "*/.aws/*"
+
+# The same, installed outside the distro package.
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/usr/local/bin/aws"
+file   = "*/.aws/*"
+
+# Ansible reads cloud credentials through its own plugins.
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/usr/bin/ansible"
+file   = "*/.aws/*"
+
+# And the playbook runner, which is a separate entry point.
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/usr/bin/ansible-playbook"
+file   = "*/.aws/*"

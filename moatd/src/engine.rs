@@ -1156,6 +1156,32 @@ impl Daemon {
             return;
         }
         if crate::alert::severity_rank(&c.severity) < crate::alert::severity_rank("high") {
+            // A chain is re-evaluated every time a step joins it, and it can go
+            // DOWN: more steps can turn "a sequence" into "one program doing its
+            // job". If this chain was contained while it looked high and no
+            // longer does, the containment has outlived the conclusion that
+            // justified it and must go.
+            //
+            // 2026-09-07, live: `dockerd` pulling an image was contained at
+            // 13:50:21 and the same chain read `medium` at 13:51:17 -- moat had
+            // withdrawn the conclusion and gone on refusing the connection for
+            // the rest of the 600 s TTL. Docker and cargo were both cut off
+            // from their registries this way. A block that outlives its reason
+            // is the worst kind: the evidence for it is gone and the breakage
+            // is not.
+            // `release` takes it OUT of the store; `release_contain` unloads the
+            // kernel policy. Both, or the record lingers claiming a block that
+            // is no longer loaded -- which is its own kind of lie.
+            if let Some(rec) = self.contain.release(&c.id) {
+                log::warn!(
+                    "releasing {}: chain {} is {} now, not high -- the containment outlived the \
+                     conclusion that justified it",
+                    rec.policy,
+                    c.id,
+                    c.severity
+                );
+                self.release_contain(&rec);
+            }
             return;
         }
         if self.contain.is_contained(&c.id) {
@@ -5482,6 +5508,58 @@ mod tests {
         assert!(
             d.contain.live().is_empty(),
             "a high chain must not contain anything while containment is off"
+        );
+    }
+
+    /// A containment must not outlive the conclusion that justified it.
+    ///
+    /// 2026-09-07, live: `dockerd` pulling an image was contained at 13:50:21,
+    /// and the SAME chain read `medium` at 13:51:17 -- a chain is re-evaluated
+    /// every time a step joins it and can go down, as more steps turn "a
+    /// sequence" into "one program doing its job". moat had withdrawn the
+    /// conclusion and went on refusing the connection for the rest of the
+    /// 600 s TTL. Docker and cargo were both cut off from their registries.
+    #[test]
+    fn a_containment_is_released_when_its_chain_is_no_longer_high() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.contain.enabled = true;
+
+        let rec = crate::contain::Containment {
+            chain: "01CHAINDEMOTED".into(),
+            policy: "moat-contain-0".into(),
+            exes: vec!["/usr/bin/dockerd".into()],
+            dests: vec!["93.184.216.34".into()],
+            since: 100,
+            expires: 700,
+        };
+        d.contain.insert(rec, 4);
+        assert!(d.contain.is_contained("01CHAINDEMOTED"), "precondition: contained");
+
+        // The same chain, re-evaluated below high.
+        let c = crate::chain::Chain {
+            v: 1,
+            id: "01CHAINDEMOTED".into(),
+            ancestor: crate::alert::Ancestor { pid: 5000, exe: "/usr/bin/dockerd".into() },
+            families: vec!["net".into(), "persist".into()],
+            severity: "medium".into(),
+            severity_base: "medium".into(),
+            severity_reason: "stays medium: no escalating sequence".into(),
+            first_ts: util::now_rfc3339(),
+            last_ts: util::now_rfc3339(),
+            span_secs: 112,
+            steps: vec![],
+            steps_total: 16,
+            truncated: false,
+            members: Vec::new(),
+            triggers_total: 0,
+            summary: "16 things happened under dockerd".into(),
+        };
+        d.maybe_contain(&c, 200);
+
+        assert!(
+            !d.contain.is_contained("01CHAINDEMOTED"),
+            "moat withdrew the conclusion, so it must withdraw the block"
         );
     }
 

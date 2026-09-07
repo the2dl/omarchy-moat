@@ -278,6 +278,12 @@ impl ContainStore {
         &self.live
     }
 
+    /// The live containment this chain caused, if any. Needed to release one
+    /// whose chain has since been re-evaluated below `high`.
+    pub fn for_chain(&self, chain: &str) -> Option<&Containment> {
+        self.live().iter().find(|c| c.chain == chain)
+    }
+
     pub fn is_contained(&self, chain: &str) -> bool {
         self.live.iter().any(|c| c.chain == chain)
     }
