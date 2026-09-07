@@ -37,7 +37,7 @@ list and in the panel ("actor: official, package coreutils 9.7-1").
 
 | Family | official actor | foreign / user / unknown actor |
 |---|---|---|
-| cred, rootkit, shell | **no change** (an official binary reading your SSH key is still worth a look) | no change |
+| cred, rootkit, shell, ransom | **no change** (an official binary reading your SSH key is still worth a look; `/usr/bin/python` encrypting your documents is no safer for the repo that shipped python) | no change |
 | persist, priv, exec, net | one step down (high→medium, medium→low) | no change |
 | pkg (userland rules) | one step down for interpreter-spawn only | no change; `downloader` and `netcat` stay |
 | x-* daemon rules | per rule, documented in the rule table | no change |

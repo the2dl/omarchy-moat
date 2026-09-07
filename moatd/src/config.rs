@@ -153,6 +153,17 @@ pub struct RuleToggles {
     /// upgrade). Reads `/proc/<pid>/fd` at exec time; no kernel hook carries
     /// file descriptors, so this cannot be a policy.
     pub shell_stdio_socket: bool,
+    /// `moat-ransom-file-churn`: one actor reading a file and then deleting,
+    /// renaming away or emptying that same file, across many distinct files in
+    /// a window -- or renaming many files to one new extension. The kernel
+    /// policy of the same name feeds it and is `signal`; the rule is the
+    /// detection.
+    pub ransom_file_churn: bool,
+    /// `moat-ransom-snapshot-command`: `btrfs subvolume delete`, `snapper
+    /// delete`, `timeshift --delete`, `restic forget` without a `--keep`,
+    /// `borg delete`. Argv is not visible to a kernel selector, so this is
+    /// matched on the exec event, which is exported unconditionally.
+    pub ransom_snapshot_command: bool,
 }
 
 impl Default for RuleToggles {
@@ -170,6 +181,8 @@ impl Default for RuleToggles {
             pkg_subtree_netcat_exec: true,
             ai_cli_in_pkg_subtree: true,
             shell_stdio_socket: true,
+            ransom_file_churn: true,
+            ransom_snapshot_command: true,
         }
     }
 }
@@ -206,6 +219,13 @@ pub struct Thresholds {
     pub mass_read_files: usize,
     /// `moat-x-mass-read`: sliding window.
     pub mass_read_window_secs: u64,
+    /// `moat-ransom-file-churn`: distinct files one actor must read-then-destroy
+    /// (or rename to one shared new extension) inside the window to fire. The
+    /// Nth file is the trigger, as for `mass_read_files`.
+    pub ransom_churn_files: usize,
+    /// `moat-ransom-file-churn`: sliding window, and how long a read counts as
+    /// "just before" the destruction of the same path.
+    pub ransom_churn_window_secs: u64,
     /// How long an exited process stays in the table (for late kprobe events).
     pub process_prune_secs: u64,
     /// Ancestry chain cap (CONTRACT §6.2).
@@ -257,6 +277,21 @@ impl Default for Thresholds {
             // undo, rather than a threshold that silently disables the rule.
             mass_read_files: 3,
             mass_read_window_secs: 30,
+            // 8 distinct files in 60 seconds.
+            //
+            // Higher than mass_read on purpose. A credential file is rare by
+            // nature, so three of them is already odd; a document is not, and
+            // the shapes this counts -- read a file, then delete or rename
+            // that same file -- have legitimate lookalikes at small N: a
+            // script tidying a handful of photos, `mv` of a few files across
+            // filesystems. None of them does it to eight distinct documents
+            // inside a minute, and ransomware does it to hundreds in that
+            // time, so the threshold sits between the two with room on both
+            // sides. A payload throttled below one file per eight seconds
+            // would slip under it -- and would also need three hours for a
+            // thousand files, which is the trade.
+            ransom_churn_files: 8,
+            ransom_churn_window_secs: 60,
             process_prune_secs: 60,
             ancestry_max: 8,
             // 20 MiB. The panel no longer reads this file (it asks moatd

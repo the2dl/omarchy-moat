@@ -43,6 +43,10 @@ API_VERSION = "cilium.io/v1alpha1"
 KIND = "TracingPolicy"
 NAME_PREFIX = "moat-"
 FAMILIES = {"cred", "pkg", "persist", "shell", "rootkit", "priv", "ai", "net", "exec",
+            # `ransom`: files or recovery points destroyed. Two policies, one a
+            # plain detection (snapshot-destroy) and one a `signal` feed for the
+            # counting rule of the same name (file-churn).
+            "ransom",
             # `telemetry` is not a detection family. A moat-telemetry-* policy
             # is a record: moatd routes it past rule evaluation entirely
             # (engine::handle_line) and it can never raise an alert. It is

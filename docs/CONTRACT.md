@@ -358,7 +358,7 @@ Reader obligations:
 
 A chain is recognised when, inside one ten-minute window, two or more alerts
 **share a process tree** and **cross two or more detection families** (`cred`,
-`net`, `persist`, `exec`, `priv`, `rootkit`, `pkg`, `shell`), at least one of
+`net`, `persist`, `exec`, `priv`, `rootkit`, `pkg`, `shell`, `ransom`), at least one of
 them is `medium` or worse, and at least one of them is new on this machine
 (`rarity` of `first_seen` or `rare`). The tree is rooted at the outermost
 process below the session boundary — pid 1, a terminal, a multiplexer, an

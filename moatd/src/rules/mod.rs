@@ -16,8 +16,15 @@
 //! | `moat-pkg-subtree-netcat-exec`      | exact package-subtree membership              |
 //! | `moat-ai-cli-in-pkg-subtree`        | exact package-subtree membership              |
 //! | `moat-shell-stdio-socket`           | fds 0/1/2 of a live process (no hook has them)|
+//! | `moat-ransom-file-churn`            | read-then-destroy of the same path, counted   |
+//! | `moat-ransom-snapshot-command`      | argv of `btrfs`/`snapper`/`restic`/`borg`     |
 //!
-//! The last four keep the ids and severities of the kernel policies they
+//! `moat-ransom-file-churn` owns the kernel policy of the same name, the way
+//! `moat-net-first-contact` does: the policy posts every unlink, rename,
+//! truncate and read-open under the document directories, and only this rule
+//! decides what they add up to.
+//!
+//! The four `pkg`/`ai` rules keep the ids and severities of the kernel policies they
 //! replace, because docs, the allowlist and the shell plugin all name them.
 //! Tetragon's `matchParentBinaries … followChildren` could not express "inside
 //! a package install" without matching half the desktop (see `pkgtree`), so the
@@ -32,6 +39,8 @@ pub mod new_exec_ioc;
 pub mod pkg_egress;
 pub mod pkg_subtree;
 pub mod pkgtree;
+pub mod ransom_churn;
+pub mod ransom_snapshot;
 pub mod self_proc_read;
 pub mod shell_stdio_socket;
 
@@ -201,6 +210,8 @@ pub fn all() -> Vec<Box<dyn UserRule>> {
         Box::new(pkg_subtree::NetcatExec),
         Box::new(pkg_subtree::AiCliInPkgSubtree),
         Box::new(shell_stdio_socket::ShellStdioSocket::default()),
+        Box::new(ransom_churn::RansomChurn::default()),
+        Box::new(ransom_snapshot::SnapshotCommand),
     ]
 }
 
@@ -620,10 +631,10 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), n, "rule ids must be unique");
         assert_eq!(
-            n, 12,
+            n, 14,
             "four gap rules, the four that replaced pkg policies, net-first-contact, \
-             the two that read binary_properties (memfd, privileges raised), and \
-             shell-stdio-socket"
+             the two that read binary_properties (memfd, privileges raised), \
+             shell-stdio-socket, and the two ransom rules (file-churn, snapshot-command)"
         );
 
         // Every rule must be switchable off, or `[rules]` is a lie.
@@ -641,6 +652,8 @@ mod tests {
             pkg_subtree_netcat_exec: false,
             ai_cli_in_pkg_subtree: false,
             shell_stdio_socket: false,
+            ransom_file_churn: false,
+            ransom_snapshot_command: false,
         };
         for r in &rules {
             assert!(r.enabled(&cfg()), "{} is off by default", r.id());

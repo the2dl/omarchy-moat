@@ -95,7 +95,7 @@ pub const CHAIN_V: u32 = 1;
 /// busiest thing on the machine this was built for; it belongs in a chain as
 /// evidence, not as one of the two families that creates one.
 pub const CHAIN_FAMILIES: &[&str] = &[
-    "cred", "net", "persist", "exec", "priv", "rootkit", "pkg", "shell",
+    "cred", "net", "persist", "exec", "priv", "rootkit", "pkg", "shell", "ransom",
 ];
 
 /// How far apart two alerts may be and still be one story.

@@ -365,7 +365,7 @@ spec:
     /// takes it off the badge for good; that should be a decision somebody
     /// makes on purpose and a test they had to update.
     #[test]
-    fn the_shipped_signal_rules_are_the_seven_the_docs_name() {
+    fn the_shipped_signal_rules_are_the_eight_the_docs_name() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().map(|p| p.join("policies"));
         // Building from a source tarball that ships only moatd/.
         let Some(dir) = dir.filter(|d| d.is_dir()) else { return };
@@ -387,8 +387,13 @@ spec:
                 "moat-persist-desktop-entry-write",
                 "moat-persist-omarchy-menu-extension-write",
                 "moat-persist-omarchy-plugin-write",
+                // 2026-09-06: the feed for the ransom counter. Owned by the
+                // userland rule of the same name, so its events are input to
+                // a count rather than records; `signal` is what they would be
+                // if the rule were switched off.
+                "moat-ransom-file-churn",
             ],
-            "the seventh, moat-pkg-subtree-interpreter-spawn, is a userland rule"
+            "the eighth, moat-pkg-subtree-interpreter-spawn, is a userland rule"
         );
         // A building block must not be able to end a process on evidence it has
         // declared too weak for the badge. `check.py` says the same at build

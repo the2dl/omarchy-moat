@@ -590,11 +590,11 @@ pub struct StepFact {
 /// Families that mean something HAPPENED, as opposed to something ran.
 ///
 /// `exec` and `pkg` describe a program starting, which is what a build does
-/// thousands of times. `net`, `cred`, `persist`, `priv` and `rootkit` describe
-/// a consequence: reaching out, reading a secret, arranging to run again,
-/// gaining privilege, touching the sensor. A sequence with no consequence in it
-/// has not yet done anything worth killing over.
-pub const CONSEQUENCE: &[&str] = &["net", "cred", "persist", "priv", "rootkit"];
+/// thousands of times. `net`, `cred`, `persist`, `priv`, `rootkit` and `ransom`
+/// describe a consequence: reaching out, reading a secret, arranging to run
+/// again, gaining privilege, touching the sensor, destroying files. A sequence
+/// with no consequence in it has not yet done anything worth killing over.
+pub const CONSEQUENCE: &[&str] = &["net", "cred", "persist", "priv", "rootkit", "ransom"];
 
 /// Is this chain confident enough to kill for?
 ///

@@ -3515,6 +3515,7 @@ function ruleScopeVerb(name) {
   case "net": return { none: "connecting out" }
   case "priv": return { none: "asking for more access" }
   case "rootkit": return { none: "touching the kernel" }
+  case "ransom": return { none: "destroying files or snapshots" }
   case "shell": return { none: "opening a shell" }
   case "ai": return { none: "running during package installs" }
   default: return { prefix: "touching", none: "what it was flagged for" }

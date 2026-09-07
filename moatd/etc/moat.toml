@@ -158,6 +158,44 @@ ai_cli_in_pkg_subtree = true
 # every service -- never fire.
 shell_stdio_socket = true
 
+# Ransomware behaviour: one actor READS a file and then deletes, renames away or
+# empties THAT SAME FILE, repeated across `ransom_churn_files` distinct files
+# inside `ransom_churn_window_secs` (see [thresholds]). Builds delete files they
+# never read; backups read files they never delete; encryption does both to the
+# same file, which is why this shape and not "many deletes" is the detection.
+# The second shape it counts is homogenisation: many different files renamed to
+# ONE new extension in the window (`report.pdf` -> `report.pdf.locked`), judged by
+# the files losing their variety, not by a list of known ransomware suffixes.
+#
+# Fed by the kernel policy of the same name, moat-ransom-file-churn, which
+# watches ~/Documents, ~/Desktop, ~/Pictures, ~/Videos, ~/Music and ~/Downloads
+# and nothing else -- documents, not build trees. A $HOME-wide read watch would
+# sit in the band the telemetry file class measured under $HOME during an npm
+# install (19-42 events/s, and that was writes alone), which is the cost the
+# telemetry fork exists to avoid; that variant is in policies/incubating/ with
+# the numbers. Measured 2026-09-06 with inotify over the six directories on this
+# desktop: zero opens, deletes or renames in 120 s at rest. That policy is `signal` and
+# carries no rateLimit, because rateLimit suppresses events and never counts
+# them. moatd never raises its per-event records while this rule is on; the
+# rule is the detection. Turning the rule OFF leaves the kernel policy posting,
+# and each unlink or rename under those directories then becomes a low timeline
+# record until you also drop the policy.
+#
+# The children of a shell are counted together with the shell: a loop of
+# `openssl enc ... && rm` is one actor, not two hundred short-lived ones.
+ransom_file_churn = true
+
+# A recovery point destroyed by command: `btrfs subvolume delete`, `snapper
+# delete`, `timeshift --delete`, `restic forget` without any --keep option,
+# `borg delete`. Argv is not visible to any kernel selector, and exec events are
+# exported whatever policies are loaded, so this costs nothing to watch. Runs
+# driven by the snapshot tools themselves (timeshift and snapperd calling
+# `btrfs`, borgmatic calling `borg`) are recognised by ancestry and stay quiet;
+# a `restic forget --keep-daily 7 --prune` is retention, not destruction, and
+# stays quiet too. The on-disk half -- `rm -rf` of ~/.snapshots, /.snapshots or
+# /timeshift -- is the kernel policy moat-ransom-snapshot-destroy.
+ransom_snapshot_command = true
+
 [ai]
 # Ancestors that are allowed to launch an AI CLI without a terminal, as globs.
 # Matched against each ancestor's binary AND each of its arguments, so a shebang
@@ -192,6 +230,22 @@ dedupe_secs = 60
 # high the rule is off.
 mass_read_files = 3
 mass_read_window_secs = 30
+
+# ransom-file-churn: this many DISTINCT files that one actor read and then
+# deleted, renamed away or emptied inside the window fires (the Nth file is the
+# trigger). The same number is the bar for the homogenisation shape: N different
+# files renamed to one shared new extension inside the window.
+#
+# 8 in 60s. Deliberately higher than mass_read: a document is not rare the way a
+# credential is, and the shape has legitimate lookalikes at small N -- a script
+# tidying a few photos, `mv` of a handful of files across filesystems (excluded
+# in the kernel anyway). Nothing legitimate does it to eight distinct documents
+# inside a minute; ransomware does it to hundreds. A payload throttled below one
+# file per eight seconds slips under this, and also needs three hours for a
+# thousand files, which is the trade. The window is also how long a read counts
+# as "just before" the destruction of the same path.
+ransom_churn_files = 8
+ransom_churn_window_secs = 60
 
 # How long an exited process stays in the table. Kprobe events can be written
 # after the exit line, and kill confirmation arrives on the exit event.
@@ -329,8 +383,10 @@ learn_min_days = 3
 noisy_rule_per_day = 20
 
 # BASELINE §2: let an official actor take one step off persist/priv/exec/net.
-# cred, rootkit and shell never move — an official binary reading your SSH key
-# is still worth a look — and a `pkg-install` context is never downgraded at all.
+# cred, rootkit, shell and ransom never move — an official binary reading your
+# SSH key is still worth a look, and /usr/bin/python encrypting your documents
+# is not made safer by the package that shipped python — and a `pkg-install`
+# context is never downgraded at all.
 provenance_downgrade = true
 
 [context]

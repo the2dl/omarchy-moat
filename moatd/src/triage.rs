@@ -187,7 +187,10 @@ pub const NEVER_DEMOTE: &[&str] = &[
     "moat-x-was-not-running",
 ];
 
-const NEVER_DEMOTE_FAMILIES: &[&str] = &["rootkit"];
+// `ransom` as well: a demotion is the one thing an injected verdict can buy, and
+// "your files are being encrypted" is the alert where a bought minute costs the
+// most.
+const NEVER_DEMOTE_FAMILIES: &[&str] = &["rootkit", "ransom"];
 
 /// The ceiling, in one function.
 ///

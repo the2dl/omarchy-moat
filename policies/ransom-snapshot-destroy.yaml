@@ -1,0 +1,149 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-ransom-snapshot-destroy
+  annotations:
+    moat.omarchy/severity: "critical"
+    moat.omarchy/title: "Snapshot or restore point deleted from disk"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,ignore"
+    moat.omarchy/why: >-
+      Encryption only holds you to ransom once the copies are gone, so destroying the
+      recovery points comes first. /.snapshots and ~/.snapshots are where snapper keeps
+      the btrfs snapshots that would roll this machine back; /timeshift is where
+      timeshift keeps its restore points. Something other than the snapshot tools
+      deleting, renaming or emptying files in there is removing your way back before
+      you know you need it.
+    moat.omarchy/expected: >-
+      Almost nothing. snapper's daemon and its hourly cleanup timer, timeshift, btrbk,
+      yabsnap and btrfs-assistant are the programs that legitimately delete snapshots
+      and they are excluded here, so a match is another program -- a script, `rm -rf`,
+      an installer -- reaching into a snapshot directory. You doing it by hand is the
+      one honest false positive. Deleting the snapshot subvolume itself goes through a
+      btrfs ioctl, not a path, and is not seen here; the commands that do that
+      (`btrfs subvolume delete`, `snapper delete`, `timeshift --delete`, `restic
+      forget`, `borg delete`) are the userland rule moat-ransom-snapshot-command.
+    moat.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  # `rm -rf /.snapshots/42`, `rm ~/.snapshots/3/info.xml`. Argument 0 is the
+  # parent directory; argument 1 is the file itself and is carried for evidence
+  # only. Only index 0 is filtered: two path filters in one selector would be
+  # compared against the same reported path downstream (see
+  # rootkit-evidence-tamper). No trailing slash on the values, so the parent of
+  # /.snapshots/42/info.xml -- /.snapshots/42 -- and /.snapshots itself both
+  # match, and Prefix is the only operator paths have.
+  - call: "security_path_unlink"
+    syscall: false
+    message: "A file was deleted from a snapshot directory"
+    args:
+    - index: 0
+      type: "path"
+    - index: 1
+      type: "dentry"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/snapperd"
+        - "/usr/lib/snapper/systemd-helper"
+        - "/usr/bin/snapper"
+        - "/usr/bin/btrfs"
+        - "/usr/bin/timeshift"
+        - "/usr/bin/timeshift-gtk"
+        - "/usr/bin/btrbk"
+        - "/usr/bin/yabsnap"
+        - "/usr/bin/btrfs-assistant"
+        - "/usr/lib/systemd/systemd"
+        - "/usr/bin/systemd-tmpfiles"
+      matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "{{HOME}}/.snapshots"
+        - "/.snapshots"
+        - "/timeshift"
+        - "/run/timeshift"
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"
+  # `mv /.snapshots/42 /tmp` evades the unlink hook. Argument 0 is the OLD parent
+  # directory, so a move out of a snapshot directory is seen and a move into one
+  # is not, which is the right way round.
+  - call: "security_path_rename"
+    syscall: false
+    message: "A file was renamed out of a snapshot directory"
+    args:
+    - index: 0
+      type: "path"
+    - index: 1
+      type: "dentry"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/snapperd"
+        - "/usr/lib/snapper/systemd-helper"
+        - "/usr/bin/snapper"
+        - "/usr/bin/btrfs"
+        - "/usr/bin/timeshift"
+        - "/usr/bin/timeshift-gtk"
+        - "/usr/bin/btrbk"
+        - "/usr/bin/yabsnap"
+        - "/usr/bin/btrfs-assistant"
+        - "/usr/lib/systemd/systemd"
+        - "/usr/bin/systemd-tmpfiles"
+      matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "{{HOME}}/.snapshots"
+        - "/.snapshots"
+        - "/timeshift"
+        - "/run/timeshift"
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"
+  # `: > /.snapshots/42/info.xml` leaves the snapshot in place and snapper unable
+  # to read it, which is as good as deleted. Any O_TRUNC open of an existing file
+  # reaches security_path_truncate (fs/open.c handle_truncate -> do_truncate);
+  # a file created by the same open is not truncated and does not. Argument 0
+  # is the file itself, hence the trailing slash.
+  - call: "security_path_truncate"
+    syscall: false
+    message: "A file in a snapshot directory was emptied"
+    args:
+    - index: 0
+      type: "path"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/snapperd"
+        - "/usr/lib/snapper/systemd-helper"
+        - "/usr/bin/snapper"
+        - "/usr/bin/btrfs"
+        - "/usr/bin/timeshift"
+        - "/usr/bin/timeshift-gtk"
+        - "/usr/bin/btrbk"
+        - "/usr/bin/yabsnap"
+        - "/usr/bin/btrfs-assistant"
+        - "/usr/lib/systemd/systemd"
+        - "/usr/bin/systemd-tmpfiles"
+      matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "{{HOME}}/.snapshots/"
+        - "/.snapshots/"
+        - "/timeshift/"
+        - "/run/timeshift/"
+      matchActions:
+      - action: Post
+        rateLimit: "60s"
+        rateLimitScope: "process"

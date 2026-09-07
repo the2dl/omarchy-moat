@@ -102,6 +102,7 @@ Item {
             "net": "Network connections",
             "priv": "Requests for more access",
             "rootkit": "Kernel-level changes",
+            "ransom": "Files or snapshots destroyed",
             "shell": "Shells that opened",
             "x": "Moat itself",
             "other": "Other"

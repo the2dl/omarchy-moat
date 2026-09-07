@@ -226,8 +226,10 @@ pub fn provenance_delta(family: &str, rule: &str, p: Provenance) -> i8 {
         return *d;
     }
     match family {
-        // An official binary reading your SSH key is still worth a look.
-        "cred" | "rootkit" | "shell" => 0,
+        // An official binary reading your SSH key is still worth a look, and
+        // /usr/bin/python encrypting your documents is not made safer by the
+        // repository that shipped python.
+        "cred" | "rootkit" | "shell" | "ransom" => 0,
         "persist" | "priv" | "exec" | "net" => -1,
         // `pkg` and `ai` userland rules are covered by RULE_DELTA above; an
         // unlisted one keeps its severity rather than being softened by default.
@@ -442,7 +444,10 @@ pub fn surface_for(sev: &str) -> &'static str {
 }
 
 fn never_lowered(f: &EventFacts) -> bool {
-    f.has_ioc || f.family == "rootkit" || NEVER_LOWERED.contains(&f.rule)
+    // `ransom` too: an interactive terminal is where a person typed `npm
+    // install`, and the payload that then encrypts ~/Documents is no less a
+    // payload for having a tty in its ancestry.
+    f.has_ioc || f.family == "rootkit" || f.family == "ransom" || NEVER_LOWERED.contains(&f.rule)
 }
 
 /// Apply provenance (§2) and context (§2b) to a base severity.
@@ -685,7 +690,7 @@ mod tests {
         for family in ["persist", "priv", "exec", "net"] {
             assert_eq!(provenance_delta(family, "moat-x", Provenance::Official), -1, "{}", family);
         }
-        for family in ["cred", "rootkit", "shell"] {
+        for family in ["cred", "rootkit", "shell", "ransom"] {
             assert_eq!(
                 provenance_delta(family, "moat-x", Provenance::Official),
                 0,
@@ -695,7 +700,7 @@ mod tests {
         }
         // Foreign / user / unknown: no change, in every row.
         for p in [Provenance::Foreign, Provenance::User, Provenance::Unknown] {
-            for family in ["cred", "persist", "priv", "exec", "net", "rootkit", "shell"] {
+            for family in ["cred", "persist", "priv", "exec", "net", "rootkit", "shell", "ransom"] {
                 assert_eq!(provenance_delta(family, "moat-x", p), 0, "{} {}", family, p);
             }
         }

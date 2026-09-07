@@ -42,3 +42,48 @@ Until then this is a **known coverage gap**, recorded in INTEGRATION.md, and not
 a regression: the previous shape (`proc_mem_open` with no mask filter) covered
 environ only in the sense that it alerted on everything and was permanently
 demoted to timeline-only, which is not coverage.
+
+## ransom-file-churn (the whole-home variant)
+
+The shipped `policies/ransom-file-churn.yaml` feeds the ransomware counter
+(`moatd/src/rules/ransom_churn.rs`: one actor reads a file and then deletes,
+renames away or empties that same file, across eight distinct files in a
+minute; or renames eight files to one shared new extension). Its scope is six
+directories -- `~/Documents`, `~/Desktop`, `~/Pictures`, `~/Videos`, `~/Music`,
+`~/Downloads`. The file here is the same policy with the scope widened to
+`{{HOME}}/`, which is what full coverage of a developer's project trees would
+take. It is not shipped, for a reason that is a number rather than a guess.
+
+The counter needs the **read half** -- every read-open under the scope, with no
+`rateLimit`, because `rateLimit` suppresses events and never counts them. Under
+the document directories that half is cheap: inotify over the same six
+directories on this desktop (164 files) saw **zero** opens, deletes or renames in
+120 s at rest on 2026-09-06, and the programs that do read them in bulk
+(thumbnailers, indexers, backup and sync clients, `rg`) are excluded in the
+kernel. Under `$HOME` it is the cost the telemetry fork was built to avoid:
+**42.3 writes/s under `$HOME` during one `npm install`, 19.2/s through a kernel
+filter of this shape** (docs/SHIPPING.md, measured 2026-09-04), and reads
+outnumber writes in a build by a wide margin. Every one of those events is a
+line in the export, a parse in moatd and a pass through every rule's `on_hook`.
+
+The false-positive surface widens with it. `Prefix` cannot say "under `$HOME`
+but not under any `node_modules`" (TETRAGON-NOTES gap 2), so the kernel would
+post every build tree's churn and moatd would cut it in userland
+(`BUILD_TREES` in the rule) -- after paying for it. And the read-then-destroy
+shape has real lookalikes in project trees that it does not have in document
+folders: `npm update` reads a package's `package.json` and removes the package,
+`cargo` and `rustc` rewrite what they just read, test suites create and delete
+fixtures they wrote a moment ago.
+
+**What it needs before it ships: a measurement, not a design.** Load this
+variant on a machine for a working day with the shipped counter, read
+`moatctl status` for the sensor's event rate and the journal for
+`moat-x-sensor-throttled`, and count how many `moat-ransom-file-churn` findings
+came out of ordinary work. If the read half stays under a few events per second
+across builds and the rule stays quiet, widen the shipped scope one directory at
+a time (`~/Projects`, `~/src`, `~/code`) rather than to `$HOME` wholesale.
+
+Until then the coverage boundary is stated in the shipped policy's `expected`,
+in `policies/README.md` under blind spots, and in the rule's own `expected`: a
+sweep that never reaches the document directories is not seen. Ransomware that
+skips a victim's documents is not ransomware anyone has written.

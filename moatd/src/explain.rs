@@ -376,6 +376,13 @@ fn what_sentence(f: &Finding) -> String {
             None => format!("{} started a shell in a place a shell should not be.", comm),
         },
         "rootkit" => format!("{} tried to load kernel code or hide itself from the system.", comm),
+        // Both ransom rules set `what_override`; this is the sentence for the
+        // kernel policy `moat-ransom-snapshot-destroy`, whose file is the
+        // recovery point being removed.
+        "ransom" => match file {
+            Some(p) => format!("{} deleted or renamed {}, part of a snapshot you would restore from.", comm, p),
+            None => format!("{} destroyed files, or the snapshots that would bring them back.", comm),
+        },
         // Telemetry is a record, not an accusation, and `engine::handle_line`
         // routes it past rule evaluation so it should never reach this
         // function at all. If it ever does — a policy renamed by hand, a

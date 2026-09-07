@@ -1,6 +1,6 @@
 # policies/ — Tetragon TracingPolicy templates
 
-42 `TracingPolicy` templates for Tetragon **v1.7.1** on Arch (kernel 7.1, BTF,
+49 `TracingPolicy` templates for Tetragon **v1.7.1** on Arch (kernel 7.1, BTF,
 `lsm=...,bpf`). One file per rule, `policies/<family>-<rule>.yaml`, policy name
 `moat-<family>-<rule>`. Everything here was written against
 `docs/TETRAGON-NOTES.md`; where the notes say something is not expressible in a
@@ -109,22 +109,28 @@ which needs no policy change and no reload.
 | `moat-cred-ssh-agent-socket` | high | `security_socket_connect` (kprobe) | Post 60s | none seen; ssh, git, ssh-add and the password-manager agents are excluded. Only covers `/tmp/ssh-*` and `$HOME` sockets — see blind spots | `matchBinaries NotPostfix`, `matchArgs Prefix` values |
 | `moat-priv-container-socket-connect` | high | `security_socket_connect` (kprobe) | Post 60s | testcontainers and other libraries that reach the socket through a language runtime rather than the `docker` CLI | `matchBinaries NotPostfix` (the container toolchain) |
 | `moat-persist-git-config-write` | high | `security_file_post_open` (kprobe) | Post 60s | git itself on clone/`git config`/fetch (excluded), TUIs and editors | `matchBinaries NotPostfix` |
+| `moat-ransom-snapshot-destroy` | critical | `security_path_unlink`, `security_path_rename`, `security_path_truncate` (kprobe) | Post 60s | you deleting a snapshot by hand under `/.snapshots`, `~/.snapshots`, `/timeshift`. snapperd, snapper's cleanup timer, timeshift, btrbk, yabsnap and btrfs-assistant are excluded. The subvolume itself dies through an ioctl this cannot see; the *commands* that do that are the userland rule `moat-ransom-snapshot-command` | `matchBinaries NotIn` (the snapshot tools) |
+| `moat-ransom-file-churn` | low (**signal**, feeds a critical userland rule) | `security_file_post_open`, `security_path_unlink`, `security_path_rename`, `security_path_truncate` (kprobe) | **Post, no rateLimit** | never on its own while `[rules] ransom_file_churn` is on: moatd owns the id and counts the events instead of raising them. Scope is ~/Documents, ~/Desktop, ~/Pictures, ~/Videos, ~/Music, ~/Downloads only. The rule's FPs: a script moving photos across filesystems, batch in-place rewriters (jpegoptim, exiftool, prettier --write) on a document folder, renaming a folder of files to a new suffix by hand | `matchBinaries NotIn` (mv/rsync/tar, toolchains, sync and backup clients, thumbnailers, `file~` editors); `[thresholds] ransom_churn_*` |
 
-Six of these are `signal` rather than `detection` (see the tier section above):
+Seven of these are `signal` rather than `detection` (see the tier section above):
 `exec-untrusted-home`, `exec-untrusted-tmpfs`, `net-first-contact`,
 `persist-desktop-entry-write`, `persist-omarchy-plugin-write`,
-`persist-omarchy-menu-extension-write`. They are recorded and correlated on;
-they do not reach the badge alone.
+`persist-omarchy-menu-extension-write`, `ransom-file-churn`. They are recorded
+and correlated on; they do not reach the badge alone. `ransom-file-churn` is the
+odd one: like `net-first-contact` it is owned by the userland rule of the same
+name, so moatd never records its individual events at all — they are input to a
+counter, and the counter is the detection.
 
-8 critical, 22 high, 12 medium, 2 low (44 **alerting** policies — 38 `detection`
-tier and the 6 `signal` ones above), plus 3
+9 critical, 22 high, 12 medium, 3 low (46 **alerting** policies — 39 `detection`
+tier and the 7 `signal` ones above), plus 3
 `moat-telemetry-*` policies which are records rather than detections and are
 rendered only when their class is on — see docs/SHIPPING.md. 4 policies carry
-`Sigkill` and 3 carry `Override` (deny); 37 are report-only. Hook load: 26 programs on the `file_post_open` path (8 as
-LSM hooks, 18 as kprobes on `security_file_post_open`), 4 on
-`security_path_unlink`, 4 on `tcp_connect`, 3 on `security_path_truncate`, 2 on
+`Sigkill` and 3 carry `Override` (deny); 39 are report-only. Hook load: 27 programs on the `file_post_open` path (8 as
+LSM hooks, 19 as kprobes on `security_file_post_open`), 6 on
+`security_path_unlink`, 4 on `tcp_connect`, 5 on `security_path_truncate`, 3 on
+`security_path_rename`, 2 on
 `security_socket_connect`, 2 on `bprm_check_security`, and one each on
-`security_path_rename`, `socket_connect`, `ptrace_access_check`, `proc_mem_open`, `bpf`,
+`socket_connect`, `ptrace_access_check`, `proc_mem_open`, `bpf`,
 `path_chmod`, `inode_setxattr`, `security_kernel_read_file`. With every
 telemetry class on that becomes 27 on the `file_post_open` path, 5 on
 `tcp_connect` and 2 on `path_chmod`. Everything added
@@ -502,3 +508,17 @@ process is shell-shaped, and only the sequence gives it away.
 * **`~/.pki/nssdb`.** Adding a certificate there is real, but browsers and
   Electron apps rewrite that database on their own schedule; the system trust
   store (`moat-rootkit-trust-store-write`) is covered instead.
+* **Ransomware outside the document directories, and the one shape inside
+  them that leaves no trace.** `moat-ransom-file-churn` watches ~/Documents,
+  ~/Desktop, ~/Pictures, ~/Videos, ~/Music and ~/Downloads. A sweep of
+  `~/Projects` alone — the build trees — is not seen, by choice: a $HOME-wide
+  read watch sits in the band of the 19-42 events/s (writes alone) that the
+  telemetry file class measured under $HOME and the telemetry fork exists to avoid, and
+  Prefix cannot say "under $HOME but not under any node_modules" (gap 2). The
+  whole-home variant is in `incubating/` with the numbers. Inside the scope, a
+  payload that opens each file O_RDWR, overwrites the bytes in place and never
+  renames, truncates or unlinks anything produces reads only; every real family
+  renames (the victim has to know which files are held), but the shape exists.
+  And a payload named `rsync` in its own directory is not excluded — the lists
+  are absolute `/usr/bin` paths for exactly that reason — but one that execs
+  the real `/usr/bin/rsync --remove-source-files` to do its moving is.
