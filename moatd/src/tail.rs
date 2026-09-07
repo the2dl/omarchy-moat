@@ -55,8 +55,11 @@ impl Tailer {
     /// Never blocks; a missing file yields an empty vector.
     ///
     /// At most `MAX_POLL_BYTES` per call: whatever is left is read by the next
-    /// poll, 200 ms later, so a burst is drained steadily instead of in one
-    /// unbounded allocation.
+    /// poll, so a burst is drained steadily instead of in one unbounded
+    /// allocation. The run loop does not sleep while polls keep returning
+    /// lines, so "the next poll" during a burst is immediate, not an interval
+    /// later -- that was true before `LogWaker` and is why the daemon keeps
+    /// pace with the sensor once it is awake.
     pub fn poll(&mut self) -> Vec<String> {
         self.reopen_if_needed();
         let Some(file) = self.file.as_mut() else {
@@ -226,5 +229,183 @@ mod tests {
         assert!(t.poll().is_empty());
         append(&p, "new\n");
         assert_eq!(t.poll(), vec!["new"]);
+    }
+}
+
+// ------------------------------------------------------------------ the waker
+
+/// Blocks until the log changes, instead of sleeping a fixed interval.
+///
+/// ## Why
+///
+/// The run loop only sleeps when a poll returned nothing, so it already keeps
+/// pace with the sensor once events are flowing -- but it starts up to one
+/// whole poll interval late. Measured end to end on this machine on
+/// 2026-09-06: **221 ms** from the eighth read-then-destroy of a ransomware
+/// sweep to the alert being recorded and SIGKILL sent, of which ~200 ms was
+/// that one sleep and ~21 ms was everything else (export write, parse,
+/// ancestry walk, rule evaluation, alert write, signal). A payload crosses the
+/// threshold well inside the interval, so the full interval was paid nearly
+/// every time -- roughly 70 more documents destroyed, at 300 files/s, than a
+/// prompt wake-up would have cost.
+///
+/// Halving the interval would have bought half of that and four times the idle
+/// wake-ups on a laptop. This buys all of it and *fewer* wake-ups than today,
+/// because the kernel says when the file changed rather than being asked five
+/// times a second.
+///
+/// ## What it watches, and why it is the directory
+///
+/// The parent directory, not the file. Tetragon rotates by rename, so a watch
+/// on the file itself follows the old inode into `tetragon.log.1` and goes
+/// quiet exactly when the log is busiest. A directory watch reports
+/// modification of the entries inside it, so it covers the writes AND the
+/// rotation that creates the next file, with no re-arming.
+///
+/// ## The wakeup that cannot be lost
+///
+/// inotify QUEUES. An event that lands between the tailer's empty poll and the
+/// wait below is already in the queue when we get there, so `poll(2)` returns
+/// immediately rather than sleeping through data that has already arrived.
+/// That ordering is the whole reason this is safe to substitute for a sleep.
+///
+/// The timeout is kept at the old poll interval, so every periodic thing the
+/// run loop does on the way round -- state writes, the feeds check, `tick` --
+/// keeps exactly the cadence it had. This only ever shortens the wait.
+pub struct LogWaker {
+    fd: libc::c_int,
+}
+
+impl LogWaker {
+    /// `None` when inotify is unavailable or the directory cannot be watched;
+    /// the caller then sleeps as before. A missing waker is slower, never
+    /// wrong.
+    pub fn new(log: &Path) -> Option<LogWaker> {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = log.parent()?;
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if fd < 0 {
+            return None;
+        }
+        let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        let wd = unsafe {
+            libc::inotify_add_watch(
+                fd,
+                c.as_ptr(),
+                libc::IN_MODIFY | libc::IN_CREATE | libc::IN_MOVED_TO,
+            )
+        };
+        if wd < 0 {
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        Some(LogWaker { fd })
+    }
+
+    /// Wait for the log to change, or for `timeout`, whichever comes first.
+    pub fn wait(&self, timeout: std::time::Duration) {
+        let mut pfd = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+        // EINTR (SIGHUP for a reload, SIGTERM on the way out) just means go
+        // round the loop, which is what the caller does next anyway.
+        if unsafe { libc::poll(&mut pfd, 1, ms) } > 0 {
+            self.drain();
+        }
+    }
+
+    /// Empty the queue, or the fd stays readable and the loop spins. The
+    /// CONTENT is irrelevant -- the tailer reads the file itself; this only
+    /// answers "has anything happened".
+    fn drain(&self) {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe {
+                libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+            };
+            if n <= 0 {
+                break;
+            }
+        }
+    }
+}
+
+impl Drop for LogWaker {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
+    }
+}
+
+#[cfg(test)]
+mod waker_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_write_wakes_it_long_before_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("tetragon.log");
+        std::fs::write(&log, "").unwrap();
+        let w = LogWaker::new(&log).expect("inotify");
+
+        let t = Instant::now();
+        std::thread::spawn({
+            let log = log.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(30));
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+                f.write_all(b"{}\n").unwrap();
+            }
+        });
+        w.wait(Duration::from_millis(2000));
+        let waited = t.elapsed();
+        assert!(
+            waited < Duration::from_millis(1000),
+            "a write must wake it, not the timeout: waited {:?}",
+            waited
+        );
+    }
+
+    #[test]
+    fn a_quiet_log_waits_the_whole_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("tetragon.log");
+        std::fs::write(&log, "").unwrap();
+        let w = LogWaker::new(&log).expect("inotify");
+
+        let t = Instant::now();
+        w.wait(Duration::from_millis(150));
+        let waited = t.elapsed();
+        assert!(
+            waited >= Duration::from_millis(140),
+            "nothing happened, so the cadence the run loop relies on must hold: {:?}",
+            waited
+        );
+    }
+
+    /// The queue is why this can replace a sleep without losing an event that
+    /// arrived while we were not looking.
+    #[test]
+    fn an_event_that_arrived_before_the_wait_does_not_sleep() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("tetragon.log");
+        std::fs::write(&log, "").unwrap();
+        let w = LogWaker::new(&log).expect("inotify");
+
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        f.write_all(b"{}\n").unwrap();
+        drop(f);
+
+        let t = Instant::now();
+        w.wait(Duration::from_millis(2000));
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "inotify queues: a write before the wait must return at once"
+        );
     }
 }

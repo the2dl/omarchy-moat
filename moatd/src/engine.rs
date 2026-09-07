@@ -4507,6 +4507,18 @@ pub fn run(daemon: Arc<Mutex<Daemon>>, opts: RunOptions) {
         )
     };
     let mut tailer = Tailer::new(&log_path, opts.from_start);
+    // Wake on the log changing rather than five times a second regardless.
+    // `None` (no inotify, unwatchable directory) falls back to the sleep this
+    // replaces: slower, never wrong. See `tail::LogWaker` for the 221 ms this
+    // came out of.
+    let waker = crate::tail::LogWaker::new(&log_path);
+    if waker.is_none() {
+        log::warn!(
+            "could not watch {} for changes; falling back to polling every {} ms",
+            log_path.display(),
+            opts.poll.as_millis()
+        );
+    }
     let mut last_state = 0u64;
     let mut last_feeds = util::unix_secs();
     let mut idle_polls = 0u32;
@@ -4573,7 +4585,13 @@ pub fn run(daemon: Arc<Mutex<Daemon>>, opts: RunOptions) {
                 d.write_state();
                 break;
             }
-            std::thread::sleep(opts.poll);
+            // Bounded by `opts.poll` either way, so every periodic thing
+            // above -- state writes, the feeds check, `tick` -- keeps the
+            // cadence it had. This only ever shortens the wait.
+            match &waker {
+                Some(w) => w.wait(opts.poll),
+                None => std::thread::sleep(opts.poll),
+            }
         }
     }
 }
