@@ -307,6 +307,20 @@ Rectangle {
                             onClicked: root.closeIt(root.incident ? root.incident.id : "")
                         }
 
+                        // The whole record, shaped like `moatctl explain`, so
+                        // a blocked card can be quoted into a bug report or an
+                        // agent. The panel is a popup and cannot be selected
+                        // with a mouse, so without this the text is trapped.
+                        Button {
+                            text: "Copy alert"
+                            foreground: root.t ? root.t.dimmer : "grey"
+                            fontSize: root.t ? root.t.fSecondary : 12
+                            onClicked: {
+                                if (root.service && root.head)
+                                    root.service.copyText(Model.alertAsText(root.head), "alert");
+                            }
+                        }
+
                         Button {
                             text: "Copy the command to re-run"
                             foreground: root.t ? root.t.dimmer : "grey"

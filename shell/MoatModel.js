@@ -4200,3 +4200,88 @@ function blockTranscript(alert) {
     cwd: shortenHome(String(process.cwd || ""))
   }
 }
+
+// ----------------------------------------------------------- copy an alert
+//
+// The panel could not be selected with a mouse, so there was no way to get an
+// alert OUT of it: not into a bug report, not into a message, not into an
+// agent you are already talking to. Mouse selection is the obvious answer and
+// the wrong one here -- this is a Quickshell popup, a click-drag across it is
+// as likely to dismiss it as to select anything, and a half-selected card
+// pastes as a soup of labels and values with no structure.
+//
+// So: copy the WHOLE record, shaped the way `moatctl explain` shapes it. That
+// is the text a person already recognises, it survives being pasted anywhere,
+// and it is the same thing whether it came from the terminal or the panel.
+// Nothing is summarised away -- the evidence lines are what make an alert
+// arguable, and an alert you cannot argue with is one you can only obey.
+function alertAsText(a) {
+    if (!a || !a.id)
+        return "";
+    var L = [];
+    var ex = a.explain || {};
+    var p = a.process || {};
+
+    L.push(String(a.title || a.rule || "moat alert"));
+    L.push(new Array(String(a.title || a.rule || "moat alert").length + 1).join("="));
+    L.push(String(a.rule || "") + " (" + String(a.severity || "") + ")   "
+           + String(a.ts || "") + "   alert " + String(a.id));
+    L.push("");
+
+    if (ex.what) {
+        L.push("WHAT HAPPENED");
+        L.push("  " + String(ex.what));
+    }
+    if (p.exe)
+        L.push("  process: " + String(p.exe)
+               + (p.pid ? " (pid " + p.pid + (p.uid !== undefined ? ", uid " + p.uid : "") + ")" : ""));
+    if (p.args)
+        L.push("  args:    " + String(p.args));
+    if (p.cwd)
+        L.push("  cwd:     " + String(p.cwd));
+    var anc = p.ancestry;
+    if (anc && anc.length)
+        L.push("  parents: " + anc.map(function (x) {
+            return typeof x === "string" ? x : String(x.exe || "");
+        }).join(" -> "));
+    if (a.mode || a.action_taken)
+        L.push("  mode:    " + String(a.mode || "") + "   action taken: " + String(a.action_taken || "none"));
+
+    if (a.chain) {
+        L.push("");
+        L.push("THIS IS PART OF A SEQUENCE");
+        L.push("  " + String(a.chain.summary || ""));
+        if (a.chain.severity_reason)
+            L.push("  " + String(a.chain.severity_reason));
+    }
+
+    if (ex.why) {
+        L.push("");
+        L.push("WHY IT WAS FLAGGED");
+        L.push("  " + String(ex.why));
+    }
+
+    var ev = ex.evidence;
+    if (ev && ev.length) {
+        L.push("");
+        L.push("EVIDENCE");
+        for (var i = 0; i < ev.length; i++)
+            L.push("  - " + String(ev[i]));
+    }
+
+    if (ex.if_expected) {
+        L.push("");
+        L.push("IF THIS IS EXPECTED");
+        L.push("  " + String(ex.if_expected));
+    }
+
+    // The suppression and the answer are part of the record: a reader who is
+    // told "this fired" and not "and a rule you wrote silenced it" has been
+    // given half the story.
+    if (a.suppressed_by)
+        L.push("", "suppressed by: " + String(a.suppressed_by));
+    if (a.acked)
+        L.push("answered: yes");
+
+    return L.join("\n") + "\n";
+}

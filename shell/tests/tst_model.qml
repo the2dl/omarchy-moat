@@ -3970,4 +3970,49 @@ TestCase {
     var bareResult = Model.ingestText(bare, current, {})
     compare(bareResult.alerts.length, 2)
   }
+  // The panel is a popup: a click-drag across it is as likely to dismiss it as
+  // to select anything, so the record has to leave by a button. What it copies
+  // is the WHOLE alert, shaped like `moatctl explain`, because an alert you
+  // cannot quote is one you can only obey.
+  function test_alertAsText_carries_the_whole_record() {
+    var a = {
+      id: "01ALERT", rule: "moat-cred-ssh-private-key-read", severity: "critical",
+      ts: "2026-09-07T13:00:00.000Z", title: "A program read your SSH key",
+      mode: "enforce", action_taken: "blocked",
+      process: { exe: "/usr/bin/curl", pid: 42, uid: 1000, args: "-fsSL http://x",
+                 cwd: "/home/u", ancestry: [{ exe: "/usr/bin/bash" }] },
+      explain: {
+        what: "curl read a private key.",
+        why: "Nothing but ssh should read that file.",
+        evidence: ["hook: file_post_open", "actor: unknown"],
+        if_expected: "Rarely."
+      },
+      suppressed_by: "user.toml#3", acked: true
+    }
+    var text = Model.alertAsText(a)
+
+    // The identity, so a reader can go and look it up.
+    verify(text.indexOf("01ALERT") >= 0, "the id travels with it")
+    verify(text.indexOf("moat-cred-ssh-private-key-read") >= 0)
+    verify(text.indexOf("critical") >= 0)
+
+    // The story.
+    verify(text.indexOf("curl read a private key.") >= 0)
+    verify(text.indexOf("/usr/bin/curl") >= 0)
+    verify(text.indexOf("pid 42") >= 0)
+    verify(text.indexOf("/usr/bin/bash") >= 0, "ancestry is rendered, not dropped")
+
+    // The evidence lines are the point: they are what make an alert arguable.
+    verify(text.indexOf("hook: file_post_open") >= 0)
+    verify(text.indexOf("actor: unknown") >= 0)
+
+    // And the two facts a half-told alert leaves out.
+    verify(text.indexOf("blocked") >= 0, "what moat DID is part of the record")
+    verify(text.indexOf("user.toml#3") >= 0, "so is the rule that silenced it")
+
+    // Nothing to copy is not a crash.
+    compare(Model.alertAsText(null), "")
+    compare(Model.alertAsText({}), "")
+  }
+
 }

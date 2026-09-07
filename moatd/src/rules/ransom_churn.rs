@@ -545,7 +545,33 @@ fn evaluate(actor: &Actor, threshold: usize) -> Option<Shape> {
         }
     }
     let (ext, group) = by_ext.into_iter().max_by_key(|(_, g)| g.len())?;
+
+    // An ATOMIC SAVE is `X.tmp.<junk> -> X`: the source is the destination plus
+    // a suffix, so the rename REMOVES one. Encryption never does that -- it
+    // adds. Dropping these first, because everything below counts what is left.
+    //
+    // 2026-09-07: Claude Code writing this very file produced
+    //   engine.rs.tmp.2618517.0ee784baa176 -> engine.rs
+    // eight times in 56 s and was reported `high`. Every editor, formatter and
+    // agent on the machine writes this way.
+    let group: Vec<&Destroyed> = group
+        .into_iter()
+        .filter(|d| {
+            let new = d.new_path.as_deref().map(basename).unwrap_or("");
+            let old = basename(&d.path);
+            !(!new.is_empty() && old.len() > new.len() && old.starts_with(new))
+        })
+        .collect();
     if group.len() < threshold {
+        return None;
+    }
+    // And count DESTINATIONS, not sources. Eight renames onto one path is one
+    // file saved eight times; ransomware leaves N distinct encrypted files. The
+    // sources were distinct here only because each temp name carried a random
+    // suffix -- which is also what made them look like "many kinds" to the
+    // variety test below.
+    let dests: BTreeSet<&str> = group.iter().filter_map(|d| d.new_path.as_deref()).collect();
+    if dests.len() < threshold {
         return None;
     }
     // The variety test. Files of several kinds became files of one kind, or a
@@ -1015,6 +1041,46 @@ mod tests {
             let p = format!("/home/dan/Pictures/cat-{}.jpeg", i);
             assert!(fire(&mut rule, &t, &c, &rename(&p, &format!("/home/dan/Pictures/cat-{}.jpg", i)), "e-node", 950).is_empty());
         }
+    }
+
+    /// The real 2026-09-07 false positive: an agent's atomic writes.
+    ///
+    /// `engine.rs.tmp.<pid>.<random> -> engine.rs`, eight times in 56 s, was
+    /// reported `high`. Two things fooled it, and both are fixed: the random
+    /// temp suffixes read as eight different "extensions" so the variety test
+    /// passed, and eight renames onto ONE destination counted as eight files.
+    #[test]
+    fn an_agents_atomic_writes_to_one_file_are_not_homogenisation() {
+        let t = table();
+        let c = cfg();
+        let mut rule = RansomChurn::default();
+        let mut out = Vec::new();
+        for i in 0..12 {
+            let from = format!("/home/dan/Documents/engine.rs.tmp.2618517.{:012x}", i * 7919);
+            out.extend(fire(&mut rule, &t, &c, &rename(&from, "/home/dan/Documents/engine.rs"), "e-node", 100));
+        }
+        assert!(
+            out.is_empty(),
+            "one file saved twelve times is not twelve files encrypted: {:?}",
+            out.first().map(|f| f.what_override.clone())
+        );
+    }
+
+    /// The same shape must still fire when the destinations really are many:
+    /// this is what stops the fix above from being a hole.
+    #[test]
+    fn homogenisation_to_many_distinct_destinations_still_fires() {
+        let t = table();
+        let c = cfg();
+        let mut rule = RansomChurn::default();
+        let mut out = Vec::new();
+        for i in 0..12 {
+            let from = format!("/home/dan/Documents/report-{}.{}", i, if i % 2 == 0 { "pdf" } else { "docx" });
+            let to = format!("{}.locked", from);
+            out.extend(fire(&mut rule, &t, &c, &rename(&from, &to), "e-node", 100));
+        }
+        assert_eq!(out.len(), 1, "twelve different documents, one new suffix: still a sweep");
+        assert_eq!(out[0].meta.severity, "high");
     }
 
     #[test]

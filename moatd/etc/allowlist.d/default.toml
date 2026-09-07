@@ -161,3 +161,56 @@ file   = "*/.aws/*"
 name   = "moat-cred-cloud-credentials-read"
 script = "/usr/bin/ansible-playbook"
 file   = "*/.aws/*"
+
+# ------------------------------------------------- package caches are not $HOME
+#
+# A persist rule asks "did something arrange to run again". That question is
+# about a place your session will later EXECUTE: ~/.bashrc, a repo's real
+# .git/hooks, ~/.config/systemd/user. It is not about a package manager
+# unpacking a tarball into its own cache, and the two look identical from the
+# kernel: a write, to a file with a persistence-shaped name.
+#
+# 2026-09-07, live, all from building this very project:
+#   moat-persist-git-hook-write      ~/.cargo/registry/src/sharded-slab-0.1.7/.envrc
+#   moat-persist-agent-config-write  ~/.claude/plugins/marketplaces/.../.mcp.json
+# cargo unpacked a crate that ships a .envrc; git cloned a plugin catalog whose
+# repo CONTENT is .mcp.json files. Nothing will ever execute either path --
+# direnv does not load the cargo registry, and a marketplace clone is a
+# catalogue, not config. Together they escalated a cargo build to a CRITICAL
+# chain ("the sequence ended by arranging to run again") 50 times.
+#
+# These are suppressions, not deletions: the rows are still recorded and still
+# show in the timeline, greyed, so nothing goes silent. Writing to the same
+# NAMES anywhere real -- your home, a repo you work in -- still fires.
+
+# Crates are tarballs; some of them ship a .envrc or a hook.
+[[rule]]
+name = "moat-persist-git-hook-write"
+file = "*/.cargo/registry/src/*"
+
+# The same registry when cargo is installed system-wide (rustup in /usr/local).
+[[rule]]
+name = "moat-persist-git-hook-write"
+file = "/usr/local/cargo/registry/src/*"
+
+# Go's module cache, which is likewise extracted source.
+[[rule]]
+name = "moat-persist-git-hook-write"
+file = "*/go/pkg/mod/*"
+
+# node_modules is extracted source too, at any depth.
+[[rule]]
+name = "moat-persist-git-hook-write"
+file = "*/node_modules/*"
+
+# A cloned plugin CATALOGUE. The operative config lives above this directory;
+# what is inside a marketplace clone is repo content, written by `git checkout`.
+[[rule]]
+name = "moat-persist-agent-config-write"
+file = "*/.claude/plugins/marketplaces/*"
+
+# npm's content-addressed cache: extracted package payloads, never executed
+# from there.
+[[rule]]
+name = "moat-persist-agent-config-write"
+file = "*/.npm/_cacache/*"

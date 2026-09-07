@@ -137,6 +137,25 @@ Rectangle {
                     onClicked: root.copyBundleRequested(root.alert ? root.alert.id : "")
                 }
 
+                // The panel cannot be selected with a mouse -- it is a popup,
+                // and a click-drag across it is as likely to dismiss it as to
+                // select anything -- so until now there was no way to get an
+                // alert OUT of here: not into a bug report, not into a message,
+                // not into an agent you are already talking to. This copies the
+                // WHOLE record, shaped the way `moatctl explain` shapes it, so
+                // it is the same text whether it came from the terminal or the
+                // panel, and the evidence lines come with it. An alert you
+                // cannot quote is one you can only obey.
+                Button {
+                    text: "Copy alert"
+                    foreground: root.t ? root.t.dimmer : "grey"
+                    fontSize: root.t ? root.t.fMeta : 11
+                    onClicked: {
+                        if (root.service && root.alert)
+                            root.service.copyText(Model.alertAsText(root.alert), "alert");
+                    }
+                }
+
             }
 
         }
