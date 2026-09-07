@@ -5533,7 +5533,7 @@ mod tests {
             } else {
                 f.hook = "file_post_open".into();
                 f.file = Some(crate::alert::FileRef {
-                    path: "/home/dan/.npmrc".into(),
+                    path: "/home/dan/.npmrc-no-such-fixture".into(),
                     sha256: None,
                 });
             }

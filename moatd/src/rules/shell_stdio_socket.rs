@@ -236,11 +236,45 @@ struct StdioSocket {
     row: Option<SocketRow>,
 }
 
+/// Was the socket simply GONE by the time we looked, rather than hidden from us?
+///
+/// An unresolvable inode has two causes and they deserve opposite answers:
+///
+/// * **It closed.** A reverse shell's socket stays open -- somebody is typing
+///   into it; that is the whole point. A socket that has already gone is not a
+///   live reverse shell, and treating it as one fires `critical` on every
+///   short-lived `sh -c` whose stdio was a socketpair. Measured on this machine
+///   2026-09-07: Claude Code's statusline spawns exactly that shape, 870 times
+///   since 2026-09-03, and every one produced a critical false positive because
+///   the pair closed inside the read window.
+/// * **It is in another network namespace.** A shell in a container can have a
+///   live network socket that never appears in the host's `/proc/net`. Here we
+///   genuinely cannot tell, and the finding must stand.
+///
+/// So: same namespace as moatd means `/proc/net` WAS authoritative and the
+/// socket is gone. A process that has exited is likewise no longer a live
+/// anything. If our own namespace cannot be read -- a synthetic proc root in a
+/// test, a stripped container -- nothing is proven and the finding stands,
+/// which keeps the conservative default where the evidence is absent.
+fn socket_is_gone_not_hidden(root: &Path, pid: u32) -> bool {
+    let ours = std::fs::read_link(root.join("self").join("ns").join("net"));
+    let Ok(ours) = ours else {
+        return false; // cannot prove anything; keep the finding
+    };
+    match std::fs::read_link(root.join(pid.to_string()).join("ns").join("net")) {
+        // Same namespace: /proc/net was the right place to look, and it was not
+        // there, so it closed.
+        Ok(theirs) => theirs == ours,
+        // The process is gone. A dead shell is not a live reverse shell.
+        Err(_) => true,
+    }
+}
+
 impl StdioSocket {
     /// `None` when no fd in 0/1/2 is a socket, or when the only socket there is
     /// a unix socket (journald's stdout, a service's own control socket): not
     /// this rule, and saying so out loud is the point of the comment.
-    fn find(root: &Path, targets: &[(u32, Target)]) -> Option<StdioSocket> {
+    fn find(root: &Path, pid: u32, targets: &[(u32, Target)]) -> Option<StdioSocket> {
         let sockets: Vec<(u32, u64)> = targets
             .iter()
             .filter_map(|(fd, t)| match t {
@@ -261,6 +295,16 @@ impl StdioSocket {
             .copied()
             .unwrap_or(sockets[0]);
         if !net.contains_key(&chosen.1) && is_unix_socket(root, chosen.1) {
+            return None;
+        }
+        // Neither a network socket nor a unix one: it resolved nowhere. Drop it
+        // only when we can PROVE it is gone rather than hidden -- see
+        // `socket_is_gone_not_hidden`. This overturns a deliberate earlier
+        // choice (`an_unresolvable_socket_inode_is_still_critical`), on the
+        // evidence that the choice fires critical on every short-lived shell
+        // with a socketpair on stdio and never on a real reverse shell, whose
+        // socket is by definition still open.
+        if !net.contains_key(&chosen.1) && socket_is_gone_not_hidden(root, pid) {
             return None;
         }
         Some(StdioSocket {
@@ -322,7 +366,8 @@ impl StdioSocket {
 impl ShellStdioSocket {
     /// Rung 1: the shell's own stdio is a network socket.
     fn direct(&self, exec_id: &str, ctx: &RuleCtx, targets: &[(u32, Target)]) -> Option<Finding> {
-        let sock = StdioSocket::find(&self.proc_root, targets)?;
+        let me = ctx.table.get(exec_id)?;
+        let sock = StdioSocket::find(&self.proc_root, me.pid, targets)?;
         let severity = sock.severity();
         let mut f = ctx.finding(ID, self.meta(), exec_id)?;
         f.meta.severity = severity.to_string();
@@ -374,7 +419,7 @@ impl ShellStdioSocket {
         }
         let parent = ctx.table.ancestry(exec_id).first().copied()?.clone();
         let ptargets = stdio_targets(&self.proc_root, parent.pid)?;
-        let sock = StdioSocket::find(&self.proc_root, &ptargets)?;
+        let sock = StdioSocket::find(&self.proc_root, parent.pid, &ptargets)?;
 
         let mut f = ctx.finding(ID, self.meta(), exec_id)?;
         f.meta.severity = "high".into();
@@ -678,6 +723,48 @@ mod tests {
             !f[0].request_kill,
             "monitor mode never kills, and an unidentified peer never kills"
         );
+    }
+
+    /// The Claude Code statusline case, and the reason the rule above was
+    /// overturned: a short-lived `sh -c` whose stdio was a socketpair, in
+    /// moatd's own network namespace, whose socket closed before we looked.
+    /// `/proc/net` was authoritative and the inode was not in it, so it is
+    /// gone -- and a reverse shell's socket, by definition, is not.
+    #[test]
+    fn a_socket_that_closed_in_our_own_namespace_is_not_a_reverse_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        proc_root(dir.path());
+        fds(dir.path(), 5100, "socket:[99999]", "/dev/null", "/dev/null");
+        // Both moatd and the shell are in the same netns.
+        for who in ["self", "5100"] {
+            let ns = dir.path().join(who).join("ns");
+            std::fs::create_dir_all(&ns).unwrap();
+            symlink("net:[4026531840]", ns.join("net")).unwrap();
+        }
+        assert!(
+            run(dir.path(), &table(), "e-bash", "monitor").is_empty(),
+            "an inode that resolved nowhere, in our own namespace, has closed"
+        );
+    }
+
+    /// The case that must keep firing: a shell in ANOTHER network namespace can
+    /// hold a live socket that never appears in the host's /proc/net, so an
+    /// unresolvable inode there proves nothing and the finding stands.
+    #[test]
+    fn a_socket_in_another_namespace_is_still_critical() {
+        let dir = tempfile::tempdir().unwrap();
+        proc_root(dir.path());
+        fds(dir.path(), 5100, "socket:[99999]", "/dev/null", "/dev/null");
+        let mine = dir.path().join("self").join("ns");
+        std::fs::create_dir_all(&mine).unwrap();
+        symlink("net:[4026531840]", mine.join("net")).unwrap();
+        let theirs = dir.path().join("5100").join("ns");
+        std::fs::create_dir_all(&theirs).unwrap();
+        symlink("net:[4026532999]", theirs.join("net")).unwrap();
+
+        let f = run(dir.path(), &table(), "e-bash", "monitor");
+        assert_eq!(f.len(), 1, "a container shell's socket is not visible to us");
+        assert_eq!(f[0].meta.severity, "critical");
     }
 
     #[test]
