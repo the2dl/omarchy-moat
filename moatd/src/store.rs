@@ -91,6 +91,24 @@ pub struct AlertStore {
     cache: Mutex<Option<Cache>>,
 }
 
+/// What collapses into one thing to decide about, mirroring the panel's
+/// `incidentKey`: a chain is one story however many steps it has; otherwise one
+/// detection by one program is one decision however many times it repeats.
+///
+/// The program is the interpreter's SCRIPT when there is one, so `gcloud` and
+/// `some-other.py` do not merge just because both ran through python3.
+fn incident_key(a: &Alert) -> String {
+    if let Some(chain) = a.chain.as_ref() {
+        if !chain.id.is_empty() {
+            return format!("chain\u{1}{}", chain.id);
+        }
+    }
+    let script = a.actor.script.as_deref().unwrap_or("");
+    let exe = if script.is_empty() { a.process.exe.as_str() } else { script };
+    let program = exe.rsplit('/').next().unwrap_or(exe);
+    format!("{}\u{1}{}", a.rule, program)
+}
+
 impl AlertStore {
     pub fn open(
         path: &Path,
@@ -448,13 +466,28 @@ impl AlertStore {
     ///   "recorded" can be read as "how much of this is scaffolding".
     pub fn ledger(&self) -> Ledger {
         let mut l = Ledger::default();
+        // `needs_you` counts THINGS TO DECIDE ABOUT, not rows.
+        //
+        // A chain that reaches `high` re-stamps every trigger member onto the
+        // badge (`engine::note_chain`), because a sequence whose every step is
+        // a building block still has to be findable -- the 2026-09-04 AUR case.
+        // The side effect is that one finding arrives as N rows. Measured
+        // 2026-09-07: `needs you 30` against five chains and nine loose alerts,
+        // while the panel -- which groups by chain, then by (rule, program) --
+        // showed 6 and was right. Two numbers for one question, and the bigger
+        // one is the one that makes a person stop reading.
+        //
+        // So this counts the same groups the panel does. The severity
+        // breakdown printed beneath it still counts rows, which is what a
+        // severity breakdown is for.
+        let mut queued: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         self.with_fold(|c| {
             for a in c.map.values() {
                 if a.is_suppressed() {
                     l.suppressed += 1;
                 } else if a.surface == "alerts" {
                     if !a.acked {
-                        l.needs_you += 1;
+                        queued.insert(incident_key(a));
                     }
                 } else {
                     l.recorded += 1;
@@ -464,6 +497,7 @@ impl AlertStore {
                 }
             }
         });
+        l.needs_you = queued.len() as u64;
         l
     }
 }
@@ -778,6 +812,71 @@ mod tests {
     /// badge of 13. Nothing here filters anything — it names what is already
     /// there.
     #[test]
+    /// `needs_you` counts THINGS TO DECIDE ABOUT, not rows.
+    ///
+    /// 2026-09-07: a chain that reaches `high` re-stamps every trigger member
+    /// onto the badge, so five chains and nine loose alerts read as
+    /// `needs you 30` while the panel -- which groups by chain, then by (rule,
+    /// program) -- showed 6. Two numbers for one question, and the bigger one
+    /// is the one that makes a person stop reading.
+    #[test]
+    fn needs_you_counts_decisions_not_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store(dir.path(), 1 << 20);
+
+        // Nine steps of ONE chain, all raised onto the badge as the daemon
+        // raises them.
+        for i in 0..9 {
+            let mut a = demo_alert(&format!("01C0000000000000000000000{}", i));
+            a.surface = "alerts".into();
+            a.acked = false;
+            a.chain = Some(crate::chain::Chain {
+                v: 1,
+                id: "01CHAIN".into(),
+                ancestor: crate::alert::Ancestor { pid: 9000, exe: "/usr/bin/bash".into() },
+                families: vec!["net".into()],
+                severity: "high".into(),
+                severity_base: "medium".into(),
+                severity_reason: "r".into(),
+                first_ts: crate::util::now_rfc3339(),
+                last_ts: crate::util::now_rfc3339(),
+                span_secs: 1,
+                steps: vec![],
+                steps_total: 9,
+                truncated: false,
+                members: Vec::new(),
+                triggers_total: 9,
+                summary: "s".into(),
+            });
+            s.append_alert(&a).unwrap();
+        }
+        // Sixty-eight repeats of one detection by one program.
+        for i in 0..68 {
+            let mut a = demo_alert(&format!("01R{:022}", i));
+            a.surface = "alerts".into();
+            a.acked = false;
+            a.rule = "moat-exec-untrusted-home".into();
+            a.process.exe = "/usr/bin/npm".into();
+            s.append_alert(&a).unwrap();
+        }
+        // And one unrelated thing.
+        let mut other = demo_alert("01Z0000000000000000000000A");
+        other.surface = "alerts".into();
+        other.acked = false;
+        other.rule = "moat-cred-ssh-private-key-read".into();
+        other.process.exe = "/usr/bin/cat".into();
+        s.append_alert(&other).unwrap();
+
+        assert_eq!(
+            s.ledger().needs_you,
+            3,
+            "one chain, one repeated detection, one other = three decisions"
+        );
+        // The severity breakdown still counts ROWS: that is what it is for.
+        let rows: u64 = s.unacked().values().sum();
+        assert_eq!(rows, 78, "78 rows behind those three decisions");
+    }
+
     fn the_ledger_splits_the_file_into_needs_you_recorded_and_suppressed() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = store(dir.path(), 1 << 20);
