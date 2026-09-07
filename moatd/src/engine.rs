@@ -1438,6 +1438,16 @@ impl Daemon {
             .names()
             .into_iter()
             .filter(|n| self.mode_for(n) == "enforce")
+            // A userland rule enforces HERE, not in the kernel, even when a
+            // policy of the same name exists -- `moat-ransom-file-churn`'s
+            // policy is its own `tier: signal` event feed and carries no
+            // enforcement, so `tetra tp set-mode` on it fails for ever
+            // ("cannot set policy mode on a policy that is monitor only") and
+            // this tick reported the failure as a protection that had been
+            // weakened, once a minute, unsilenceably. See the note in
+            // `control::cmd_set_mode`. The armed set is unchanged; this is only
+            // about what the KERNEL is asked to do.
+            .filter(|n| !self.armable_userland_rules().iter().any(|m| &m.name == n))
             .collect()
     }
 

@@ -1747,7 +1747,43 @@ fn set_mode(d: &mut Daemon, value: &str, rule: &str, who: &str) -> Value {
         }
         vec![rule.to_string()]
     };
-    let in_kernel = |name: &String| all.contains(name);
+    // "The kernel has a policy of this name" is NOT the same question as "the
+    // kernel has something of this name it can arm".
+    //
+    // 2026-09-06: `moat-ransom-file-churn` is a userland rule whose kernel
+    // policy of the SAME name is its `tier: signal` event feed -- Post only, no
+    // enforcement action, because `engine::rule_owns` matches the two by
+    // identical name. Arming it ran `tetra tp set-mode` on that feed, and
+    // tetragon answered, correctly, "cannot set policy mode on a policy that is
+    // monitor only". moatd read that as enforcement that did not take: an ERROR
+    // every 60 s for ever, a permanent `*** NOT ARMED IN KERNEL ***` on the
+    // status line, and a `moat-x-protection-changed` alert claiming a
+    // protection had been WEAKENED -- which is in NEVER_SILENCE, so it could
+    // not even be dismissed. All of it false: the rule was armed, in the
+    // daemon, where its enforcement lives.
+    //
+    // A policy that declares no enforcement cannot be armed in the kernel, so
+    // do not ask it to be. That is the general form of the same bug for any
+    // future signal policy that shares its name with the rule it feeds.
+    // "The kernel has a policy of this name" was standing in for "this is not a
+    // userland rule", and those stopped being the same question on 2026-09-06.
+    //
+    // `moat-ransom-file-churn` is a userland rule whose kernel policy of the
+    // SAME name is its `tier: signal` event feed -- Post only, no enforcement
+    // action, because `engine::rule_owns` matches the two by identical name.
+    // Arming it ran `tetra tp set-mode` on that feed, and tetragon answered,
+    // correctly, "cannot set policy mode on a policy that is monitor only".
+    // moatd read that as enforcement that did not take: an ERROR every 60 s, a
+    // permanent `*** NOT ARMED IN KERNEL ***` on the status line, and a
+    // `moat-x-protection-changed` alert claiming a protection had been
+    // WEAKENED -- which NEVER_SILENCE meant could not even be dismissed. All of
+    // it false. The rule was armed the whole time, in the daemon, which is
+    // where its enforcement lives.
+    //
+    // So ask the question the comment below always meant: is this a rule that
+    // enforces in this process? A name can now be both.
+    let userland_set: std::collections::BTreeSet<String> = userland.iter().cloned().collect();
+    let in_kernel = |name: &String| all.contains(name) && !userland_set.contains(name);
 
     let mut applied = Vec::new();
     let mut failed = Vec::new();
@@ -3486,6 +3522,59 @@ mod tests {
         // The daemon-wide switch still governs everything that is not armed.
         d.mode = "enforce".into();
         assert_eq!(d.mode_for(other), "enforce");
+    }
+
+    /// A `tier: signal` policy that shares its name with the userland rule it
+    /// feeds must never be pushed at the kernel.
+    ///
+    /// 2026-09-06, live: arming `moat-ransom-file-churn` ran `tetra tp set-mode`
+    /// on its own event feed, tetragon answered "cannot set policy mode on a
+    /// policy that is monitor only", and moatd reported that as enforcement
+    /// that did not take -- an ERROR every 60 s, a permanent `*** NOT ARMED IN
+    /// KERNEL ***`, and a `moat-x-protection-changed` alert saying a protection
+    /// had been WEAKENED, which NEVER_SILENCE meant could not be dismissed. The
+    /// rule was armed correctly the whole time, in the daemon.
+    #[test]
+    fn a_userland_rule_sharing_its_name_with_a_signal_policy_is_not_pushed_at_the_kernel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        // The case that broke: a name that is BOTH a loaded kernel policy and
+        // an armable userland rule. That is `moat-ransom-file-churn` -- the
+        // rule enforces here, its same-named policy is only its event feed.
+        let names = d.policies.names();
+        let rule = match d
+            .armable_userland_rules()
+            .into_iter()
+            .map(|m| m.name)
+            .find(|n| names.contains(n))
+        {
+            Some(r) => r,
+            // Built from a source tree without policies/; nothing to assert.
+            None => return,
+        };
+        assert_eq!(
+            d.policies.get(&rule).map(|m| m.enforce.clone()),
+            Some("none".to_string()),
+            "the feed policy must declare no enforcement; that is why the kernel refuses it"
+        );
+
+        let r = dispatch(
+            &mut d,
+            &json!({"cmd":"set","key":"mode","value":"enforce","rule":rule}),
+        );
+        // tetra is absent in tests. An enforceable policy would fail here (see
+        // the test below); this one must not even be offered to it.
+        assert_eq!(r["ok"], true, "arming must succeed: {:?}", r["error"]);
+        assert_eq!(r["applied"], 1);
+        assert_eq!(r["tetra_applied"], false, "the kernel was never asked");
+        assert!(d.enforcing_rules.contains(&rule));
+
+        // And the re-arm tick must not keep asking for it either, which is what
+        // produced the false "protection was weakened" every minute.
+        assert!(
+            !d.enforcement_to_apply().contains(&rule),
+            "a monitor-only policy must never be in the set pushed at the kernel"
+        );
     }
 
     /// Enforcement has to be arm-able one rule at a time. Seven shipped
