@@ -4286,10 +4286,34 @@ function alertAsText(a) {
             L.push("  - " + String(ev[i]));
     }
 
-    if (ex.if_expected) {
+    // `if_expected` is NOT prose -- it is {hint, options:[{scope, cmd, line}]}.
+    // Stringifying it printed "[object Object]", which is what the very first
+    // copied alert showed. The prose lives in `expected`; these are the
+    // commands, and they are the most useful lines in the whole record to have
+    // on a clipboard, because they are the thing you actually go and run.
+    var expectedProse = ex.expected ? String(ex.expected) : "";
+    var ie = ex.if_expected || {};
+    var opts = ie.options || [];
+    if (expectedProse || opts.length) {
         L.push("");
         L.push("IF THIS IS EXPECTED");
-        L.push("  " + String(ex.if_expected));
+        if (expectedProse)
+            L.push("  " + expectedProse);
+        if (ie.hint)
+            L.push("  (recommended scope: " + String(ie.hint) + ")");
+        for (var k = 0; k < opts.length; k++) {
+            var o = opts[k] || {};
+            if (!o.cmd)
+                continue;
+            L.push("");
+            L.push("  * " + String(o.cmd));
+            var line = String(o.line || "").replace(/\n+$/, "");
+            if (line) {
+                var parts = line.split("\n");
+                for (var q = 0; q < parts.length; q++)
+                    L.push("      " + parts[q]);
+            }
+        }
     }
 
     // The suppression and the answer are part of the record: a reader who is

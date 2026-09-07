@@ -4043,4 +4043,29 @@ TestCase {
     compare(Model.alertAsText({}), "")
   }
 
+  // The first alert ever copied out of the panel printed "[object Object]":
+  // `if_expected` is {hint, options:[{scope, cmd, line}]}, not prose. The
+  // commands in it are the most useful lines on the clipboard, because they are
+  // what you go and run.
+  function test_alertAsText_renders_the_ignore_commands() {
+    var a = {
+      id: "01ALERT", rule: "moat-exec-untrusted-home", severity: "medium",
+      explain: {
+        what: "something ran.",
+        expected: "A build you started yourself.",
+        if_expected: {
+          hint: "exe",
+          options: [{ scope: "exe", cmd: "moatctl ignore 01ALERT --scope exe",
+                      line: "[[rule]]\nname = \"moat-exec-untrusted-home\"\nexe = \"/x\"\n" }]
+        }
+      }
+    }
+    var text = Model.alertAsText(a)
+    verify(text.indexOf("[object Object]") < 0, "never stringify the options object")
+    verify(text.indexOf("A build you started yourself.") >= 0, "the prose comes from `expected`")
+    verify(text.indexOf("moatctl ignore 01ALERT --scope exe") >= 0, "the command you would run")
+    verify(text.indexOf("name = \"moat-exec-untrusted-home\"") >= 0, "and the TOML it writes")
+    verify(text.indexOf("recommended scope: exe") >= 0)
+  }
+
 }

@@ -44,6 +44,20 @@ const EXFIL_WINDOW_SECS: u64 = 60;
 #[derive(Default)]
 pub struct NetFirstContact {
     compiled: Option<(Vec<String>, Vec<Cidr>)>,
+    /// `exe -> ip:port -> when we last reported it on the exfil path`.
+    ///
+    /// The novelty path reports a destination once because RARITY remembers it
+    /// afterwards. The credential-context path had no such memory: it fires
+    /// BECAUSE familiarity is being overridden, so nothing stopped it firing
+    /// again on the next packet. Measured 2026-09-07: `kubectl`, which reads
+    /// ~/.kube/config before every call, produced **84 reports of one address**
+    /// in an afternoon -- while the card said "a destination is reported once
+    /// and then never again".
+    ///
+    /// One report is all the override is for: it exists so the cred -> net
+    /// chain can form, and a chain forms on the first step. The 84th says
+    /// nothing the 1st did not.
+    reported: std::collections::HashMap<String, u64>,
 }
 
 impl NetFirstContact {
@@ -127,6 +141,27 @@ impl UserRule for NetFirstContact {
         let lan = crate::rules::netmatch::is_private(&ip);
         if familiar && (lan || !exfil_context) {
             return Vec::new();
+        }
+        // Report a familiar destination ONCE per exe, however many times the
+        // credential override re-qualifies it. See `reported`: the override is
+        // what makes the cred -> net chain form, and a chain forms on the first
+        // step. Novelty is untouched -- rarity already remembers a genuinely new
+        // destination after the first sighting, which is why that path never
+        // needed this.
+        if familiar {
+            let key = format!("{}\u{1}{}:{}", proc.exe, ip_s, port);
+            // Bounded, and pruned by the same window that gates the override.
+            if self.reported.len() > 512 {
+                let now = ctx.now;
+                self.reported
+                    .retain(|_, t| now.saturating_sub(*t) < EXFIL_WINDOW_SECS * 10);
+            }
+            if let Some(t) = self.reported.get(&key) {
+                if ctx.now.saturating_sub(*t) < EXFIL_WINDOW_SECS * 10 {
+                    return Vec::new();
+                }
+            }
+            self.reported.insert(key, ctx.now);
         }
 
         let m = self.meta();
@@ -397,6 +432,83 @@ mod tests {
             out[0].extra_evidence[1].contains("NOT new to this machine"),
             "and it says why it fired despite being familiar: {:?}",
             out[0].extra_evidence
+        );
+    }
+
+    /// 84 reports of ONE address, from a card that says "a destination is
+    /// reported once and then never again".
+    ///
+    /// 2026-09-07, measured: `kubectl` reads ~/.kube/config before every call,
+    /// so the credential override re-qualified a familiar cluster address on
+    /// every single connection. The override exists so the cred -> net chain can
+    /// form, and a chain forms on the FIRST step.
+    #[test]
+    fn the_credential_override_reports_a_destination_once_not_once_per_packet() {
+        use std::collections::HashMap;
+        let cfg = Config::default();
+
+        let mut seen = RarityStore::default();
+        let tup = Tuple::net("/usr/bin/kubectl", "162.209.114.112", 443, None);
+        for i in 0..8u64 {
+            seen.observe(&tup, 1_000 + i * 1_800);
+        }
+        let now = 1_000 + 7 * 1_800;
+        assert!(seen.is_familiar(&tup, now), "precondition: familiar");
+
+        let mut t = ProcTable::new(8, 60);
+        t.observe(&proc("e-kubectl", 41201, "/usr/bin/kubectl", "get pods", None));
+        t.set_session("e-kubectl", Some(77), Some(0));
+        let feeds = Feeds::default();
+        let ev = HookEvent {
+            function_name: Some("tcp_connect".into()),
+            args: vec![serde_json::json!({"sock_arg":{
+                "family":"AF_INET","daddr":"162.209.114.112","dport":443,
+                "saddr":"192.168.1.20","sport":51234
+            }})],
+            policy_name: Some(ID.into()),
+            ..Default::default()
+        };
+        let h = HookHit { kind: HookKind::Kprobe, ev: &ev };
+        let mut creds: HashMap<u32, u64> = HashMap::new();
+        creds.insert(77u32, now - 10);
+
+        // One rule instance across the whole burst, as the daemon has.
+        let mut rule = NetFirstContact::default();
+        let mut fired = 0;
+        for _ in 0..40 {
+            let ctx = RuleCtx {
+                rarity: &seen, cfg: &cfg, table: &t, feeds: &feeds, homes: &[],
+                now, mode: "monitor",
+                armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &creds,
+            };
+            fired += rule.on_hook(&h, "e-kubectl", &ctx).len();
+        }
+        assert_eq!(fired, 1, "forty calls to one known address is one report, not forty");
+
+        // A DIFFERENT destination in the same session still reports: the memory
+        // is per destination, not a mute button on the rule.
+        let ev2 = HookEvent {
+            function_name: Some("tcp_connect".into()),
+            args: vec![serde_json::json!({"sock_arg":{
+                "family":"AF_INET","daddr":"162.209.114.113","dport":443,
+                "saddr":"192.168.1.20","sport":51235
+            }})],
+            policy_name: Some(ID.into()),
+            ..Default::default()
+        };
+        let tup2 = Tuple::net("/usr/bin/kubectl", "162.209.114.113", 443, None);
+        for i in 0..8u64 {
+            seen.observe(&tup2, 1_000 + i * 1_800);
+        }
+        let ctx2 = RuleCtx {
+            rarity: &seen, cfg: &cfg, table: &t, feeds: &feeds, homes: &[],
+            now, mode: "monitor",
+            armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &creds,
+        };
+        assert_eq!(
+            rule.on_hook(&HookHit { kind: HookKind::Kprobe, ev: &ev2 }, "e-kubectl", &ctx2).len(),
+            1,
+            "a different destination is a different fact and still reports"
         );
     }
 

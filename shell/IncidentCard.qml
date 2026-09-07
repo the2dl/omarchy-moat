@@ -163,16 +163,47 @@ Rectangle {
 
         // The consequence in the user's terms (3g), never the detection's name.
         // The rule id is available, at the bottom, in the dimmest colour there is.
-        Text {
+        // The title, and beside it the way to get this record OUT of the panel.
+        // The panel is a popup: a click-drag across it is as likely to dismiss
+        // it as to select anything, so without a button the text is trapped
+        // here. It sits in the header because that is where a person looks when
+        // they have decided they want to keep or send an alert -- not at the
+        // bottom, after the evidence they have already finished reading.
+        Item {
             width: parent.width
-            text: root.incident ? root.incident.title : ""
-            color: root.t ? root.t.primary : "white"
-            font.family: root.t ? root.t.family : "monospace"
-            font.pixelSize: root.t ? root.t.fHeading : 19
-            font.weight: Font.Medium
-            lineHeight: 1.4
-            wrapMode: Text.WordWrap
-            textFormat: Text.PlainText
+            implicitHeight: Math.max(titleText.implicitHeight, copyAlert.implicitHeight)
+
+            Text {
+                id: titleText
+
+                anchors.left: parent.left
+                anchors.right: copyAlert.left
+                anchors.rightMargin: root.t ? root.t.s(10) : 6
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.incident ? root.incident.title : ""
+                color: root.t ? root.t.primary : "white"
+                font.family: root.t ? root.t.family : "monospace"
+                font.pixelSize: root.t ? root.t.fHeading : 19
+                font.weight: Font.Medium
+                lineHeight: 1.4
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+            }
+
+            Button {
+                id: copyAlert
+
+                anchors.right: parent.right
+                anchors.top: parent.top
+                text: "copy"
+                foreground: root.t ? root.t.fainter : "grey"
+                fontSize: root.t ? root.t.fMeta : 11
+                onClicked: {
+                    if (root.service && root.head)
+                        root.service.copyText(Model.alertAsText(root.head), "alert");
+                }
+            }
+
         }
 
         // 1e/3g put the rule id last and dimmest; Advanced puts it first and bright,

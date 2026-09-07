@@ -67,15 +67,44 @@ Rectangle {
         bottomPadding: root.t ? root.t.cardPadBottom : 14
         spacing: root.t ? root.t.s(18) : 10
 
-        Text {
+        // Copy sits in the header, where a person looks once they have decided
+        // they want to keep or send this -- not below the evidence they have
+        // already finished reading. A blocked card is the one most likely to be
+        // pasted somewhere: it is the one that broke something.
+        Item {
             width: parent.width
-            text: "Moat stopped something while you were working"
-            color: root.t ? root.t.primary : "white"
-            font.family: root.t ? root.t.family : "monospace"
-            font.pixelSize: root.t ? root.t.fHeading : 19
-            font.weight: Font.Medium
-            wrapMode: Text.WordWrap
-            textFormat: Text.PlainText
+            implicitHeight: Math.max(blockedTitle.implicitHeight, blockedCopy.implicitHeight)
+
+            Text {
+                id: blockedTitle
+
+                anchors.left: parent.left
+                anchors.right: blockedCopy.left
+                anchors.rightMargin: root.t ? root.t.s(10) : 6
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Moat stopped something while you were working"
+                color: root.t ? root.t.primary : "white"
+                font.family: root.t ? root.t.family : "monospace"
+                font.pixelSize: root.t ? root.t.fHeading : 19
+                font.weight: Font.Medium
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+            }
+
+            Button {
+                id: blockedCopy
+
+                anchors.right: parent.right
+                anchors.top: parent.top
+                text: "copy"
+                foreground: root.t ? root.t.fainter : "grey"
+                fontSize: root.t ? root.t.fMeta : 11
+                onClicked: {
+                    if (root.service && root.head)
+                        root.service.copyText(Model.alertAsText(root.head), "alert");
+                }
+            }
+
         }
 
         Text {
