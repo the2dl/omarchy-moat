@@ -32,7 +32,25 @@ spec:
     - index: 1
       type: "int"
     selectors:
-    - matchBinaries:
+    # HOST /etc/shadow, not every container's.
+    #
+    # A path is namespace-relative, and this policy matches the STRING
+    # "/etc/shadow". On 2026-09-07 `pg_isready -U nanosiem`, running as root
+    # inside a container, read the CONTAINER's own /etc/shadow -- a different
+    # file, on a different filesystem, holding nothing of this machine's -- and
+    # the Override refused it. What the user saw was "permission denied" from a
+    # database health check, with nothing pointing at moat.
+    #
+    # `host_ns` is resolved by tetragon at load time, so this needs no inode.
+    # It is only right for policies naming an absolute HOST path: a kernel
+    # module or a BPF program is global and has no namespace to be in, and
+    # adding this there would be a hole.
+    - matchNamespaces:
+      - namespace: Mnt
+        operator: "In"
+        values:
+        - "host_ns"
+      matchBinaries:
       - operator: "NotIn"
         values:
         - "/usr/bin/passwd"

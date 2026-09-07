@@ -29,7 +29,16 @@ spec:
     - index: 1
       type: "int"
     selectors:
-    - matchBinaries:
+    # The HOST's /etc/ld.so.preload. A path is namespace-relative, and this
+    # policy carries Sigkill: a container writing its own ld.so.preload -- its
+    # own file, on its own filesystem -- would have been killed for it. Same
+    # bug as cred-etc-shadow-read on 2026-09-07, found the same day.
+    - matchNamespaces:
+      - namespace: Mnt
+        operator: "In"
+        values:
+        - "host_ns"
+      matchBinaries:
       - operator: "NotIn"
         values:
         - "/usr/bin/pacman"

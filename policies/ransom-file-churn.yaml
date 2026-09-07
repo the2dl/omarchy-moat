@@ -119,7 +119,16 @@ spec:
         - "{{HOME}}/code/"
       - index: 1
         operator: "Mask"
-        values: ["4"]            # MAY_READ (NOTES section 3)
+        # 6 = MAY_READ|MAY_WRITE. The mask filter is bitwise-ANY in the BPF
+        # (`args & w`), so this matches an open for either.
+        #
+        # The WRITE half is what tells the rule a file is the actor's OWN.
+        # 2026-09-07: `lake_sidecar_build` writes bucket-NNN.bin into a scratch
+        # directory it invented, reads it back and deletes it -- read-then-
+        # destroy exactly, and moat SIGKILLed it. Order separates a pipeline
+        # from an encryptor: a pipeline writes a file before it reads it,
+        # ransomware reads yours before it destroys it. See `Actor::wrote_first`.
+        values: ["6"]
       matchActions:
       - action: Post
   # THE DESTROY HALF, three ways. Argument 0 is the parent directory (a

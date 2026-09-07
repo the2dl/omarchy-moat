@@ -54,6 +54,10 @@ const TRUNCATE_HOOK: &str = "security_path_truncate";
 /// MAY_READ, from NOTES §3.
 const MAY_READ: i64 = 4;
 
+/// MAY_WRITE. A write-open is how we learn a file is the actor's OWN -- see
+/// `Actor::wrote_first`.
+const MAY_WRITE: i64 = 2;
+
 /// Path fragments that mark a build or cache tree. The kernel policy scopes by
 /// directory prefix, and Prefix cannot say "not under a node_modules anywhere
 /// below ~/Documents" (NOTES gap 2: no middle wildcard), so a project checked
@@ -149,6 +153,26 @@ impl Destroyed {
 struct Actor {
     /// Recent read-opens, oldest first: `(when, path)`.
     reads: VecDeque<(u64, String)>,
+    /// Paths this actor was seen WRITING BEFORE it ever read them -- its own
+    /// scratch, not somebody's documents.
+    ///
+    /// 2026-09-07: `lake_sidecar_build` writes `bucket-001.bin` into a scratch
+    /// directory it invented, reads it back, and deletes it -- across dozens of
+    /// files, which is read-then-destroy exactly. moat SIGKILLed it. Every data
+    /// pipeline, incremental build, video encoder and database compaction does
+    /// this, so the shape alone cannot be worth killing over, and no path
+    /// filter helps: the app names its own scratch `.lake-derivatives-rJYPm2`.
+    ///
+    /// ORDER is what separates them, and it is exact:
+    ///
+    /// * a pipeline WRITES a file, then reads it, then destroys it -- the first
+    ///   touch is a write, so the file is the actor's own;
+    /// * ransomware READS your file first, because it needs the plaintext, and
+    ///   only then destroys it -- the first touch is a read.
+    ///
+    /// Testing "did the actor ever write this" would have been wrong: encrypting
+    /// IN PLACE writes too, and would have been excused. First touch is not.
+    wrote_first: BTreeSet<String>,
     /// Distinct paths destroyed inside the window, oldest first.
     destroyed: VecDeque<Destroyed>,
     /// Comms of every process that contributed, for a folded actor.
@@ -172,6 +196,18 @@ impl Actor {
             } else {
                 break;
             }
+        }
+    }
+
+    /// A write-open. Only interesting when it is the FIRST thing this actor did
+    /// to the path: after a read, a write is what encrypting in place looks
+    /// like, and excusing it would be the hole.
+    fn note_write(&mut self, path: String) {
+        if self.reads.iter().any(|(_, p)| p == &path) {
+            return;
+        }
+        if self.wrote_first.len() < MAX_READS_PER_ACTOR {
+            self.wrote_first.insert(path);
         }
     }
 
@@ -336,12 +372,11 @@ impl UserRule for RansomChurn {
         actor.members.insert(by.clone());
 
         if READ_HOOKS.contains(&hook.as_str()) {
-            // A mask, when present, must include MAY_READ (`file_post_open`
-            // reports acc_mode; a write-open is not a read).
-            if let Some(mask) = h.int_arg() {
-                if mask & MAY_READ == 0 {
-                    return Vec::new();
-                }
+            let mask = h.int_arg();
+            let is_read = mask.map(|m| m & MAY_READ != 0).unwrap_or(true);
+            let is_write = mask.map(|m| m & MAY_WRITE != 0).unwrap_or(false);
+            if !is_read && !is_write {
+                return Vec::new();
             }
             let Some(path) = h.file_path() else {
                 return Vec::new();
@@ -349,7 +384,13 @@ impl UserRule for RansomChurn {
             if in_build_tree(&path) {
                 return Vec::new();
             }
-            actor.note_read(now, path);
+            // A read wins when an open is both: O_RDWR on a file it has not
+            // touched is a read of somebody's data, whatever else it is.
+            if is_read {
+                actor.note_read(now, path);
+            } else {
+                actor.note_write(path);
+            }
             return Vec::new();
         }
 
@@ -387,7 +428,11 @@ impl UserRule for RansomChurn {
         if in_build_tree(&path) {
             return Vec::new();
         }
-        let read_first = actor.read_recently(&path);
+        // Read it before destroying it -- AND it was not the actor's own file.
+        // `wrote_first` holds paths this actor wrote before it ever read them:
+        // a pipeline's scratch. See its doc comment for why FIRST TOUCH is the
+        // test and "did it ever write this" is not.
+        let read_first = actor.read_recently(&path) && !actor.wrote_first.contains(&path);
         actor.note_destroyed(Destroyed {
             at: now,
             path,
@@ -661,6 +706,15 @@ mod tests {
     use crate::feeds::Feeds;
     use crate::rules::testkit::{cfg, proc};
 
+    fn write(path: &str) -> HookEvent {
+        let mut e = read(path);
+        e.args = vec![
+            serde_json::json!({"file_arg":{"path":path,"permission":"-rw-------"}}),
+            serde_json::json!({"int_arg":2}),
+        ];
+        e
+    }
+
     fn read(path: &str) -> HookEvent {
         HookEvent {
             function_name: Some("security_file_post_open".into()),
@@ -908,6 +962,50 @@ mod tests {
         let f = &out[0];
         assert_eq!(f.meta.severity, "critical");
         assert!(f.extra_evidence[1].contains("(emptied)"), "{:?}", f.extra_evidence);
+    }
+
+    /// The 2026-09-07 kill: `lake_sidecar_build` writes `bucket-NNN.bin` into a
+    /// scratch directory it invented, reads it back, deletes it, dozens of
+    /// times. That is read-then-destroy exactly, and moat SIGKILLed it. No path
+    /// filter helps -- the app names its own scratch `.lake-derivatives-rJYPm2`.
+    /// ORDER separates them: a pipeline writes first, ransomware reads first.
+    #[test]
+    fn a_pipeline_destroying_its_own_scratch_is_not_a_sweep() {
+        let t = table();
+        let c = cfg();
+        let mut rule = RansomChurn::default();
+        let mut out = Vec::new();
+        for i in 0..12 {
+            let p = format!("/home/dan/Documents/.lake-derivatives-rJYPm2/bucket-{:03}.bin", i);
+            // write -> read -> delete, the pipeline order.
+            out.extend(fire(&mut rule, &t, &c, &write(&p), "e-node", 100));
+            out.extend(fire(&mut rule, &t, &c, &read(&p), "e-node", 100));
+            out.extend(fire(&mut rule, &t, &c, &unlink(&p), "e-node", 100));
+        }
+        assert!(
+            out.is_empty(),
+            "a program destroying files it created is not encrypting yours: {:?}",
+            out.first().map(|f| f.what_override.clone())
+        );
+    }
+
+    /// And the hole that a naive "did it ever write this" check would open:
+    /// encrypting IN PLACE writes too. Read first, then write, then truncate --
+    /// still a sweep.
+    #[test]
+    fn encrypting_in_place_still_fires_even_though_it_writes() {
+        let t = table();
+        let c = cfg();
+        let mut rule = RansomChurn::default();
+        let mut out = Vec::new();
+        for i in 0..12 {
+            let p = format!("/home/dan/Documents/report-{:02}.pdf", i);
+            out.extend(fire(&mut rule, &t, &c, &read(&p), "e-node", 100));
+            out.extend(fire(&mut rule, &t, &c, &write(&p), "e-node", 100));
+            out.extend(fire(&mut rule, &t, &c, &truncate(&p), "e-node", 100));
+        }
+        assert_eq!(out.len(), 1, "a write AFTER a read excuses nothing");
+        assert_eq!(out[0].meta.severity, "critical");
     }
 
     #[test]
