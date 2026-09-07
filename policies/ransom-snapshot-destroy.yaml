@@ -5,7 +5,7 @@ metadata:
   annotations:
     moat.omarchy/severity: "critical"
     moat.omarchy/title: "Snapshot or restore point deleted from disk"
-    moat.omarchy/enforce: "none"
+    moat.omarchy/enforce: "deny"
     moat.omarchy/actions: "kill,ignore"
     moat.omarchy/why: >-
       Encryption only holds you to ransom once the copies are gone, so destroying the
@@ -28,7 +28,7 @@ spec:
   options:
   - name: "policy-mode"
     value: "monitor"
-  kprobes:
+  lsmhooks:
   # `rm -rf /.snapshots/42`, `rm ~/.snapshots/3/info.xml`. Argument 0 is the
   # parent directory; argument 1 is the file itself and is carried for evidence
   # only. Only index 0 is filtered: two path filters in one selector would be
@@ -36,8 +36,7 @@ spec:
   # rootkit-evidence-tamper). No trailing slash on the values, so the parent of
   # /.snapshots/42/info.xml -- /.snapshots/42 -- and /.snapshots itself both
   # match, and Prefix is the only operator paths have.
-  - call: "security_path_unlink"
-    syscall: false
+  - hook: "path_unlink"
     message: "A file was deleted from a snapshot directory"
     args:
     - index: 0
@@ -68,14 +67,21 @@ spec:
         - "/timeshift"
         - "/run/timeshift"
       matchActions:
-      - action: Post
-        rateLimit: "60s"
-        rateLimitScope: "process"
+      # -1 is -EPERM. The operation fails and the snapshot stays where it is;
+      # the process lives and can be looked at, which is this project's stated
+      # preference everywhere else -- a refused action you can investigate
+      # beats a dead process you cannot. Sigkill would be wrong here for the
+      # same reason it was wrong on cred-ssh-private-key-read: an installer
+      # reaching into /timeshift by mistake should fail that one call, not die.
+      #
+      # No rateLimit. On a Post it limits the noise; on an Override it would
+      # let every second deletion through, which is not a refusal at all.
+      - action: Override
+        argError: -1
   # `mv /.snapshots/42 /tmp` evades the unlink hook. Argument 0 is the OLD parent
   # directory, so a move out of a snapshot directory is seen and a move into one
   # is not, which is the right way round.
-  - call: "security_path_rename"
-    syscall: false
+  - hook: "path_rename"
     message: "A file was renamed out of a snapshot directory"
     args:
     - index: 0
@@ -106,16 +112,23 @@ spec:
         - "/timeshift"
         - "/run/timeshift"
       matchActions:
-      - action: Post
-        rateLimit: "60s"
-        rateLimitScope: "process"
+      # -1 is -EPERM. The operation fails and the snapshot stays where it is;
+      # the process lives and can be looked at, which is this project's stated
+      # preference everywhere else -- a refused action you can investigate
+      # beats a dead process you cannot. Sigkill would be wrong here for the
+      # same reason it was wrong on cred-ssh-private-key-read: an installer
+      # reaching into /timeshift by mistake should fail that one call, not die.
+      #
+      # No rateLimit. On a Post it limits the noise; on an Override it would
+      # let every second deletion through, which is not a refusal at all.
+      - action: Override
+        argError: -1
   # `: > /.snapshots/42/info.xml` leaves the snapshot in place and snapper unable
   # to read it, which is as good as deleted. Any O_TRUNC open of an existing file
   # reaches security_path_truncate (fs/open.c handle_truncate -> do_truncate);
   # a file created by the same open is not truncated and does not. Argument 0
   # is the file itself, hence the trailing slash.
-  - call: "security_path_truncate"
-    syscall: false
+  - hook: "path_truncate"
     message: "A file in a snapshot directory was emptied"
     args:
     - index: 0
@@ -144,6 +157,14 @@ spec:
         - "/timeshift/"
         - "/run/timeshift/"
       matchActions:
-      - action: Post
-        rateLimit: "60s"
-        rateLimitScope: "process"
+      # -1 is -EPERM. The operation fails and the snapshot stays where it is;
+      # the process lives and can be looked at, which is this project's stated
+      # preference everywhere else -- a refused action you can investigate
+      # beats a dead process you cannot. Sigkill would be wrong here for the
+      # same reason it was wrong on cred-ssh-private-key-read: an installer
+      # reaching into /timeshift by mistake should fail that one call, not die.
+      #
+      # No rateLimit. On a Post it limits the noise; on an Override it would
+      # let every second deletion through, which is not a refusal at all.
+      - action: Override
+        argError: -1

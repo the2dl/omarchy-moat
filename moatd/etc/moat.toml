@@ -184,6 +184,23 @@ shell_stdio_socket = true
 # The children of a shell are counted together with the shell: a loop of
 # `openssl enc ... && rm` is one actor, not two hundred short-lived ones.
 ransom_file_churn = true
+#
+# ENFORCEMENT. This rule can end the process, and does not unless you arm it:
+#
+#     moatctl set mode enforce --rule moat-ransom-file-churn
+#
+# Armed, a sweep is killed at the threshold -- the difference between losing
+# `ransom_churn_files` documents and losing every one of them. Two things it
+# will not do even when armed:
+#
+#   * only the CRITICAL shape kills. Read the plaintext and destroy the
+#     original, eight times over, has no honest lookalike. Homogenisation is
+#     `high` and does -- renaming a folder of files to `.bak` by hand is that
+#     same shape -- so it alerts and never kills.
+#   * a session leader is never signalled. The children of a shell are counted
+#     as the shell, and on a desktop that shell is usually the terminal you are
+#     sitting in; SIGKILL there ends everything else you had open, not just the
+#     sweep. The finding stays critical, stays on the badge, and says so.
 
 # A recovery point destroyed by command: `btrfs subvolume delete`, `snapper
 # delete`, `timeshift --delete`, `restic forget` without any --keep option,

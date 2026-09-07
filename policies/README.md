@@ -109,7 +109,7 @@ which needs no policy change and no reload.
 | `moat-cred-ssh-agent-socket` | high | `security_socket_connect` (kprobe) | Post 60s | none seen; ssh, git, ssh-add and the password-manager agents are excluded. Only covers `/tmp/ssh-*` and `$HOME` sockets — see blind spots | `matchBinaries NotPostfix`, `matchArgs Prefix` values |
 | `moat-priv-container-socket-connect` | high | `security_socket_connect` (kprobe) | Post 60s | testcontainers and other libraries that reach the socket through a language runtime rather than the `docker` CLI | `matchBinaries NotPostfix` (the container toolchain) |
 | `moat-persist-git-config-write` | high | `security_file_post_open` (kprobe) | Post 60s | git itself on clone/`git config`/fetch (excluded), TUIs and editors | `matchBinaries NotPostfix` |
-| `moat-ransom-snapshot-destroy` | critical | `security_path_unlink`, `security_path_rename`, `security_path_truncate` (kprobe) | Post 60s | you deleting a snapshot by hand under `/.snapshots`, `~/.snapshots`, `/timeshift`. snapperd, snapper's cleanup timer, timeshift, btrbk, yabsnap and btrfs-assistant are excluded. The subvolume itself dies through an ioctl this cannot see; the *commands* that do that are the userland rule `moat-ransom-snapshot-command` | `matchBinaries NotIn` (the snapshot tools) |
+| `moat-ransom-snapshot-destroy` | critical | `path_unlink`, `path_rename`, `path_truncate` (lsm) | **Override -EPERM** (deny) | you deleting a snapshot by hand under `/.snapshots`, `~/.snapshots`, `/timeshift`. snapperd, snapper's cleanup timer, timeshift, btrbk, yabsnap and btrfs-assistant are excluded. The subvolume itself dies through an ioctl this cannot see; the *commands* that do that are the userland rule `moat-ransom-snapshot-command` | `matchBinaries NotIn` (the snapshot tools) |
 | `moat-ransom-file-churn` | low (**signal**, feeds a critical userland rule) | `security_file_post_open`, `security_path_unlink`, `security_path_rename`, `security_path_truncate` (kprobe) | **Post, no rateLimit** | never on its own while `[rules] ransom_file_churn` is on: moatd owns the id and counts the events instead of raising them. Scope is ~/Documents, ~/Desktop, ~/Pictures, ~/Videos, ~/Music, ~/Downloads only. The rule's FPs: a script moving photos across filesystems, batch in-place rewriters (jpegoptim, exiftool, prettier --write) on a document folder, renaming a folder of files to a new suffix by hand | `matchBinaries NotIn` (mv/rsync/tar, toolchains, sync and backup clients, thumbnailers, `file~` editors); `[thresholds] ransom_churn_*` |
 
 Seven of these are `signal` rather than `detection` (see the tier section above):
@@ -125,9 +125,9 @@ counter, and the counter is the detection.
 tier and the 7 `signal` ones above), plus 3
 `moat-telemetry-*` policies which are records rather than detections and are
 rendered only when their class is on — see docs/SHIPPING.md. 4 policies carry
-`Sigkill` and 3 carry `Override` (deny); 39 are report-only. Hook load: 27 programs on the `file_post_open` path (8 as
-LSM hooks, 19 as kprobes on `security_file_post_open`), 6 on
-`security_path_unlink`, 4 on `tcp_connect`, 5 on `security_path_truncate`, 3 on
+`Sigkill` and 4 carry `Override` (deny); 38 are report-only. Hook load: 27 programs on the `file_post_open` path (8 as
+LSM hooks, 19 as kprobes on `security_file_post_open`), 3 on
+`security_path_unlink` (3 more as the `path_unlink` LSM hook), 4 on `tcp_connect`, 5 on `security_path_truncate`, 3 on
 `security_path_rename`, 2 on
 `security_socket_connect`, 2 on `bprm_check_security`, and one each on
 `socket_connect`, `ptrace_access_check`, `proc_mem_open`, `bpf`,

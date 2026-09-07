@@ -198,6 +198,53 @@ pub struct RansomChurn {
     actors: HashMap<String, Actor>,
 }
 
+impl RansomChurn {
+    /// Whether this finding is allowed to end the process, and if not, why not.
+    ///
+    /// Two gates, both deliberate:
+    ///
+    /// * **Only the critical shape.** Homogenisation is `high` and has honest
+    ///   lookalikes -- a person renaming a folder of files to `.bak` is that
+    ///   shape too. Read the plaintext, destroy the original, eight times
+    ///   over, is the one that has no lookalike, and it is the only one
+    ///   allowed to kill.
+    /// * **Never a session leader.** The children of a shell are folded into
+    ///   the shell (`actor_key`), so the actor named here may BE a shell --
+    ///   and on this machine that shell is usually the terminal the person is
+    ///   sitting in. SIGKILL on a session leader ends the loop and every other
+    ///   thing they had open in that session. The finding stays critical and
+    ///   stays on the badge; it just does not get to do that.
+    fn arm(&self, f: &mut Finding, ctx: &RuleCtx, folded_under: Option<&ProcInfo>) {
+        if f.meta.severity != "critical" {
+            return;
+        }
+        if let Some(shell) = folded_under {
+            if shell.sid == Some(shell.pid) {
+                f.extra_evidence.push(format!(
+                    "not killed, even armed: the actor is {} (pid {}), a session leader -- \
+                     killing it would end the terminal session it belongs to, not just the \
+                     sweep. Stop the loop yourself, or `moatctl kill <id>` after you have \
+                     read this",
+                    shell.comm(),
+                    shell.pid
+                ));
+                return;
+            }
+        }
+        if ctx.enforcing(ID) {
+            f.request_kill = true;
+        } else {
+            f.extra_evidence.push(format!(
+                "monitor mode: nothing was killed and the files already named are gone. \
+                 `moatctl kill <id>` stops it now; arming this one rule with `moatctl set \
+                 mode enforce --rule {}` ends the next sweep at the threshold instead, \
+                 which is the difference between losing eight files and losing all of them",
+                ID
+            ));
+        }
+    }
+}
+
 impl UserRule for RansomChurn {
     fn id(&self) -> &'static str {
         ID
@@ -208,7 +255,7 @@ impl UserRule for RansomChurn {
     }
 
     fn meta(&self) -> PolicyMeta {
-        meta(
+        let mut m = meta(
             ID,
             "ransom",
             "critical",
@@ -233,7 +280,12 @@ impl UserRule for RansomChurn {
             &[],
             &["kill", "ignore"],
             "exe",
-        )
+        );
+        // It can end a process, and `arm` below decides when. Declared here so
+        // the panel offers the button and `check.py`'s enforce accounting sees
+        // it, exactly as moat-shell-stdio-socket does.
+        m.enforce = "kill".into();
+        m
     }
 
     fn on_hook(&mut self, h: &HookHit, exec_id: &str, ctx: &RuleCtx) -> Vec<Finding> {
@@ -428,6 +480,7 @@ impl UserRule for RansomChurn {
                 shell.pid
             ));
         }
+        self.arm(&mut f, ctx, folded_under.as_ref());
         vec![f]
     }
 }
@@ -646,8 +699,26 @@ mod tests {
     }
 
     fn fire(rule: &mut RansomChurn, t: &ProcTable, c: &Config, e: &HookEvent, exec_id: &str, now: u64) -> Vec<Finding> {
+        fire_armed(rule, t, c, e, exec_id, now, false)
+    }
+
+    /// `armed` is `moatctl set mode enforce --rule moat-ransom-file-churn`:
+    /// this one rule armed while the daemon stays in monitor.
+    fn fire_armed(
+        rule: &mut RansomChurn,
+        t: &ProcTable,
+        c: &Config,
+        e: &HookEvent,
+        exec_id: &str,
+        now: u64,
+        armed: bool,
+    ) -> Vec<Finding> {
         let feeds = Feeds::default();
         let homes = vec!["/home/dan".to_string()];
+        let mut set = std::collections::BTreeSet::new();
+        if armed {
+            set.insert(ID.to_string());
+        }
         let ctx = RuleCtx {
             rarity: &crate::rarity::RarityStore::default(),
             cfg: c,
@@ -656,10 +727,95 @@ mod tests {
             homes: &homes,
             now,
             mode: "monitor",
-            armed: &crate::rules::NO_RULES_ARMED,
+            armed: &set,
             cred_read_sessions: &crate::rules::NO_CRED_SESSIONS,
         };
         rule.on_hook(&HookHit { kind: HookKind::Kprobe, ev: e }, exec_id, &ctx)
+    }
+
+    /// Drive a read-then-destroy sweep by `exec_id` until it fires.
+    fn sweep(rule: &mut RansomChurn, t: &ProcTable, c: &Config, exec_id: &str, armed: bool) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for i in 0..10 {
+            let d = doc(i);
+            out.extend(fire_armed(rule, t, c, &read(&d), exec_id, 100, armed));
+            out.extend(fire_armed(rule, t, c, &unlink(&d), exec_id, 100, armed));
+        }
+        out
+    }
+
+    #[test]
+    fn an_armed_sweep_ends_the_process() {
+        let t = table();
+        let c = cfg();
+        let mut rule = RansomChurn::default();
+        let out = sweep(&mut rule, &t, &c, "e-node", true);
+        assert_eq!(out.len(), 1, "one finding");
+        assert!(out[0].request_kill, "armed: the sweep is ended");
+    }
+
+    #[test]
+    fn monitor_mode_kills_nothing_and_says_how_to_arm() {
+        let t = table();
+        let c = cfg();
+        let mut rule = RansomChurn::default();
+        let out = sweep(&mut rule, &t, &c, "e-node", false);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].request_kill, "monitor mode never kills");
+        assert!(
+            out[0].extra_evidence.iter().any(|e| e.contains("set mode enforce --rule")),
+            "it must say how to arm it: {:?}",
+            out[0].extra_evidence
+        );
+    }
+
+    #[test]
+    fn homogenisation_alone_never_ends_a_process_even_armed() {
+        let t = table();
+        let c = cfg();
+        let mut rule = RansomChurn::default();
+        let mut out = Vec::new();
+        // Renames only, no reads: the `high` shape.
+        for i in 0..10 {
+            let from = format!("/home/dan/Documents/f{}.{}", i, if i % 2 == 0 { "pdf" } else { "txt" });
+            let to = format!("{}.locked", from);
+            out.extend(fire_armed(&mut rule, &t, &c, &rename(&from, &to), "e-node", 100, true));
+        }
+        assert_eq!(out.len(), 1, "homogenisation fires");
+        assert_eq!(out[0].meta.severity, "high");
+        assert!(
+            !out[0].request_kill,
+            "only read-then-destroy may kill; renaming a folder by hand is this shape too"
+        );
+    }
+
+    #[test]
+    fn the_terminal_a_person_is_sitting_in_is_never_killed() {
+        let mut t = table();
+        // e-loop is the bash the openssl/rm children fold into. Make it a
+        // session leader, which is what an interactive shell is.
+        t.set_session("e-loop", Some(41400), Some(34818));
+        let c = cfg();
+        let mut rule = RansomChurn::default();
+        let mut out = Vec::new();
+        for i in 0..10 {
+            let d = doc(i);
+            // Each file read and deleted by a DIFFERENT short-lived child, all
+            // folded into the one shell.
+            out.extend(fire_armed(&mut rule, &t, &c, &read(&d), &format!("e-ossl-{}", i), 100, true));
+            out.extend(fire_armed(&mut rule, &t, &c, &unlink(&d), &format!("e-rm-{}", i), 100, true));
+        }
+        assert_eq!(out.len(), 1, "the shell loop is one actor and fires once");
+        assert_eq!(out[0].meta.severity, "critical");
+        assert!(
+            !out[0].request_kill,
+            "SIGKILL on a session leader ends the person's terminal, not just the sweep"
+        );
+        assert!(
+            out[0].extra_evidence.iter().any(|e| e.contains("session leader")),
+            "and it must say why: {:?}",
+            out[0].extra_evidence
+        );
     }
 
     fn doc(i: usize) -> String {
