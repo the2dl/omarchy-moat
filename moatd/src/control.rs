@@ -1019,7 +1019,25 @@ pub fn verify_pid(pid: u32, start_ts: &str, exe: &str) -> Result<(), String> {
     }
     if let Some(live_exe) = util::proc_exe(pid) {
         let live_exe = live_exe.trim_end_matches(" (deleted)");
-        if !exe.is_empty() && live_exe != exe {
+        // `binary_aliases` already answers this, and has since 2026-09-05:
+        // tetragon reports the path a process was INVOKED by, /proc/<pid>/exe
+        // reports the binary it RESOLVED to, and on Arch those differ
+        // constantly (`/usr/bin/python3` -> `python3.14`, `/usr/bin/sh` ->
+        // `bash`). That fix landed on the containment path; this one, the kill
+        // path, kept comparing the two as strings.
+        //
+        // 2026-09-06, live: an armed `moat-ransom-file-churn` declined to kill
+        // a real sweep -- "pid N now runs /usr/bin/python3.14 but the alert
+        // names /usr/bin/python3; refusing to kill" -- and the same string
+        // compare had been quietly declining to kill shells for
+        // `moat-shell-stdio-socket`, whose whole job is killing /usr/bin/sh.
+        //
+        // A recycled pid is caught by the START TIME above, which is the strong
+        // half of this check; this is the belt to those braces. Asking the one
+        // function that knows about aliases keeps a genuinely different binary
+        // refused, and means the next fix to name resolution lands in one place.
+        let aliases = crate::contain::binary_aliases(exe);
+        if !exe.is_empty() && live_exe != exe && !aliases.iter().any(|a| a == live_exe) {
             return Err(format!(
                 "pid {} now runs {} but the alert names {}; refusing to kill",
                 pid, live_exe, exe
@@ -3534,6 +3552,43 @@ mod tests {
     /// KERNEL ***`, and a `moat-x-protection-changed` alert saying a protection
     /// had been WEAKENED, which NEVER_SILENCE meant could not be dismissed. The
     /// rule was armed correctly the whole time, in the daemon.
+    /// The kill path must not refuse over a symlink.
+    ///
+    /// 2026-09-05 fixed this for CONTAINMENT (`contain::binary_aliases`);
+    /// 2026-09-06 it turned out the KILL path still compared the two as
+    /// strings, so an armed rule declined to kill a live sweep because
+    /// tetragon said `/usr/bin/python3` and /proc said `/usr/bin/python3.14`.
+    /// `/usr/bin/sh` -> `bash` means it had been declining to kill shells too.
+    #[test]
+    fn a_symlinked_interpreter_is_still_the_process_the_alert_names() {
+        // This process is the only pid whose start time we can be sure of.
+        let me = std::process::id();
+        // An unparseable start stamp skips the start-time half deliberately:
+        // this test is about the exe comparison and nothing else.
+        let ts = "";
+        let real = crate::util::proc_exe(me).expect("own exe");
+
+        // Named by its resolved path: always was fine.
+        assert!(verify_pid(me, ts, &real).is_ok(), "resolved name must verify");
+
+        // Named by a symlink TO it: the case that refused. Build one, so the
+        // test does not depend on which interpreters this machine symlinks.
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(
+            verify_pid(me, ts, link.to_str().unwrap()).is_ok(),
+            "a symlink to the same binary is the same process"
+        );
+
+        // And a genuinely different binary is still refused.
+        let other = if real.ends_with("/true") { "/usr/bin/false" } else { "/usr/bin/true" };
+        assert!(
+            verify_pid(me, ts, other).is_err(),
+            "a different binary must still refuse"
+        );
+    }
+
     #[test]
     fn a_userland_rule_sharing_its_name_with_a_signal_policy_is_not_pushed_at_the_kernel() {
         let dir = tempfile::tempdir().unwrap();
