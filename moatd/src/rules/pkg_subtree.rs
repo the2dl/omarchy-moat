@@ -100,7 +100,10 @@ fn subtree_finding(
 #[derive(Default)]
 pub struct InterpreterSpawn {
     /// package-manager root exec_id -> unix seconds we first alerted on it.
-    seen: HashMap<String, u64>,
+    /// One alert per package-install root. `rules::Said` is this idea
+    /// shared; it grew here first and independently in
+    /// `net_first_contact`, which is what made it worth having once.
+    seen: Option<crate::rules::Said>,
 }
 
 /// Roots are forgotten an hour after their first interpreter, which is far
@@ -147,12 +150,12 @@ impl UserRule for InterpreterSpawn {
             return Vec::new();
         }
 
-        self.seen
-            .retain(|_, t| ctx.now.saturating_sub(*t) < ROOT_MEMORY_SECS);
-        if self.seen.contains_key(&root.exec_id) {
+        let said = self
+            .seen
+            .get_or_insert_with(|| crate::rules::Said::new(ROOT_MEMORY_SECS, 512));
+        if !said.worth_saying(&root.exec_id, ctx.now) {
             return Vec::new();
         }
-        self.seen.insert(root.exec_id.clone(), ctx.now);
 
         subtree_finding(
             ctx,

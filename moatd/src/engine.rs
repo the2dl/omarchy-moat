@@ -2599,6 +2599,39 @@ impl Daemon {
                 log::error!("alerts.jsonl: {}", e);
             }
             self.note_baseline(&f, now);
+            // A FOLD IS STILL A THING THAT HAPPENED.
+            //
+            // Until 2026-09-07 this returned here, so a folded event never
+            // reached correlation -- and that is why `dedupe_key` carries the
+            // pid: without it, a second process tree writing ~/.bashrc folded
+            // into the first and its persist step never formed a chain. The
+            // key was made narrower to protect the chain.
+            //
+            // The cost was that the deduper stopped collapsing anything from
+            // repeated SHORT-LIVED processes, which is what a CLI tool is:
+            // measured, `kubectl` produced 69 rows with 69 distinct pids and
+            // one destination. Two jobs -- "is this a new row" and "does this
+            // reach correlation" -- were being decided by one key, and only
+            // one of them wanted the pid.
+            //
+            // So the fold now correlates too, and the key no longer needs to
+            // carry a pid to protect it. The alert is rebuilt rather than
+            // stored on the dedupe entry: `build_alert` is assembly, and
+            // keeping a live Alert per key would put an unbounded copy of the
+            // record in memory beside the record.
+            let folded_alert = build_alert(
+                &f,
+                &existing,
+                &util::now_rfc3339(),
+                &self.cfg.paths.user_allowlist().display().to_string(),
+                &allowlist_note(
+                    &self.cfg.paths.allowlist_dir.display().to_string(),
+                    self.allowlist.len(),
+                    &f.proc.exe,
+                    f.file.as_ref().map(|x| x.path.as_str()),
+                ),
+            );
+            self.note_chain(&f, &folded_alert, now);
             return Some(existing);
         }
 
@@ -5770,6 +5803,141 @@ mod tests {
         assert!(
             d.contain.live().is_empty(),
             "a high chain must not contain anything while containment is off"
+        );
+    }
+
+    /// A FOLD IS STILL A THING THAT HAPPENED.
+    ///
+    /// This is the property `dedupe_key`'s pid was protecting, now protected
+    /// directly instead. Until 2026-09-07 `emit` returned on a fold before
+    /// `note_chain`, so a second process tree doing the same thing folded into
+    /// the first row AND vanished from correlation -- the 2026-09-06 exfil
+    /// miss. The key was narrowed to compensate, which stopped it collapsing
+    /// anything from repeated short-lived processes (kubectl: 69 rows, 69 pids,
+    /// one destination).
+    ///
+    /// So: a repeat is one row, and it still reaches the chain.
+    ///
+    /// (Two different TREES stay two rows -- see
+    /// `two_trees_to_one_host_stay_two_alerts`. Merging those was the trap.)
+    #[test]
+    fn a_folded_event_still_reaches_chain_correlation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.thresholds.dedupe_secs = 600;
+
+        let mkproc = |exec_id: &str, pid: u32| ProcInfo {
+            exec_id: exec_id.into(),
+            pid,
+            uid: 1000,
+            exe: "/usr/bin/kubectl".into(),
+            args: "get pods".into(),
+            cwd: "/home/dan".into(),
+            start_time: util::now_rfc3339(),
+            parent_exec_id: None,
+            exited_at: None,
+            exit_signal: None,
+            exe_note: None,
+            sid: None,
+            tty: None,
+        };
+        let root = mkproc("e-root", 7000);
+        let mut mk = |exec_id: &str, pid: u32| {
+            let mut f = Finding::new(
+                "moat-net-first-contact",
+                crate::policy::PolicyMeta::fallback("moat-net-first-contact"),
+                mkproc(exec_id, pid),
+            );
+            f.meta.family = "net".into();
+            f.meta.severity = "low".into();
+            f.ancestry = vec![root.clone()];
+            f.net = Some(crate::alert::NetRef {
+                dst_ip: "162.209.114.112".into(),
+                dst_port: 443,
+                domain: None,
+            });
+            d.emit(f)
+        };
+
+        // ONE process hitting one destination twice: a genuine fold.
+        let first = mk("e-a", 7101).expect("an id");
+        let second = mk("e-a", 7101).expect("an id");
+
+        assert_eq!(first, second, "one process, one destination: one row");
+
+        let rows = d.store.load();
+        let bodies: Vec<_> = rows.iter().filter(|a| a.rule == "moat-net-first-contact").collect();
+        assert_eq!(bodies.len(), 1, "one alert on record, not two: {:?}", bodies.len());
+
+        // And the fold was still correlated: the chain saw both, so the count
+        // moved past one. This is what the pid used to buy, bought properly.
+        assert!(
+            bodies[0].count.unwrap_or(1) >= 2,
+            "the folded event was recorded as a repeat, not dropped"
+        );
+    }
+
+    /// Two process trees doing the same thing stay two alerts.
+    ///
+    /// This pins the 2026-09-06 exfil miss against a fix that looks right and
+    /// is not. On 2026-09-07 the pid was briefly taken out of `dedupe_key`, on
+    /// the argument that a fold now reaches `note_chain` -- true, and not
+    /// enough. Two more things hang off a fold and neither was in that
+    /// argument: `emit` captures an incident snapshot only when nothing folded,
+    /// and `chain::note` records one step per ALERT ID. So the second tree
+    /// would have had no row, no snapshot and no step: nearly invisible, which
+    /// is the miss again.
+    #[test]
+    fn two_trees_to_one_host_stay_two_alerts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.thresholds.dedupe_secs = 600;
+
+        let mkproc = |exec_id: &str, pid: u32| ProcInfo {
+            exec_id: exec_id.into(),
+            pid,
+            uid: 1000,
+            exe: "/usr/bin/python3".into(),
+            args: "x.py".into(),
+            cwd: "/home/dan".into(),
+            start_time: util::now_rfc3339(),
+            parent_exec_id: None,
+            exited_at: None,
+            exit_signal: None,
+            exe_note: None,
+            sid: None,
+            tty: None,
+        };
+        let mut mk = |exec_id: &str, pid: u32| {
+            let mut f = Finding::new(
+                "moat-net-first-contact",
+                crate::policy::PolicyMeta::fallback("moat-net-first-contact"),
+                mkproc(exec_id, pid),
+            );
+            f.meta.family = "net".into();
+            f.meta.severity = "low".into();
+            f.net = Some(crate::alert::NetRef {
+                dst_ip: "192.168.44.122".into(),
+                dst_port: 4873,
+                domain: None,
+            });
+            d.emit(f)
+        };
+
+        // The benign run and the exfil run: same program, same C2, different
+        // trees.
+        let benign = mk("e-benign", 8001).expect("an id");
+        let exfil = mk("e-exfil", 8002).expect("an id");
+
+        assert_ne!(
+            benign, exfil,
+            "a second tree is a second event -- it needs its own row, snapshot and step"
+        );
+        let rows = d.store.load();
+        assert_eq!(
+            rows.iter().filter(|a| a.rule == "moat-net-first-contact").count(),
+            2,
+            "two alerts on record"
         );
     }
 

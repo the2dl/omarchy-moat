@@ -115,6 +115,87 @@ pub static NO_RULES_ARMED: std::collections::BTreeSet<String> = std::collections
 pub static NO_CRED_SESSIONS: std::sync::LazyLock<std::collections::HashMap<u32, u64>> =
     std::sync::LazyLock::new(std::collections::HashMap::new);
 
+/// "Have I already said this?" — the memory a rule needs when it fires because
+/// some silence was OVERRIDDEN.
+///
+/// A rule that reports something new does not need this: `rarity` remembers the
+/// thing afterwards, so the second sighting is not new. A rule that fires
+/// *despite* familiarity has no such memory by construction, and will fire
+/// again on the next identical event, for ever.
+///
+/// Measured 2026-09-07, all three of one afternoon:
+///
+/// * `moat-net-first-contact` reported ONE cluster address **69 times** —
+///   `kubectl` reads ~/.kube/config before every call, so the credential
+///   override re-qualified a familiar destination on every connection;
+/// * the same rule reported one migration host 51 times, for the same reason;
+/// * `moat-shell-stdio-socket` fired 47 times on one statusline.
+///
+/// The daemon's own deduper cannot help here, and the reason is structural: its
+/// key contains the pid (`Finding::dedupe_key`), because a fold RETURNS BEFORE
+/// `note_chain` and two process trees writing one path must both reach
+/// correlation. A CLI tool is a fresh pid every invocation — 69 rows, 69 pids,
+/// one destination — so nothing folds.
+///
+/// Two rules had already grown this by hand with different windows and
+/// different pruning. This is that idea, once, with a test.
+#[derive(Debug)]
+pub struct Said {
+    seen: std::collections::HashMap<String, u64>,
+    window: u64,
+    cap: usize,
+}
+
+impl Said {
+    /// `window` is how long a thing stays said. `cap` bounds the map on a busy
+    /// machine; the oldest entries go first, which at worst says something
+    /// twice rather than growing without limit.
+    pub fn new(window: u64, cap: usize) -> Said {
+        Said {
+            seen: std::collections::HashMap::new(),
+            window,
+            cap,
+        }
+    }
+
+    /// True when this is worth saying — i.e. it has NOT been said inside the
+    /// window. Records it when it returns true, so the caller cannot forget to.
+    ///
+    /// Deliberately not "have I seen this": the name is the question the caller
+    /// is actually asking, and `if said.worth_saying(k, now)` reads as the
+    /// decision it is.
+    pub fn worth_saying(&mut self, key: &str, now: u64) -> bool {
+        if let Some(t) = self.seen.get(key) {
+            if now.saturating_sub(*t) < self.window {
+                return false;
+            }
+        }
+        if self.seen.len() >= self.cap {
+            let window = self.window;
+            self.seen.retain(|_, t| now.saturating_sub(*t) < window);
+            // Still full after pruning: everything is recent, so drop the
+            // oldest rather than refuse to record anything new.
+            if self.seen.len() >= self.cap {
+                if let Some(oldest) = self
+                    .seen
+                    .iter()
+                    .min_by_key(|(_, t)| **t)
+                    .map(|(k, _)| k.clone())
+                {
+                    self.seen.remove(&oldest);
+                }
+            }
+        }
+        self.seen.insert(key.to_string(), now);
+        true
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+}
+
 pub struct RuleCtx<'a> {
     pub cfg: &'a Config,
     pub table: &'a ProcTable,
@@ -662,5 +743,74 @@ mod tests {
             assert!(r.enabled(&cfg()), "{} is off by default", r.id());
             assert!(!r.enabled(&off), "{} has no working toggle", r.id());
         }
+    }
+}
+
+#[cfg(test)]
+mod said_tests {
+    use super::Said;
+
+    #[test]
+    fn a_thing_is_worth_saying_once_inside_the_window() {
+        let mut s = Said::new(600, 512);
+        assert!(s.worth_saying("kubectl\u{1}1.2.3.4:443", 1_000), "the first time");
+        for i in 0..68 {
+            assert!(
+                !s.worth_saying("kubectl\u{1}1.2.3.4:443", 1_000 + i),
+                "and not the other 68 times -- this is the kubectl case exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn a_different_thing_is_a_different_fact() {
+        let mut s = Said::new(600, 512);
+        assert!(s.worth_saying("kubectl\u{1}1.2.3.4:443", 1_000));
+        assert!(
+            s.worth_saying("kubectl\u{1}1.2.3.5:443", 1_000),
+            "one destination going quiet must not mute the next"
+        );
+        assert!(
+            s.worth_saying("ssh\u{1}1.2.3.4:443", 1_000),
+            "nor must one program mute another"
+        );
+    }
+
+    #[test]
+    fn it_is_worth_saying_again_once_the_window_has_passed() {
+        let mut s = Said::new(600, 512);
+        assert!(s.worth_saying("k", 1_000));
+        assert!(!s.worth_saying("k", 1_500));
+        assert!(s.worth_saying("k", 1_601), "silence is for a window, not for ever");
+    }
+
+    /// The failure mode a memory like this has: it fills up, and then either
+    /// grows without bound or silently stops recording. Neither is acceptable
+    /// -- the first is a leak in a daemon that runs for months, the second
+    /// makes it say everything twice with no sign anything is wrong.
+    #[test]
+    fn it_stays_bounded_and_keeps_working_when_full() {
+        let mut s = Said::new(600, 8);
+        for i in 0..200 {
+            assert!(s.worth_saying(&format!("k{}", i), 1_000 + i));
+        }
+        assert!(s.len() <= 8, "bounded: {}", s.len());
+        // Still functioning after eviction: the most recent thing said is
+        // still remembered, so the common case does not regress.
+        assert!(!s.worth_saying("k199", 1_200), "the newest entry survives eviction");
+    }
+
+    /// Eviction may cost a repeat; it must never cost silence.
+    #[test]
+    fn eviction_can_repeat_but_never_mutes() {
+        let mut s = Said::new(600, 4);
+        assert!(s.worth_saying("first", 1_000));
+        for i in 0..50 {
+            s.worth_saying(&format!("filler{}", i), 1_000 + i);
+        }
+        assert!(
+            s.worth_saying("first", 1_060),
+            "an evicted key is said again -- louder is the safe direction, quieter is not"
+        );
     }
 }

@@ -794,22 +794,37 @@ impl ChainStore {
             let was_severity = c.chain.severity.clone();
             let was_families = c.chain.families.clone();
             c.last_at = at;
-            c.chain.steps_total += 1;
-            if step.is_trigger() {
-                c.chain.triggers_total += 1;
-                // BEFORE the cap, and regardless of it. This is the whole fix:
-                // the thirteenth observation still gets to change the verdict
-                // even though the story has no room to show it.
-                c.state.observe(&step.family, &step.severity, novel);
-            }
-            // The member is recorded whether or not the story has room for it.
-            if !c.chain.members.contains(&step.alert) {
+
+            // A STEP IS AN ALERT, AND AN ALERT APPEARS ONCE.
+            //
+            // `members` was already deduped by alert id; `steps`, `steps_total`
+            // and -- the one that matters -- `state.observe` were not. That was
+            // harmless while a fold RETURNED before `note_chain`, because a
+            // repeat never arrived here. Since 2026-09-07 it does, so the same
+            // alert re-observed 69 times (kubectl, one destination) would have
+            // added 69 steps, counted 69 things as having happened, and fed the
+            // severity machine 69 times off one event.
+            //
+            // "Sixteen things happened in two seconds" has to mean sixteen
+            // THINGS. A repeat updates when the chain was last active and
+            // nothing else.
+            let already = c.chain.members.contains(&step.alert);
+            if !already {
+                c.chain.steps_total += 1;
+                if step.is_trigger() {
+                    c.chain.triggers_total += 1;
+                    // BEFORE the cap, and regardless of it. This is the whole
+                    // fix: the thirteenth observation still gets to change the
+                    // verdict even though the story has no room to show it.
+                    c.state.observe(&step.family, &step.severity, novel);
+                }
+                // The member is recorded whether or not the story has room.
                 c.chain.members.push(step.alert.clone());
             }
-            let added = c.chain.steps.len() < MAX_STEPS;
+            let added = !already && c.chain.steps.len() < MAX_STEPS;
             if added {
                 c.chain.steps.push(step);
-            } else {
+            } else if !already {
                 c.chain.truncated = true;
             }
             c.chain.last_ts = ts;
@@ -1058,6 +1073,44 @@ mod tests {
     /// itself. Testing the acting process let a dropper inside a package build
     /// step out of that build's tree and correlate with nothing, which is a
     /// one-line evasion of the whole sequence detection.
+    /// "Sixteen things happened in two seconds" has to mean sixteen THINGS.
+    ///
+    /// Since 2026-09-07 a folded event reaches correlation (so a second process
+    /// tree's step cannot vanish), which means the SAME alert id can arrive
+    /// here many times -- kubectl produced 69 for one destination. Only
+    /// `members` was deduped; steps, the total, and the severity machine were
+    /// not, so one event would have counted as sixty-nine.
+    #[test]
+    fn one_alert_arriving_many_times_is_one_step() {
+        let mut store = ChainStore::default();
+
+        // Two genuinely different things: a chain forms and says so.
+        store.note(obs("01SAME", 1_000, "net", "low", typed_at_a_shell(5000)));
+        let c = store
+            .note(obs("01OTHER", 1_001, "persist", "medium", typed_at_a_shell(5000)))
+            .expect("two different things is a sequence");
+        assert_eq!(c.steps_total, 2);
+
+        // Now the SAME alert arrives forty more times, which is what a folded
+        // event does since `emit` started correlating on the fold path.
+        let mut last = c;
+        for i in 0..40 {
+            if let Some(c) = store.note(obs("01SAME", 1_002 + i, "net", "low", typed_at_a_shell(5000))) {
+                last = c;
+            }
+        }
+        assert_eq!(last.steps_total, 2, "forty arrivals of a known alert is still two things");
+        assert_eq!(last.steps.len(), 2, "and two steps in the story");
+        assert_eq!(last.members.len(), 2);
+        assert!(!last.truncated, "a repeat must not look like a truncated story");
+
+        // A genuinely new alert is still a third thing.
+        let c3 = store
+            .note(obs("01THIRD", 1_100, "exec", "medium", typed_at_a_shell(5000)))
+            .expect("the chain grows");
+        assert_eq!(c3.steps_total, 3, "a different alert is a different thing");
+    }
+
     #[test]
     fn a_payload_cannot_setsid_its_way_out_of_the_tree_it_ran_in() {
         // Two stages under one build, each having made itself a session leader.

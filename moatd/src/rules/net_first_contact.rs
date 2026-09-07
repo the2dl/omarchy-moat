@@ -44,7 +44,8 @@ const EXFIL_WINDOW_SECS: u64 = 60;
 #[derive(Default)]
 pub struct NetFirstContact {
     compiled: Option<(Vec<String>, Vec<Cidr>)>,
-    /// `exe -> ip:port -> when we last reported it on the exfil path`.
+    /// "Have I already said this?" for the exfil-override path, keyed
+    /// `exe|ip:port`. See `rules::Said`, which is this idea shared.
     ///
     /// The novelty path reports a destination once because RARITY remembers it
     /// afterwards. The credential-context path had no such memory: it fires
@@ -57,7 +58,7 @@ pub struct NetFirstContact {
     /// One report is all the override is for: it exists so the cred -> net
     /// chain can form, and a chain forms on the first step. The 84th says
     /// nothing the 1st did not.
-    reported: std::collections::HashMap<String, u64>,
+    reported: Option<crate::rules::Said>,
 }
 
 impl NetFirstContact {
@@ -150,18 +151,12 @@ impl UserRule for NetFirstContact {
         // needed this.
         if familiar {
             let key = format!("{}\u{1}{}:{}", proc.exe, ip_s, port);
-            // Bounded, and pruned by the same window that gates the override.
-            if self.reported.len() > 512 {
-                let now = ctx.now;
-                self.reported
-                    .retain(|_, t| now.saturating_sub(*t) < EXFIL_WINDOW_SECS * 10);
+            let said = self
+                .reported
+                .get_or_insert_with(|| crate::rules::Said::new(EXFIL_WINDOW_SECS * 10, 512));
+            if !said.worth_saying(&key, ctx.now) {
+                return Vec::new();
             }
-            if let Some(t) = self.reported.get(&key) {
-                if ctx.now.saturating_sub(*t) < EXFIL_WINDOW_SECS * 10 {
-                    return Vec::new();
-                }
-            }
-            self.reported.insert(key, ctx.now);
         }
 
         let m = self.meta();

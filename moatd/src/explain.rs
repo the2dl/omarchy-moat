@@ -147,6 +147,30 @@ impl Finding {
     /// remain two events, and the rule stays in it so a sweep of browser
     /// stores never merges with an SSH key read -- crossing rules is the
     /// chain's job, not the dedupe's.
+    /// **The pid is load-bearing, and taking it out is a trap I fell into on
+    /// 2026-09-07.**
+    ///
+    /// The reasoning that says to remove it is seductive and half right: a CLI
+    /// tool is a fresh pid every invocation, so nothing repeated ever folds
+    /// (kubectl produced 69 rows, 69 pids, one destination). The stated reason
+    /// for the pid -- that a fold returned before `note_chain`, so a second
+    /// process tree's step never reached correlation -- was then genuinely
+    /// fixed: `engine::emit` correlates on the fold path now.
+    ///
+    /// But TWO more things hang off a fold, and neither was in that reasoning:
+    ///
+    /// * `emit` captures an incident snapshot only when `folded.is_none()`, so
+    ///   the second tree gets no evidence captured;
+    /// * `chain::note` records one step per ALERT ID, so the second tree adds
+    ///   no step either.
+    ///
+    /// Folding two trees into one row therefore makes the second nearly
+    /// invisible -- which is the 2026-09-06 exfil miss again, wearing a
+    /// different hat. `two_trees_to_one_host_stay_two_alerts` pins it.
+    ///
+    /// The repeated-CLI noise is real and is fixed where it belongs: in the
+    /// rule, with `rules::Said`, which suppresses a REPORT without merging two
+    /// events into one record.
     pub fn dedupe_key(&self) -> String {
         // Moat's own meta alerts key on their TITLE.
         //
@@ -1127,6 +1151,10 @@ mod tests {
         assert_eq!(a.dedupe_key(), same.dedupe_key(), "same process, same host folds");
 
         // Different process (a different tree) to the same host: kept apart.
+        // 2026-09-07: this was briefly removed on the argument that the fold
+        // now correlates, which is true and not sufficient -- a fold also skips
+        // the incident snapshot and adds no chain step, so merging two trees
+        // makes the second nearly invisible. See the note on `dedupe_key`.
         let other_proc = base("/usr/bin/python3", 200, "192.168.44.122", 4873);
         assert_ne!(a.dedupe_key(), other_proc.dedupe_key(), "different tree must not fold");
 
@@ -1170,10 +1198,17 @@ mod tests {
             "two credential stores read by one process in the window are one sweep"
         );
 
-        // Two different programs reading credentials stay two events...
+        // Two different programs reading credentials stay two events, and so
+        // do two RUNS of one program: each is its own tree, its own snapshot,
+        // its own chain step. Repeated-CLI noise is suppressed in the rule
+        // (`rules::Said`), never by merging two events into one record.
         let mut other = finding();
         other.proc.pid = a.proc.pid + 1;
         assert_ne!(a.dedupe_key(), other.dedupe_key());
+
+        let mut other_exe = finding();
+        other_exe.proc.exe = "/usr/bin/some-other-reader".into();
+        assert_ne!(a.dedupe_key(), other_exe.dedupe_key(), "different programs too");
 
         // ...and a sweep never merges across rules. Crossing rules is what the
         // chain correlates; folding them here would destroy that.
