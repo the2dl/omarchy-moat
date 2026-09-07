@@ -369,7 +369,30 @@ fn run_passes(
         if max_passes.is_some_and(|m| passes >= m) {
             break;
         }
-        std::thread::sleep(poll);
+        // Sleep in slices so SIGTERM is answered promptly.
+        //
+        // `thread::sleep` retries on EINTR, so a signal during it does not cut
+        // it short: the handler set STOP and the process went on sleeping for
+        // the rest of `poll_secs`. With the 5 s TimeoutStopSec this machine
+        // defaults to and a 10 s poll, that made a clean stop IMPOSSIBLE --
+        // every restart ended `State 'stop-sigterm' timed out. Killing.` and
+        // `Failed with result 'timeout'`, which is what a shipper looks like
+        // when it is losing data even though this one is not (the cursor only
+        // advances past acknowledged batches, so a SIGKILL re-sends at worst
+        // one batch).
+        //
+        // Raising the timeout would have hidden it. A daemon should answer a
+        // stop request at the speed of the request, not of its poll interval.
+        let slice = std::time::Duration::from_millis(250);
+        let mut slept = std::time::Duration::ZERO;
+        while slept < poll {
+            if STOP.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            let step = slice.min(poll - slept);
+            std::thread::sleep(step);
+            slept += step;
+        }
     }
     let s = shipper.stats();
     log::info!(
