@@ -13,7 +13,7 @@ metadata:
       intruder does after acting: the machine looks quiet afterwards because there is
       nothing left to read, not because nothing happened.
     moat.omarchy/expected: >-
-      Nothing but Moat itself. Only moatd, moatctl, moat-feeds and the sensor write in
+      Nothing but Moat itself. Only moatd, moatctl, moat-feeds, moat-ship and the sensor write in
       these two directories, and they are all excluded here, so a match means some other
       program removed, emptied or renamed evidence.
     moat.omarchy/fp-hint: "exe"
@@ -40,6 +40,7 @@ spec:
         - "/usr/bin/moatd"
         - "/usr/bin/moatctl"
         - "/usr/bin/moat-feeds"
+        - "/usr/bin/moat-ship"
         - "/usr/bin/tetragon"
         - "/usr/bin/systemd-tmpfiles"
         - "/usr/lib/systemd/systemd"
@@ -71,6 +72,7 @@ spec:
         - "/usr/bin/moatd"
         - "/usr/bin/moatctl"
         - "/usr/bin/moat-feeds"
+        - "/usr/bin/moat-ship"
         - "/usr/bin/tetragon"
         - "/usr/bin/systemd-tmpfiles"
         - "/usr/lib/systemd/systemd"
@@ -103,6 +105,7 @@ spec:
         - "/usr/bin/moatd"
         - "/usr/bin/moatctl"
         - "/usr/bin/moat-feeds"
+        - "/usr/bin/moat-ship"
         - "/usr/bin/tetragon"
         - "/usr/bin/systemd-tmpfiles"
         - "/usr/lib/systemd/systemd"
