@@ -758,7 +758,7 @@ pub fn envelope(
         "kind": kind,
         "moat_tier": moat_tier(&body, &class, &kind),
         "severity": severity,
-        "@timestamp": body.get("ts").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+        "@timestamp": record_time(&body),
         "moat": body,
     });
 
@@ -821,6 +821,35 @@ fn moat_tier(body: &Value, class: &str, kind: &str) -> &'static str {
         return "ripple";
     }
     "silt"
+}
+
+/// The time a record is ABOUT, for the collector's `@timestamp`.
+///
+/// A full alert carries `ts` at the top level. The other two shapes on this
+/// file do not, and both are common: an UPDATE keeps its stamp inside the
+/// `update` map (`engine::emit` sets `ts` there on every fold), and a RECEIPT
+/// names its own field `started`.
+///
+/// 2026-09-07, measured against a live collector: **about 55% of shipped
+/// records arrived with `"@timestamp": ""`** because this read only the
+/// top-level `ts`. An empty timestamp is worse than a wrong one -- it is the
+/// field a SIEM sorts, buckets and retains on, so those records either landed
+/// at the epoch or were rescued by a fallback the COLLECTOR had to implement.
+/// Making the receiver guess the time of the thing we are describing is not
+/// its job.
+///
+/// Last resort is the send time. It is a lie by at most one poll interval,
+/// and it is a much smaller lie than 1970.
+fn record_time(body: &Value) -> String {
+    let s = |v: Option<&Value>| {
+        v.and_then(|t| t.as_str())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+    };
+    s(body.get("ts"))
+        .or_else(|| s(body.get("update").and_then(|u| u.get("ts"))))
+        .or_else(|| s(body.get("receipt").and_then(|r| r.get("started"))))
+        .unwrap_or_else(util::now_rfc3339)
 }
 
 fn classify(body: &Value, class: &str) -> (String, Option<String>, String) {
@@ -1814,6 +1843,49 @@ pub fn describe_https(cfg: &HttpsConfig) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// About 55% of shipped records had `"@timestamp": ""` -- every update and
+    /// every receipt -- because only the top-level `ts` was read. That is the
+    /// field a SIEM sorts, buckets and retains on, and an empty one is worse
+    /// than a wrong one.
+    #[test]
+    fn every_shape_ships_the_time_it_is_about() {
+        let host = "mars";
+        let red = Redactor::default();
+        let g = guard();
+        let mut w = 0usize;
+        let mut at = |line: &str| -> String {
+            envelope(line, "alerts", host, &red, &g, &mut w)
+                .expect("an envelope")
+                .value["@timestamp"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // A full alert: top-level `ts`, as before.
+        assert_eq!(
+            at(r#"{"id":"01A","rule":"r","severity":"high","ts":"2026-09-07T10:00:00.000Z"}"#),
+            "2026-09-07T10:00:00.000Z"
+        );
+        // An update keeps its stamp inside the `update` map.
+        assert_eq!(
+            at(r#"{"id":"01A","update":{"count":2,"ts":"2026-09-07T11:00:00.000Z"}}"#),
+            "2026-09-07T11:00:00.000Z",
+            "an update is about the moment it folded"
+        );
+        // A receipt names its own field.
+        assert_eq!(
+            at(r#"{"receipt":{"id":"01R","started":"2026-09-07T12:00:00.000Z","root_exe":"/usr/bin/pacman"}}"#),
+            "2026-09-07T12:00:00.000Z",
+            "a receipt is about when the install started"
+        );
+        // Nothing at all: the send time, which is wrong by at most one poll
+        // interval rather than by fifty-six years.
+        let none = at(r#"{"id":"01A","rule":"r","severity":"high"}"#);
+        assert!(!none.is_empty(), "never ship an empty timestamp");
+        assert!(none.starts_with("20"), "and never the epoch: {}", none);
+    }
+
     /// The moat vocabulary a collector facets on. Derived, additive, and every
     /// field it comes from is still under `moat` in the same record.
     #[test]
