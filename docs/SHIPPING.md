@@ -250,6 +250,26 @@ a stream fallback) or `tcp://host:port` (RFC6587 octet counting).
 > 306 bytes against the record's 1.4 KB. The id is there so the whole thing is
 > one `moatctl explain <id>` away. **If you want the full record, use HTTPS.**
 
+### `moat_tier` — the one field to facet on
+
+Every shipped record carries `moat_tier`, derived from `surface`, `tier`,
+`suppressed_by` and `action_taken` so a collector does not have to reason about
+four fields to answer "did this need a human". It is **additive**: all four are
+still under `moat` in the same record, and this is a convenience for the query
+bar, never the source of truth.
+
+| `moat_tier` | means | derived from |
+|---|---|---|
+| `gator`   | the moat bit — blocked, contained, killed or quarantined. The highest-value audit record moat produces. | `action_taken != none` |
+| `alert`   | on the badge, waiting for a person | `surface = alerts` |
+| `duck`    | belongs in the moat: an allowlist or baseline rule said so. Still recorded, because a suppression nobody can see is a silence. | `suppressed_by` set |
+| `ripple`  | a building block. One ripple means nothing; several in a row is something moving, which is what a chain is made of. | `tier = signal` |
+| `silt`    | settled. In the timeline, asking nothing. Also updates and receipts. | everything else in `alerts` |
+| `current` | the water itself — telemetry, which never entered rule evaluation at all. | `class != alerts` |
+
+Precedence is top to bottom: a contained row is a `gator` even though it is also
+on the badge, because what moat DID is the fact a collector most wants to find.
+
 ### Delivery
 
 At-least-once with receiver-side dedupe. Every record carries an `event_id`:

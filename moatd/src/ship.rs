@@ -756,6 +756,7 @@ pub fn envelope(
         "host": host,
         "class": class.clone(),
         "kind": kind,
+        "moat_tier": moat_tier(&body, &class, &kind),
         "severity": severity,
         "@timestamp": body.get("ts").and_then(|t| t.as_str()).unwrap_or("").to_string(),
         "moat": body,
@@ -776,6 +777,52 @@ pub fn envelope(
 /// `alerts.jsonl` carries three shapes (CONTRACT §4): a full alert, an
 /// `{"id":…,"update":{…}}` state change, and a `{"receipt":{…}}` install
 /// receipt. `telemetry.jsonl` carries the class records of `telemetry.rs`.
+/// The moat's own vocabulary for how much attention a record is asking for.
+///
+/// A collector wants one field to facet on, and "surface", "tier",
+/// "suppressed_by" and "action_taken" are four. This is derived from all four
+/// and is purely additive: every field it comes from is still under `moat`, so
+/// it is a convenience for the query bar and never the source of truth.
+///
+/// * `gator`  — the moat bit. Something was blocked, contained, killed or
+///   quarantined. The highest-value audit record moat produces.
+/// * `alert`  — on the badge. A person has not answered it yet.
+/// * `duck`   — belongs in the moat: an allowlist or baseline rule said so.
+///   Still recorded, because a suppression nobody can see is a silence.
+/// * `ripple` — a building block (`tier: signal`). One ripple means nothing;
+///   several in a row is something moving, which is what a chain is made of.
+/// * `silt`   — settled. Recorded, in the timeline, asking nothing.
+/// * `current`— the water itself: telemetry, which never entered rule
+///   evaluation at all.
+fn moat_tier(body: &Value, class: &str, kind: &str) -> &'static str {
+    if class != "alerts" {
+        return "current";
+    }
+    // Updates and receipts describe a record rather than being one.
+    if kind != "alert" {
+        return "silt";
+    }
+    let s = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let acted = s("action_taken");
+    if !acted.is_empty() && acted != "none" {
+        return "gator";
+    }
+    if body
+        .get("suppressed_by")
+        .map(|v| !v.is_null())
+        .unwrap_or(false)
+    {
+        return "duck";
+    }
+    if s("surface") == "alerts" {
+        return "alert";
+    }
+    if s("tier") == "signal" {
+        return "ripple";
+    }
+    "silt"
+}
+
 fn classify(body: &Value, class: &str) -> (String, Option<String>, String) {
     if class == "alerts" {
         if body.get("update").is_some() {
@@ -1767,6 +1814,48 @@ pub fn describe_https(cfg: &HttpsConfig) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The moat vocabulary a collector facets on. Derived, additive, and every
+    /// field it comes from is still under `moat` in the same record.
+    #[test]
+    fn every_record_carries_the_tier_it_belongs_to() {
+        let host = "mars";
+        let red = Redactor::default();
+        let guard = guard();
+        let mut w = 0usize;
+        let mut tier = |line: &str, source: &str| -> String {
+            envelope(line, source, host, &red, &guard, &mut w)
+                .expect("an envelope")
+                .value["moat_tier"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        let base = |extra: &str| {
+            format!(
+                r#"{{"id":"01ABC","rule":"moat-x-test","severity":"high","ts":"2026-09-07T00:00:00Z"{}}}"#,
+                extra
+            )
+        };
+
+        // The moat bit outranks everything: it is the audit record that matters.
+        assert_eq!(tier(&base(r#","surface":"alerts","action_taken":"contained""#), "alerts"), "gator");
+        assert_eq!(tier(&base(r#","surface":"alerts","action_taken":"killed""#), "alerts"), "gator");
+        // Answered by a rule you wrote: recorded, never on the badge.
+        assert_eq!(tier(&base(r#","surface":"alerts","suppressed_by":"user.toml#3""#), "alerts"), "duck");
+        // Waiting for a person.
+        assert_eq!(tier(&base(r#","surface":"alerts","action_taken":"none""#), "alerts"), "alert");
+        // A building block: only means something with the others.
+        assert_eq!(tier(&base(r#","surface":"timeline","tier":"signal""#), "alerts"), "ripple");
+        // Settled.
+        assert_eq!(tier(&base(r#","surface":"timeline""#), "alerts"), "silt");
+        // The water itself, which never reached rule evaluation.
+        assert_eq!(
+            tier(r#"{"class":"file","ts":"2026-09-07T00:00:00Z"}"#, "telemetry"),
+            "current"
+        );
+    }
+
     use super::*;
 
     fn red() -> Redactor {
