@@ -74,7 +74,19 @@ Item {
             SettingsRow {
                 width: parent.width
                 tokens: root.t
-                question: "Should Moat stop things, or just tell you?"
+                // Names the STATE, not the question.
+                //
+                // 2026-09-07: every enforcement change that day was made from
+                // the terminal, by someone who had these buttons and did not
+                // find them -- because when a build is being killed you go
+                // looking for an off switch, not for a question about
+                // philosophy. A chip should say what mode you are IN.
+                //
+                // Neither says "Off": in monitor mode moat still watches,
+                // records, correlates and alerts. Only the stopping is off, and
+                // labelling that "Off" beside a daemon about to raise a
+                // critical would be the same lie as an empty timestamp.
+                question: "Is Moat allowed to stop things?"
                 help: "Stopping happens in the kernel, before this panel sees it — a wrong guess kills a real program mid-write. Stay on telling you until Rules has been quiet for a week."
                 helpLoud: root.enforcing
 
@@ -84,7 +96,7 @@ Item {
 
                     MoatChip {
                         tokens: root.t
-                        text: "Just tell me"
+                        text: "On, alerting"
                         selected: !root.enforcing
                         onClicked: {
                             if (root.service)
@@ -95,7 +107,7 @@ Item {
 
                     MoatChip {
                         tokens: root.t
-                        text: "Stop things"
+                        text: "On, blocking"
                         selected: root.enforcing
                         // Deliberately the duller chip even when it is the honest answer:
                         // it is the option whose worst case the user cannot see from here.
