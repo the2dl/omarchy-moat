@@ -389,8 +389,21 @@ fn what_sentence(f: &Finding) -> String {
             (_, None) => format!("{} did something unusual during a package install.", comm),
         },
         "persist" => match file {
+            // NOT "runs automatically on your next login".
+            //
+            // That was asserted for every persist alert whatever the file, and
+            // it is false for most of them: a git hook runs on a git command, a
+            // .vscode/tasks.json runs in the editor, an AGENTS.md is read by an
+            // agent, a systemd unit runs at boot as root, and authorized_keys
+            // grants a login rather than running at one.
+            //
+            // 2026-09-08: `pnpm install` unpacked a dependency that ships an
+            // AGENTS.md and the card told the user it would run at their next
+            // login. The mechanism belongs in each rule's `why`, which states
+            // it exactly; the headline says the thing that is true of the whole
+            // family -- this file is acted on, not merely stored.
             Some(p) => format!(
-                "{} wrote to {}, which runs automatically on your next login.",
+                "{} wrote to {}, a file that gets acted on without anyone opening it.",
                 comm, p
             ),
             None => format!("{} installed something that survives a reboot.", comm),

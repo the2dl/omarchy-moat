@@ -249,3 +249,43 @@ file = "*/.cargo/registry/src/*"
 [[rule]]
 name = "moat-persist-agent-config-write"
 file = "/usr/local/cargo/registry/src/*"
+
+# ------------------------------- a dependency tree is extracted, not installed
+#
+# Fourth instance of one shape in a day: a package manager unpacks a dependency
+# that happens to SHIP a file whose name is one the persist rules watch, and the
+# unpack reads as somebody arranging to run again.
+#
+# 2026-09-08, live: `pnpm install` unpacked recharts, which ships an AGENTS.md,
+# into node_modules/.pnpm/recharts@3.8.1_.../recharts_tmp_696437/AGENTS.md. The
+# card said it "runs automatically on your next login" and the sequence
+# escalated to CRITICAL off 57 events in two seconds. Nothing reads AGENTS.md
+# from inside a transitive dependency: the rule's own reasoning -- that these
+# files are "executed or obeyed by tools that already have your permissions" --
+# is true of ~/.claude/settings.json and false of a vendored copy six
+# directories down.
+#
+# The git-hook half of this was covered when cargo did it; the agent-config
+# half was not. These are suppressions, so the rows are still recorded and
+# still show greyed in the timeline -- and writing the same names anywhere
+# REAL, including the top of your own project, still fires.
+
+# npm/pnpm/yarn dependency trees, at any depth.
+[[rule]]
+name = "moat-persist-agent-config-write"
+file = "*/node_modules/*"
+
+# pnpm's content-addressed store, which is where the tarballs land first.
+[[rule]]
+name = "moat-persist-agent-config-write"
+file = "*/.pnpm-store/*"
+
+# yarn's cache, the same idea under a different name.
+[[rule]]
+name = "moat-persist-agent-config-write"
+file = "*/.yarn/cache/*"
+
+# Go module cache: extracted source, read-only by design, never executed there.
+[[rule]]
+name = "moat-persist-agent-config-write"
+file = "*/go/pkg/mod/*"
