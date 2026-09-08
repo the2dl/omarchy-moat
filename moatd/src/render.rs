@@ -39,7 +39,7 @@ pub const PLACEHOLDER: &str = "{{HOME}}";
 pub const FILE_SCOPE: &str = "{{FILE_SCOPE}}";
 pub const FILE_SUFFIXES: &str = "{{FILE_SUFFIXES}}";
 
-/// The two export-allowlist lines, matching `policies/export-allowlist.example`.
+/// The three export-allowlist lines, matching `policies/export-allowlist.example`.
 ///
 /// Line 1 keeps exec/exit — they carry no `policy_name`, so there is no other
 /// way to select them, and without them there is no ancestry. Line 2 restricts
@@ -47,6 +47,17 @@ pub const FILE_SUFFIXES: &str = "{{FILE_SUFFIXES}}";
 /// exact-match with no globs (NOTES §8, gap 8), which is why this file is
 /// regenerated on every render. NOTES §8 also offers a CEL `startsWith`
 /// variant, but that is UNVERIFIED live and exact names cost nothing.
+///
+/// Line 3 is `PROCESS_THROTTLE`, and its absence until 2026-09-08 was a hole
+/// in moat's account of itself. Tetragon is run with `--cgroup-rate 1000,1s`;
+/// when a cgroup exceeds that, base events are DROPPED and a `process_throttle`
+/// event says so. moatd parses those (`event::ThrottleEvent`) and raises
+/// `moat-x-sensor-throttled` — a rule that could never once have fired, because
+/// this filter discarded the only event that triggers it. So "no throttle
+/// alerts" meant "moat cannot see whether it is losing events", which is the
+/// worst thing for a sensor to be quietly unsure about: every ancestry gap and
+/// every unformed chain downstream had an explanation nobody could check.
+/// It carries no `policy_name`, so like exec/exit it needs its own line.
 fn allowlist_body(names: &BTreeSet<String>) -> String {
     let list = names
         .iter()
@@ -55,7 +66,8 @@ fn allowlist_body(names: &BTreeSet<String>) -> String {
         .join(",");
     format!(
         "{{\"event_set\":[\"PROCESS_EXEC\",\"PROCESS_EXIT\"]}}\n\
-         {{\"event_set\":[\"PROCESS_KPROBE\",\"PROCESS_LSM\",\"PROCESS_TRACEPOINT\",\"PROCESS_UPROBE\"],\"policy_names\":[{}]}}\n",
+         {{\"event_set\":[\"PROCESS_KPROBE\",\"PROCESS_LSM\",\"PROCESS_TRACEPOINT\",\"PROCESS_UPROBE\"],\"policy_names\":[{}]}}\n\
+         {{\"event_set\":[\"PROCESS_THROTTLE\"]}}\n",
         list
     )
 }
@@ -670,6 +682,13 @@ spec:
             lines[1],
             r#"{"event_set":["PROCESS_KPROBE","PROCESS_LSM","PROCESS_TRACEPOINT","PROCESS_UPROBE"],"policy_names":["moat-cred-a","moat-net-b"]}"#
         );
+        // PROCESS_THROTTLE carries no policy_name, so it needs its own line --
+        // and without it `moat-x-sensor-throttled` can never fire, which means
+        // moat cannot tell whether it is losing events. This assertion is the
+        // whole guard: the old test checked lines[0] and lines[1] and passed
+        // happily while the third line did not exist.
+        assert_eq!(lines[2], r#"{"event_set":["PROCESS_THROTTLE"]}"#);
+        assert_eq!(lines.len(), 3, "three lines, no more: {:?}", lines);
         for l in lines {
             let _: serde_json::Value = serde_json::from_str(l).expect("each line is valid JSON");
         }
