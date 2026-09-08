@@ -783,3 +783,72 @@ mod interpreter_tests {
         assert_eq!(interpreter_of("/nonexistent/moat/probe"), None);
     }
 }
+
+/// Is this process inside a container, i.e. a different mount namespace to ours?
+///
+/// moatd runs in the host's namespaces, so "not ours" means "not this machine's
+/// filesystem". That is the whole question a container check has to answer, and
+/// asking the kernel is the only honest way to ask it: a path is
+/// namespace-relative, an ancestry walk truncates (measured at depth 8, which
+/// is short of `runc` for an npm postinstall), and an exe path that does not
+/// exist on the host only tells you it is missing NOW.
+///
+/// `proc` is a parameter so this is testable without a container.
+///
+/// Unknown means NOT a container. A process that has already exited cannot be
+/// read, and defaulting to "container" there would let anything quiet itself by
+/// dying fast -- the same trade `socket_is_gone_not_hidden` makes, in the same
+/// direction.
+pub fn in_container_at(proc: &std::path::Path, pid: u32) -> bool {
+    let Ok(ours) = std::fs::read_link(proc.join("self").join("ns").join("mnt")) else {
+        return false;
+    };
+    match std::fs::read_link(proc.join(pid.to_string()).join("ns").join("mnt")) {
+        Ok(theirs) => theirs != ours,
+        Err(_) => false,
+    }
+}
+
+/// [`in_container_at`] against the real `/proc`.
+pub fn in_container(pid: u32) -> bool {
+    in_container_at(std::path::Path::new("/proc"), pid)
+}
+
+#[cfg(test)]
+mod container_tests {
+    use super::in_container_at;
+    use std::os::unix::fs::symlink;
+
+    /// A fake /proc where `self` and `pid` point at named namespaces.
+    fn proc_with(dir: &std::path::Path, ours: &str, theirs: &str) -> std::path::PathBuf {
+        for (who, ns) in [("self", ours), ("42", theirs)] {
+            let d = dir.join(who).join("ns");
+            std::fs::create_dir_all(&d).unwrap();
+            symlink(ns, d.join("mnt")).unwrap();
+        }
+        dir.to_path_buf()
+    }
+
+    #[test]
+    fn a_process_in_our_own_mount_namespace_is_not_a_container() {
+        let d = tempfile::tempdir().unwrap();
+        let p = proc_with(d.path(), "mnt:[4026531840]", "mnt:[4026531840]");
+        assert!(!in_container_at(&p, 42));
+    }
+
+    #[test]
+    fn a_different_mount_namespace_is_a_container() {
+        let d = tempfile::tempdir().unwrap();
+        let p = proc_with(d.path(), "mnt:[4026531840]", "mnt:[4026532999]");
+        assert!(in_container_at(&p, 42));
+    }
+
+    #[test]
+    fn a_process_that_has_already_gone_is_not_a_container() {
+        // Unknown must mean "not a container", or anything could quieten itself
+        // by exiting fast enough to lose the race.
+        let d = tempfile::tempdir().unwrap();
+        let p = proc_with(d.path(), "mnt:[4026531840]", "mnt:[4026532999]");
+        assert!(!in_container_at(&p, 999), "no such pid");
+    }
+}

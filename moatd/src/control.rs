@@ -197,7 +197,7 @@ const ROOT_ONLY: &[(&str, &str)] = &[
 /// it decides whether a weekly summary is sent, which is a preference and not a
 /// protection, and making a person sudo for it would teach them that the sudo
 /// prompt is meaningless -- which is how the meaningful one gets waved through.
-const ROOT_ONLY_SET_KEYS: &[&str] = &["mode", "sandbox", "contain", "kill"];
+const ROOT_ONLY_SET_KEYS: &[&str] = &["mode", "sandbox", "contain", "kill", "containers"];
 
 /// `(command, action)` pairs that need root, where the COMMAND itself does not.
 ///
@@ -250,6 +250,8 @@ fn needs_root(req: &Value) -> Option<String> {
         let key = req.get("key").and_then(|v| v.as_str()).unwrap_or("");
         if is_threshold_key(key) {
             "changing how many events a detection needs before it fires"
+        } else if key == "containers" {
+            "changing whether container activity is shown to you"
         } else if ROOT_ONLY_SET_KEYS.contains(&key) {
             "changing what Moat enforces"
         } else {
@@ -1983,6 +1985,7 @@ fn cmd_set(d: &mut Daemon, req: &Value) -> Value {
     match key {
         "mode" => set_mode(d, value, req["rule"].as_str().unwrap_or(""), &who),
         "sandbox" => set_sandbox(d, value, &who),
+        "containers" => set_containers(d, value, &who),
         "digest" => set_digest(d, value),
         "contain" => set_contain(d, value, &who),
         "kill" => set_kill(d, value, &who),
@@ -2000,6 +2003,31 @@ fn cmd_set(d: &mut Daemon, req: &Value) -> Value {
 /// and `status.digest`. The user timer keeps firing either way; with the digest
 /// off, `moatctl digest --notify` simply sends nothing, so switching it off
 /// needs neither root nor `systemctl`.
+/// `moatctl set containers on|off`.
+///
+/// Recorded as a protection change in BOTH directions. Turning it OFF hides a
+/// population of events from the badge, which is the shape of the thing this
+/// daemon records; turning it ON is a deliberate acceptance of noise and is
+/// just as worth knowing when someone asks why the queue grew overnight.
+fn set_containers(d: &mut Daemon, value: &str, who: &str) -> Value {
+    let on = match value {
+        "on" | "true" | "1" => true,
+        "off" | "false" | "0" => false,
+        other => return err(format!("containers must be on or off, got {:?}", other)),
+    };
+    d.set_inspect_containers(on);
+    d.raise_protection_change(
+        &format!("show container activity: {}", if on { "on" } else { "off" }),
+        who,
+        vec![if on {
+            "container events now reach the badge; builds are noisy by nature".into()
+        } else {
+            "container events stay on the timeline; nothing stops being recorded".to_string()
+        }],
+    );
+    ok(json!({ "containers": on }))
+}
+
 fn set_digest(d: &mut Daemon, value: &str) -> Value {
     let on = match value {
         "on" | "true" | "1" => true,

@@ -165,6 +165,14 @@ pub struct Daemon {
     pub receipts: receipt::Tracker,
     /// LEARNING §5: `moatctl set digest on|off`, persisted in state.json.
     pub digest_enabled: bool,
+    /// `moatctl set containers on|off` -- whether container activity reaches
+    /// the badge. It is always RECORDED; this decides whether it is asked
+    /// about. Off by default: a build does things that look like an intrusion
+    /// (unpacking setuid binaries, fetching toolchains into /tmp, running
+    /// postinstalls on a socketpair), and on this machine that was 452 of 639
+    /// rows in one night. Enforcement is a separate question and is already
+    /// answered in the kernel -- moat never refuses anything in a container.
+    pub inspect_containers: bool,
     /// `moatctl set threshold.<name> <value>`, persisted in state.json.
     ///
     /// Held separately from `cfg.thresholds` rather than being folded into it,
@@ -329,6 +337,11 @@ impl Daemon {
             persisted_u64(&state, "content", "used") as u32,
         );
         let digest_enabled = persisted_digest_enabled(&state).unwrap_or(cfg.digest.enabled);
+        let inspect_containers = state
+            .as_ref()
+            .and_then(|s| s.get("inspect_containers"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let digest_last_sent = persisted_u64(&state, "digest_summary", "last_sent_unix");
 
         let mut d = Daemon {
@@ -371,6 +384,7 @@ impl Daemon {
             in_meta_alert: false,
             receipts: receipt::Tracker::default(),
             digest_enabled,
+            inspect_containers,
             threshold_overrides: persisted_threshold_overrides(&state),
             digest_last_sent,
             incidents_captured: 0,
@@ -2651,6 +2665,27 @@ impl Daemon {
         if killed {
             alert.action_taken = "killed".into();
         }
+        // A container is watched, not asked about -- unless you asked to be.
+        //
+        // The kernel already refuses to ENFORCE inside a container
+        // (render::split_container_enforcement); this is the other half, and it
+        // is only about the badge. The row is written, keeps its severity, stays
+        // on the timeline and stays a chain member, so a real sequence that runs
+        // through a container still reaches you: `note_chain` re-stamps trigger
+        // members to `alerts` when a chain goes high, and that runs after this.
+        // What stops is one build's worth of setuid layer-unpacking and toolchain
+        // fetches asking 452 questions in a night.
+        if !self.inspect_containers
+            && alert.surface == "alerts"
+            && crate::util::in_container(alert.process.pid)
+        {
+            alert.surface = "timeline".into();
+            alert.severity_reason = format!(
+                "{}; shown on the timeline only: this ran in a container and container \
+                 inspection is off",
+                alert.severity_reason
+            );
+        }
         if let Err(e) = self.store.append_alert(&alert) {
             log::error!("alerts.jsonl: {}", e);
             return None;
@@ -3456,6 +3491,13 @@ impl Daemon {
         log::info!("weekly digest {}", if on { "on" } else { "off" });
     }
 
+    /// `moatctl set containers on|off`.
+    pub fn set_inspect_containers(&mut self, on: bool) {
+        self.inspect_containers = on;
+        self.write_state();
+        log::info!("container inspection {}", if on { "on" } else { "off" });
+    }
+
     /// `moatctl digest --notify` reports back that it delivered one, so a
     /// catch-up run after a suspend does not send twice.
     pub fn digest_sent(&mut self, now: u64) {
@@ -4222,6 +4264,13 @@ impl Daemon {
             // how long moat was not running. Stopping the daemon needs root,
             // and a root-level shutdown left no trace at all before this.
             o.insert("heartbeat".into(), Value::from(util::unix_secs()));
+            // Whether container activity reaches the badge. Set out here rather
+            // than in the literal above, which is already at serde_json's macro
+            // recursion limit.
+            o.insert(
+                "inspect_containers".into(),
+                Value::Bool(self.inspect_containers),
+            );
         }
         out
     }

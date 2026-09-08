@@ -199,13 +199,24 @@ pub fn stage(alert: &Alert, dir: &Path, max_bytes: u64, group: &str) -> Vec<Arti
         };
         let p = Path::new(&path);
         let meta = std::fs::metadata(p).ok();
-        // Metadata is safe to report for anything, including a secret: a size
-        // and a hash say "this exists and is this big", not what is in it.
+        // Size is safe to report for anything, including a secret: it says
+        // "this exists and is this big", not what is in it.
         if let Some(m) = meta.as_ref() {
             a.bytes = Some(m.len());
         }
-        a.sha256 = util::sha256_file(p).ok();
 
+        // A HASH IS NOT METADATA. It used to be computed here, unconditionally,
+        // under a comment claiming it said no more than the size did. Computing
+        // sha256 means opening the file and reading every byte of it, so moat
+        // read the private key it was two lines away from refusing to stage --
+        // root pulling secret bytes into memory after it had already decided it
+        // must not. On 2026-09-08 the enforced ssh-key policy caught moat's own
+        // dev daemon doing exactly that, which is how this was found.
+        //
+        // The hash is also not free to publish: a digest of a secret is an
+        // oracle for it, and the incident directory is readable by the `moat`
+        // group, which on this threat model is the attacker. So ask permission
+        // FIRST, and hash only what may be staged.
         match may_stage(&path, is_target, family) {
             Err(why) => a.withheld = Some(why),
             Ok(()) => match meta {
@@ -221,6 +232,7 @@ pub fn stage(alert: &Alert, dir: &Path, max_bytes: u64, group: &str) -> Vec<Arti
                     ));
                 }
                 Some(_) => {
+                    a.sha256 = util::sha256_file(p).ok();
                     let name = util::basename(&path);
                     let name = if name.is_empty() { "artifact" } else { name };
                     let dest = dir.join(format!("{}.{}.suspect", role, name));
@@ -390,9 +402,18 @@ mod tests {
         let tgt = staged.iter().find(|x| x.role == "target").unwrap();
         assert!(tgt.staged_as.is_none(), "the key is NOT staged");
         assert!(tgt.withheld.is_some());
-        // Withheld is not hidden: it is still described.
+        // Withheld is not hidden: it is still described BY ITS SIZE.
         assert_eq!(tgt.bytes, Some(std::fs::metadata(&key).unwrap().len()));
-        assert!(tgt.sha256.is_some());
+        // But NOT by its hash. This assertion was the other way round until
+        // 2026-09-08, and it was wrong twice over: computing sha256 reads every
+        // byte of the file, so moat opened the private key it had just refused
+        // to stage; and a digest of a secret is an oracle for that secret,
+        // published into a directory the `moat` group can read.
+        assert!(
+            tgt.sha256.is_none(),
+            "a refused file is not opened, and its hash is not published"
+        );
+        assert!(act.sha256.is_some(), "what IS staged is still hashed");
         assert_eq!(tgt.original_path, key.display().to_string());
         // And its bytes are nowhere in the staging directory.
         for e in std::fs::read_dir(dir.path()).unwrap().flatten() {

@@ -586,6 +586,10 @@ Item {
             return [root.ctlPath, "set", "mode", Model.normalizeMode(arg2), "--rule", String(arg), "--json"];
         case "sandbox":
             return [root.ctlPath, "set", "sandbox", arg === true || arg === "on" ? "on" : "off", "--json"];
+        case "containers":
+            // Whether container activity reaches the badge. Root-gated, so an
+            // unprivileged toggle comes back as the daemon's refusal text.
+            return [root.ctlPath, "set", "containers", arg === true || arg === "on" ? "on" : "off", "--json"];
         case "digest":
             // LEARNING 5: the daemon owns the schedule and sends the digest; this is
             // only the on/off switch, so it is a `set` like mode and sandbox.
@@ -778,6 +782,12 @@ Item {
 
     function setSandbox(on) {
         return root._enqueue("sandbox", on === true || on === "on");
+    }
+
+    /// Whether container activity reaches the badge. Root-gated like the other
+    /// protection switches: `_enqueue` carries that refusal back as-is.
+    function setContainers(on) {
+        return root._enqueue("containers", on === true || on === "on");
     }
 
     function setDigest(on) {

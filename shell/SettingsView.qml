@@ -330,7 +330,44 @@ Item {
 
             }
 
-            // ------------------------------------------------- the weekly note (row 4)
+            // ------------------------------------------- inspect containers (row 4)
+            SettingsRow {
+                width: parent.width
+                tokens: root.t
+                question: "Inspect containers"
+                help: "Off: Docker and Kubernetes activity is recorded on the timeline but never asked about. On: it reaches the badge too. Expect more false alarms — a build legitimately unpacks setuid binaries, fetches toolchains into /tmp and runs install scripts, and all of that looks like an intrusion from outside. Moat never blocks anything inside a container either way."
+
+                Row {
+                    anchors.right: parent.right
+                    spacing: root.t ? root.t.s(10) : 6
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: !!root.status && root.status.inspect_containers ? "on" : "off"
+                        color: root.t ? root.t.faint : "grey"
+                        font.family: root.t ? root.t.family : "monospace"
+                        font.pixelSize: root.t ? root.t.fSecondary : 12
+                    }
+
+                    ToggleSwitch {
+                        anchors.verticalCenter: parent.verticalCenter
+                        checked: !!root.status && root.status.inspect_containers
+                        busy: !!root.service && root.service.busy
+                        foreground: root.t ? root.t.secondary : "white"
+                        accent: root.t ? root.t.accent : "orange"
+                        trackHeight: root.t ? root.t.s(23) : 18
+                        onToggled: {
+                            if (root.service)
+                                root.service.setContainers(!root.service.status.inspect_containers);
+
+                        }
+                    }
+
+                }
+
+            }
+
+            // ------------------------------------------------- the weekly note (row 5)
             SettingsRow {
                 width: parent.width
                 tokens: root.t
