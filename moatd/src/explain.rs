@@ -863,6 +863,7 @@ mod tests {
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            in_container: None,
             sid: None,
             tty: None,
         }
@@ -897,6 +898,7 @@ mod tests {
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            in_container: None,
             sid: None,
             tty: None,
         }, ProcInfo {
@@ -911,6 +913,7 @@ mod tests {
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            in_container: None,
             sid: None,
             tty: None,
         }];

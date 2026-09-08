@@ -2675,9 +2675,16 @@ impl Daemon {
         // members to `alerts` when a chain goes high, and that runs after this.
         // What stops is one build's worth of setuid layer-unpacking and toolchain
         // fetches asking 452 questions in a night.
+        //
+        // Asked of the SENSOR, not of /proc. The first version of this read
+        // /proc/<pid>/ns/mnt and defaulted to "not a container" when the pid was
+        // gone -- which is every process this is about. Twenty container psql
+        // and pg_isready rows reached the badge on 2026-09-08 with the switch
+        // off, because each had exited before moatd looked. `ProcInfo`
+        // carries what `process.ns` said at event time instead.
         if !self.inspect_containers
             && alert.surface == "alerts"
-            && crate::util::in_container(alert.process.pid)
+            && f.proc.in_container == Some(true)
         {
             alert.surface = "timeline".into();
             alert.severity_reason = format!(
@@ -4877,6 +4884,9 @@ fn persisted_u64(state: &Option<Value>, section: &str, key: &str) -> u64 {
 fn self_proc(about: &str) -> ProcInfo {
     let (sid, tty) = crate::proctable::read_session(std::process::id());
     ProcInfo {
+        // moatd runs on the host. An alert moat raises about ITSELF must never
+        // be quietened by the container switch.
+        in_container: Some(false),
         exec_id: String::new(),
         pid: std::process::id(),
         uid: unsafe { libc::geteuid() },
@@ -5498,6 +5508,7 @@ mod tests {
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            in_container: None,
             sid: None,
             tty: None,
         };
@@ -5611,6 +5622,7 @@ mod tests {
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            in_container: None,
             sid: None,
             tty: None,
         };
@@ -5821,6 +5833,7 @@ mod tests {
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            in_container: None,
             sid: None,
             tty: None,
         };
@@ -5887,6 +5900,7 @@ mod tests {
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            in_container: None,
             sid: None,
             tty: None,
         };
@@ -5954,6 +5968,7 @@ mod tests {
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            in_container: None,
             sid: None,
             tty: None,
         };
@@ -6078,6 +6093,7 @@ mod tests {
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            in_container: None,
             sid: None,
             tty: None,
         };
@@ -6233,6 +6249,7 @@ mod tests {
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            in_container: None,
             sid: None,
             tty: None,
         };
@@ -6728,6 +6745,7 @@ esac
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            in_container: None,
             sid: None,
             tty: None,
         };
@@ -6837,6 +6855,7 @@ esac
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            in_container: None,
             sid: None,
             tty: None,
         };
@@ -6949,6 +6968,7 @@ esac
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            in_container: None,
             sid: None,
             tty: None,
         }
@@ -7460,6 +7480,7 @@ esac
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            in_container: None,
             sid: None,
             tty: None,
         };
@@ -8535,6 +8556,7 @@ esac
                     exited_at: None,
                     exit_signal: None,
                     exe_note: None,
+            in_container: None,
                     sid: None,
                     tty: None,
                 },

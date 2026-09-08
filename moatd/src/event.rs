@@ -94,11 +94,31 @@ pub struct Process {
     pub start_time: Option<String>,
     pub parent_exec_id: Option<String>,
     pub in_init_tree: Option<bool>,
+    /// Only present with `--enable-process-ns`. The namespaces the process was
+    /// in AT EVENT TIME, which is the only time they can be trusted: by the
+    /// time moatd reads the event, a `psql` or a `pg_isready` in a container has
+    /// long exited and `/proc/<pid>/ns/mnt` is gone.
+    pub ns: Option<Namespaces>,
     pub binary_properties: Option<BinaryProperties>,
     /// Only present with `--enable-process-environment-variables`. protojson
     /// capitalises the keys of this message (NOTES §4).
     #[serde(default)]
     pub environment_variables: Vec<EnvVar>,
+}
+
+/// `process.ns`. Only `mnt` is read: it is the one that answers "is this this
+/// machine's filesystem", which is the question every path-matching policy is
+/// really asking.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+pub struct Namespaces {
+    pub mnt: Option<Namespace>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+pub struct Namespace {
+    pub inum: Option<u64>,
+    #[serde(rename = "is_host", alias = "isHost")]
+    pub is_host: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq)]
@@ -119,6 +139,15 @@ pub struct EnvVar {
 }
 
 impl Process {
+    /// Did this run in a container?
+    ///
+    /// `None` when the sensor did not say -- `--enable-process-ns` off, or an
+    /// event shape that carries no `ns`. The caller decides what silence means;
+    /// this does not guess, because the two callers want opposite defaults.
+    pub fn in_container(&self) -> Option<bool> {
+        self.ns.as_ref()?.mnt.as_ref()?.is_host.map(|host| !host)
+    }
+
     pub fn exe(&self) -> &str {
         self.binary.as_deref().unwrap_or("")
     }
@@ -404,5 +433,43 @@ mod tests {
         let l = r#"{"process_exec":{"process":{"pid":1,"binary":"/bin/x","future_field":7}},"brand_new":true}"#;
         let ev = RawEvent::parse(l).unwrap();
         assert_eq!(ev.process_exec.unwrap().process.unwrap().pid, Some(1));
+    }
+}
+
+#[cfg(test)]
+mod ns_tests {
+    use super::Process;
+
+    fn parse(js: &str) -> Process {
+        serde_json::from_str(js).expect("parses")
+    }
+
+    #[test]
+    fn a_host_process_is_not_in_a_container() {
+        let p = parse(r#"{"ns":{"mnt":{"inum":4026531840,"is_host":true}}}"#);
+        assert_eq!(p.in_container(), Some(false));
+    }
+
+    #[test]
+    fn a_process_whose_mount_namespace_is_not_the_hosts_is() {
+        let p = parse(r#"{"ns":{"mnt":{"inum":4026532999,"is_host":false}}}"#);
+        assert_eq!(p.in_container(), Some(true));
+    }
+
+    #[test]
+    fn protojson_camel_case_is_accepted_too() {
+        // Tetragon's protojson export capitalises differently to its proto
+        // field names; NOTES section 4 records the same trap for env vars.
+        let p = parse(r#"{"ns":{"mnt":{"inum":4026532999,"isHost":false}}}"#);
+        assert_eq!(p.in_container(), Some(true));
+    }
+
+    #[test]
+    fn a_sensor_that_did_not_say_is_not_guessed_at() {
+        // `--enable-process-ns` off, or an older daemon. The caller decides
+        // what silence means; this must never invent an answer.
+        assert_eq!(parse("{}").in_container(), None);
+        assert_eq!(parse(r#"{"ns":{}}"#).in_container(), None);
+        assert_eq!(parse(r#"{"ns":{"mnt":{"inum":1}}}"#).in_container(), None);
     }
 }

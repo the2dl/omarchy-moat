@@ -27,6 +27,15 @@ pub struct ProcInfo {
     pub exited_at: Option<u64>,
     /// `process_exit.signal`, the only proof that a kill actually happened.
     pub exit_signal: Option<String>,
+    /// Did this run in a container? Captured from the event's `process.ns` at
+    /// the moment the sensor saw it, which is the only moment it can be
+    /// captured: reading `/proc/<pid>/ns/mnt` later fails for exactly the
+    /// processes this is about -- a `psql` or a `pg_isready` in a compose stack
+    /// is gone microseconds after the open that raised the alert.
+    ///
+    /// `None` means the sensor did not say (`--enable-process-ns` off, or an
+    /// older daemon). Never guessed.
+    pub in_container: Option<bool>,
     /// Set when `exe` is not what the kernel reported: a `/proc/self/fd/<n>`
     /// binary we resolved (or failed to). Shown as evidence on every alert.
     pub exe_note: Option<String>,
@@ -154,6 +163,7 @@ impl ProcTable {
             exited_at: None,
             exit_signal: None,
             exe_note: None,
+            in_container: p.in_container(),
             sid,
             tty,
         };
@@ -179,6 +189,11 @@ impl ProcTable {
                 }
                 if existing.pid == 0 {
                     existing.pid = info.pid;
+                }
+                // A sparse `parent` block carries no `ns`; never let it blank
+                // out an answer a full block already gave.
+                if info.in_container.is_some() {
+                    existing.in_container = info.in_container;
                 }
             }
             None => {
