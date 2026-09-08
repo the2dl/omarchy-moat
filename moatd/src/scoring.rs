@@ -1061,3 +1061,4 @@ mod tests {
         assert_eq!(final_surface(&escalated, signal, true, true), "timeline");
     }
 }
+

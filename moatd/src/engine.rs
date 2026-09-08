@@ -2682,9 +2682,21 @@ impl Daemon {
         // and pg_isready rows reached the badge on 2026-09-08 with the switch
         // off, because each had exited before moatd looked. `ProcInfo`
         // carries what `process.ns` said at event time instead.
+        //
+        // NOT for a package install. moat's own sandbox runs npm, pip, cargo
+        // and makepkg under bwrap, which gives them their own mount namespace,
+        // so `is_host` is false and this cannot tell moat's box from Docker. On
+        // 2026-09-08 that demoted a HOST `makepkg` build to the timeline under
+        // a reason that read "package install: never downgraded; shown on the
+        // timeline only" -- the sentence contradicting itself in one line. The
+        // package-install path is the one moat exists for; it is never
+        // downgraded, and a namespace it entered because moat put it there is
+        // the worst possible reason to start.
         if !self.inspect_containers
             && alert.surface == "alerts"
             && f.proc.in_container == Some(true)
+            && f.context != crate::context::Context::PkgInstall
+            && !f.pkg_install_escalation()
         {
             alert.surface = "timeline".into();
             alert.severity_reason = format!(
@@ -6980,6 +6992,40 @@ esac
     /// detection", said by the rule instead of discovered by a 24 h circuit
     /// breaker that forgets. What it changes and what it must not change are
     /// both load-bearing, so both are asserted here.
+    /// moat's own sandbox runs npm, pip, cargo and makepkg under bwrap, which
+    /// gives them their own mount namespace. Nothing downstream can tell that
+    /// namespace from Docker's, so the container switch has to be told about
+    /// the one case moat exists for.
+    ///
+    /// On 2026-09-08 a HOST makepkg build produced a reason that argued with
+    /// itself in one line: "stays high: package install: never downgraded;
+    /// shown on the timeline only: this ran in a container and container
+    /// inspection is off".
+    #[test]
+    fn a_sandboxed_package_install_is_not_quietened_as_a_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.thresholds.dedupe_secs = 0;
+        assert!(!d.inspect_containers, "off is the default this test is about");
+
+        let mut actor = no_such_proc("e-mk", 4_200_100, "/usr/bin/makepkg");
+        // What bwrap does to a package install, and what Docker does to a
+        // container, are the same fact by the time it reaches here.
+        actor.in_container = Some(true);
+        let parent = no_such_proc("e-sh2", 4_200_000, "/usr/bin/no-such-shell");
+
+        let f = signal_finding(&actor, &parent, "/tmp/moat-tier-test-no-such-dir/build.sh");
+        let id = d.emit(f).expect("recorded");
+        let a = d.find_alert(&id).unwrap();
+
+        assert!(
+            !a.severity_reason.contains("container inspection is off")
+                || !a.severity_reason.contains("never downgraded"),
+            "the reason may not both escalate and demote: {}",
+            a.severity_reason
+        );
+    }
+
     #[test]
     fn a_signal_rule_is_recorded_at_full_severity_and_never_reaches_the_badge() {
         let dir = tempfile::tempdir().unwrap();

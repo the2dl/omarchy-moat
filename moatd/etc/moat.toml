@@ -353,6 +353,21 @@ registry_cidrs = [
   "185.199.108.0/22", # GitHub Pages / raw
   "104.16.0.0/12",    # Cloudflare: pypi.org and much else
   "172.64.0.0/13",    # Cloudflare
+
+  # IPv6, and not an afterthought: node, npm and mise resolve AAAA first, so on
+  # a v6-capable network the registry is reached over v6 EVERY time and none of
+  # the ranges above are ever consulted. Until 2026-09-08 this list was v4-only,
+  # which made `npx tsc` -- an install talking to its own CDN -- a pkg-egress
+  # alert, and turned one `mise use -g npm:wrangler` into nine first-contact
+  # rows. The rule was right; the list simply could not see where it went.
+  "2606:4700::/32",   # Cloudflare
+  "2803:f800::/32",   # Cloudflare
+  "2405:b500::/32",   # Cloudflare
+  "2405:8100::/32",   # Cloudflare
+  "2a06:98c0::/29",   # Cloudflare
+  "2c0f:f248::/32",   # Cloudflare
+  "2a04:4e42::/32",   # Fastly: registry.npmjs.org, crates.io
+  "2606:50c0::/32",   # GitHub Pages / raw
 ]
 
 # RFC1918, loopback, link-local and CGNAT are allowed implicitly. Set false to

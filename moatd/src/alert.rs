@@ -16,6 +16,15 @@ pub struct ProcessRef {
     pub args: String,
     pub cwd: String,
     pub start_ts: String,
+    /// Did this run in a container? From the sensor's `process.ns.mnt.is_host`
+    /// at event time. `None` when the sensor did not say.
+    ///
+    /// Exported because it decides whether a row reaches the badge, and a
+    /// decision nobody can see is a decision nobody can check: verifying the
+    /// container switch on 2026-09-08 meant inferring it from severity_reason
+    /// strings, which is how a host `makepkg` sat demoted for three hours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_container: Option<bool>,
     pub ancestry: Vec<Ancestor>,
 }
 
@@ -495,6 +504,7 @@ pub mod tests_support {
                 args: "setup.mjs".into(),
                 cwd: "/home/dan/proj".into(),
                 start_ts: "2026-09-03T16:21:06.900Z".into(),
+                in_container: None,
                 ancestry: vec![Ancestor {
                     pid: 41230,
                     exe: "/usr/bin/sh".into(),

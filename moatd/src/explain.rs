@@ -285,6 +285,7 @@ pub fn build_alert(f: &Finding, id: &str, ts: &str, allowlist_file: &str, allowl
             args: f.proc.args.clone(),
             cwd: f.proc.cwd.clone(),
             start_ts: crate::util::normalize_ts(&f.proc.start_time),
+            in_container: f.proc.in_container,
             ancestry,
         },
         file: f.file.clone(),

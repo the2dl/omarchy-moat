@@ -175,3 +175,67 @@ mod tests {
         assert_eq!(bad, vec!["nope"]);
     }
 }
+
+#[cfg(test)]
+mod shipped_registry_list {
+    use super::{contains_any, parse_all, parse_cidr};
+
+    /// Every CIDR moat ships for `net.registry_cidrs` must parse.
+    #[test]
+    fn the_shipped_registry_cidrs_all_parse() {
+        let toml = include_str!("../../etc/moat.toml");
+        let start = toml.find("registry_cidrs = [").expect("the key is shipped");
+        let end = start + toml[start..].find(']').expect("the list closes");
+        let cidrs: Vec<String> = toml[start..end]
+            .lines()
+            .filter_map(|l| l.split('"').nth(1).map(str::to_string))
+            .collect();
+        assert!(cidrs.len() >= 8, "read {} entries, the list is not that short", cidrs.len());
+        let (ok, bad) = parse_all(&cidrs);
+        assert!(bad.is_empty(), "unparseable shipped CIDRs: {:?}", bad);
+        assert_eq!(ok.len(), cidrs.len());
+    }
+
+    /// node, npm and mise resolve AAAA first, so on a v6-capable network the
+    /// registry is reached over v6 every time. A v4-only list is not a
+    /// conservative list -- it is one that never matches.
+    #[test]
+    fn the_registry_is_recognised_over_ipv6() {
+        let toml = include_str!("../../etc/moat.toml");
+        let start = toml.find("registry_cidrs = [").unwrap();
+        let end = start + toml[start..].find(']').unwrap();
+        let cidrs: Vec<String> = toml[start..end]
+            .lines()
+            .filter_map(|l| l.split('"').nth(1).map(str::to_string))
+            .collect();
+        let (nets, _) = parse_all(&cidrs);
+
+        // Seen live on 2026-09-08: `npx tsc` and `mise use -g npm:wrangler`.
+        for addr in [
+            "2606:4700::6810:722",  // Cloudflare, the npx tsc alert
+            "2606:4700::6810:822",  // Cloudflare, one of the wrangler nine
+            "2a04:4e42:4e::760",    // Fastly, registry.npmjs.org
+        ] {
+            let ip = addr.parse().expect("test address parses");
+            assert!(
+                contains_any(&nets, &ip),
+                "{} is a package registry and the shipped list does not know it",
+                addr
+            );
+        }
+    }
+
+    /// The list is an allowlist, so it must not quietly cover the internet.
+    #[test]
+    fn it_does_not_allow_somewhere_it_should_not() {
+        let (nets, _) = parse_all(&[
+            "104.16.0.0/12".to_string(),
+            "2606:4700::/32".to_string(),
+        ]);
+        for addr in ["8.8.8.8", "2001:4860:4860::8888", "192.0.2.1"] {
+            let ip = addr.parse().unwrap();
+            assert!(!contains_any(&nets, &ip), "{} must not be inside the registry list", addr);
+        }
+        assert!(parse_cidr("2606:4700::/32").is_some());
+    }
+}
