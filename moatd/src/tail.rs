@@ -121,11 +121,41 @@ impl Tailer {
             }
         };
         let rotated = self.file.is_some() && meta.ino() != self.inode;
-        let truncated = self.file.is_some() && meta.len() < self.pos;
+        // A shorter file only means TRUNCATION when it is the same file. After
+        // a rename the new inode legitimately starts at zero, so without the
+        // `!rotated` guard every rotation also looked like a truncation -- and
+        // the truncation path is the one that throws away a half-line we are
+        // still waiting on the newline for.
+        let truncated = self.file.is_some() && !rotated && meta.len() < self.pos;
         if self.file.is_some() && !rotated && !truncated {
             return;
         }
         if rotated {
+            // Drain the RENAMED file before letting go of it.
+            //
+            // The old descriptor still points at the rotated-away inode, and
+            // whatever was written to it between our last poll and the rename
+            // is only reachable through that descriptor. Dropping it here threw
+            // those events away: measured 2026-09-08, tetragon.log rotated 612
+            // times in eight hours (188 in one hour, 385 of the gaps two seconds
+            // or less), so this was not a rare edge -- it was a steady leak, and
+            // exec events lost this way are ancestry that never arrives and
+            // chains that cannot form.
+            //
+            // Bounded by the same MAX_POLL_BYTES as an ordinary read, so a flood
+            // that forces rotation costs bounded lag rather than loss, and
+            // cannot be used to make this call expensive.
+            if let Some(old) = self.file.as_mut() {
+                let mut rest = Vec::new();
+                if old.take(MAX_POLL_BYTES).read_to_end(&mut rest).is_ok() && !rest.is_empty() {
+                    self.pending.push_str(&String::from_utf8_lossy(&rest));
+                    log::info!(
+                        "{}: drained {} byte(s) from the rotated file",
+                        self.path.display(),
+                        rest.len()
+                    );
+                }
+            }
             log::info!("{}: rotated (new inode), reopening", self.path.display());
         } else if truncated {
             log::info!("{}: truncated, restarting from 0", self.path.display());
@@ -145,7 +175,13 @@ impl Tailer {
         };
         self.inode = meta.ino();
         self.pos = pos;
-        self.pending.clear();
+        // Only a TRUNCATE invalidates what is pending: the file we were reading
+        // was rewritten under us, so a half-line in hand belongs to bytes that
+        // no longer exist. A rotation is the opposite -- the drain above just
+        // put the tail of the old file here on purpose.
+        if truncated {
+            self.pending.clear();
+        }
         self.file = Some(f);
         self.opened_once = true;
     }
@@ -182,6 +218,44 @@ mod tests {
         assert!(t.poll().is_empty());
         append(&p, "1}\n");
         assert_eq!(t.poll(), vec!["{\"a\":1}"]);
+    }
+
+    #[test]
+    fn the_tail_of_the_rotated_file_is_not_lost() {
+        // The leak this exists for: a line written to the old inode AFTER our
+        // last poll but BEFORE the rename is reachable only through the old
+        // descriptor. Dropping that descriptor on rotation discarded it, and
+        // tetragon.log rotated 612 times in eight hours on 2026-09-08.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.log");
+        append(&p, "seen\n");
+        let mut t = Tailer::new(&p, true);
+        assert_eq!(t.poll(), vec!["seen"]);
+
+        // Written, never polled, then rotated away.
+        append(&p, "written-then-rotated\n");
+        std::fs::rename(&p, dir.path().join("t.log.1")).unwrap();
+        append(&p, "after\n");
+
+        assert_eq!(
+            t.poll(),
+            vec!["written-then-rotated", "after"],
+            "the rotated file's unread tail must arrive before the new file's lines"
+        );
+    }
+
+    #[test]
+    fn a_partial_line_survives_rotation_but_not_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.log");
+        let mut t = Tailer::new(&p, true);
+
+        // Half a line on the old inode; its newline lands on the new one.
+        append(&p, "{\"half\":");
+        assert!(t.poll().is_empty());
+        std::fs::rename(&p, dir.path().join("t.log.1")).unwrap();
+        append(&p, "1}\n");
+        assert_eq!(t.poll(), vec!["{\"half\":1}"], "a rotation does not cut a line in two");
     }
 
     #[test]

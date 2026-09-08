@@ -126,7 +126,20 @@ pub const MAX_CHAINS: usize = 32;
 
 /// Alerts held as chain candidates. Sized so a burst cannot push a real
 /// sequence out of the buffer before its second family arrives.
-pub const MAX_RECENT: usize = 128;
+///
+/// 2026-09-08: at 128 that sentence was false on this machine. One `cargo test`
+/// of moatd itself put 330 chain-family observations into a single 60-second
+/// window, which turns the whole ring over in about 23 seconds; of 997 measured
+/// (credential read -> network) row pairs, 375 had more than 128 observations
+/// pushed between them and so could never have met. That is also a cheap
+/// blinding primitive: an unprivileged loop of allowlisted execs flushes every
+/// pending candidate on the machine in under half a minute.
+///
+/// An `Observation` is small and the ring is per-daemon, so the memory this
+/// costs is measured in tens of kilobytes. The eviction is still oldest-first
+/// and everything still ages out at `WINDOW_SECS`; this only stops a burst
+/// from being able to outrun the window.
+pub const MAX_RECENT: usize = 1024;
 
 /// One alert's place in the story.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -973,6 +986,14 @@ impl ChainStore {
     }
 
     fn push_recent(&mut self, r: Recent) {
+        // One slot per ALERT, not per observation. `note_chain` re-enters every
+        // time a chain grows and (since 2026-09-07) folds re-observe an alert
+        // that is already here, so without this the same id occupies slot after
+        // slot and evicts genuine candidates to make room for copies of itself.
+        if let Some(seat) = self.recent.iter_mut().find(|x| x.obs.alert == r.obs.alert) {
+            *seat = r;
+            return;
+        }
         if self.recent.len() >= MAX_RECENT {
             self.recent.remove(0);
         }
