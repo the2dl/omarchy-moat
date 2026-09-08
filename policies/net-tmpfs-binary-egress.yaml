@@ -69,6 +69,15 @@ spec:
         - "192.168.0.0/16"
         - "127.0.0.0/8"
         - "169.254.0.0/16"
+        # The unspecified addresses. `connect()` to 0.0.0.0 or :: is routed to
+        # loopback by the kernel, so these ARE the loopback case arriving under
+        # a different name -- a connection that never leaves the machine, which
+        # is what the two entries around them already say is not this rule's
+        # business. Omitting them cost a docker build its Rust toolchain on
+        # 2026-09-08: /tmp/rustup-init connected to :::0 and took a CRITICAL
+        # enforced EPERM for a packet that was never going anywhere.
+        - "0.0.0.0/32"
+        - "::/128"
         - "::1/128"
         - "fc00::/7"
         - "fe80::/10"

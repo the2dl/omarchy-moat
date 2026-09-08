@@ -149,7 +149,15 @@ REQUIRED_ANNOTATIONS = [
     "moat.omarchy/fp-hint",
 ]
 OPTIONAL_ANNOTATIONS = ["moat.omarchy/rotate", "moat.omarchy/telemetry-class",
-                        "moat.omarchy/tier"]
+                        "moat.omarchy/tier", "moat.omarchy/namespace"]
+# `moat.omarchy/namespace: global` opts a policy OUT of the container
+# enforcement split (render.rs::split_container_enforcement). Absent means the
+# policy's object is namespace-relative -- a path a container has its own copy
+# of -- so enforcement is scoped to the host and containers are monitored.
+# Say `global` only when the object genuinely has no namespace: the kernel's
+# module table, the BPF program table. Getting this wrong in the `global`
+# direction keeps a policy denying inside containers; getting it wrong in the
+# other direction lets a container act on the host and be merely watched.
 # BASELINE section 4. Absent means "detection": a policy that says nothing is a
 # detection, because the failure mode of a forgotten annotation must be "keeps
 # asking" and never "went quiet". moatd applies the same default, and rejects an

@@ -3,6 +3,13 @@ kind: TracingPolicy
 metadata:
   name: moat-rootkit-bpf-prog-load
   annotations:
+    # There is ONE kernel. A module or BPF program loaded from inside a
+    # container is loaded on this machine, so this policy's object has no
+    # namespace to be scoped to. Without this, the container-enforcement split
+    # in render.rs would demote it to monitor for anyone who can start a
+    # container -- which is the cheapest possible way to load a rootkit and be
+    # merely watched doing it.
+    moat.omarchy/namespace: "global"
     moat.omarchy/severity: "high"
     moat.omarchy/title: "eBPF program loaded by an unexpected binary"
     moat.omarchy/enforce: "none"

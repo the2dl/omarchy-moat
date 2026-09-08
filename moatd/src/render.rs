@@ -331,6 +331,99 @@ fn exclude_binaries(doc: &mut Value, bins: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Enforcement is a decision about THIS machine, so it stops at the namespace
+/// boundary. Every selector that would kill or deny is scoped to the host mount
+/// namespace, and a copy of it WITHOUT the action is added for everywhere else.
+///
+/// A container is somebody else's filesystem wearing our path names. `/etc/shadow`
+/// inside an image is not this machine's; `/tmp/rustup-init` in a `docker build`
+/// is the documented way a Rust toolchain installs. Refusing those is refusing
+/// work the user asked for, in a process tree they cannot see, with an errno that
+/// points at nothing. Two of those landed on 2026-09-07 and -09-08: `pg_isready`
+/// denied reading its own container's shadow file, and a build's rustup-init took
+/// a CRITICAL EPERM.
+///
+/// The events are NOT dropped. The copy still posts, so container activity stays
+/// on the timeline and in the chain correlator; what it loses is the power to
+/// refuse. That is the whole trade, and it is the conservative half of it: an
+/// attacker who can start a container can already reach root on the host, and
+/// the rules that catch THAT -- a kernel module, a BPF program load -- are global
+/// and have no namespace to hide in, so they are deliberately left alone below.
+fn split_container_enforcement(doc: &mut Value) {
+    fn ns_clause(op: &str) -> Value {
+        serde_yaml::from_str(&format!(
+            "namespace: Mnt\noperator: \"{}\"\nvalues:\n- \"host_ns\"",
+            op
+        ))
+        .expect("literal parses")
+    }
+    // A policy whose object is GLOBAL opts out by annotation. There is one
+    // kernel: a module loaded from inside a container is loaded on this
+    // machine, and scoping that to the host namespace would let anyone who can
+    // start a container load a rootkit and be merely watched doing it. The
+    // annotation lives in the YAML, next to the hook it describes, because
+    // deciding this from Rust means the list and the policies drift apart.
+    if doc
+        .get("metadata")
+        .and_then(|m| m.get("annotations"))
+        .and_then(|a| a.get("moat.omarchy/namespace"))
+        .and_then(|v| v.as_str())
+        == Some("global")
+    {
+        return;
+    }
+    let Some(spec) = doc.get_mut("spec").and_then(|s| s.as_mapping_mut()) else { return };
+    for (_, hooks) in spec.iter_mut() {
+        let Some(hooks) = hooks.as_sequence_mut() else { continue };
+        for hook in hooks.iter_mut() {
+            let Some(selectors) = hook.get_mut("selectors").and_then(|s| s.as_sequence_mut())
+            else {
+                continue;
+            };
+            let mut mirrors: Vec<Value> = Vec::new();
+            for sel in selectors.iter_mut() {
+                let Some(map) = sel.as_mapping_mut() else { continue };
+                if !selector_enforces(map) {
+                    continue;
+                }
+                // The mirror REPLACES any hand-written Mnt clause rather than
+                // skipping it. Three policies already carried `Mnt In host_ns`,
+                // added in September to stop a container's own /etc/shadow
+                // being refused -- which fixed the denial by making container
+                // activity invisible. Monitoring it is strictly better, and it
+                // is what this function exists to say.
+                let mut mirror = map.clone();
+                mirror.remove(Value::String("matchActions".into()));
+                mirror.insert(
+                    Value::String("matchNamespaces".into()),
+                    Value::Sequence(vec![ns_clause("NotIn")]),
+                );
+                mirrors.push(Value::Mapping(mirror));
+                map.insert(
+                    Value::String("matchNamespaces".into()),
+                    Value::Sequence(vec![ns_clause("In")]),
+                );
+            }
+            selectors.extend(mirrors);
+        }
+    }
+}
+
+/// Does this selector kill or deny? `Post` and friends are not enforcement.
+fn selector_enforces(map: &serde_yaml::Mapping) -> bool {
+    map.get(Value::String("matchActions".into()))
+        .and_then(|a| a.as_sequence())
+        .map(|acts| {
+            acts.iter().any(|a| {
+                matches!(
+                    a.get("action").and_then(|v| v.as_str()),
+                    Some("Override") | Some("Sigkill")
+                )
+            })
+        })
+        .unwrap_or(false)
+}
+
 pub fn render_text(
     text: &str,
     homes: &[String],
@@ -368,6 +461,7 @@ pub fn render_text(
     if let Some(bins) = exclusions.get(&name) {
         exclude_binaries(&mut doc, bins)?;
     }
+    split_container_enforcement(&mut doc);
 
     let body = serde_yaml::to_string(&doc).map_err(|e| e.to_string())?;
     if body.contains(PLACEHOLDER) {
@@ -891,5 +985,113 @@ spec:
             render_text(ARMED, &["/home/dan".into()], &default_lists(), &ex).unwrap().1
         };
         assert_eq!(plain, other, "an exclusion names one policy and touches only it");
+    }
+
+    /// The template every container test below renders: one enforcing selector.
+    const DENIES: &str = r#"apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-cred-thing-read
+spec:
+  lsmhooks:
+  - hook: "file_post_open"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values: ["/usr/bin/cat"]
+      matchActions:
+      - action: Override
+        argError: -1
+"#;
+
+    fn sels(text: &str) -> Vec<serde_yaml::Mapping> {
+        let (_, y) =
+            render_text(text, &["/home/dan".into()], &default_lists(), &BTreeMap::new()).unwrap();
+        let doc: Value = serde_yaml::from_str(&y).unwrap();
+        doc["spec"]["lsmhooks"][0]["selectors"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_mapping().unwrap().clone())
+            .collect()
+    }
+
+    fn ns_of(m: &serde_yaml::Mapping) -> Option<String> {
+        m.get(Value::String("matchNamespaces".into()))?
+            .as_sequence()?
+            .iter()
+            .find(|e| e.get("namespace").and_then(|v| v.as_str()) == Some("Mnt"))?
+            .get("operator")?
+            .as_str()
+            .map(|s| s.to_string())
+    }
+
+    #[test]
+    fn enforcement_is_scoped_to_the_host_and_containers_are_still_watched() {
+        let s = sels(DENIES);
+        assert_eq!(s.len(), 2, "one enforcing selector becomes host + container");
+        assert_eq!(ns_of(&s[0]).as_deref(), Some("In"), "the deny is host-only");
+        assert!(s[0].contains_key(Value::String("matchActions".into())));
+        assert_eq!(ns_of(&s[1]).as_deref(), Some("NotIn"), "the mirror is everywhere else");
+        assert!(
+            !s[1].contains_key(Value::String("matchActions".into())),
+            "a container is watched, never refused -- that is the whole point"
+        );
+    }
+
+    #[test]
+    fn the_container_mirror_keeps_every_filter_the_deny_had() {
+        let s = sels(DENIES);
+        assert_eq!(
+            s[0].get(Value::String("matchBinaries".into())),
+            s[1].get(Value::String("matchBinaries".into())),
+            "a mirror that watches MORE than the deny would invent container noise"
+        );
+    }
+
+    #[test]
+    fn a_global_object_is_never_scoped_to_a_namespace() {
+        // There is one kernel. Scoping a module load to the host namespace
+        // would let anyone who can start a container load a rootkit and be
+        // merely watched doing it.
+        let global = DENIES.replace(
+            "  name: moat-cred-thing-read",
+            "  name: moat-rootkit-thing-load
+  annotations:
+    moat.omarchy/namespace: \"global\"",
+        );
+        let s = sels(&global);
+        assert_eq!(s.len(), 1, "no mirror was added");
+        assert_eq!(ns_of(&s[0]), None, "and the deny still applies everywhere");
+    }
+
+    #[test]
+    fn a_policy_that_only_watches_is_left_exactly_as_it_was() {
+        let watch = DENIES
+            .replace("      matchActions:\n      - action: Override\n        argError: -1\n", "");
+        let s = sels(&watch);
+        assert_eq!(s.len(), 1, "nothing to split: it was never enforcing");
+        assert_eq!(ns_of(&s[0]), None);
+    }
+
+    #[test]
+    fn a_hand_written_host_clause_is_replaced_not_doubled() {
+        // Three shipped policies already carried `Mnt In host_ns`, added to stop
+        // a container's own /etc/shadow being refused -- which fixed the denial
+        // by making container activity invisible. The mirror must OVERWRITE
+        // that clause, or the container copy inherits `In` and matches nothing.
+        let already = DENIES.replace(
+            "      matchActions:",
+            "      matchNamespaces:\n      - namespace: Mnt\n        operator: \"In\"\n        values: [\"host_ns\"]\n      matchActions:",
+        );
+        let s = sels(&already);
+        assert_eq!(s.len(), 2);
+        assert_eq!(ns_of(&s[0]).as_deref(), Some("In"));
+        assert_eq!(ns_of(&s[1]).as_deref(), Some("NotIn"), "the mirror now sees containers");
+        assert_eq!(
+            s[1].get(Value::String("matchNamespaces".into())).unwrap().as_sequence().unwrap().len(),
+            1,
+            "one Mnt clause, not two contradicting each other"
+        );
     }
 }
