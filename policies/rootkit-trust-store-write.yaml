@@ -31,7 +31,23 @@ spec:
     - index: 1
       type: "int"
     selectors:
-    - matchBinaries:
+    # The HOST's trust store, not every container's.
+    #
+    # 2026-09-07: a Debian container ran `update-ca-certificates` and `dpkg`
+    # installed its own ca-certificates -- 42 alerts, and the user read the pile
+    # as a rootkit. It was a container writing its OWN /etc/ssl, on its own
+    # filesystem, holding nothing this machine trusts.
+    #
+    # Third instance of one bug in one day: a path is namespace-relative and
+    # these policies match the STRING. See cred-etc-shadow-read (pg_isready
+    # reading the container's /etc/shadow) and rootkit-ldso-preload-write.
+    # `host_ns` is resolved by tetragon at load, so no inode is pinned here.
+    - matchNamespaces:
+      - namespace: Mnt
+        operator: "In"
+        values:
+        - "host_ns"
+      matchBinaries:
       - operator: "NotPostfix"
         values:
         - "/pacman"

@@ -29,7 +29,20 @@ spec:
     - index: 1
       type: "int"
     selectors:
-    - matchBinaries:
+    # The HOST's copy of this path, not every container's.
+    #
+    # A path is namespace-relative and this policy matches the STRING, so a
+    # container writing its OWN copy -- a different file, on a different
+    # filesystem, meaning nothing to this machine -- matched. Found three times
+    # on 2026-09-07 (pg_isready reading a container's /etc/shadow, dpkg
+    # installing a container's ca-certificates, runc's seccomp) before this was
+    # swept. `host_ns` is resolved by tetragon at load; no inode is pinned.
+    - matchNamespaces:
+      - namespace: Mnt
+        operator: "In"
+        values:
+        - "host_ns"
+      matchBinaries:
       - operator: "NotPostfix"
         values:
         - "/pacman"
