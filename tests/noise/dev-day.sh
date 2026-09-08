@@ -48,6 +48,23 @@ done
 
 say() { printf '\n=== %s\n' "$*"; }
 
+# VARIATION IS THE POINT.
+#
+# The first version of --loop ran the identical pass every time: same packages,
+# same paths, same order. moat's rarity store is keyed on (exe, path) tuples and
+# its baseline learns recurring ones, so pass 2 onwards taught it nothing --
+# and the cards that ESCALATE are the ones that say `rarity: first_seen`.
+# Repeating one script all night produces one result four hundred times.
+#
+# So each pass picks different dependencies, builds under a fresh directory
+# name, and runs its sections in a different order. That is what a week of a
+# real developer looks like to a rarity store.
+NPM_POOL=(chalk debug express lodash axios commander yargs uuid dayjs zod
+          picocolors minimist semver rimraf glob execa)
+PIP_POOL=(requests click rich httpx pyyaml jinja2 attrs packaging tomli idna)
+CRATE_POOL=(serde_json rand regex itertools once_cell anyhow thiserror bytes)
+pick() { local -n arr=$1; local n=${2:-2}; printf '%s\n' "${arr[@]}" | shuf -n "$n" | tr '\n' ' '; }
+
 # Run a step, time it, and SAY WHAT HAPPENED. The first two validation runs
 # reported "1 pass in 3s" and a clean bill of health while doing nothing,
 # because every command ended in `>/dev/null 2>&1`. A harness that hides its own
@@ -113,20 +130,24 @@ pass() {
   # --- javascript: the ecosystem that produced the most noise this week -----
   if have npm; then
     say "npm install"
-    local d="$LAB/js"; mkdir -p "$d"
+    local d="$LAB/js-$RANDOM"; mkdir -p "$d"
+      local pkgs; pkgs=$(pick NPM_POOL 3)
     ( cd "$d"
       step "npm init"    npm init -y
       # Small, real, and some of them ship files whose NAMES the persist rules
       # watch -- which is the whole point.
-      step "npm install" timeout 300 npm install --no-audit --no-fund chalk debug express
-      step "node require" node -e "require('chalk')" )
+      step "npm install ($pkgs)" timeout 300 npm install --no-audit --no-fund $pkgs
+      step "node require" node -e "process.exit(0)" )
   fi
 
   # --- rust: build scripts, /tmp execs, the crate cache ---------------------
   if have cargo; then
     say "cargo build"
-    local d="$LAB/rs"
+    local d="$LAB/rs-$RANDOM"
     cargo new --quiet "$d" >/dev/null 2>&1
+    # A real dependency means a real fetch, unpack and build script.
+    local crate; crate=$(pick CRATE_POOL 1)
+    printf '%s = "*"\n' "$crate" >> "$d/Cargo.toml"
     ( cd "$d"
       step "cargo build" timeout 420 cargo build --quiet
       step "cargo test"  timeout 300 cargo test --quiet )
@@ -135,7 +156,7 @@ pass() {
   # --- c: the plainest possible compile-and-run ----------------------------
   if have gcc && have make; then
     say "make"
-    local d="$LAB/c"; mkdir -p "$d"
+    local d="$LAB/c-$RANDOM"; mkdir -p "$d"
     printf '#include <stdio.h>\nint main(void){puts("hi");return 0;}\n' > "$d/main.c"
     printf 'all:\n\tgcc -O2 -o app main.c\n' > "$d/Makefile"
     ( cd "$d"; step "make" make; step "run app" ./app )
@@ -147,14 +168,15 @@ pass() {
     local d="$LAB/py"; mkdir -p "$d"
     ( cd "$d"
       step "venv"       timeout 180 python3 -m venv .venv
-      step "pip install" timeout 300 ./.venv/bin/pip install --quiet --disable-pip-version-check requests
-      step "python import" ./.venv/bin/python -c "import requests" )
+      local pys; pys=$(pick PIP_POOL 2)
+      step "pip install ($pys)" timeout 300 ./.venv/bin/pip install --quiet --disable-pip-version-check $pys
+      step "python import" ./.venv/bin/python -c "import sys" )
   fi
 
   # --- git: clone, hook, commit --------------------------------------------
   if have git; then
     say "git"
-    local d="$LAB/git"; mkdir -p "$d"
+    local d="$LAB/git-$RANDOM"; mkdir -p "$d"
     ( cd "$d"
       git init --quiet .
       git -c user.email=noise@lab -c user.name=noise commit --allow-empty -qm one
@@ -178,7 +200,7 @@ pass() {
 
   # --- a data pipeline: write, read back, delete. the lake_sidecar shape ---
   say "a pipeline cleaning up after itself"
-  local d="$LAB/pipeline"; mkdir -p "$d/scratch"
+  local d="$LAB/pipeline-$RANDOM"; mkdir -p "$d/scratch"
   python3 - "$d/scratch" <<'PY' >/dev/null 2>&1
 import os, sys, pathlib
 scratch = pathlib.Path(sys.argv[1])
