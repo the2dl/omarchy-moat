@@ -313,7 +313,13 @@ impl StdioSocket {
             .find(|(_, i)| net.contains_key(i))
             .copied()
             .unwrap_or(sockets[0]);
-        if !net.contains_key(&chosen.1) && is_unix_socket(root, chosen.1) {
+        // Same namespace lesson as the table above: a containerised shell's
+        // unix socket lives in ITS /proc/net/unix, not ours. Ask the process's
+        // own table first, or journald-shaped stdio inside a container reads as
+        // "resolved nowhere" for a reason that has nothing to do with the file.
+        let unix_here = is_unix_socket(&root.join(pid.to_string()), chosen.1)
+            || is_unix_socket(root, chosen.1);
+        if !net.contains_key(&chosen.1) && unix_here {
             return None;
         }
         // Neither a network socket nor a unix one: it resolved nowhere. Drop it

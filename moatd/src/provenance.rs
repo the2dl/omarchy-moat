@@ -188,7 +188,7 @@ pub fn runs_inline_code(exe: &str, args: &str) -> bool {
 pub fn is_interpreter(comm: &str) -> bool {
     SHELL_INTERPRETERS.contains(&comm)
         || comm.starts_with("python")
-        || matches!(comm, "node" | "nodejs" | "perl" | "ruby")
+        || matches!(comm, "node" | "nodejs" | "perl" | "ruby" | "deno" | "bun")
 }
 
 /// The script an interpreter was handed: `argv[1]`, or the first non-flag

@@ -339,3 +339,27 @@ file = "/var/lib/docker/*"
 [[rule]]
 name = "moat-priv-setuid-chmod"
 file = "/var/lib/containerd/*"
+
+# An application reading its OWN profile is not a credential theft. Spotify's
+# Chromium-embedded core writes a "Local State" and a "Cookies" file with the
+# same names Chrome uses, so the browser-secrets rule reads Spotify opening its
+# own session as a browser cookie-jar theft. Scoped to the shipped binary AND
+# its own cache, because the pattern that makes this safe is "this actor, this
+# actor's own directory" -- not either half alone.
+[[rule]]
+name = "moat-cred-browser-secrets-read"
+exe = "/opt/spotify/spotify"
+file = "/home/*/.cache/spotify/*"
+
+# The same process under its own /proc/self/exe name, which is how the
+# Chromium utility subprocesses re-exec themselves.
+[[rule]]
+name = "moat-cred-browser-secrets-read"
+exe = "/proc/self/exe"
+file = "/home/*/.cache/spotify/*"
+
+# Spotify's config half, same argument.
+[[rule]]
+name = "moat-cred-browser-secrets-read"
+exe = "/opt/spotify/spotify"
+file = "/home/*/.config/spotify/*"
