@@ -40,9 +40,28 @@ spec:
         - "/usr/bin/dockerd"
         - "/usr/bin/containerd"
         - "/usr/bin/runc"
+        # A CONTAINER's runc, whose path is its own, not this machine's.
+        #
+        # 2026-09-08, overnight: 299 of 302 alerts on this rule came from
+        # `/usr/local/sbin/runc`, which does not exist on the host -- it is the
+        # runc inside a Kubernetes node container, and `matchBinaries` compares
+        # the path as that namespace sees it. The exclusion for `/usr/bin/runc`
+        # right above could never match it.
+        #
+        # These are the layouts seen in practice rather than a guess. Matching
+        # `NotPostfix "/runc"` would cover every layout at once and is
+        # deliberately NOT done: this rule is the one that catches an eBPF
+        # rootkit, and "anything called runc, anywhere" is too cheap a name to
+        # buy silence with.
+        - "/usr/local/sbin/runc"
+        - "/usr/local/bin/runc"
+        - "/usr/sbin/runc"
         - "/usr/bin/crun"
         - "/usr/bin/podman"
         - "/usr/bin/cilium-agent"
+        # Calico is the other CNI that loads BPF per node, same as Cilium.
+        - "/usr/bin/calico-node"
+        - "/opt/cni/bin/calico"
         - "/usr/bin/ip"
         - "/usr/bin/tc"
       matchArgs:

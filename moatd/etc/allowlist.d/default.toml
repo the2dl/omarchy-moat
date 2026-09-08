@@ -289,3 +289,53 @@ file = "*/.yarn/cache/*"
 [[rule]]
 name = "moat-persist-agent-config-write"
 file = "*/go/pkg/mod/*"
+
+# ------------------- a container runtime unpacking an image into its own store
+#
+# 2026-09-08, overnight: 85 badge rows from `dockerd` alone, all of them writes
+# and reads under its OWN storage --
+#
+#   /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/291/fs/tenzir/AGENTS.md
+#   /var/lib/docker/buildkit/containerd-overlayfs/cachemounts/.../app/tenzir/AGENTS.md
+#   /var/lib/docker/volumes/<id>/_data/mail
+#
+# An image layer is a tarball someone else built. It can contain an AGENTS.md, a
+# .npmrc, a setuid bit -- and unpacking it is extraction, not installation. The
+# same reasoning as the cargo registry and node_modules entries above, one layer
+# down: nothing in /var/lib/docker runs on this host until a container is
+# started from it, and THAT is what the exec and net rules are for.
+#
+# Scoped to the runtime's own directories, so a container escaping to write
+# somewhere real still fires, and so does anything writing into these paths that
+# is not the runtime -- these are `file` rules, not `exe` rules, deliberately:
+# naming dockerd would excuse dockerd everywhere.
+
+# docker's image store, overlay layers, buildkit cache mounts and volumes.
+[[rule]]
+name = "moat-persist-agent-config-write"
+file = "/var/lib/docker/*"
+
+# containerd's snapshotter, the same store under a different name.
+[[rule]]
+name = "moat-persist-agent-config-write"
+file = "/var/lib/containerd/*"
+
+# Image layers carry their own .npmrc, .pypirc and cargo credentials.
+[[rule]]
+name = "moat-cred-project-token-read"
+file = "/var/lib/docker/*"
+
+# The same, for containerd.
+[[rule]]
+name = "moat-cred-project-token-read"
+file = "/var/lib/containerd/*"
+
+# Layers legitimately carry setuid binaries: sudo, ping, mount.
+[[rule]]
+name = "moat-priv-setuid-chmod"
+file = "/var/lib/docker/*"
+
+# The same, for containerd.
+[[rule]]
+name = "moat-priv-setuid-chmod"
+file = "/var/lib/containerd/*"

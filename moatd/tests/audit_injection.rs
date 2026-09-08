@@ -191,6 +191,7 @@ fn ignoring_one_program_cannot_allowlist_a_whole_subtree() {
         exe: "/tmp/some-other-dropper/payload",
         file: None,
         parents: vec![],
+        script: None,
     });
     assert!(
         hit.is_none(),

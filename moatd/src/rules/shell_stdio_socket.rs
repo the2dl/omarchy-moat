@@ -285,7 +285,26 @@ impl StdioSocket {
         if sockets.is_empty() {
             return None;
         }
-        let net = net_sockets(root);
+        // Look in the PROCESS's network namespace, not only our own.
+        //
+        // `/proc/<pid>/net/*` is the socket table as that process sees it, so a
+        // shell inside a container is resolved against its container's table.
+        // Without this, every containerised shell landed in the "belongs to
+        // another network namespace" branch, which by design keeps the finding:
+        // measured overnight 2026-09-08, sixteen CRITICAL alerts, all of them
+        // npm postinstalls (`prebuild-install || node-gyp rebuild`) inside
+        // image builds, each with a socketpair on stdio that had already closed.
+        //
+        // moatd is root, so the per-process table is readable. Falling back to
+        // our own keeps the synthetic-proc tests working and costs nothing:
+        // for a host process the two files are the same table.
+        let mut net = net_sockets(&root.join(pid.to_string()));
+        // Whether we managed to read the process's OWN table decides what an
+        // unresolvable inode means below.
+        let own_table = !net.is_empty();
+        if net.is_empty() {
+            net = net_sockets(root);
+        }
         // Prefer an fd whose inode resolves to a network socket; a process can
         // legitimately have journald's unix socket on stderr and the C2 on
         // stdin at the same time.
@@ -304,7 +323,13 @@ impl StdioSocket {
         // evidence that the choice fires critical on every short-lived shell
         // with a socketpair on stdio and never on a real reverse shell, whose
         // socket is by definition still open.
-        if !net.contains_key(&chosen.1) && socket_is_gone_not_hidden(root, pid) {
+        // Gone, not hidden -- and since 2026-09-08 there is a second way to
+        // know that. If we read the process's OWN socket table and the inode is
+        // not in it, the socket is gone in the only namespace that could have
+        // held it, whatever namespace that was. That is what retires the
+        // "belongs to another network namespace" excuse for containerised
+        // shells, which was sixteen critical false positives in one night.
+        if !net.contains_key(&chosen.1) && (own_table || socket_is_gone_not_hidden(root, pid)) {
             return None;
         }
         Some(StdioSocket {
@@ -744,6 +769,37 @@ mod tests {
         assert!(
             run(dir.path(), &table(), "e-bash", "monitor").is_empty(),
             "an inode that resolved nowhere, in our own namespace, has closed"
+        );
+    }
+
+    /// A containerised shell is resolved against ITS OWN socket table.
+    ///
+    /// 2026-09-08, overnight: sixteen CRITICAL alerts, every one an npm
+    /// postinstall inside a container image build, every one landing in the
+    /// "belongs to another network namespace" branch that keeps the finding.
+    /// `/proc/<pid>/net/*` is that namespace's table and moatd is root, so
+    /// there is no need to guess.
+    #[test]
+    fn a_socket_is_resolved_in_the_processs_own_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        proc_root(dir.path());
+        fds(dir.path(), 5100, "socket:[90001]", "/dev/null", "/dev/null");
+        // Our namespace knows nothing about inode 90001...
+        std::fs::write(dir.path().join("net/tcp"), "  sl  local_address rem_address\n").unwrap();
+        // ...but the process's own table has it, on loopback.
+        let pnet = dir.path().join("5100").join("net");
+        std::fs::create_dir_all(&pnet).unwrap();
+        std::fs::write(
+            pnet.join("tcp"),
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n                0: 0100007F:1F90 0100007F:C350 01 00000000:00000000 00:00000000 00000000  1000        0 90001\n",
+        )
+        .unwrap();
+
+        let f = run(dir.path(), &table(), "e-bash", "monitor");
+        assert_eq!(f.len(), 1, "still a finding: the socket is real and live");
+        assert_eq!(
+            f[0].meta.severity, "medium",
+            "and resolved as LOOPBACK from the container's own table, not left unknown"
         );
     }
 
