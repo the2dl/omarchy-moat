@@ -852,3 +852,102 @@ mod container_tests {
         assert!(!in_container_at(&p, 999), "no such pid");
     }
 }
+
+/// Binaries that only ever appear between the host and a container's processes.
+///
+/// Deliberately short and deliberately specific. Every name here is a container
+/// RUNTIME -- the thing that made the namespace -- and not a program that merely
+/// tends to run in one. `node` and `python` are the obvious wrong answers: they
+/// are ancestors of half this machine either way.
+const CONTAINER_RUNTIMES: &[&str] = &[
+    "runc",
+    "crun",
+    "containerd-shim",
+    "containerd-shim-runc-v1",
+    "containerd-shim-runc-v2",
+    "conmon",
+    "dockerd",
+    "containerd",
+    "podman",
+];
+
+/// Did this run in a container, judged from its ancestry?
+///
+/// The FALLBACK, and only that. `process.ns.mnt.is_host` from the sensor is the
+/// real answer, because it is what the kernel says and it cannot be spoofed by
+/// naming a binary `runc`. But Tetragon puts `ns` on `process_exec` events only,
+/// and moatd learns it only if it saw that exec -- which for short-lived
+/// processes inside a container it frequently does not (`cgroup-rate` throttles
+/// exec under exactly the bursts a compose stack produces). Measured on
+/// 2026-09-08: of 1802 rows, 354 carried the sensor's answer and 1448 carried
+/// nothing, and `is_host: false` was never once reported.
+///
+/// So: believe the sensor when it speaks; ask the ancestry when it does not.
+///
+/// The trade is stated plainly because it is a real one. An attacker who can
+/// name a process `runc` in the alert's parent chain can reach this fallback and
+/// be quietened -- but only down to the TIMELINE, never out of the record, never
+/// past enforcement (the kernel decides that, and it uses the namespace itself),
+/// and never for a package install. Weigh that against the alternative measured
+/// today, which is that the switch does nothing at all for containers.
+pub fn ancestry_looks_containerised(ancestry: &[String]) -> bool {
+    ancestry
+        .iter()
+        .any(|exe| CONTAINER_RUNTIMES.contains(&basename(exe)))
+}
+
+#[cfg(test)]
+mod ancestry_container_tests {
+    use super::ancestry_looks_containerised as looks;
+
+    fn chain(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_ancestry_of_a_real_container_process_is_recognised() {
+        // Verbatim from the pg_isready rows on 2026-09-08, which the sensor
+        // reported nothing at all about.
+        assert!(looks(&chain(&[
+            "/usr/lib/systemd/systemd",
+            "/usr/bin/containerd",
+            "/usr/bin/containerd-shim-runc-v2",
+            "/usr/bin/containerd-shim-runc-v2",
+        ])));
+        // And the docker build shape.
+        assert!(looks(&chain(&[
+            "/usr/lib/systemd/systemd",
+            "/usr/bin/dockerd",
+            "/usr/bin/runc",
+            "/bin/sh",
+            "/usr/bin/apt-get",
+        ])));
+    }
+
+    #[test]
+    fn an_ordinary_host_chain_is_not() {
+        // The one that matters most: moat's own sandbox and a normal build must
+        // never be mistaken for a container by this path.
+        assert!(!looks(&chain(&[
+            "/usr/lib/systemd/systemd",
+            "/usr/bin/herdr",
+            "/usr/bin/bash",
+            "/usr/bin/makepkg",
+        ])));
+        assert!(!looks(&chain(&[
+            "/usr/bin/bash",
+            "/usr/bin/cargo",
+            "/usr/bin/node",
+            "/usr/bin/python3",
+        ])));
+        assert!(!looks(&[]));
+    }
+
+    #[test]
+    fn a_runtime_is_matched_on_its_basename_not_a_substring() {
+        // `/usr/bin/runc` yes; a project called runc-tools no.
+        assert!(looks(&chain(&["/usr/local/sbin/runc"])), "container-side path");
+        assert!(!looks(&chain(&["/home/dan/src/runc-tools/target/debug/helper"])));
+        assert!(!looks(&chain(&["/usr/bin/podman-compose-wrapper"])));
+    }
+}

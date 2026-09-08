@@ -2692,17 +2692,27 @@ impl Daemon {
         // package-install path is the one moat exists for; it is never
         // downgraded, and a namespace it entered because moat put it there is
         // the worst possible reason to start.
+        // The sensor is the authority; the ancestry is the fallback for the
+        // (common) case where it said nothing. See
+        // `util::ancestry_looks_containerised` for why both are needed and what
+        // the fallback costs.
+        let containerised = f.proc.in_container.unwrap_or_else(|| {
+            let chain: Vec<String> =
+                f.ancestry.iter().map(|a| a.exe.clone()).collect();
+            crate::util::ancestry_looks_containerised(&chain)
+        });
         if !self.inspect_containers
             && alert.surface == "alerts"
-            && f.proc.in_container == Some(true)
+            && containerised
             && f.context != crate::context::Context::PkgInstall
             && !f.pkg_install_escalation()
         {
             alert.surface = "timeline".into();
             alert.severity_reason = format!(
-                "{}; shown on the timeline only: this ran in a container and container \
-                 inspection is off",
-                alert.severity_reason
+                "{}; shown on the timeline only: this ran in a container ({}) and \
+                 container inspection is off",
+                alert.severity_reason,
+                if f.proc.in_container.is_some() { "per the sensor" } else { "per its ancestry" }
             );
         }
         if let Err(e) = self.store.append_alert(&alert) {
