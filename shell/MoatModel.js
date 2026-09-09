@@ -4181,6 +4181,54 @@ function learningDoneCard(status, nowMs) {
 // Enforce mode's real UI is the apology, not the switch. A kernel-level block
 // shows up in the user's terminal as a program dying for no reason, so the panel
 // owes them the explanation after the fact.
+/// The footer's two facts about what Moat will DO, as a list of strings.
+///
+/// Here rather than inline in NowView.qml so it can be tested: the footer is
+/// the line that answers "will this stop anything", and on 2026-09-09 it
+/// answered wrongly.
+///
+/// **Enforcement is not one switch.** `mode` is the daemon-wide default and
+/// `enforcing_rules` is the set armed to act regardless of it. Reading only
+/// `mode`, this line said "Watching, not blocking" on a machine where eight
+/// rules were armed -- and it said it on the morning one of them SIGKILLed a
+/// udev worker. Understating enforcement is the dangerous direction: someone
+/// who believes nothing will be stopped will do things they would otherwise
+/// not.
+///
+/// **"Never updated" is not a fault when nothing was configured.** The threat
+/// feeds need an abuse.ch auth key; without one `moat-feeds` refuses, says so,
+/// and exits successfully, so the reason lived only in a journal nobody reads.
+/// The footer reported the symptom as a defect with no remedy.
+function footerFacts(status) {
+  if (!status)
+    return [];
+
+  var bits = [];
+  var armed = Array.isArray(status.enforcing_rules) ? status.enforcing_rules.length : 0;
+
+  if (String(status.mode) === "enforce")
+    bits.push("Blocking, not just watching");
+  else if (armed === 1)
+    bits.push("Watching, and blocking 1 rule");
+  else if (armed > 1)
+    bits.push("Watching, and blocking " + armed + " rules");
+  else
+    bits.push("Watching, not blocking");
+
+  var feeds = status.feeds;
+  if (feeds && !feeds.updated) {
+    // `configured` is absent on a daemon older than this field. Treat that as
+    // configured, so an old daemon keeps the message it always had rather than
+    // being told to set a key it may already have.
+    var configured = feeds.configured === undefined ? true : !!feeds.configured;
+    bits.push(configured
+      ? "Threat feeds have never updated"
+      : "Threat feeds are off (no abuse.ch key)");
+  }
+
+  return bits;
+}
+
 function blockedIncidents(incidents) {
   // The SAME question as `stoppedIncidents`, so it gets the same answer.
   //

@@ -159,13 +159,11 @@ Item {
         if (!root.status)
             return "";
 
-        var bits = [];
-        bits.push(root.status.mode === "enforce" ? "Blocking, not just watching" : "Watching, not blocking");
+        // Model.footerFacts owns the two facts about what Moat will DO, so
+        // they can be tested; the learning line is presentation and stays here.
+        var bits = Model.footerFacts(root.status);
         if (root.service && root.service.learningSummary)
-            bits.push(String(root.service.learningSummary));
-
-        if (root.status.feeds && !root.status.feeds.updated)
-            bits.push("Threat feeds have never updated");
+            bits.splice(1, 0, String(root.service.learningSummary));
 
         return bits.join("   ·   ");
     }

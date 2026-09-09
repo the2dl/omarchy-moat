@@ -5067,6 +5067,15 @@ impl Daemon {
                 "hashes": self.feeds.meta.hashes,
                 "domains": self.feeds.meta.domains,
                 "urls": self.feeds.meta.urls,
+                // Whether an abuse.ch key is set at all. Without this, "never
+                // updated" is all anyone can say -- and it reads as a fault
+                // when the truth is usually that an optional feature was never
+                // switched on. The reason lived only in the journal of a
+                // service that exits successfully, which is nobody's first
+                // place to look.
+                "configured": crate::feeds::FeedsConfig::load(&self.cfg.paths.feeds_config)
+                    .map(|c| c.key().is_some())
+                    .unwrap_or(false),
             },
             "unacked": unacked,
             "sandbox": self.sandbox_on(),

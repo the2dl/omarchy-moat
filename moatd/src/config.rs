@@ -43,6 +43,10 @@ pub struct Paths {
     pub tetra: PathBuf,
     /// `moat-feeds` binary, spawned by `feeds refresh`.
     pub feeds_bin: PathBuf,
+    /// `feeds.toml`. moatd never fetches anything; it reads this only to
+    /// answer "is an abuse.ch key configured at all", which is the difference
+    /// between a feature that is failing and one nobody switched on.
+    pub feeds_config: PathBuf,
     /// `policies/check.py`, re-run by `moatd telemetry apply` before any
     /// profile switch. On 2026-09-03 a bad policy load left the sensor dead for
     /// 25 minutes while every surface still read "running"; a profile switch is
@@ -75,6 +79,7 @@ impl Default for Paths {
             tetragon_bpf_dir: d("/sys/fs/bpf/tetragon"),
             tetra: d("/usr/bin/tetra"),
             feeds_bin: d("/usr/bin/moat-feeds"),
+            feeds_config: d("/etc/moat/feeds.toml"),
             policy_check: d("/usr/lib/moat/check.py"),
             python: d("/usr/bin/python3"),
             passwd: d("/etc/passwd"),
@@ -100,6 +105,7 @@ impl Paths {
     pub fn feeds(&self) -> PathBuf {
         self.state_dir.join("feeds")
     }
+
     pub fn user_allowlist(&self) -> PathBuf {
         self.allowlist_dir.join("user.toml")
     }

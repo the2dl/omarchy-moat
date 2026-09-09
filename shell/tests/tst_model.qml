@@ -4068,4 +4068,65 @@ TestCase {
     verify(text.indexOf("recommended scope: exe") >= 0)
   }
 
+
+  /// The footer answers "will this stop anything". On 2026-09-09 it answered
+  /// wrongly: it read only `mode`, so a machine with eight rules armed to
+  /// enforce was told "Watching, not blocking" -- on the morning one of those
+  /// rules SIGKILLed a udev worker.
+  function test_the_footer_counts_armed_rules_and_not_just_the_mode() {
+    // Control: nothing armed, nothing claimed.
+    var quiet = Model.footerFacts({ mode: "monitor", enforcing_rules: [] })
+    verify(quiet.indexOf("Watching, not blocking") >= 0, quiet.join(" | "))
+
+    // The real shape of this machine.
+    var armed = Model.footerFacts({
+      mode: "monitor",
+      enforcing_rules: ["moat-cred-etc-shadow-read", "moat-rootkit-kernel-module-load",
+                        "moat-shell-reverse-shell-connect"]
+    })
+    verify(armed.indexOf("Watching, and blocking 3 rules") >= 0, armed.join(" | "))
+    verify(armed.indexOf("Watching, not blocking") < 0,
+           "it must not still claim nothing is blocked: " + armed.join(" | "))
+
+    // One reads as one, not "1 rules".
+    var one = Model.footerFacts({ mode: "monitor", enforcing_rules: ["moat-x"] })
+    verify(one.indexOf("Watching, and blocking 1 rule") >= 0, one.join(" | "))
+
+    // Daemon-wide enforce still outranks the count.
+    var all = Model.footerFacts({ mode: "enforce", enforcing_rules: ["a", "b"] })
+    verify(all.indexOf("Blocking, not just watching") >= 0, all.join(" | "))
+  }
+
+  /// "Never updated" is a fault. "No key configured" is a setup step nobody
+  /// took. The footer said the first when it meant the second, and the reason
+  /// existed only in the journal of a service that exits successfully.
+  function test_unconfigured_feeds_are_not_reported_as_a_failure() {
+    var off = Model.footerFacts({
+      mode: "monitor", enforcing_rules: [],
+      feeds: { updated: "", configured: false }
+    })
+    verify(off.indexOf("Threat feeds are off (no abuse.ch key)") >= 0, off.join(" | "))
+
+    // Configured and still empty IS worth reporting as a fault.
+    var broken = Model.footerFacts({
+      mode: "monitor", enforcing_rules: [],
+      feeds: { updated: "", configured: true }
+    })
+    verify(broken.indexOf("Threat feeds have never updated") >= 0, broken.join(" | "))
+
+    // Updated feeds say nothing at all.
+    var ok = Model.footerFacts({
+      mode: "monitor", enforcing_rules: [],
+      feeds: { updated: "2026-09-09T12:00:00Z", configured: true }
+    })
+    verify(ok.length === 1, "a working feed is not news: " + ok.join(" | "))
+
+    // A daemon too old to send `configured` keeps the message it always had,
+    // rather than being told to set a key it may already have.
+    var old = Model.footerFacts({
+      mode: "monitor", enforcing_rules: [], feeds: { updated: "" }
+    })
+    verify(old.indexOf("Threat feeds have never updated") >= 0, old.join(" | "))
+  }
+
 }
