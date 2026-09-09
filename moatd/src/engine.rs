@@ -101,6 +101,59 @@ pub struct Downtime {
     pub suspended: u64,
 }
 
+/// The arithmetic of `Daemon::downtime`, with the three clocks passed in.
+///
+/// Split out from the daemon because it is the part that can be wrong in a way
+/// nobody notices: every branch returns a plausible-looking `Downtime`, and the
+/// difference between "the machine was asleep" and "nothing was watching" is
+/// invisible unless the numbers are checked directly.
+pub fn split_downtime(
+    wall: u64,
+    boot: u64,
+    last_heartbeat: u64,
+    started: u64,
+    last_awake: u64,
+    awake_now: u64,
+) -> Downtime {
+    // Rebooted inside the gap.
+    if boot > 0 && last_heartbeat > 0 && boot > last_heartbeat {
+        let blind = started.saturating_sub(boot);
+        return Downtime {
+            wall,
+            blind: blind.min(wall),
+            powered_off: wall.saturating_sub(blind),
+            suspended: 0,
+        };
+    }
+
+    // Same boot: awake time is the blind time.
+    //
+    // Unless the monotonic clock went BACKWARDS, which it cannot do within a
+    // boot -- so it means the machine rebooted and the branch above did not
+    // catch it, because `/proc/stat` was unreadable or `btime` was 0. Without
+    // this check `saturating_sub` floors at zero and the gap is reported as
+    // `blind: 0, suspended: wall`: a reboot rendered as a machine that was
+    // merely asleep, which hides the entire unobserved window. That is the one
+    // direction this function must never fail in.
+    if last_awake > 0 && awake_now >= last_awake {
+        let blind = awake_now - last_awake;
+        return Downtime {
+            wall,
+            blind: blind.min(wall),
+            powered_off: 0,
+            suspended: wall.saturating_sub(blind.min(wall)),
+        };
+    }
+
+    // Nothing better to go on.
+    Downtime {
+        wall,
+        blind: wall,
+        powered_off: 0,
+        suspended: 0,
+    }
+}
+
 impl Downtime {
     /// The half-sentence that says where the unblind time went, or `None` when
     /// all of it was blind and there is nothing to explain.
@@ -3998,40 +4051,18 @@ impl Daemon {
     ///
     /// Missing inputs fall back to the wall gap -- an old `state.json` with no
     /// `awake` key, or an unreadable `/proc/stat`. That direction is deliberate:
-    /// not knowing must over-report a hole, never hide one.
+    /// not knowing must over-report a hole, never hide one. A monotonic clock
+    /// that has gone backwards counts as a missing input for the same reason:
+    /// it can only mean a reboot this function did not otherwise see.
     pub fn downtime(&self) -> Downtime {
-        let wall = self.downtime_secs();
-        let boot = crate::util::boot_time();
-
-        // Rebooted inside the gap.
-        if boot > 0 && self.last_heartbeat > 0 && boot > self.last_heartbeat {
-            let blind = self.started.saturating_sub(boot);
-            return Downtime {
-                wall,
-                blind: blind.min(wall),
-                powered_off: wall.saturating_sub(blind),
-                suspended: 0,
-            };
-        }
-
-        // Same boot: awake time is the blind time.
-        if self.last_awake > 0 {
-            let blind = crate::util::awake_secs().saturating_sub(self.last_awake);
-            return Downtime {
-                wall,
-                blind: blind.min(wall),
-                powered_off: 0,
-                suspended: wall.saturating_sub(blind.min(wall)),
-            };
-        }
-
-        // Nothing better to go on.
-        Downtime {
-            wall,
-            blind: wall,
-            powered_off: 0,
-            suspended: 0,
-        }
+        split_downtime(
+            self.downtime_secs(),
+            crate::util::boot_time(),
+            self.last_heartbeat,
+            self.started,
+            self.last_awake,
+            crate::util::awake_secs(),
+        )
     }
 
     /// Raise `moat-x-binary-modified` the first time a path's bytes are found
@@ -11509,5 +11540,96 @@ esac
         assert_eq!(access_word(Some(6)).unwrap(), "read+write");
         assert_eq!(access_word(Some(0)).unwrap(), "mask 0");
         assert!(access_word(None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod downtime_tests {
+    use super::split_downtime;
+
+    /// The 2026-09-09 alert, as arithmetic: watched until 5 s before shutdown,
+    /// back 38 s after the next boot, 73 minutes powered off in between. Only
+    /// the 38 seconds were blind, and 38 is under the alerting floor.
+    #[test]
+    fn a_reboot_is_mostly_not_a_blind_window() {
+        let d = split_downtime(4416, 1_000_000, 995_600, 1_000_038, 0, 0);
+        assert_eq!(d.blind, 38);
+        assert_eq!(d.powered_off, 4416 - 38);
+        assert_eq!(d.suspended, 0);
+    }
+
+    /// A laptop asleep overnight: a large wall gap, almost none of it blind.
+    #[test]
+    fn a_suspend_is_not_a_blind_window() {
+        // Same boot (btime older than the heartbeat), and the monotonic clock
+        // advanced only 12 s across a 30,000 s wall gap.
+        let d = split_downtime(30_000, 500_000, 900_000, 930_000, 4_000, 4_012);
+        assert_eq!(d.blind, 12);
+        assert_eq!(d.suspended, 30_000 - 12);
+        assert_eq!(d.powered_off, 0);
+    }
+
+    /// Same boot, awake the whole time: the whole gap is blind. `pkill moatd`
+    /// is the case this rule exists for and it must not be explained away.
+    #[test]
+    fn a_killed_daemon_on_a_running_machine_is_entirely_blind() {
+        let d = split_downtime(600, 500_000, 900_000, 900_600, 4_000, 4_600);
+        assert_eq!(d.blind, 600);
+        assert_eq!(d.suspended, 0);
+        assert_eq!(d.powered_off, 0);
+    }
+
+    /// A reboot the btime branch did not catch, because `/proc/stat` could not
+    /// be read. CLOCK_MONOTONIC reset, so `awake_now` is far BELOW `last_awake`.
+    ///
+    /// This used to floor at zero through `saturating_sub` and report
+    /// `blind: 0, suspended: wall` -- a reboot rendered as a machine that had
+    /// merely been asleep, which hid the entire unobserved window. Exactly
+    /// backwards from the rule this function documents: not knowing must
+    /// over-report a hole, never hide one.
+    #[test]
+    fn a_missed_reboot_does_not_hide_the_window() {
+        let d = split_downtime(4416, 0, 995_600, 1_000_038, 90_000, 38);
+        assert_eq!(d.blind, 4416, "a reboot we could not see must not be hidden");
+        assert_eq!(d.suspended, 0);
+        assert_eq!(d.powered_off, 0);
+    }
+
+    /// The same, with a readable btime that is nonetheless useless because no
+    /// heartbeat was ever recorded. Falls to the wall gap rather than to zero.
+    #[test]
+    fn no_heartbeat_falls_back_to_the_wall_gap() {
+        let d = split_downtime(4416, 1_000_000, 0, 1_000_038, 90_000, 38);
+        assert_eq!(d.blind, 4416);
+    }
+
+    /// An old state.json with no `awake` key: nothing better to go on, so the
+    /// whole gap is reported blind.
+    #[test]
+    fn a_state_file_without_awake_over_reports() {
+        let d = split_downtime(4416, 0, 995_600, 1_000_038, 0, 12_000);
+        assert_eq!(d.blind, 4416);
+    }
+
+    /// `blind` can never exceed `wall`, whichever branch produced it -- the
+    /// parts have to add up or the sentence the alert prints is nonsense.
+    #[test]
+    fn the_parts_always_add_up() {
+        for (wall, boot, hb, started, la, an) in [
+            (4416u64, 1_000_000u64, 995_600u64, 1_000_038u64, 0u64, 0u64),
+            (30_000, 500_000, 900_000, 930_000, 4_000, 4_012),
+            (600, 500_000, 900_000, 900_600, 4_000, 4_600),
+            (4416, 0, 995_600, 1_000_038, 90_000, 38),
+            (100, 1_000_000, 995_600, 1_000_500, 0, 0),
+        ] {
+            let d = split_downtime(wall, boot, hb, started, la, an);
+            assert!(d.blind <= d.wall, "blind {} > wall {}", d.blind, d.wall);
+            assert_eq!(
+                d.blind + d.powered_off + d.suspended,
+                d.wall,
+                "parts must sum to the wall gap: {:?}",
+                d
+            );
+        }
     }
 }
