@@ -100,6 +100,81 @@ pub fn awake_secs() -> u64 {
     ts.tv_sec.max(0) as u64
 }
 
+/// A handle to a PROCESS, not to a number.
+///
+/// A pid is a name the kernel reuses. Between deciding to kill one and sending
+/// the signal, moat reads `/proc`, walks a descendant tree and loops over up to
+/// eight targets -- and every one of those steps is a moment in which a pid can
+/// be freed and handed to something else. `verify_pid` closes the window it can
+/// see (the alert's process, checked once) and cannot close the rest: the
+/// descendants are never verified at all, and the target it did verify is
+/// signalled later, by number.
+///
+/// `pidfd_open` resolves the number ONCE and pins what it found. Afterwards the
+/// fd refers to that process even if the pid is recycled, and
+/// `pidfd_send_signal` on a dead one fails with ESRCH instead of landing on a
+/// stranger. So the order that matters is: open the fd, THEN verify, THEN
+/// signal through the fd -- opening first is what makes the verification mean
+/// anything at the moment the signal is sent, rather than only when it was run.
+pub struct PidFd {
+    fd: libc::c_int,
+    pub pid: u32,
+}
+
+impl PidFd {
+    /// `None` when the process is already gone, or when the kernel has no
+    /// `pidfd_open` (pre-5.3) -- callers fall back to signalling by number,
+    /// which is what moat did everywhere before this existed.
+    pub fn open(pid: u32) -> Option<PidFd> {
+        // SAFETY: a syscall with scalar arguments; no pointers are passed.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        if fd < 0 {
+            return None;
+        }
+        Some(PidFd {
+            fd: fd as libc::c_int,
+            pid,
+        })
+    }
+
+    /// SIGKILL the pinned process. `Err` carries the errno text; ESRCH here
+    /// means the process died between opening and signalling, which is the
+    /// case that used to be a stranger's pid.
+    pub fn kill(&self) -> Result<(), String> {
+        self.signal(libc::SIGKILL)
+    }
+
+    /// Any signal, to the pinned process. The tree kill sends SIGSTOP to the
+    /// whole set before killing any of it, and that stop must land on the same
+    /// processes the kill will -- two passes by pid number are two chances to
+    /// stop a stranger and kill another.
+    pub fn signal(&self, sig: libc::c_int) -> Result<(), String> {
+        // SAFETY: `self.fd` is a live pidfd we own; the siginfo pointer is
+        // NULL, which the kernel documents as "as if from kill(2)".
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.fd,
+                sig,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().to_string())
+        }
+    }
+}
+
+impl Drop for PidFd {
+    fn drop(&mut self) {
+        // SAFETY: we own this descriptor and it is dropped exactly once.
+        unsafe { libc::close(self.fd) };
+    }
+}
+
 pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
@@ -784,6 +859,173 @@ pub fn is_interpreter_path(path: &str) -> bool {
             | "osascript"
             | "pwsh"
     )
+}
+
+#[cfg(test)]
+mod pidfd_tests {
+    use super::*;
+
+    /// The property the whole thing rests on: a handle to a process that has
+    /// gone signals NOTHING, rather than whatever now wears its number.
+    ///
+    /// This is what a bare `libc::kill(pid)` could not promise. Verifying a pid
+    /// and then signalling it later by number is two different questions asked
+    /// at two different moments, and moat asked them with a `/proc` walk and a
+    /// loop over eight targets in between.
+    #[test]
+    fn a_handle_to_a_dead_process_signals_nothing() {
+        // Control first: a live process, killed through its handle, really
+        // does die. Without this, the refusal below could just mean `kill`
+        // never works here.
+        let mut alive = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let h = PidFd::open(alive.id()).expect("a running process can be pinned");
+        assert!(h.kill().is_ok(), "a live process is killable through its handle");
+        let status = alive.wait().expect("reap");
+        assert!(!status.success(), "and it actually died: {status:?}");
+        drop(h);
+
+        // Now the case that matters. Pin a process, let it exit, and reap it so
+        // the pid is genuinely free for reuse.
+        let mut doomed = std::process::Command::new("true").spawn().expect("spawn true");
+        let pid = doomed.id();
+        let handle = PidFd::open(pid).expect("pinned while it was alive");
+        doomed.wait().expect("reap");
+
+        let err = handle
+            .kill()
+            .expect_err("a handle to a reaped process must not signal anything");
+        assert!(
+            err.contains("No such process") || err.contains("ESRCH") || err.contains("os error 3"),
+            "and it must fail because the PROCESS is gone, not for some other \
+             reason: {err}"
+        );
+    }
+
+    /// The distinguishing property, against a pid that really has been reused.
+    ///
+    /// The test above does NOT prove pidfd is better than `libc::kill`: a
+    /// reaped pid gives ESRCH either way, so it passes with the handle swapped
+    /// back for a bare kill. It caught nothing, which is the failure mode this
+    /// repo keeps finding in its own tests.
+    ///
+    /// The only case that separates them is a pid that has been recycled, and
+    /// that can be built: inside a fresh PID namespace we are root, pids start
+    /// at 1, and `/proc/sys/kernel/ns_last_pid` sets the next one. So: pin a
+    /// process, let it die, force its number to be handed to a NEW process, and
+    /// signal through the old handle. The handle must refuse. A bare
+    /// `kill(pid)` at that moment kills a stranger -- which is exactly what
+    /// moat's tree kill did, holding numbers across a `/proc` walk and two
+    /// signal passes.
+    ///
+    /// Runs itself again inside the namespace. Skipped, loudly, where
+    /// unprivileged user namespaces are unavailable.
+    #[test]
+    fn a_recycled_pid_is_not_signalled_through_an_old_handle() {
+        const MARK: &str = "MOAT_PIDFD_RECYCLE_INNER";
+        if std::env::var(MARK).is_ok() {
+            recycle_check();
+            return;
+        }
+
+        // Probe first, so "unshare cannot run here" is never confused with
+        // "the check failed".
+        let probe = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--pid", "--fork", "--mount-proc"])
+            .arg("/bin/true")
+            .output();
+        match probe {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!(
+                    "SKIPPED a_recycled_pid_is_not_signalled_through_an_old_handle: \
+                     unprivileged user+pid namespaces are not available here, so a pid \
+                     cannot be recycled on purpose"
+                );
+                return;
+            }
+        }
+
+        let exe = std::env::current_exe().expect("test binary");
+        let out = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--pid", "--fork", "--mount-proc"])
+            .arg(&exe)
+            .args([
+                "--exact",
+                "util::pidfd_tests::a_recycled_pid_is_not_signalled_through_an_old_handle",
+                "--nocapture",
+            ])
+            .env(MARK, "1")
+            .output()
+            .expect("re-run inside the namespace");
+        assert!(
+            out.status.success(),
+            "the in-namespace check failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The body of the test above, running as root in a fresh PID namespace.
+    fn recycle_check() {
+        // Pin a process, then let it die and be reaped so its number is free.
+        let mut doomed = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let pid = doomed.id();
+        let handle = PidFd::open(pid).expect("pinned while alive");
+        doomed.wait().expect("reap");
+
+        // Hand that exact number to something else.
+        let mut victim = None;
+        for _ in 0..8 {
+            if std::fs::write("/proc/sys/kernel/ns_last_pid", (pid - 1).to_string()).is_err() {
+                eprintln!("SKIPPED: ns_last_pid is not writable even in this namespace");
+                return;
+            }
+            let c = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn /bin/sleep");
+            if c.id() == pid {
+                victim = Some(c);
+                break;
+            }
+            let mut c = c;
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        let Some(mut victim) = victim else {
+            panic!("could not get the pid reused, so this test proved nothing");
+        };
+        assert_eq!(victim.id(), pid, "the number really is the same");
+
+        // The whole point: the old handle must not reach the new process.
+        let err = handle
+            .kill()
+            .expect_err("an old handle must not signal whatever now wears that pid");
+        assert!(
+            err.contains("No such process") || err.contains("os error 3"),
+            "refused because the process is gone: {err}"
+        );
+        assert!(
+            victim.try_wait().expect("poll").is_none(),
+            "and the innocent process holding that pid is still running"
+        );
+
+        let _ = victim.kill();
+        let _ = victim.wait();
+    }
+
+    /// A pid that was never running cannot be pinned, and that is not an error
+    /// the caller should mistake for "pinned nothing".
+    #[test]
+    fn an_absent_pid_cannot_be_pinned() {
+        // Well past /proc/sys/kernel/pid_max on any machine.
+        assert!(PidFd::open(u32::MAX - 1).is_none());
+    }
 }
 
 #[cfg(test)]

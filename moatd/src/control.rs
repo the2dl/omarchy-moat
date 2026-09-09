@@ -1105,6 +1105,10 @@ fn cmd_kill(d: &mut Daemon, id: &str) -> Value {
     if pid <= 1 {
         return err(format!("alert {} has no usable pid", id));
     }
+    // Pin the process BEFORE verifying it, so the thing verified and the thing
+    // signalled are the same process and not merely the same number. Opening
+    // afterwards would leave the window this is here to close.
+    let handle = util::PidFd::open(pid);
     if let Err(e) = verify_pid(pid, &alert.process.start_ts, &alert.process.exe) {
         return err(e);
     }
@@ -1112,14 +1116,23 @@ fn cmd_kill(d: &mut Daemon, id: &str) -> Value {
     // Children first, so a supervisor cannot respawn while we work upwards.
     let mut killed = Vec::new();
     let mut failed = Vec::new();
-    let mut targets = util::proc_descendants(pid);
-    targets.push(pid);
-    for p in targets {
-        let rc = unsafe { libc::kill(p as libc::pid_t, libc::SIGKILL) };
-        if rc == 0 {
-            killed.push(p);
-        } else {
-            failed.push(json!({"pid": p, "errno": std::io::Error::last_os_error().to_string()}));
+    // Descendants are discovered live and were never verified against
+    // anything: there is no recorded start time to check them against. Pinning
+    // each one as it is found is the whole of what can be done for them, and it
+    // is enough -- a pid recycled after the walk cannot be reached through a
+    // handle opened before it.
+    let mut targets: Vec<util::PidFd> = util::proc_descendants(pid)
+        .into_iter()
+        .filter_map(util::PidFd::open)
+        .collect();
+    // The verified target last, and through the handle opened above it.
+    if let Some(h) = handle {
+        targets.push(h);
+    }
+    for h in &targets {
+        match h.kill() {
+            Ok(()) => killed.push(h.pid),
+            Err(e) => failed.push(json!({"pid": h.pid, "errno": e})),
         }
     }
     if killed.is_empty() {

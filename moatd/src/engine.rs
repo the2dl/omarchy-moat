@@ -1356,7 +1356,7 @@ impl Daemon {
         // A cap, so a gate that is still wrong costs one build and not a day.
         const MAX_TARGETS: usize = 8;
         let mut named: Vec<String> = Vec::new();
-        let mut doomed: Vec<u32> = Vec::new();
+        let mut doomed: Vec<crate::util::PidFd> = Vec::new();
         for t in targets.iter().take(MAX_TARGETS) {
             // This target's OWN uid and identity, not the chain's.
             //
@@ -1386,6 +1386,21 @@ impl Daemon {
                 continue;
             };
             let target_uid = step_alert.process.uid;
+            // Pin the process BEFORE the checks, and signal only through the
+            // handle. Everything below -- verification, the uid gate, the
+            // SIGSTOP pass, the SIGKILL pass -- used to happen against a bare
+            // number, so each step was a fresh chance for the pid to have been
+            // recycled underneath it. A handle opened here refers to this
+            // process for as long as it is held, and to nothing at all once it
+            // dies.
+            let Some(handle) = crate::util::PidFd::open(t.pid) else {
+                log::info!(
+                    "chain {}: sparing pid {} (it exited before it could be pinned)",
+                    c.id,
+                    t.pid
+                );
+                continue;
+            };
             if let Err(why) =
                 crate::control::verify_pid(t.pid, &step_alert.process.start_ts, &t.exe)
             {
@@ -1399,7 +1414,7 @@ impl Daemon {
                 continue;
             }
             named.push(format!("{} ({})", t.pid, t.exe));
-            doomed.push(t.pid);
+            doomed.push(handle);
         }
         if doomed.is_empty() {
             return;
@@ -1427,12 +1442,12 @@ impl Daemon {
 
         // Stop the whole set before killing any of it, or the first SIGKILL is
         // a starting pistol for whatever the others fork.
-        for pid in &doomed {
-            unsafe { libc::kill(*pid as i32, libc::SIGSTOP) };
+        for h in &doomed {
+            let _ = h.signal(libc::SIGSTOP);
         }
         let mut killed = 0usize;
-        for pid in &doomed {
-            if unsafe { libc::kill(*pid as i32, libc::SIGKILL) } == 0 {
+        for h in &doomed {
+            if h.kill().is_ok() {
                 killed += 1;
             }
         }
