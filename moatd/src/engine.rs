@@ -1154,6 +1154,102 @@ impl Daemon {
     /// Runs on every `high` chain regardless of mode, because the whole point
     /// of `log` is to gather the evidence that says whether the rules are safe
     /// to act on. Nothing is signalled unless `[contain] kill = "kill"`.
+    /// The (binary, destination) pairs a containment may be built from.
+    ///
+    /// Trigger steps only, unsuppressed, with a destination -- and NOT from a
+    /// container. The generated policy is scoped to the host namespace, which
+    /// decides where it applies and says nothing about whether the evidence for
+    /// it came from this machine: a containerised step naming `/usr/bin/curl`
+    /// would otherwise install a policy refusing HOST curl to that destination,
+    /// an unprivileged container choosing what the host may not reach. The path
+    /// is namespace-relative and names a different file over there.
+    ///
+    /// A method so a test can call what production calls; the policy load
+    /// itself needs a live sensor and so cannot be the observable.
+    pub fn host_net_members(
+        &self,
+        c: &crate::chain::Chain,
+    ) -> std::collections::BTreeMap<String, (String, String)> {
+        // Only from steps that TRIGGERED. A step the user allowlisted is in the
+        // story for context, and a sequence is not a licence to act on
+        // something they said was fine.
+        let mut members: std::collections::BTreeMap<String, (String, String)> =
+            std::collections::BTreeMap::new();
+        for step in c.steps.iter().filter(|s| s.is_trigger()) {
+            let Some(a) = self.find_alert(&step.alert) else {
+                continue;
+            };
+            if a.suppressed_by.is_some() {
+                continue;
+            }
+            let Some(net) = a.net.as_ref() else { continue };
+            if net.dst_ip.is_empty() {
+                continue;
+            }
+            // A container step must not name the binary to block.
+            //
+            // The policy this builds is scoped to the host namespace, which
+            // decides WHERE it applies -- it says nothing about whether the
+            // evidence for it came from this machine. A containerised step
+            // naming `/usr/bin/curl` would otherwise install a policy refusing
+            // HOST curl to that destination: an unprivileged container
+            // deciding what the host may not connect to. The path is
+            // namespace-relative and names a different file over there.
+            if a.process.in_container == Some(true) {
+                log::info!(
+                    "chain {}: not containing {} — that path was seen in a container, and it \
+                     names a different file on this machine",
+                    c.id,
+                    a.process.exe
+                );
+                continue;
+            }
+            members.insert(a.id.clone(), (a.process.exe.clone(), net.dst_ip.clone()));
+        }
+        members
+    }
+
+    /// Drop the targets that are not on this machine.
+    ///
+    /// `chain_gate` refuses a wholly-container chain; it says nothing about
+    /// where a MIXED chain aims. One host trigger permits the chain and
+    /// `tree_targets` then returns every trigger pid, container ones included,
+    /// so a container build step could be killed because something on the host
+    /// in the same tree looked bad. The permit and the aim are different
+    /// questions.
+    ///
+    /// A method rather than an expression inline, so a test can call the thing
+    /// production calls: the first test written for this copied the filter into
+    /// its own body, which made the mutation check check the test.
+    ///
+    /// The sensor's answer only, as everywhere an action is decided
+    /// (`containerised_for_enforcement`): a forged ancestor named `runc` must
+    /// not make a target un-killable either.
+    pub fn host_targets(
+        &self,
+        targets: Vec<crate::contain::Target>,
+        chain_id: &str,
+    ) -> Vec<crate::contain::Target> {
+        targets
+            .into_iter()
+            .filter(|t| {
+                let in_container = self
+                    .find_alert(&t.alert)
+                    .and_then(|a| a.process.in_container)
+                    .unwrap_or(false);
+                if in_container {
+                    log::info!(
+                        "chain {}: sparing pid {} — it is in a container, and moat does not \
+                         enforce across a namespace boundary",
+                        chain_id,
+                        t.pid
+                    );
+                }
+                !in_container
+            })
+            .collect()
+    }
+
     fn maybe_kill_tree(&mut self, c: &crate::chain::Chain, now: u64) {
         let mode = self.cfg.contain.kill.clone();
         if mode == "off" {
@@ -1190,38 +1286,11 @@ impl Daemon {
             .collect();
         let spare_ancestor = ancestor_families.len() < 2;
 
-        let targets = crate::contain::tree_targets(&c.steps, c.ancestor.pid, spare_ancestor);
-        // Host-only TARGETS, not merely a host-only decision.
-        //
-        // `chain_gate` refuses when every trigger is containerised, which stops
-        // a wholly-container chain acting at all. It says nothing about a MIXED
-        // chain: one host trigger permits the chain, and `tree_targets` then
-        // hands back every trigger pid including the ones in containers. The
-        // permit and the aim are different questions and only the first was
-        // being asked -- so a build step in a container could be killed because
-        // something on the host, in the same tree, looked bad.
-        //
-        // The sensor's answer only, as everywhere an action is decided
-        // (`containerised_for_enforcement`): a forged ancestor named `runc`
-        // must not be able to make a target un-killable either.
-        let targets: Vec<crate::contain::Target> = targets
-            .into_iter()
-            .filter(|t| {
-                let in_container = self
-                    .find_alert(&t.alert)
-                    .and_then(|a| a.process.in_container)
-                    .unwrap_or(false);
-                if in_container {
-                    log::info!(
-                        "chain {}: sparing pid {} — it is in a container, and moat does not \
-                         enforce across a namespace boundary",
-                        c.id,
-                        t.pid
-                    );
-                }
-                !in_container
-            })
-            .collect();
+        let targets = self.host_targets(crate::contain::tree_targets(
+            &c.steps,
+            c.ancestor.pid,
+            spare_ancestor,
+        ), &c.id);
         // A cap, so a gate that is still wrong costs one build and not a day.
         const MAX_TARGETS: usize = 8;
         let mut named: Vec<String> = Vec::new();
@@ -1352,24 +1421,7 @@ impl Daemon {
             return;
         }
 
-        // Only from steps that TRIGGERED. A step the user allowlisted is in the
-        // story for context, and a sequence is not a licence to act on
-        // something they said was fine.
-        let mut members: std::collections::BTreeMap<String, (String, String)> =
-            std::collections::BTreeMap::new();
-        for step in c.steps.iter().filter(|s| s.is_trigger()) {
-            let Some(a) = self.find_alert(&step.alert) else {
-                continue;
-            };
-            if a.suppressed_by.is_some() {
-                continue;
-            }
-            let Some(net) = a.net.as_ref() else { continue };
-            if net.dst_ip.is_empty() {
-                continue;
-            }
-            members.insert(a.id.clone(), (a.process.exe.clone(), net.dst_ip.clone()));
-        }
+        let members = self.host_net_members(c);
         let targets = crate::contain::targets(&members);
         // A sequence with nothing outbound in it has nothing to contain. That
         // is most of them, and it is not a failure.
@@ -3949,7 +4001,15 @@ impl Daemon {
             // still covering scripts nobody observed. Re-checking provenance
             // alone would never withdraw them, because `python3` does not stop
             // being official -- that is the whole reason the entry was wrong.
-            if crate::provenance::path_is_not_identity(crate::util::basename(&e.exe)) {
+            //
+            // NEVER a human's entry. `Baseline::accept` puts a reviewed
+            // proposal in this same collection, and on 2026-09-09 this branch
+            // could withdraw one: a person read that proposal and approved it,
+            // and a heuristic added later does not get to overrule them. It
+            // withdraws what the LEARNER wrote and nothing else.
+            if e.accepted_by.is_none()
+                && crate::provenance::path_is_not_identity(crate::util::basename(&e.exe))
+            {
                 let reason = format!(
                     "{}: {} runs code chosen by its arguments, so this entry names the \
                      runtime and not the code it ran -- it would cover scripts nobody has \
@@ -3957,15 +4017,57 @@ impl Daemon {
                     e.rule,
                     crate::util::basename(&e.exe)
                 );
-                if let Some(t) = self.baseline.state.tuples.get(&e.key).cloned() {
-                    if let Some(idx) = crate::allowlist::find_index(&path, &t.spec()) {
-                        if let Err(err) = crate::allowlist::disable_rule(&path, idx, &reason) {
-                            log::warn!("{}: {}", path.display(), err);
-                        }
-                    }
+                // Marked revoked ONLY if the on-disk block is actually gone.
+                //
+                // The provenance path above marks it either way, which turns a
+                // failed write into a permanent false success: `learned_entries`
+                // stops returning the entry, so the next re-check never retries
+                // it, and a grant that is still live in baseline.toml is
+                // recorded as withdrawn. Leaving it un-marked costs a repeated
+                // attempt; marking it costs the grant.
+                let disabled = match self.baseline.state.tuples.get(&e.key).cloned() {
+                    Some(t) => match crate::allowlist::find_index(&path, &t.spec()) {
+                        Some(idx) => match crate::allowlist::disable_rule(&path, idx, &reason) {
+                            Ok(_) => true,
+                            Err(err) => {
+                                log::warn!("{}: {}", path.display(), err);
+                                false
+                            }
+                        },
+                        // No block to disable: nothing is granting anything, so
+                        // the entry is safe to mark.
+                        None => true,
+                    },
+                    None => true,
+                };
+                if !disabled {
+                    log::warn!(
+                        "baseline: {} still grants {}; will retry on the next re-check",
+                        path.display(),
+                        e.key
+                    );
+                    continue;
                 }
                 self.baseline.mark_revoked(&e.key, &reason);
                 revoked += 1;
+
+                // Said out loud, like the provenance withdrawal. A rule that
+                // stops covering something changes what moat will ask about,
+                // and a silent change to that is the thing this project keeps
+                // finding it has to apologise for.
+                let meta = crate::rules::baseline_revoked_meta(&e.rule);
+                let mut f =
+                    Finding::new(crate::rules::BASELINE_REVOKED, meta, self_proc(&e.rule));
+                f.mode = self.mode.clone();
+                f.what_override = Some(format!(
+                    "A learned baseline entry for {} was disabled: {} runs code chosen by \
+                     its arguments, so the entry named the runtime and not the code.",
+                    e.rule, e.exe
+                ));
+                f.extra_evidence = vec![reason.clone(), format!("entry written {}", e.written)];
+                self.in_meta_alert = true;
+                self.emit(f);
+                self.in_meta_alert = false;
                 continue;
             }
             let (prov, package) = self.provenance.classify_path(&e.exe);
@@ -7054,7 +7156,7 @@ esac
 
     /// A dropped-events message is an alert, not a shrug.
     ///
-    /// `cgroup-rate` is 1000 events/s and serde ignores unknown fields, so
+    /// `cgroup-rate` is 20000 events/s per cpu and serde ignores unknown fields, so
     /// `process_throttle` parsed into nothing. An attacker exceeding that rate
     /// gets the sensor to discard their own events -- the one evasion where the
     /// evidence is what goes missing, so the throttle itself has to be said out
@@ -7746,22 +7848,77 @@ esac
             v
         );
 
-        // But the container step is not a target.
-        let targets = crate::contain::tree_targets(&c.steps, c.ancestor.pid, false);
-        let kept: Vec<u32> = targets
+        // The PRODUCTION filter, called -- not a copy of it.
+        //
+        // The first version of this test reimplemented the filter in its own
+        // body and asserted on that, so deleting the real one changed nothing
+        // and the mutation check was checking the test. Driving
+        // `maybe_kill_tree` end to end does not work either: `refuse_to_kill`
+        // spares every target because these pids do not exist, so nothing is
+        // ever recorded. `host_targets` is the seam that is both real and
+        // reachable.
+        let kept: Vec<u32> = d
+            .host_targets(
+                crate::contain::tree_targets(&c.steps, c.ancestor.pid, false),
+                &c.id,
+            )
             .into_iter()
-            .filter(|t| {
-                !d.find_alert(&t.alert)
-                    .and_then(|a| a.process.in_container)
-                    .unwrap_or(false)
-            })
             .map(|t| t.pid)
             .collect();
-        assert!(kept.contains(&host.process.pid), "the host step is still a target");
+        assert!(kept.contains(&host.process.pid), "the host step is still a target: {:?}", kept);
         assert!(
             !kept.contains(&cont.process.pid),
             "the container step must not be killed: {:?}",
             kept
+        );
+    }
+
+    /// A container step must not decide what the HOST may not connect to.
+    ///
+    /// The generated containment policy is scoped to the host namespace, which
+    /// decides where it applies -- not whether the evidence for it came from
+    /// this machine. A containerised step naming `/usr/bin/curl` would install
+    /// a policy refusing HOST curl to that destination: an unprivileged
+    /// container choosing what the host may not reach. The path is
+    /// namespace-relative and names a different file over there.
+    #[test]
+    fn a_container_step_does_not_name_the_binary_the_host_is_blocked_from_using() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.contain.enabled = true;
+
+        let mut a = stored_alert(&mut d, "01QJ0000000000000000000000", "moat-net-first-contact",
+                                 "net", "", crate::rarity::Rarity::FirstSeen);
+        a.process.exe = "/usr/bin/curl".into();
+        a.process.in_container = Some(true);
+        a.net = Some(crate::alert::NetRef {
+            dst_ip: "203.0.113.9".into(),
+            dst_port: 443,
+            domain: None,
+        });
+        d.store.append_alert(&a).unwrap();
+        let c = chain_over(&d, &[a.clone()], "critical");
+
+        // `host_net_members`, not `maybe_contain`: the policy load needs a live
+        // sensor, so `contain.live()` is empty in a test either way and
+        // asserting on it proves nothing. This is the seam that decides WHAT a
+        // containment would be built from.
+        assert!(
+            d.host_net_members(&c).is_empty(),
+            "a container's evidence would have built a host policy: {:?}",
+            d.host_net_members(&c)
+        );
+
+        // And the same chain on the host DOES yield evidence, or the assertion
+        // above would pass for want of a destination rather than for the reason
+        // it claims.
+        let mut host = d.find_alert(&a.id).unwrap();
+        host.process.in_container = Some(false);
+        d.store.append_alert(&host).unwrap();
+        assert_eq!(
+            d.host_net_members(&c).len(),
+            1,
+            "the identical host chain must still be containable"
         );
     }
 
@@ -9418,6 +9575,7 @@ esac
                 exe: "/usr/bin/python3.14".into(),
                 written: util::now_rfc3339(),
                 revoked: None,
+                accepted_by: None,
             },
         );
         assert_eq!(d.baseline.learned_entries().len(), 1, "the old-build state");
@@ -9435,6 +9593,114 @@ esac
             why.contains("runs code chosen by its arguments"),
             "withdrawn, but not for naming a runtime instead of the code: {}",
             why
+        );
+    }
+
+    /// A human's approval is not moat's to revisit.
+    ///
+    /// `Baseline::accept` puts a reviewed proposal into the same collection as
+    /// an automatically learned entry. The runtime-path withdrawal added on
+    /// 2026-09-08 could therefore disable one a person had read and approved --
+    /// a heuristic added later overruling a decision already made.
+    #[test]
+    fn an_accepted_proposal_is_not_withdrawn_by_the_runtime_path_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        let key = "k-accepted".to_string();
+        d.baseline.state.learned.insert(
+            key.clone(),
+            crate::baseline::LearnedEntry {
+                key: key.clone(),
+                rule: "moat-cred-ssh-private-key-read".into(),
+                exe: "/usr/bin/python3.14".into(),
+                written: util::now_rfc3339(),
+                revoked: None,
+                accepted_by: Some("dan".into()),
+            },
+        );
+        d.revoke_stale_learned_entries();
+        // It MAY still be revoked -- this fixture has no pacman database, so
+        // python3.14 is not official and the provenance rule withdraws it, which
+        // is the pre-existing behaviour and correct. What must not happen is
+        // withdrawal for the RUNTIME-PATH reason, which is the rule a person's
+        // approval outranks.
+        let why = d.baseline.state.learned[&key].revoked.clone();
+        assert!(
+            why.as_deref()
+                .map(|w| !w.contains("runs code chosen by its arguments"))
+                .unwrap_or(true),
+            "a heuristic overruled a person's approval: {:?}",
+            why
+        );
+    }
+
+    /// A withdrawal that did not happen must not be recorded as one.
+    ///
+    /// `mark_revoked` takes the entry out of `learned_entries`, so the next
+    /// re-check never retries it. If the on-disk block is still there, the
+    /// grant is still live and moat has written down that it is not. The
+    /// provenance path above marks unconditionally; this one does not.
+    #[test]
+    fn a_failed_withdrawal_is_retried_rather_than_recorded_as_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, cfg) = dev_daemon(dir.path());
+
+        // A tuple whose spec really matches a block on disk.
+        for day in 0..3u64 {
+            d.baseline.observe(&Observation {
+                rule: "moat-cred-ssh-private-key-read",
+                exe: "/usr/bin/python3.14",
+                parent: "",
+                dir: "/home/dan/.ssh",
+                severity: "medium",
+                severity_base: "medium",
+                provenance: "official",
+                package: Some("python 3.14-1".into()),
+                context: "service",
+                rarity: "common",
+                suppressed: false,
+                demoted: false,
+                ts: format!("2026-09-0{}T10:00:00.000Z", day + 1),
+                now: util::unix_secs(),
+            });
+        }
+        let key = d.baseline.state.tuples.keys().next().unwrap().clone();
+        let spec = d.baseline.state.tuples[&key].spec();
+        let path = cfg.paths.baseline_allowlist();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("# learned\n{}", crate::allowlist::render_block(&spec)))
+            .unwrap();
+        assert!(
+            crate::allowlist::find_index(&path, &spec).is_some(),
+            "precondition: the block is findable, or this tests the wrong branch"
+        );
+
+        d.baseline.state.learned.insert(
+            key.clone(),
+            crate::baseline::LearnedEntry {
+                key: key.clone(),
+                rule: "moat-cred-ssh-private-key-read".into(),
+                exe: "/usr/bin/python3.14".into(),
+                written: util::now_rfc3339(),
+                revoked: None,
+                accepted_by: None,
+            },
+        );
+
+        // Make the rewrite fail. `disable_rule` writes through
+        // `util::atomic_write` (temp file + rename), so read-only on the FILE
+        // changes nothing -- the directory is what has to refuse.
+        use std::os::unix::fs::PermissionsExt;
+        let parent = path.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let n = d.revoke_stale_learned_entries();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(n, 0, "nothing was actually withdrawn");
+        assert_eq!(
+            d.baseline.learned_entries().len(),
+            1,
+            "the entry must stay in the retry set while the block is still live"
         );
     }
 

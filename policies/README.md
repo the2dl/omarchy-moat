@@ -303,7 +303,7 @@ reload, so rendering must happen before the daemon starts, and a new user needs
 | `log-level` | `info` | |
 | `event-queue-size` | `32768` | notes section 10: builds spawn thousands of execs |
 | `process-cache-size` | `131072` | keeps ancestry resolvable under load |
-| `cgroup-rate` | `1000,1s` | per-cgroup base-event throttle; emits `process_throttle`. Remove it if you would rather lose no exec events than throttle a runaway build |
+| `cgroup-rate` | `20000,1s` | per-cgroup base-event throttle, **evaluated per CPU**; emits `process_throttle`. It was `1000,1s` until 2026-09-09, which dropped ~88% of a single-CPU fork storm — and what it drops is exec/exit, i.e. ancestry. Remove it if you would rather lose no exec events at all than throttle a runaway build |
 | `enable-process-environment-variables` | `true` | + the next line, this is the only way to see `LD_PRELOAD` |
 | `filter-environment-variables` | `LD_PRELOAD` | capture nothing else — unfiltered env capture is expensive and leaks secrets into the log |
 

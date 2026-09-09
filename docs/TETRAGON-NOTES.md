@@ -575,12 +575,29 @@ What it drops is base exec/exit events -- which is ancestry. That is the input
 `chain.rs` correlates on, the input `context.rs` walks for a tty, and the source
 of `process.ns`. Losing it during a build is losing exactly the evidence needed
 to tell one build from another and to connect a malicious step to the tree it
-ran in. The limit is now `20000,1s`. That figure was a guess when it was set and is
-no longer: measured 2026-09-09 against the live config, 8,000 forks pinned to
-one cpu ran at 2,940 forks/s = **5,880 events/s on that cpu**, and moatd saw
-16,661 events against ~16,000 expected -- no loss at all, against 88% loss at
-the old limit. So a real fork storm peaks around a third of the ceiling, and
-20,000 is roughly 3.4x headroom rather than an arbitrary round number.
+ran in. The limit is now `20000,1s`. What that figure IS and IS NOT supported by,
+stated carefully because the first version of this note overclaimed:
+
+Measured 2026-09-09 against the live config: 8,000 forks pinned to one cpu ran
+for 2.72 s at 2,940 forks/s = **5,880 events/s on that cpu**, and moatd's
+`events_seen` rose by 16,661 against the ~16,000 those forks should produce.
+
+That supports keeping 20,000 over 1,000, and nothing stronger. In particular:
+
+* It does **not** prove "no loss". The counter is an aggregate over the whole
+  machine, so unrelated events can mask dropped ones; the 661 surplus (4.1%) is
+  background, not proof of completeness. Proving no loss needs event-identity
+  reconciliation, which has not been done.
+* It does **not** establish a fork-storm PEAK. A serial `for` loop measures an
+  average over 2.72 s. The true peak of a parallel build is unmeasured and
+  higher.
+* 3.4x is headroom against THAT workload's average, not worst-case capacity.
+* Per-cgroup and per-cpu means the nominal ceiling across 32 cpus is 640,000
+  events/s, which is a lot of rope.
+
+Treat 20,000 as provisional. If it needs changing, measure the same way --
+pinned to one cpu, `events_seen` before and after -- and record the numbers
+and their limits here.
 
 It exists as flood protection, not as a noise control, and it must never be
 tuned down to quieten moat. If it ever needs raising again, measure the same

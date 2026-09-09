@@ -257,6 +257,15 @@ pub struct LearnedEntry {
     /// Set once provenance stopped being official and the entry was disabled.
     #[serde(default)]
     pub revoked: Option<String>,
+    /// Who approved this, when a human did.
+    ///
+    /// `accept` puts a reviewed proposal into the same collection as an
+    /// automatically learned entry, and until 2026-09-09 nothing told them
+    /// apart -- so a rule added to withdraw entries the LEARNER should never
+    /// have written could also withdraw one a person had read and approved.
+    /// A human's decision is not moat's to revisit on a heuristic.
+    #[serde(default)]
+    pub accepted_by: Option<String>,
 }
 
 /// What `observe` decided to do about one alert.
@@ -446,6 +455,7 @@ impl Baseline {
                     exe: stat.exe.clone(),
                     written: o.ts.clone(),
                     revoked: None,
+                    accepted_by: None,
                 },
             );
             Learned::Entry {
@@ -643,6 +653,7 @@ impl Baseline {
                 exe: p.exe.clone(),
                 written: crate::util::now_rfc3339(),
                 revoked: None,
+                accepted_by: Some(who.to_string()),
             },
         );
         self.dirty = true;

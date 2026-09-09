@@ -49,7 +49,7 @@ pub const FILE_SUFFIXES: &str = "{{FILE_SUFFIXES}}";
 /// variant, but that is UNVERIFIED live and exact names cost nothing.
 ///
 /// Line 3 is `PROCESS_THROTTLE`, and its absence until 2026-09-08 was a hole
-/// in moat's account of itself. Tetragon is run with `--cgroup-rate 1000,1s`;
+/// in moat's account of itself. Tetragon is run with `--cgroup-rate` set;
 /// when a cgroup exceeds that, base events are DROPPED and a `process_throttle`
 /// event says so. moatd parses those (`event::ThrottleEvent`) and raises
 /// `moat-x-sensor-throttled` — a rule that could never once have fired, because

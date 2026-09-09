@@ -18,7 +18,7 @@ pub struct RawEvent {
     pub process_tracepoint: Option<HookEvent>,
     /// Tetragon telling us it is DROPPING events.
     ///
-    /// `cgroup-rate` is configured at 1000 events/s per cgroup, and serde
+    /// `cgroup-rate` is configured at 20000 events/s per cgroup PER CPU, and serde
     /// ignores unknown fields -- so this message was parsed into nothing and
     /// discarded. An attacker who exceeds that rate in their own cgroup gets
     /// the sensor to drop their own events, which is the cheapest blinding
