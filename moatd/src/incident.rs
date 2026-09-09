@@ -1277,7 +1277,7 @@ mod container_paths {
             ts: "2026-09-09T00:00:00.000Z",
             context: "pkg-install",
             mode: "monitor",
-            pid: 999_999_9,
+            pid: 9_999_999,
             exe: "/app/server",
             args: "",
             cwd: "/",

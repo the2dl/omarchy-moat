@@ -225,7 +225,7 @@ fn restic_forget(comm: &str, toks: &[&str]) -> Option<String> {
     if toks.iter().any(|t| t.starts_with("--keep")) {
         return None;
     }
-    if toks.iter().any(|t| *t == "--unsafe-allow-remove-all") {
+    if toks.contains(&"--unsafe-allow-remove-all") {
         return Some(format!("{} was asked to forget EVERY snapshot in the repository", comm));
     }
     Some(format!(

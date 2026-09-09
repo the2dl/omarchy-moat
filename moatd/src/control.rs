@@ -1191,7 +1191,6 @@ pub fn verify_pid(pid: u32, start_ts: &str, exe: &str) -> Result<(), String> {
         ));
     };
     {
-        let live_exe = live_exe;
         let live_exe = live_exe.trim_end_matches(" (deleted)");
         // `binary_aliases` already answers this, and has since 2026-09-05:
         // tetragon reports the path a process was INVOKED by, /proc/<pid>/exe
@@ -2770,7 +2769,7 @@ fn current_gids() -> Vec<u32> {
         let got = unsafe { libc::getgroups(n, buf.as_mut_ptr()) };
         if got > 0 {
             buf.truncate(got as usize);
-            gids.extend(buf.into_iter().map(|g| g as u32));
+            gids.extend(buf);
         }
     }
     gids

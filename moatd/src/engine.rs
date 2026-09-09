@@ -3193,7 +3193,7 @@ impl Daemon {
             if a.pkg_install_escalation {
                 continue;
             }
-            let raised_by_chain = a.chain.as_ref().map_or(false, |c| {
+            let raised_by_chain = a.chain.as_ref().is_some_and(|c| {
                 crate::alert::severity_rank(&c.severity) >= high
                     && c.steps.iter().any(|s| s.alert == a.id && s.is_trigger())
             });
@@ -7160,8 +7160,7 @@ mod tests {
             .store
             .load()
             .into_iter()
-            .filter(|x| x.rule == "moat-net-tmpfs-binary-egress")
-            .last()
+            .rfind(|x| x.rule == "moat-net-tmpfs-binary-egress")
             .unwrap();
         assert_eq!(b.mode, "enforce");
         assert_eq!(b.action_taken, "blocked");
@@ -8369,8 +8368,8 @@ esac
             "a noise-guard demotion must not turn a step into context"
         );
         // ...so the chain sees the `high` and says so...
-        assert_eq!(crate::alert::severity_rank(&chain.severity) >= 2, true,
-                   "chain is {} with a high trigger in it", chain.severity);
+        assert!(crate::alert::severity_rank(&chain.severity) >= 2,
+                "chain is {} with a high trigger in it", chain.severity);
         // ...and it reaches the user, which is the part that failed live.
         assert_eq!(by_id(&a).surface, "alerts", "a high chain has to reach the badge");
     }
@@ -10485,7 +10484,7 @@ esac
             .store
             .load()
             .into_iter()
-            .find(|a| a.file.as_ref().map_or(false, |f| f.path.contains("conf.d")))
+            .find(|a| a.file.as_ref().is_some_and(|f| f.path.contains("conf.d")))
             .expect("the conf.d alert");
         assert_eq!(other.surface, "alerts", "precondition: on the badge");
 
@@ -10508,7 +10507,7 @@ esac
         let alerts = d.store.load();
         let flood: Vec<_> = alerts
             .iter()
-            .filter(|a| a.file.as_ref().map_or(false, |f| f.path.contains("/hypr/gen")))
+            .filter(|a| a.file.as_ref().is_some_and(|f| f.path.contains("/hypr/gen")))
             .collect();
         assert!(flood.len() > 20);
         for a in &flood {

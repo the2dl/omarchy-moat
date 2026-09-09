@@ -581,7 +581,7 @@ pub fn parse_subvol_roots(text: &str) -> Vec<(String, String)> {
             out.push(pair);
         }
     }
-    out.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    out.sort_by_key(|e| std::cmp::Reverse(e.0.len()));
     out
 }
 
@@ -770,7 +770,7 @@ pub fn interpreter_of(path: &str) -> Option<String> {
     if head.starts_with(b"#!") {
         let line = head[2..].split(|b| *b == b'\n').next()?;
         let text = String::from_utf8_lossy(line);
-        if let Some(interp) = text.trim().split_whitespace().next() {
+        if let Some(interp) = text.split_whitespace().next() {
             if interp.starts_with('/') {
                 return Some(interp.to_string());
             }

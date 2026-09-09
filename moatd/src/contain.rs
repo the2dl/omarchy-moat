@@ -397,7 +397,7 @@ mod alias_tests {
 
     #[test]
     fn a_real_path_is_not_duplicated() {
-        assert_eq!(binary_aliases("/usr/bin/env").len() <= 2, true);
+        assert!(binary_aliases("/usr/bin/env").len() <= 2);
         let names = binary_aliases("/usr/lib/os-release");
         assert!(!names.is_empty() && names[0] == "/usr/lib/os-release");
     }
@@ -525,6 +525,7 @@ mod tests {
 /// * **`system.slice`.** systemd puts the machine's own services there:
 ///   moatd, tetragon, sshd, dbus, logind. A payload cannot move itself into it
 ///   without root, and with root this feature is already lost.
+///
 /// `alert_uid` is THIS TARGET's uid, from the step that named it -- not the
 /// chain's. It used to be whatever the last trigger ran as, applied to every
 /// target, which on a chain spanning two users compared one against the
@@ -576,6 +577,7 @@ pub struct Target {
 ///   by naming itself `systemd` either -- that only ever removes a target.
 /// * **Each pid once**, in first-seen order, so the earliest step in the
 ///   sequence dies first and cannot spawn more while the rest are signalled.
+///
 /// `spare_ancestor` is false when the ancestor is ITSELF a multi-family actor:
 /// `node -e "import('hijacked')"` and `curl | sh` put the malicious process at
 /// the root of its own tree, so sparing it unconditionally makes the whole
