@@ -4006,6 +4006,33 @@ impl Daemon {
 
     // ------------------------------------------- pacman transactions, LEARNING §1
 
+    /// Everything that happens once, at every start.
+    ///
+    /// A method rather than four lines in `run`, so the sequence can be tested:
+    /// the re-check below is only correct if it is actually PART of startup,
+    /// and a call site buried in the daemon loop is one no test can reach.
+    pub fn on_start(&mut self, now: u64) {
+        self.begin_arming(now);
+        self.report_downtime();
+        // Re-check every learned entry ONCE, at every start.
+        //
+        // `on_pacman_change` only acts when the database mtime moved, and a
+        // fresh process reads the current mtime as its baseline -- so an entry
+        // that a NEW RULE would refuse to write today survives indefinitely, on
+        // disk and matching, until some unrelated pacman transaction happens to
+        // move the file. The runtime-path withdrawal added on 2026-09-08 had
+        // exactly that shape: the gate stopped new entries being written and
+        // the old ones sat there.
+        //
+        // A rule change is not a filesystem event, and waiting for one to
+        // notice is how an upgrade silently does nothing. This is the
+        // migration, and it costs one pass over the learned set.
+        let withdrawn = self.revoke_stale_learned_entries();
+        if withdrawn > 0 {
+            log::info!("startup: withdrew {} learned entry(ies) on re-check", withdrawn);
+        }
+    }
+
     /// Re-read the pacman database when it moved, and re-check every learned
     /// baseline entry against it: an entry whose actor stopped being official is
     /// disabled in place, with a reason, and a low alert says so.
@@ -5375,9 +5402,7 @@ pub fn run(daemon: Arc<Mutex<Daemon>>, opts: RunOptions) {
         // the last of 44 policies, and all seven `set-mode` calls failed
         // against a sensor that did not have those names yet.
         let mut d = daemon.lock().expect("daemon lock");
-        let now = util::unix_secs();
-        d.begin_arming(now);
-        d.report_downtime();
+        d.on_start(util::unix_secs());
     }
     let (log_path, state_every, feeds_every, feeds_dir) = {
         let d = daemon.lock().expect("daemon lock");
@@ -9692,6 +9717,46 @@ esac
         assert!(
             why.contains("runs code chosen by its arguments"),
             "withdrawn, but not for naming a runtime instead of the code: {}",
+            why
+        );
+    }
+
+    /// The re-check is part of STARTUP, not only of a pacman transaction.
+    ///
+    /// `on_pacman_change` acts only when the database mtime moved, and a fresh
+    /// process takes the current mtime as its baseline. So an entry that a new
+    /// rule would refuse to write today survived on disk, matching, until some
+    /// unrelated transaction happened to move the file -- which for a rule
+    /// change is never, because a rule change is not a filesystem event. An
+    /// upgrade that fixes what moat is willing to learn has to fix what it
+    /// already learned, or it silently does nothing on every existing machine.
+    #[test]
+    fn a_stale_learned_entry_is_withdrawn_at_startup_without_a_pacman_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        let key = "k-startup".to_string();
+        d.baseline.state.learned.insert(
+            key.clone(),
+            crate::baseline::LearnedEntry {
+                key: key.clone(),
+                rule: "moat-cred-ssh-private-key-read".into(),
+                exe: "/usr/bin/python3.14".into(),
+                written: util::now_rfc3339(),
+                revoked: None,
+                accepted_by: None,
+            },
+        );
+        assert_eq!(d.baseline.learned_entries().len(), 1);
+
+        // No mtime moved; nothing touched the pacman database. Only a start.
+        d.on_start(util::unix_secs());
+
+        let why = d.baseline.state.learned[&key].revoked.clone();
+        assert!(
+            why.as_deref()
+                .map(|w| w.contains("runs code chosen by its arguments"))
+                .unwrap_or(false),
+            "startup did not re-check the learned set: {:?}",
             why
         );
     }
