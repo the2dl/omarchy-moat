@@ -171,6 +171,14 @@ pub struct Daemon {
     /// this one tampered binary would raise `moat-x-binary-modified` as often
     /// as anything else mentions it. Keyed on the reason too, so a file that
     /// changes AGAIN is reported again.
+    ///
+    /// Persisted, because a modified file is a fact about the disk and not
+    /// about this process. Omarchy's own installer rewrites the shebang of
+    /// `/usr/bin/powerprofilesctl` so it uses the system python3 rather than
+    /// mise's, which means EVERY Omarchy machine has one permanently modified
+    /// package file -- and an in-memory set turned that into a `high` alert on
+    /// every restart, for ever. Once per change is the claim; once per boot is
+    /// just noise wearing its clothes.
     modified_reported: std::collections::BTreeSet<String>,
     /// Template stems that failed to render, from the last `render-policies`.
     pub policies_failed: Vec<String>,
@@ -421,7 +429,16 @@ impl Daemon {
             last_unwatched_alert: 0,
             kernel_exclusions: exclusions_at_start,
             killed_chains: std::collections::BTreeSet::new(),
-            modified_reported: std::collections::BTreeSet::new(),
+            modified_reported: state
+                .as_ref()
+                .and_then(|s| s.get("modified_reported"))
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
             contain: crate::contain::ContainStore::from_state(
                 state.as_ref().and_then(|s| s.get("contain")),
             ),
@@ -3968,6 +3985,10 @@ impl Daemon {
         if !self.modified_reported.insert(key) {
             return;
         }
+        // Written now rather than at the next periodic save: a crash between
+        // the alert and the save would report it all over again on restart,
+        // which is the thing this set exists to prevent.
+        self.write_state();
         let package = actor.package.clone().unwrap_or_else(|| "its package".into());
         log::warn!("{} is not the file {} shipped: {}", path, package, why);
         let meta = crate::rules::binary_modified_meta(&path, &package);
@@ -5040,6 +5061,18 @@ impl Daemon {
             // it says how much of a later gap the machine spent awake, which is
             // the only part of it anything could have happened in.
             o.insert("awake".into(), Value::from(util::awake_secs()));
+            // Which modified files have already been reported. See the field's
+            // comment: without this a distribution's own post-install edit is
+            // a high alert on every boot.
+            o.insert(
+                "modified_reported".into(),
+                Value::from(
+                    self.modified_reported
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<String>>(),
+                ),
+            );
             // Whether container activity reaches the badge. Set out here rather
             // than in the literal above, which is already at serde_json's macro
             // recursion limit.
@@ -7759,6 +7792,85 @@ esac
             rows[0].count,
             Some(2),
             "but counted, so the second change is not lost"
+        );
+    }
+
+    /// A file the operator has already been told about stays told about,
+    /// across a restart.
+    ///
+    /// Omarchy's installer rewrites `/usr/bin/powerprofilesctl`'s shebang so it
+    /// uses the system python3 and not mise's, so every Omarchy machine has one
+    /// permanently modified package file. Held in memory only, that was a
+    /// `high` alert every time moatd started. The fact is about the disk, so
+    /// the record of having reported it has to outlive the process.
+    #[test]
+    fn a_reported_modification_is_not_reported_again_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = self_proc("exec");
+        let actor = crate::provenance::Actor {
+            provenance: crate::provenance::Provenance::Foreign,
+            package: Some("power-profiles-daemon 0.30-1".into()),
+            script: None,
+            modified: Some(
+                "the bytes on disk are 10733 where power-profiles-daemon 0.30-1 recorded 10741"
+                    .into(),
+            ),
+        };
+
+        let cfg = {
+            let (mut d, cfg) = dev_daemon(dir.path());
+            d.report_modified_binary(&actor, &p);
+            assert_eq!(
+                d.store
+                    .load()
+                    .iter()
+                    .filter(|a| a.rule == crate::rules::BINARY_MODIFIED)
+                    .count(),
+                1,
+                "reported once by the first daemon"
+            );
+            cfg
+        };
+
+        // A new Daemon over the same state directory: a restart.
+        let mut d2 = Daemon::new(cfg, &dir.path().join("moat.toml")).unwrap();
+        d2.homes = vec!["/home/dan".into()];
+        assert!(
+            d2.modified_reported
+                .iter()
+                .any(|k| k.contains("power-profiles-daemon")),
+            "the restarted daemon remembers what it already said"
+        );
+        d2.report_modified_binary(&actor, &p);
+        assert_eq!(
+            d2.store
+                .load()
+                .iter()
+                .filter(|a| a.rule == crate::rules::BINARY_MODIFIED)
+                .count(),
+            1,
+            "and does not say it again"
+        );
+
+        // Control: a DIFFERENT modification is still reported, so the memory
+        // silences a repeat and not the rule.
+        let changed = crate::provenance::Actor {
+            modified: Some("the sha256 on disk (deadbeef0000) is not the one recorded".into()),
+            ..actor.clone()
+        };
+        d2.report_modified_binary(&changed, &p);
+        assert!(
+            d2.store
+                .load()
+                .iter()
+                .filter(|a| a.rule == crate::rules::BINARY_MODIFIED)
+                .count()
+                >= 1,
+            "a new change still gets through the memory"
+        );
+        assert!(
+            d2.modified_reported.len() >= 2,
+            "and is remembered in its own right"
         );
     }
 

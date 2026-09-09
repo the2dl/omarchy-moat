@@ -426,6 +426,28 @@ name = "moat-cred-browser-secrets-read"
 exe = "/opt/spotify/spotify"
 file = "/home/*/.config/spotify/*"
 
+# NO entry for /usr/bin/powerprofilesctl, and that is a decision too.
+#
+# Omarchy's own installer rewrites its shebang so it uses the system python3
+# rather than mise's shim:
+#
+#   install/config/fix-powerprofilesctl-shebang.sh
+#   sudo sed -i '/env python3/ c\#!/bin/python3' /usr/bin/powerprofilesctl
+#
+# So every Omarchy machine has one package-owned file whose bytes do not match
+# what pacman recorded, and `moat-x-binary-modified` says so once. Benign, and
+# `pacman -Qkk power-profiles-daemon` agrees independently.
+#
+# It is not allowlisted because an entry here would read "any modification to
+# powerprofilesctl is fine, for ever" -- and it is a root-installed python
+# script the user runs, which is a serviceable persistence vector. The cost of
+# not allowlisting is ONE alert per machine per change: the daemon persists
+# what it has already reported, so this does not return on every restart. That
+# is the right side of the trade, and it is one ack.
+#
+# If this ever becomes many files rather than one, fix the shebang upstream in
+# Omarchy instead of widening anything here.
+
 # NO azure-cli entry, and that is a decision rather than an omission.
 #
 # Two anchored attempts have now been wrong. The first named
