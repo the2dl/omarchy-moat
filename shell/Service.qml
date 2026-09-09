@@ -171,21 +171,14 @@ Item {
         "sensorUnhealthy": root.status ? root.status.sensorUnhealthy === true : false,
         "unacked": root.unacked
     })
-    /// The number on the shield: DECISIONS, which is what the tab renders.
+    /// The daemon's row count, kept for a consumer that wants it.
     ///
-    /// `unackedCounts` counts ROWS, and a chain puts every trigger member on
-    /// the badge, so one story was counted once per step -- measured
-    /// 2026-09-08, 77 badge rows held 28 members of 15 chains and the honest
-    /// answer was 64. `NowView` has rendered `needsYouIncidents` for a while
-    /// and the shield never followed, so the number on the glyph and the number
-    /// of cards behind it were different numbers for the same queue. The
-    /// daemon has always agreed with the cards: `store::ledger` counts `needs
-    /// you` by `incident_key`.
-    ///
-    /// The fallback is the daemon's own `status.unacked`, used only when the
-    /// alert log is unreadable -- there are no incidents to group then, and a
-    /// row count is the best answer available.
-    readonly property int badgeCount: Model.shieldCount(root.needsYou, root.unacked, root.logReadable)
+    /// NOT the shield: `barState` and the panel both count DECISIONS through
+    /// `needsYouCount`, and have for a while. On 2026-09-08 I "fixed" this
+    /// property to count incidents and claimed a 16.9% reduction in what the
+    /// user sees; nothing reads it, so nothing changed. The bar was already
+    /// right. Recorded because the wrong version was committed and pushed.
+    readonly property int badgeCount: Model.badgeCount(root.unacked)
     readonly property string statusSummary: Model.statusSummary(root.status, root.unacked, root.nowMs)
     // BASELINE 4's demoted rule ids and BASELINE 3's proposals both ride on the
     // status poll, so the surfacing rules re-evaluate the moment the daemon

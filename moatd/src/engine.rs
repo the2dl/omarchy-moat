@@ -951,11 +951,13 @@ impl Daemon {
         // Enforcement stops at the namespace boundary, for chains too.
         //
         // `maybe_enforce` refuses a single-event kill into a container; this is
-        // the same refusal for the chain path, which owns containment, tree
-        // kills and quarantine. Without it the advertised contract ("moat never
-        // blocks anything inside a container") held for the kernel policies and
-        // for userland single events, and quietly did not hold for the one path
-        // that acts on a whole process tree -- the most damaging of the three.
+        // the same refusal for the chain path.
+        //
+        // It governs the TREE KILL and QUARANTINE, and NOT network containment:
+        // `maybe_contain` never calls this function. An earlier version of this
+        // comment claimed all three and was simply wrong. Containment is scoped
+        // instead by the `matchNamespaces` clause in the policy it generates
+        // (`contain::policy_yaml`), which is the only thing that ever scoped it.
         //
         // Recorded as a refusal, not a silent skip: `record_decision` writes
         // every spared verdict to decisions.jsonl, and a week of refusals that
@@ -993,14 +995,13 @@ impl Daemon {
             // no facts, so `verdict.is_ok()` above is false first. Kept because
             // that coupling is not a contract, and no test covers it for the
             // same reason: a mutation dropping this guard changes nothing today.
+            // The SENSOR only, never the ancestry heuristic: see
+            // `containerised_for_enforcement`. A single forged ancestor named
+            // `runc` above an attack would otherwise make every one of its
+            // descendants look containerised at once, and `all()` is no defence
+            // against a shared spoofed ancestor.
             let all_contained = !triggers.is_empty()
-                && triggers.iter().all(|a| {
-                    a.process.in_container.unwrap_or_else(|| {
-                        let chain: Vec<String> =
-                            a.process.ancestry.iter().map(|x| x.exe.clone()).collect();
-                        crate::util::ancestry_looks_containerised(&chain)
-                    })
-                });
+                && triggers.iter().all(|a| a.process.in_container == Some(true));
             if all_contained {
                 verdict = Err("every step of this ran in a container, and moat does not \
                                enforce across a namespace boundary"
@@ -3973,17 +3974,41 @@ impl Daemon {
     /// Returns whether the process was actually killed; the outcome is recorded
     /// as evidence either way, because "we tried and it was already gone" and
     /// "we killed it" are different facts.
-    /// Did this run in a container? The sensor when it answers, the ancestry
-    /// when it does not -- see `util::ancestry_looks_containerised` for why
-    /// both are needed and what the fallback costs.
+    /// Did this run in a container, for the BADGE? The sensor when it answers,
+    /// the ancestry when it does not -- see `util::ancestry_looks_containerised`
+    /// for why both are needed and what the fallback costs.
     ///
-    /// One place, because the answer now governs three different things (the
-    /// badge, userspace kills, containment) and three copies would drift.
+    /// Display only. Never ask this before acting: see
+    /// [`Daemon::containerised_for_enforcement`].
     pub fn containerised(&self, proc: &ProcInfo, ancestry: &[ProcInfo]) -> bool {
         proc.in_container.unwrap_or_else(|| {
             let chain: Vec<String> = ancestry.iter().map(|a| a.exe.clone()).collect();
             crate::util::ancestry_looks_containerised(&chain)
         })
+    }
+
+    /// Did this run in a container, for a DECISION TO ACT? The sensor, and
+    /// nothing else.
+    ///
+    /// `util::ancestry_looks_containerised` matches basenames, and its own doc
+    /// promises the quietening it buys reaches "only down to the TIMELINE,
+    /// never out of the record, never past enforcement". On 2026-09-08 I used
+    /// the display answer to gate `maybe_enforce` and `chain_gate` and broke
+    /// exactly that promise: any process with an ancestor named `runc` --
+    /// which needs no privilege, no container and no docker access, only the
+    /// ability to name a file -- became un-killable and un-quarantinable, and
+    /// one such ancestor covers every descendant at once.
+    ///
+    /// The kernel's answer cannot be spoofed that way, so it is the only one
+    /// allowed to stop an action. Unknown means NOT exempt: an action refused
+    /// on evidence nobody produced is a hiding place, and the safe direction
+    /// for enforcement is the opposite of the safe direction for a badge.
+    ///
+    /// The real container protection is the kernel policy split
+    /// (`render::split_container_enforcement`), which is namespace-based and
+    /// not forgeable. This is the userspace backstop, not the mechanism.
+    pub fn containerised_for_enforcement(&self, proc: &ProcInfo) -> bool {
+        proc.in_container == Some(true)
     }
 
     fn maybe_enforce(&self, f: &mut Finding) -> bool {
@@ -4004,7 +4029,7 @@ impl Daemon {
         // A container is somebody else's process tree. Killing into it takes
         // down a build step or a service replica with an errno its owner cannot
         // trace back to this machine's security tool.
-        if self.containerised(&f.proc, &f.ancestry) {
+        if self.containerised_for_enforcement(&f.proc) {
             f.extra_evidence.push(
                 "enforce mode: NOT killed — this ran in a container, and moat does \
                  not enforce across a namespace boundary"
@@ -7166,12 +7191,42 @@ esac
     /// kernel half has been true since the policy split; the userspace half
     /// was never written, so a userland rule armed with `set mode enforce
     /// --rule X` could SIGKILL into somebody else's process tree.
+    /// A forged ancestor must not buy an enforcement exemption.
+    ///
+    /// `ancestry_looks_containerised` matches basenames, and naming a file
+    /// `runc` needs no privilege, no container and no docker access. It may
+    /// quieten a BADGE; it may never stop a kill. One such ancestor would
+    /// otherwise cover every descendant at once, which is why `all()` over the
+    /// triggers is no defence against it.
+    #[test]
+    fn a_forged_runtime_ancestor_does_not_stop_a_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, _) = dev_daemon(dir.path());
+
+        let actor = no_such_proc("e-fake", 4_500_100, "/usr/bin/no-such-payload");
+        // The sensor said nothing; only the NAME suggests a container.
+        assert_eq!(actor.in_container, None);
+        let fake = no_such_proc("e-fake-runc", 4_500_000, "/home/dan/tmp/runc");
+        let mut f = signal_finding(&actor, &fake, "/tmp/moat-tier-test-no-such-dir/x");
+        f.request_kill = true;
+        f.ancestry = vec![fake.clone()];
+
+        // The DISPLAY answer is yes -- that is the fallback doing its job.
+        assert!(d.containerised(&f.proc, &f.ancestry), "the badge may believe this");
+        // The ENFORCEMENT answer is no.
+        assert!(
+            !d.containerised_for_enforcement(&f.proc),
+            "a name is not evidence a kernel produced"
+        );
+    }
+
     #[test]
     fn a_userland_kill_is_refused_across_a_namespace_boundary() {
         let dir = tempfile::tempdir().unwrap();
         let (d, _) = dev_daemon(dir.path());
 
         let mut actor = no_such_proc("e-c", 4_400_100, "/usr/bin/no-such-payload");
+        // The SENSOR's answer: only this may stop an action.
         actor.in_container = Some(true);
         let parent = no_such_proc("e-runc2", 4_400_000, "/usr/bin/runc");
         let mut f = signal_finding(&actor, &parent, "/tmp/moat-tier-test-no-such-dir/x");

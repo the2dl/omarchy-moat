@@ -945,27 +945,6 @@ TestCase {
     }
   }
 
-  /// The shield counts DECISIONS, because that is what the tab renders.
-  ///
-  /// A chain puts every trigger member on the badge, so counting rows counted
-  /// one story once per step: 77 badge rows on 2026-09-08 held 28 members of
-  /// 15 chains. `NowView` has rendered `needsYouIncidents` for a while; the
-  /// shield had not followed, so the glyph and the cards behind it were
-  /// different numbers for the same queue.
-  function test_the_shield_counts_incidents_not_rows() {
-    var needsYou = [{ key: "a" }, { key: "b" }, { key: "c" }]
-    var rows = { critical: 4, high: 9, total: 13, badge: 13 }
-    compare(Model.shieldCount(needsYou, rows, true), 3,
-            "three cards on the tab is three things to answer, not thirteen rows")
-
-    // Without the log there is nothing to group, and the daemon's own row
-    // count beats a shield that reads "all clear" because it cannot see.
-    compare(Model.shieldCount([], rows, false), 13, "falls back to the daemon's count")
-    compare(Model.shieldCount(null, rows, true), 0, "a missing list is zero, not a crash")
-    compare(Model.shieldCount([], { critical: 2, high: 1 }, false), 3,
-            "the fallback still means critical+high when there is no badge field")
-  }
-
   function test_the_badge_asks_the_same_function_the_tab_does() {
     // Two copies of "where does this alert belong" is how the shield came to
     // say 51 while the daemon said 8.

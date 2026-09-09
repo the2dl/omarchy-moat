@@ -169,6 +169,16 @@ pub fn binary_aliases(exe: &str) -> Vec<String> {
     out
 }
 
+/// The policy moatd writes for itself when a chain is contained.
+///
+/// Scoped to the HOST mount namespace, like every static policy that denies
+/// (`render::split_container_enforcement`). It was not, until 2026-09-08: it
+/// named a binary path and a destination and nothing else, so a containment
+/// decided for one process refused that path's connections everywhere the path
+/// resolves -- inside every container running the same image, and for any host
+/// program at the same path. `maybe_contain` does not call `chain_gate`, so
+/// nothing upstream was scoping it either; the comment claiming the gate
+/// governed containment was simply false.
 pub fn policy_yaml(name: &str, exes: &[String], dests: &[String], chain: &str, ttl_secs: u64) -> String {
     let values: String = dests
         .iter()
@@ -211,7 +221,12 @@ pub fn policy_yaml(name: &str, exes: &[String], dests: &[String], chain: &str, t
              - index: 1\n      \
                type: \"sockaddr\"\n    \
              selectors:\n    \
-             - matchBinaries:\n      \
+             - matchNamespaces:\n      \
+               - namespace: Mnt\n        \
+                 operator: \"In\"\n        \
+                 values:\n        \
+                 - \"host_ns\"\n      \
+               matchBinaries:\n      \
                - operator: \"In\"\n        \
                  values:\n{bins}      \
                matchArgs:\n      \
@@ -810,5 +825,61 @@ mod kill_tests {
 
         // One step is a rule firing, not a sequence.
         assert!(worth_killing_for("high", &good[..1]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod generated_policy_scope {
+    use super::policy_yaml;
+
+    /// A containment moatd writes for itself must be scoped to the host, like
+    /// every static policy that denies.
+    ///
+    /// Until 2026-09-08 it named a binary path and a destination and nothing
+    /// else, so containing one process refused that path's connections
+    /// everywhere the path resolves: inside every container running the same
+    /// image, and for any host program installed at the same path. Nothing
+    /// upstream scoped it either -- `maybe_contain` never calls `chain_gate`.
+    #[test]
+    fn a_generated_containment_is_scoped_to_the_host_namespace() {
+        let y = policy_yaml(
+            "moat-contain-0",
+            &["/usr/bin/curl".to_string()],
+            &["203.0.113.5".to_string()],
+            "01CHAIN",
+            600,
+        );
+        assert!(y.contains("matchNamespaces"), "no namespace selector:\n{}", y);
+        assert!(y.contains("namespace: Mnt"));
+        assert!(y.contains("host_ns"));
+        // And it still does the thing it exists for.
+        assert!(y.contains("/usr/bin/curl"));
+        assert!(y.contains("203.0.113.5"));
+        assert!(y.contains("action: Override"));
+    }
+
+    /// The namespace clause must sit in the SAME selector as the binary and
+    /// destination, not as a second selector -- selectors are ORed, so a
+    /// separate one would match every host connection rather than narrowing
+    /// this one.
+    #[test]
+    fn the_namespace_clause_narrows_the_selector_it_shares() {
+        // Parsed, not string-matched: selectors are ORed, so the namespace
+        // clause has to be IN the selector that names the binary. A second
+        // selector carrying it alone would match every host connection instead
+        // of narrowing this one -- and a string search cannot tell those apart.
+        let y = policy_yaml("n", &["/usr/bin/x".into()], &["198.51.100.9".into()], "c", 60);
+        let doc: serde_yaml::Value = serde_yaml::from_str(&y).expect("generated policy parses");
+        let sels = doc["spec"]["lsmhooks"][0]["selectors"]
+            .as_sequence()
+            .expect("has selectors");
+        assert_eq!(sels.len(), 1, "one selector, not two ORed ones");
+        let m = sels[0].as_mapping().unwrap();
+        for k in ["matchNamespaces", "matchBinaries", "matchArgs", "matchActions"] {
+            assert!(m.contains_key(serde_yaml::Value::String(k.into())), "missing {}", k);
+        }
+        assert_eq!(m["matchNamespaces"][0]["namespace"], "Mnt");
+        assert_eq!(m["matchNamespaces"][0]["operator"], "In");
+        assert_eq!(m["matchNamespaces"][0]["values"][0], "host_ns");
     }
 }

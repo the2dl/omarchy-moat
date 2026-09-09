@@ -104,9 +104,20 @@ parent = "/usr/bin/pacman"
 # A leading wildcard on a SCRIPT path is attacker-selectable. Anyone who can
 # create /tmp/x/google-cloud-cli/lib/gcloud.py inherits a credential-read grant,
 # and creating a directory is not a privilege. These are anchored to real
-# install roots instead: six lines each, none of them conjurable in a writable
+# install roots instead: root-owned ones only, none of them conjurable in a writable
 # directory. An install somewhere else simply does not match, and the alert
 # stands -- which is the safe direction to be wrong in.
+#
+# /home/* was in this list until an external review pointed out the obvious:
+# the attacker in this threat model IS the user, so a home directory is exactly
+# as writable as /tmp and anchoring there defeats the whole point. A per-user
+# gcloud install now alerts. That is the correct trade and the entry to write
+# by hand is an absolute path to YOUR install, not a wildcard over homes.
+#
+# Note the residual, which anchoring cannot fix: `script` names a path, not the
+# code at it. Anyone who can write to the named path -- or arrange for the CLI
+# to be installed somewhere they control -- still inherits the grant. This
+# narrows who can do that to root; it does not establish code identity.
 
 # gcloud (Arch's google-cloud-cli layout) reading gcloud's own store.
 # under /opt
@@ -131,12 +142,6 @@ file   = "*/.config/gcloud/*"
 [[rule]]
 name   = "moat-cred-cloud-credentials-read"
 script = "/usr/local/share/google-cloud-cli/lib/gcloud.py"
-file   = "*/.config/gcloud/*"
-
-# under /home/*
-[[rule]]
-name   = "moat-cred-cloud-credentials-read"
-script = "/home/*/google-cloud-cli/lib/gcloud.py"
 file   = "*/.config/gcloud/*"
 
 # under /snap
@@ -168,12 +173,6 @@ file   = "*/.config/gcloud/*"
 [[rule]]
 name   = "moat-cred-cloud-credentials-read"
 script = "/usr/local/share/google-cloud-sdk/lib/gcloud.py"
-file   = "*/.config/gcloud/*"
-
-# under /home/*
-[[rule]]
-name   = "moat-cred-cloud-credentials-read"
-script = "/home/*/google-cloud-sdk/lib/gcloud.py"
 file   = "*/.config/gcloud/*"
 
 # under /snap
@@ -223,12 +222,6 @@ file   = "*/.azure/*"
 [[rule]]
 name   = "moat-cred-cloud-credentials-read"
 script = "/usr/local/share/azure/cli/__main__.py"
-file   = "*/.azure/*"
-
-# under /home/*
-[[rule]]
-name   = "moat-cred-cloud-credentials-read"
-script = "/home/*/azure/cli/__main__.py"
 file   = "*/.azure/*"
 
 # under /snap

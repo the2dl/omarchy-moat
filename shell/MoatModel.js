@@ -2159,28 +2159,6 @@ function sameCounts(a, b) {
 // already excluded demoted and suppressed alerts); falls back to critical+high
 // for the daemon's own `status.unacked`, which has no such field and is only
 // used when the log is unreadable.
-/// The number on the shield, from the two things that can answer it.
-///
-/// DECISIONS when the alert log is readable -- `needsYouIncidents` is what
-/// `NowView` renders, and a chain puts every trigger member on the badge, so
-/// counting rows counted one story once per step. Measured 2026-09-08: 77
-/// badge rows held 28 members of 15 chains, and the honest answer was 64. The
-/// daemon has always agreed with the cards (`store::ledger` counts `needs you`
-/// by `incident_key`); only the shield disagreed.
-///
-/// ROWS when it is not: there are no incidents to group without the log, and
-/// the daemon's own `status.unacked` is then the best answer available. A
-/// number that is slightly wrong beats a shield that reads "all clear" because
-/// it could not see anything.
-///
-/// Lives here rather than in Service.qml because Service imports Quickshell and
-/// cannot be instantiated by qmltestrunner -- a decision made there is a
-/// decision no test can reach.
-function shieldCount(needsYou, unacked, logReadable) {
-  if (logReadable) return Array.isArray(needsYou) ? needsYou.length : 0
-  return badgeCount(unacked)
-}
-
 function badgeCount(unacked) {
   var u = unacked || {}
   if (u.badge !== undefined && u.badge !== null) return Number(u.badge) || 0
