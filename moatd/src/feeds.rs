@@ -166,10 +166,33 @@ impl FeedsConfig {
         if body.is_empty() {
             return Ok(None);
         }
-        let bytes = decode_key(body).ok_or_else(|| {
+        // The shipped file is type-tagged, ssh-style:
+        //     moat-feed-ed25519 <base64 of 32 bytes>
+        // A bare key is accepted too, so an operator can paste one in. The tag
+        // is checked rather than skipped: an `ssh-ed25519` line is a different
+        // encoding entirely (an SSH wire blob, not the raw point), and "that is
+        // the wrong kind of key" is a far better answer than a length error.
+        let mut fields = body.split_whitespace();
+        let first = fields.next().unwrap_or("");
+        let (tag, encoded) = match fields.next() {
+            Some(second) => (Some(first), second),
+            None => (None, first),
+        };
+        if let Some(tag) = tag {
+            if tag != "moat-feed-ed25519" {
+                return Err(format!(
+                    "{}: this is a {:?} key; moat pins a `moat-feed-ed25519` key \
+                     (generate one with aggregator/scripts/keygen.mjs)",
+                    self.public_key_path, tag
+                ));
+            }
+        }
+        let bytes = decode_key(encoded).ok_or_else(|| {
             format!(
-                "{}: public key is neither 64 hex chars nor base64 of 32 bytes",
-                self.public_key_path
+                "{}: public key is neither 64 hex chars nor base64 of 32 bytes \
+                 (got {} characters)",
+                self.public_key_path,
+                encoded.len()
             )
         })?;
         Ok(Some(bytes))
@@ -936,6 +959,48 @@ mod tests {
 
         std::fs::write(&p, format!("# a comment\n{}\n", crate::util::to_base64(&raw))).unwrap();
         assert_eq!(cfg.verifying_key().unwrap().unwrap(), raw);
+    }
+
+    /// The exact bytes `aggregator/scripts/keygen.mjs` writes. These two halves
+    /// are built separately and only meet on the machine that deploys them, so
+    /// the format they agree on has to be pinned by a test rather than by two
+    /// people remembering the same thing. It was NOT agreed at first: keygen
+    /// emitted a type tag and this parser rejected it, which would have read as
+    /// "your key is broken" on day one.
+    #[test]
+    fn the_key_file_keygen_writes_is_the_key_file_this_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("feed-key.pub");
+        let raw = [0x11u8; 32];
+        std::fs::write(
+            &p,
+            format!(
+                "# omarchy-moat package feed signing key\nmoat-feed-ed25519 {}\n",
+                crate::util::to_base64(&raw)
+            ),
+        )
+        .unwrap();
+        let cfg = FeedsConfig {
+            public_key_path: p.display().to_string(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.verifying_key().unwrap().unwrap(), raw);
+    }
+
+    /// An ssh-ed25519 key is base64 too, and the same length class, so pasting
+    /// one in has to be named rather than reported as a decode failure.
+    #[test]
+    fn a_key_of_the_wrong_kind_is_named_as_such() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("feed-key.pub");
+        std::fs::write(&p, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample\n").unwrap();
+        let cfg = FeedsConfig {
+            public_key_path: p.display().to_string(),
+            ..Default::default()
+        };
+        let e = cfg.verifying_key().unwrap_err();
+        assert!(e.contains("ssh-ed25519"), "{}", e);
+        assert!(e.contains("moat-feed-ed25519"), "{}", e);
     }
 
     #[test]
