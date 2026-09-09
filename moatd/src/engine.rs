@@ -1018,7 +1018,7 @@ impl Daemon {
             let all_contained = !triggers.is_empty()
                 && !c.truncated
                 && triggers.len() == resolvable
-                && triggers.iter().all(|a| a.process.in_container == Some(true));
+                && triggers.iter().all(|a| !Self::may_act_on(a));
             if all_contained {
                 verdict = Err("every step of this ran in a container, and moat does not \
                                enforce across a namespace boundary"
@@ -1108,7 +1108,7 @@ impl Daemon {
             // a HOST file that merely shares the name. `chain_gate` only decides
             // whether the chain may act at all; a mixed chain reaches this loop
             // with container steps still in it.
-            if a.process.in_container == Some(true) {
+            if !Self::may_act_on(&a) {
                 log::info!(
                     "chain {}: not quarantining the file named by {} -- it ran in a container, \
                      and that path names a file in the container's filesystem, not this one's",
@@ -1195,7 +1195,7 @@ impl Daemon {
             // HOST curl to that destination: an unprivileged container
             // deciding what the host may not connect to. The path is
             // namespace-relative and names a different file over there.
-            if a.process.in_container == Some(true) {
+            if !Self::may_act_on(&a) {
                 log::info!(
                     "chain {}: not containing {} — that path was seen in a container, and it \
                      names a different file on this machine",
@@ -1235,7 +1235,7 @@ impl Daemon {
             .filter(|t| {
                 let in_container = self
                     .find_alert(&t.alert)
-                    .and_then(|a| a.process.in_container)
+                    .map(|a| !Self::may_act_on(&a))
                     .unwrap_or(false);
                 if in_container {
                     log::info!(
@@ -4206,6 +4206,30 @@ impl Daemon {
             let chain: Vec<String> = ancestry.iter().map(|a| a.exe.clone()).collect();
             crate::util::ancestry_looks_containerised(&chain)
         })
+    }
+
+    /// May moat act on the thing this ALERT names?
+    ///
+    /// The one question every destination asks, in one place. Four call sites
+    /// had grown four copies of it -- the chain gate, the tree kill's target
+    /// filter, quarantine, and the containment evidence collector -- and each
+    /// was found and fixed separately over two days, which is the argument for
+    /// this existing at all. A copied expression cannot protect the next
+    /// caller.
+    ///
+    /// The SENSOR only, as everywhere an action is decided
+    /// (`containerised_for_enforcement`): a forged ancestor named `runc` must
+    /// not make anything un-actionable. Unknown means actionable, which is the
+    /// opposite of the badge's default and deliberately so -- an action refused
+    /// on evidence nobody produced is a hiding place, while a badge shown on
+    /// the same absence is only noise.
+    ///
+    /// Note the ONE place that must not use this: `incident::capture`. It does
+    /// not act, it READS, and following a container's path there reaches a host
+    /// file that merely shares the name. There the display answer is right and
+    /// "might be a container" must mean "do not touch it".
+    pub fn may_act_on(a: &Alert) -> bool {
+        a.process.in_container != Some(true)
     }
 
     /// Did this run in a container, for a DECISION TO ACT? The sensor, and
@@ -7899,6 +7923,53 @@ esac
             !kept.contains(&cont.process.pid),
             "the container step must not be killed: {:?}",
             kept
+        );
+    }
+
+    /// Nor is a container's file quarantined off this machine's disk.
+    ///
+    /// The fourth destination of `may_act_on`. A path named by a container step
+    /// is namespace-relative, so moving `/app/server` would move a HOST file
+    /// that merely shares the name -- and quarantine is the one action with a
+    /// visible, immediate cost to the user.
+    #[test]
+    fn a_container_named_file_is_not_quarantined_off_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.contain.enabled = true;
+        d.homes = vec![dir.path().to_string_lossy().to_string()];
+
+        // A real host file whose path a container step also names.
+        let victim = dir.path().join("server");
+        std::fs::write(&victim, b"HOST BINARY").unwrap();
+
+        // Two families, or the gate refuses and nothing is quarantined for a
+        // reason that has nothing to do with namespaces -- which is how the
+        // first version of this test passed while proving nothing.
+        let mut a = stored_alert(&mut d, "01QK0000000000000000000000", "moat-exec-untrusted-home",
+                                 "exec", &victim.to_string_lossy(),
+                                 crate::rarity::Rarity::FirstSeen);
+        a.process.in_container = Some(true);
+        d.store.append_alert(&a).unwrap();
+        let b = stored_alert(&mut d, "01QL0000000000000000000000", "moat-persist-autostart-write",
+                             "persist", &dir.path().join("no-such-file").to_string_lossy(),
+                             crate::rarity::Rarity::FirstSeen);
+        let c = chain_over(&d, &[a.clone(), b.clone()], "critical");
+
+        d.quarantine_chain_artifacts(&c);
+        assert!(victim.exists(), "a container step moved a host file off the disk");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"HOST BINARY");
+
+        // Control: the SAME chain with that step on the host DOES move it.
+        // Without this the assertion above passes whenever quarantine declines
+        // for any unrelated reason.
+        let mut host = d.find_alert(&a.id).unwrap();
+        host.process.in_container = Some(false);
+        d.store.append_alert(&host).unwrap();
+        d.quarantine_chain_artifacts(&c);
+        assert!(
+            !victim.exists(),
+            "the fixture cannot quarantine at all, so the assertion above is vacuous"
         );
     }
 
