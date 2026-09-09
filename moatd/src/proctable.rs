@@ -334,6 +334,17 @@ impl ProcTable {
         }
     }
 
+    /// State the sensor's namespace answer, for the same reason `set_session`
+    /// exists: a fixture pid's real /proc entry belongs to whatever happens to
+    /// be running on the machine under test, so the container tests have to
+    /// state the kernel's answer rather than read one.
+    #[cfg(test)]
+    pub fn set_container(&mut self, exec_id: &str, in_container: Option<bool>) {
+        if let Some(p) = self.map.get_mut(exec_id) {
+            p.in_container = in_container;
+        }
+    }
+
     pub fn prune(&mut self, now: u64) {
         let cutoff = self.prune_secs;
         self.map

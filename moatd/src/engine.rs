@@ -961,20 +961,50 @@ impl Daemon {
         // every spared verdict to decisions.jsonl, and a week of refusals that
         // are all correct is the argument for ever trusting the action.
         if verdict.is_ok() {
-            if let Some(a) = c
+            // EVERY trigger must be containerised, not the first one found.
+            //
+            // A chain can span both sides: a container step beside a host step
+            // is what a build that also touches the host looks like. Refusing
+            // on the first container member would let one such step veto
+            // enforcement for the host half -- so an attacker able to start a
+            // container (no privilege beyond docker access) could disarm
+            // containment for their real, host-side activity by making sure one
+            // container event joined the chain. If any trigger is on this
+            // machine, this machine's enforcement still applies.
+            //
+            // Answered from the ALERT, never from the process table: `exec_id`
+            // is `#[serde(skip)]`, so an alert read back through `find_alert`
+            // has an empty one and every table lookup here missed. The first
+            // version of this did exactly that and was dead code in production
+            // as well as in its own test. `process.in_container` and
+            // `process.ancestry` are both serialised, which is why the former
+            // was put on the record in the first place.
+            let triggers: Vec<Alert> = c
                 .steps
                 .iter()
                 .filter(|s| s.is_trigger())
-                .find_map(|s| self.find_alert(&s.alert))
-            {
-                if let Some(p) = self.table.get(&a.exec_id) {
-                    let anc: Vec<ProcInfo> =
-                        self.table.ancestry(&a.exec_id).into_iter().cloned().collect();
-                    if self.containerised(p, &anc) {
-                        verdict = Err("this ran in a container, and moat does not enforce                                        across a namespace boundary"
-                            .to_string());
-                    }
-                }
+                .filter_map(|s| self.find_alert(&s.alert))
+                .collect();
+            // `!is_empty()` is belt and braces: `all()` over an empty list is
+            // TRUE, and an unresolvable chain must not be refused as
+            // containerised -- silence is not evidence. It is currently
+            // unreachable, because `facts` is built from the same `find_alert`
+            // resolution and `worth_killing_for` already refuses a chain with
+            // no facts, so `verdict.is_ok()` above is false first. Kept because
+            // that coupling is not a contract, and no test covers it for the
+            // same reason: a mutation dropping this guard changes nothing today.
+            let all_contained = !triggers.is_empty()
+                && triggers.iter().all(|a| {
+                    a.process.in_container.unwrap_or_else(|| {
+                        let chain: Vec<String> =
+                            a.process.ancestry.iter().map(|x| x.exe.clone()).collect();
+                        crate::util::ancestry_looks_containerised(&chain)
+                    })
+                });
+            if all_contained {
+                verdict = Err("every step of this ran in a container, and moat does not \
+                               enforce across a namespace boundary"
+                    .to_string());
             }
         }
         ChainGate {
@@ -3976,7 +4006,8 @@ impl Daemon {
         // trace back to this machine's security tool.
         if self.containerised(&f.proc, &f.ancestry) {
             f.extra_evidence.push(
-                "enforce mode: NOT killed — this ran in a container, and moat does not                  enforce across a namespace boundary"
+                "enforce mode: NOT killed — this ran in a container, and moat does \
+                 not enforce across a namespace boundary"
                     .into(),
             );
             return false;
@@ -7528,6 +7559,67 @@ esac
                 .contains("this machine has seen this shape before"),
             "the same sentence the kill gate prints: {}",
             refusals[0]["reason"]
+        );
+    }
+
+    /// The chain path owns containment, tree kills and quarantine -- the three
+    /// actions that hit a whole process tree. It must refuse across a namespace
+    /// boundary, and it must refuse only when EVERY trigger is over there.
+    ///
+    /// A chain can span both sides: a container step beside a host step is what
+    /// a build that also touches the host looks like. Refusing on the first
+    /// container member would let one such step veto enforcement for the host
+    /// half -- so an attacker able to start a container (no privilege beyond
+    /// docker access) could disarm containment for their real, host-side
+    /// activity by making sure one container event joined the chain.
+    #[test]
+    fn the_chain_gate_refuses_a_container_but_not_a_chain_that_merely_touches_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        let a = stored_alert(&mut d, "01QE0000000000000000000000", "moat-exec-untrusted-home",
+                             "exec", "/tmp/no-such-a", crate::rarity::Rarity::FirstSeen);
+        let b = stored_alert(&mut d, "01QF0000000000000000000000", "moat-persist-autostart-write",
+                             "persist", "/tmp/no-such-b", crate::rarity::Rarity::FirstSeen);
+        let c = chain_over(&d, &[a.clone(), b.clone()], "critical");
+
+        // Precondition: with both on the host this shape passes the gate.
+        assert!(d.chain_gate(&c).verdict.is_ok(), "precondition: the gate would act");
+
+        // Stated on the STORED alert, because that is where chain_gate reads
+        // it: `exec_id` is serde(skip), so an alert loaded back from the store
+        // can never be matched against the process table at all.
+        let contain_both = |d: &mut Daemon, v: Option<bool>| {
+            for al in [&a, &b] {
+                let mut stored = d.find_alert(&al.id).unwrap();
+                stored.process.in_container = v;
+                d.store.append_alert(&stored).unwrap();
+            }
+        };
+        contain_both(&mut d, Some(true));
+
+        // The REASON, not merely a refusal. Asserting `is_err()` alone passes
+        // with the whole guard deleted: re-appending the alerts moves the
+        // gate's own verdict for unrelated reasons, so only the message tells
+        // this refusal apart from any other.
+        let why = d
+            .chain_gate(&c)
+            .verdict
+            .expect_err("a wholly containerised chain must be refused");
+        assert!(
+            why.contains("namespace boundary"),
+            "refused, but not for being in a container: {}",
+            why
+        );
+
+        // Now put ONE of them back on the host: the host half stays actionable.
+        let mut host = d.find_alert(&a.id).unwrap();
+        host.process.in_container = Some(false);
+        d.store.append_alert(&host).unwrap();
+        let after = d.chain_gate(&c).verdict;
+        assert!(
+            after.as_ref().err().map(|e| !e.contains("namespace boundary")).unwrap_or(true),
+            "one host step keeps the chain actionable; otherwise a container step is a veto: {:?}",
+            after
         );
     }
 

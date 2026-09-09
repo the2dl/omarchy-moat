@@ -20,6 +20,7 @@ fn proc(exe: &str) -> ProcInfo {
         exited_at: None,
         exit_signal: None,
         exe_note: None,
+        in_container: None,
         sid: None,
         tty: None,
     }
