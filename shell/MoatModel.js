@@ -3850,6 +3850,39 @@ function trustedPrograms(tuples, incidents) {
 // Both are drawn with 2b's rail-and-dot layout because both are "what led
 // here" told with times. The second is what 3a is about.
 
+/// Put the shared chains back on the alerts that reference them.
+///
+/// A chain is SHARED by its members, and the daemon used to serialise it in
+/// full inside every one of them. On 2026-09-09 that was two chains across 89
+/// alerts: 6.08 MB of duplication in a 10.1 MB response, re-parsed on the UI
+/// thread about once a second under a container healthcheck loop.
+///
+/// `cmd_feed` now sends each chain once under `result.chains` and leaves a
+/// `chain_id` on each member. Rehydrating in ONE place keeps every reader of
+/// `alert.chain` -- chainOf, chainPosition, IncidentCard, EvidenceBlock --
+/// exactly as it was.
+///
+/// The assignment shares a REFERENCE, so the model holds one chain object with
+/// many pointers rather than many copies: the saving is in this process's heap
+/// as well as on the wire.
+///
+/// An older daemon that still inlines `chain` is left alone, so a panel newer
+/// than its daemon keeps working.
+function rehydrateChains(result) {
+  if (!result || !result.chains || !Array.isArray(result.alerts))
+    return result
+
+  for (var i = 0; i < result.alerts.length; i++) {
+    var a = result.alerts[i]
+    if (a && a.chain_id && !a.chain) {
+      var c = result.chains[a.chain_id]
+      if (c)
+        a.chain = c
+    }
+  }
+  return result
+}
+
 /// The chain an alert is a step of, or null.
 function chainOf(alert) {
   return alert && alert.chain && alert.chain.steps ? alert.chain : null

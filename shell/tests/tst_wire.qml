@@ -912,4 +912,52 @@ TestCase {
     compare(response.flag, "/etc/moat/sandbox.enabled")
     verify(String(response.note).length > 0, "the re-login caveat is carried")
   }
+  // --- shared chains -------------------------------------------------------
+  //
+  // A chain belongs to several alerts. The daemon sends it once under `chains`
+  // and leaves `chain_id` on each member; the panel puts it back. Before this,
+  // two chains across 89 alerts cost 6.08 MB of duplication in a 10.1 MB
+  // response, parsed on the UI thread about once a second.
+
+  function test_a_shared_chain_is_rehydrated_onto_every_member() {
+    var steps = [{ alert: "01A", rule: "moat-a" }, { alert: "01B", rule: "moat-b" }]
+    var result = {
+      alerts: [
+        { id: "01A", chain_id: "01CHAIN" },
+        { id: "01B", chain_id: "01CHAIN" },
+        { id: "01C" }
+      ],
+      chains: { "01CHAIN": { id: "01CHAIN", steps: steps, steps_total: 2 } }
+    }
+    Model.rehydrateChains(result)
+
+    compare(result.alerts[0].chain.id, "01CHAIN")
+    compare(result.alerts[1].chain.id, "01CHAIN")
+    compare(result.alerts[2].chain, undefined, "an alert with no chain gains none")
+
+    // The point: ONE object, shared. Not two copies that happen to be equal.
+    verify(result.alerts[0].chain === result.alerts[1].chain,
+           "members must share the chain object, or the heap saving is lost")
+
+    // And it is the chain the readers already know how to use.
+    compare(Model.chainOf(result.alerts[0]).steps_total, 2)
+    compare(Model.chainPosition(result.alerts[1]), 2)
+  }
+
+  function test_an_older_daemon_that_inlines_the_chain_still_works() {
+    // A panel newer than its daemon must not lose the chain it was sent.
+    var inline = { id: "01OLD", steps: [{ alert: "01A" }], steps_total: 1 }
+    var result = { alerts: [{ id: "01A", chain: inline }] }
+    Model.rehydrateChains(result)
+    compare(result.alerts[0].chain.id, "01OLD")
+  }
+
+  function test_rehydrate_survives_a_response_with_no_chains() {
+    var result = { alerts: [{ id: "01A", chain_id: "01MISSING" }] }
+    Model.rehydrateChains(result)
+    compare(result.alerts[0].chain, undefined, "a dangling id is left dangling, not crashed on")
+    compare(Model.rehydrateChains(null), null)
+    compare(Model.rehydrateChains({}).alerts, undefined)
+  }
+
 }

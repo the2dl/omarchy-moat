@@ -400,8 +400,42 @@ fn cmd_feed(d: &Daemon, req: &Value) -> Value {
         }
     }
     let receipts = d.receipt_list(50);
+
+    // A chain is SHARED by its members, and it was serialised in full inside
+    // every one of them. On 2026-09-09 that was 89 alerts carrying 2 distinct
+    // chains: 6.08 MB of duplication in a 10.1 MB response, re-fetched and
+    // re-parsed on the panel's UI thread every time an alert landed -- about
+    // once a second under a container healthcheck loop, which is how quickshell
+    // reached 2.1 GB RSS.
+    //
+    // Each chain is emitted once under `chains`, and the alert keeps `chain_id`.
+    // The panel rehydrates in one place, so the model it builds is unchanged --
+    // and holds two objects with 89 references rather than 89 copies.
+    let mut chains = serde_json::Map::new();
+    let mut wire: Vec<Value> = Vec::with_capacity(alerts.len());
+    for a in &alerts {
+        let mut v = serde_json::to_value(a).unwrap_or(Value::Null);
+        if let Some(obj) = v.as_object_mut() {
+            if let Some(chain) = obj.remove("chain") {
+                // An id is what makes it shareable; without one it stays inline
+                // rather than being dropped.
+                match chain.get("id").and_then(|i| i.as_str()).map(str::to_string) {
+                    Some(id) => {
+                        chains.entry(id.clone()).or_insert(chain);
+                        obj.insert("chain_id".into(), Value::String(id));
+                    }
+                    None => {
+                        obj.insert("chain".into(), chain);
+                    }
+                }
+            }
+        }
+        wire.push(v);
+    }
+
     ok(json!({
-        "alerts": alerts,
+        "alerts": wire,
+        "chains": Value::Object(chains),
         "receipts": receipts,
         "truncated": dropped_unprotected,
     }))
@@ -4744,6 +4778,62 @@ mod tests {
         assert_eq!(r["ok"], false);
         assert!(r["error"].as_str().unwrap().contains("outside"));
         assert!(Path::new("/usr/bin/ls").exists());
+    }
+
+    /// A chain is shared by its members and was serialised in full inside every
+    /// one of them. On 2026-09-09 that was two chains across 89 alerts: 6.08 MB
+    /// of duplication in a 10.1 MB response, re-parsed on the panel's UI thread
+    /// about once a second under a container healthcheck loop, which is how
+    /// quickshell reached 2.1 GB RSS.
+    ///
+    /// The sample log this daemon ingests already produces a real shared chain,
+    /// so the property is asserted against that rather than a synthetic one.
+    #[test]
+    fn a_shared_chain_is_sent_once_and_referenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = daemon(dir.path());
+
+        let r = cmd_feed(&d, &json!({"limit": 500}));
+        let alerts = r["alerts"].as_array().unwrap();
+        let chains = r["chains"].as_object().expect("feed carries a chains map");
+
+        let mut referencing = 0usize;
+        for a in alerts {
+            assert!(
+                a.get("chain").is_none(),
+                "{} still carries an inline chain",
+                a["id"]
+            );
+            if let Some(cid) = a.get("chain_id").and_then(|v| v.as_str()) {
+                referencing += 1;
+                assert!(chains.contains_key(cid), "{} references a chain that was not sent", cid);
+            }
+        }
+
+        assert!(!chains.is_empty(), "the sample log produces at least one chain");
+        assert!(
+            referencing > chains.len(),
+            "this fixture must actually SHARE a chain, or the test proves nothing: \
+             {} members across {} chains",
+            referencing,
+            chains.len()
+        );
+
+        // The point, stated exactly: the expensive part of a chain appears in
+        // the response ONCE, however many members reference it. A size
+        // comparison would not say this -- the rest of an alert dwarfs a small
+        // fixture's chain -- so count the actual bytes.
+        let body = r.to_string();
+        for (id, chain) in chains {
+            let steps = chain["steps"].to_string();
+            assert!(steps.len() > 2, "fixture chain {} has no steps to share", id);
+            assert_eq!(
+                body.matches(&steps).count(),
+                1,
+                "chain {} steps appear more than once: it is being inlined per member",
+                id
+            );
+        }
     }
 
     /// R0: the feed window is `protected ∪ tail(limit)`, so a burst of trivial

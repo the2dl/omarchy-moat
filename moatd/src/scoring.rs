@@ -177,6 +177,22 @@ pub fn row(key: &str) -> Option<&'static MatrixRow> {
 /// Rules and findings nothing may soften. A feed hash match and a kernel-module
 /// load are facts about the artefact; the workload's context does not change
 /// them, and a `pkg-install` netcat is the exact thing this project watches for.
+/// Rules whose object is GLOBAL: they have no namespace to be scoped to, so
+/// `render::split_container_enforcement` leaves them enforcing everywhere.
+///
+/// There is one kernel. A module load or a BPF program load from inside a
+/// container is a fact about THIS machine, so the namespace step below must not
+/// quieten it -- that would make starting a container the cheapest way to load a
+/// rootkit and be merely watched doing it.
+///
+/// Mirrors the `moat.omarchy/namespace: "global"` annotation in `policies/`,
+/// which only the renderer reads. `global_rules_match_the_annotated_policies`
+/// fails if the two ever disagree.
+pub const GLOBAL_RULES: &[&str] = &[
+    "moat-rootkit-kernel-module-load",
+    "moat-rootkit-bpf-prog-load",
+];
+
 pub const NEVER_LOWERED: &[&str] = &[
     "moat-x-new-exec-ioc",
     "moat-pkg-subtree-netcat-exec",
@@ -262,6 +278,10 @@ pub struct EventFacts<'a> {
     pub build_tool_in_chain: bool,
     /// Human homes, for the `~/…` rows.
     pub homes: &'a [String],
+    /// The SENSOR's answer only (`process.ns.mnt.is_host`), never the ancestry
+    /// guess: this decides how loudly moat speaks, and a forged ancestor named
+    /// `runc` must not buy quiet. See `Daemon::containerised_for_enforcement`.
+    pub in_container: bool,
 }
 
 /// Cloud and forge credentials that developer tooling reads by design — the
@@ -543,6 +563,38 @@ pub fn score(
                 }
             }
         }
+    }
+
+    // --- the namespace step -------------------------------------------------
+    //
+    // `render::split_container_enforcement` scopes every enforcing selector to
+    // the host mount namespace and adds a copy WITHOUT the action for everywhere
+    // else. Its own contract is that container activity "stays on the timeline
+    // and in the chain correlator"; nothing implemented the second half, so a
+    // container reading its own /etc/shadow arrived on the badge as CRITICAL --
+    // 241 of them from one postgres healthcheck loop on 2026-09-09, pinned into
+    // the panel's window for ever by `is_protected`.
+    //
+    // Severity is a claim about this machine. For a namespace-split rule moat
+    // has already decided it will not act inside a container, and a critical it
+    // declined to act on is a number that means nothing a reader can use.
+    //
+    // This runs even for a `never_lowered` rule, which the context steps above
+    // deliberately do not. Those resist a GUESS -- a tty in the ancestry, an
+    // official package. This is not a guess: the policy loaded in the kernel has
+    // no action in that namespace, so the decision was already taken upstream of
+    // scoring. Refusing to say so here would only hide it.
+    if facts.in_container && !GLOBAL_RULES.contains(&facts.rule) {
+        if severity_rank(&sev) > severity_rank("low") || !timeline {
+            reasons.push(
+                "inside a container: moat does not enforce across the namespace \
+                 boundary for this rule, so this is context about somebody else's \
+                 filesystem — timeline only"
+                    .into(),
+            );
+        }
+        sev = "low".into();
+        timeline = true;
     }
 
     if ctx == Context::PkgInstall && reasons.is_empty() {
@@ -1065,3 +1117,139 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod namespace_step_tests {
+    use super::*;
+    use crate::provenance::{Actor, Provenance};
+
+    fn facts<'a>(rule: &'a str, family: &'a str, in_container: bool, homes: &'a [String]) -> EventFacts<'a> {
+        EventFacts {
+            family,
+            rule,
+            hook: "file",
+            exe: "/usr/bin/pg_isready",
+            file: Some("/etc/shadow"),
+            has_net: false,
+            has_ioc: false,
+            build_tool_in_chain: false,
+            homes,
+            in_container,
+        }
+    }
+
+    // `provenance_downgrade: false` throughout: these tests are about the
+    // namespace step alone, and an official actor moving the number by a step
+    // would make a pass or a failure here mean two things.
+    fn actor() -> Actor {
+        Actor {
+            provenance: Provenance::Official,
+            ..Default::default()
+        }
+    }
+
+    /// The case that started this: `pg_isready` in a postgres container reading
+    /// the CONTAINER's /etc/shadow, 241 times, each one critical and each one
+    /// pinned into the panel's window by `is_protected`.
+    #[test]
+    fn a_container_reading_its_own_shadow_file_is_timeline_not_critical() {
+        let homes: Vec<String> = vec!["/home/dan".into()];
+        let s = score(
+            "critical",
+            &facts("moat-cred-etc-shadow-read", "cred", true, &homes),
+            &actor(),
+            Context::Unknown,
+            false,
+        );
+        assert_eq!(s.severity, "low");
+        assert_eq!(s.surface, "timeline", "off the badge, still on the record");
+        assert!(s.severity_reason.contains("namespace"), "{}", s.severity_reason);
+    }
+
+    /// The same read on the HOST is untouched. If this ever goes quiet, the
+    /// change has switched off the rule rather than scoped it.
+    #[test]
+    fn the_same_read_on_the_host_is_still_critical() {
+        let homes: Vec<String> = vec!["/home/dan".into()];
+        let s = score(
+            "critical",
+            &facts("moat-cred-etc-shadow-read", "cred", false, &homes),
+            &actor(),
+            Context::Unknown,
+            false,
+        );
+        assert_eq!(s.severity, "critical");
+        assert_eq!(s.surface, "alerts");
+    }
+
+    /// There is one kernel. A module load from inside a container is a fact
+    /// about THIS machine and keeps its severity, or starting a container
+    /// becomes the cheapest way to load a rootkit and be merely watched.
+    #[test]
+    fn a_global_rule_is_not_quietened_by_a_container() {
+        let homes: Vec<String> = vec![];
+        for rule in GLOBAL_RULES {
+            let s = score(
+                "critical",
+                &facts(rule, "rootkit", true, &homes),
+                &actor(),
+                Context::Unknown,
+                false,
+            );
+            assert_eq!(s.severity, "critical", "{} was quietened", rule);
+            assert_eq!(s.surface, "alerts", "{} left the badge", rule);
+        }
+    }
+
+    /// A `never_lowered` rule IS lowered by this step, unlike by the context
+    /// steps. Those resist a guess; this is not one -- the policy in the kernel
+    /// has no action in that namespace, so moat already declined to act.
+    #[test]
+    fn the_namespace_step_applies_even_to_a_never_lowered_rule() {
+        let homes: Vec<String> = vec![];
+        let rule = NEVER_LOWERED[1]; // moat-pkg-subtree-netcat-exec
+        assert!(!GLOBAL_RULES.contains(&rule));
+        let s = score("high", &facts(rule, "pkg", true, &homes), &actor(), Context::Unknown, false);
+        assert_eq!(s.severity, "low");
+        assert_eq!(s.surface, "timeline");
+    }
+
+    /// The constant mirrors an annotation only the renderer reads. If someone
+    /// marks a new policy global and forgets this list, that rule would be
+    /// quietened inside containers while still being enforced there.
+    #[test]
+    fn global_rules_match_the_annotated_policies() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("policies");
+        if !dir.is_dir() {
+            return;
+        }
+        let mut annotated: Vec<String> = Vec::new();
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&p).unwrap_or_default();
+            if !text.contains("moat.omarchy/namespace: \"global\"") {
+                continue;
+            }
+            let name = text
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("name: "))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            annotated.push(name);
+        }
+        annotated.sort();
+        let mut expect: Vec<String> = GLOBAL_RULES.iter().map(|s| s.to_string()).collect();
+        expect.sort();
+        assert_eq!(
+            annotated, expect,
+            "policies/ and scoring::GLOBAL_RULES disagree about which rules are global"
+        );
+    }
+}

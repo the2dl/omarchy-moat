@@ -2944,6 +2944,10 @@ impl Daemon {
                 has_ioc: f.ioc.is_some(),
                 build_tool_in_chain: build_tool,
                 homes: &self.homes,
+                // The sensor's word only, as everywhere a decision rests on it:
+                // `containerised()` would accept an ancestor named `runc`, and
+                // buying quiet with a filename is exactly the hole that closes.
+                in_container: self.containerised_for_enforcement(&f.proc),
             };
             scoring::score(
                 &f.meta.severity,

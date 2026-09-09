@@ -375,6 +375,8 @@ Item {
 
     /// Shared by both paths, so they cannot drift in how a result is applied.
     function _apply(result) {
+        result = Model.rehydrateChains(result);
+
         // Identity guards, not micro-optimisation. FileView fires onFileChanged
         // more than once per append, and a re-read that folded nothing new hands
         // back the SAME arrays. Assigning them anyway would fire alertsChanged and
