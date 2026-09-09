@@ -554,12 +554,29 @@ Relevant flags (defaults from `--help`):
 | `--parents-map-enabled` | false | needed by `matchParentBinaries` |
 | `--event-queue-size` / `--process-cache-size` | 10000 / 65536 | userspace queue / process table |
 | `--rb-size` / `--rb-size-total` / `--rb-queue-size` | 0(=64k/cpu) / 0 / 65535 | ring buffer |
-| `--cgroup-rate` | off | `"1000,1s"` per-cgroup base-event throttle (emits `process_throttle`) |
+| `--cgroup-rate` | off | per-cgroup base-event throttle, **evaluated PER CPU** (emits `process_throttle`) |
 | `--server-address` | `localhost:54321` | `unix:///run/tetragon/tetragon.sock` |
 | `--metrics-server`, `--gops-address`, `--pprof-address` | disabled | |
 | `--health-server-address` | `:6789` | **set to empty to disable** (listens by default) |
 | `--log-format` / `--log-level` | text / info | |
 | `--keep-sensors-on-exit` | false | enforcement persists across daemon restart |
+
+**`--cgroup-rate` is per CPU, and moat shipped it far too low.** Measured
+2026-09-08 on a 32-core machine: a `for i in $(seq 6000); do /bin/true; done`
+loop pinned with `taskset -c 0` ran at ~3,100 forks/s on ONE cpu and moatd saw
+**1,448 events where ~12,000 were expected -- about 88% dropped**, with five
+`moat-x-sensor-throttled` alerts raised. The SAME loop unpinned looked
+completely clean (4,150 events/s across 32 cpus is ~130/s per cpu, an eighth of
+the old 1000 limit) and produced no throttle at all, which is how "throttling is
+ruled out" was concluded and why it was wrong. Any test of this MUST pin to one
+cpu.
+
+What it drops is base exec/exit events -- which is ancestry. That is the input
+`chain.rs` correlates on, the input `context.rs` walks for a tty, and the source
+of `process.ns`. Losing it during a build is losing exactly the evidence needed
+to tell one build from another and to connect a malicious step to the tree it
+ran in. The limit is now `20000,1s`; it exists as flood protection, not as a
+noise control, and it must never be tuned down to quieten moat.
 
 Export filter object = `tetragon.Filter` JSON (snake_case): `event_set`, `binary_regex`,
 `parent_binary_regex`, `ancestor_binary_regex`, `arguments_regex`, `parent_arguments_regex`,
