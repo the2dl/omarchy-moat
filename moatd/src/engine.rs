@@ -4549,13 +4549,18 @@ impl Daemon {
     /// -- so sweeping them would report the administrator's own work as
     /// tampering, every day, for ever.
     fn sweep_tick(&mut self, now: u64) {
-        const EVERY: u64 = 24 * 3_600;
+        let every = self.cfg.thresholds.sweep_secs;
+        if every == 0 {
+            // Off. Not "due immediately": a zero interval read as `now - last
+            // >= 0` would sweep on every single tick.
+            return;
+        }
 
         if self.sweep.is_none() {
             // A pacman transaction rewrites both the files and the checksums
             // that describe them, so the moment after one is the cheapest time
             // to be sure: everything legitimate matches again by construction.
-            let due = self.last_sweep == 0 || now.saturating_sub(self.last_sweep) >= EVERY;
+            let due = self.last_sweep == 0 || now.saturating_sub(self.last_sweep) >= every;
             if !due {
                 return;
             }
@@ -8062,6 +8067,69 @@ esac
             "named by its package: {:?}",
             hits[0].explain.evidence
         );
+    }
+
+    /// `sweep_secs = 0` means off, not "due every tick".
+    ///
+    /// The interval is compared as `now - last >= every`, which a zero
+    /// satisfies always. Read that way, switching the sweep off would instead
+    /// hash every package-owned executable on the machine on EVERY tick --
+    /// the loudest possible reading of "disabled".
+    #[test]
+    fn a_zero_sweep_interval_turns_the_sweep_off_rather_than_on() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pacman-local");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("curl");
+        std::fs::write(&exe, b"#!/bin/sh\nreal\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let exe_s = exe.to_string_lossy().to_string();
+        std::fs::create_dir_all(&db).unwrap();
+        crate::provenance::testkit::fake_local(&db, &[("curl", "8.9.1-1", "pgp", &[&exe_s])]);
+        crate::provenance::testkit::fake_mtree(&db, "curl-8.9.1-1", &[&exe_s]);
+        std::fs::write(&exe, b"#!/bin/sh\nfake\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (_, mut cfg) = dev_daemon(dir.path());
+        cfg.paths.pacman_local = db.clone();
+
+        // Control: with an interval set, this modification IS found -- so the
+        // silence below is the switch and not a broken fixture.
+        let mut on = Daemon::new(cfg.clone(), &dir.path().join("on.toml")).unwrap();
+        on.cfg.thresholds.sweep_secs = 24 * 3_600;
+        for i in 0..20 {
+            on.tick(1_000 + i, false);
+        }
+        assert_eq!(
+            on.store
+                .load()
+                .iter()
+                .filter(|a| a.rule == crate::rules::BINARY_MODIFIED)
+                .count(),
+            1,
+            "the fixture really does contain a modified executable"
+        );
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let (_, mut cfg2) = dev_daemon(dir2.path());
+        cfg2.paths.pacman_local = db;
+        let mut off = Daemon::new(cfg2, &dir2.path().join("off.toml")).unwrap();
+        off.cfg.thresholds.sweep_secs = 0;
+        for i in 0..20 {
+            off.tick(1_000 + i, false);
+        }
+        assert_eq!(
+            off.store
+                .load()
+                .iter()
+                .filter(|a| a.rule == crate::rules::BINARY_MODIFIED)
+                .count(),
+            0,
+            "zero means off"
+        );
+        assert_eq!(off.last_sweep, 0, "and nothing was even started");
     }
 
     /// A file the operator has already been told about stays told about,

@@ -215,6 +215,14 @@ impl Default for AiConfig {
 pub struct Thresholds {
     /// Same rule+exe+file inside this window folds into a `count` update.
     pub dedupe_secs: u64,
+    /// How often the integrity sweep re-checks every package-owned executable
+    /// against the checksum its package recorded. `0` switches it off.
+    ///
+    /// The sweep is what finds a replaced binary that never runs, so switching
+    /// it off gives up the only check that does not need the file to act
+    /// first. It costs one package per tick and, on a machine with 8,761
+    /// package-owned executables, 6.8 GiB of reading spread across a day.
+    pub sweep_secs: u64,
     /// `moat-x-mass-read`: distinct files that trip the rule.
     pub mass_read_files: usize,
     /// `moat-x-mass-read`: sliding window.
@@ -266,6 +274,7 @@ impl Default for Thresholds {
     fn default() -> Self {
         Self {
             dedupe_secs: 60,
+            sweep_secs: 24 * 3_600,
             // 3 distinct credential files in 30 seconds, not 40 in 10.
             //
             // 40 was a threshold nothing could ever reach: a real stealer

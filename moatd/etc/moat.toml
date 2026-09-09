@@ -234,6 +234,10 @@ headless_allowed_parents = [
 # Same rule + exe + file inside this many seconds folds into one alert with a
 # `count` update instead of a new alert.
 dedupe_secs = 60
+# Integrity sweep: re-check package-owned executables against pacman's own
+# per-file checksums this often. 0 turns it off, which gives up the only check
+# that finds a replaced binary before it does anything.
+sweep_secs = 86400
 
 # mass-read: this many distinct CREDENTIAL files inside the window fires (the
 # Nth read is the trigger, not the N+1th).
