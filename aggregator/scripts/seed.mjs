@@ -54,6 +54,19 @@ if (!text.startsWith('# moat-packages v1\n')) throw new Error('not a moat-packag
 const entries = parseArtifact(text).size;
 const declared = Number(/^# entries (\d+)$/m.exec(text)[1]);
 if (entries !== declared) throw new Error(`header says ${declared} entries, body has ${entries}`);
+// The sequence lives inside the signed bytes, and these bytes are uploaded
+// verbatim -- there is no re-serialisation step to add it later. A seed
+// without it is signed correctly and rejected by every client, which is a
+// confusing way to start. Checked here so the bootstrap cannot regress
+// silently when the artifact is regenerated.
+const seqLine = /^# seq (\d+)$/m.exec(text);
+if (!seqLine) {
+  throw new Error('seed artifact has no `# seq` header; regenerate it with '
+    + '`node scripts/normalize-local.mjs <corpus> <out.txt> --seq 1` and gzip it');
+}
+if (Number(seqLine[1]) !== 1) {
+  throw new Error(`seed artifact declares seq ${seqLine[1]}; the seed must be seq 1`);
+}
 
 const signer = await importSigner(secret.trim());
 const name = `packages-1-${sha.slice(0, 12)}.txt.gz`;

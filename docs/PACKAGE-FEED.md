@@ -94,7 +94,8 @@ Three tab-separated fields:
 ```
 # moat-packages v1
 # generated 2026-09-09T18:36:13Z
-# entries 241815
+# entries 241813
+# seq 412
 crates.io	append-only-vec	=0.1.9
 npm	@abacusmirror/react-fontawesome	>=1.1.2
 npm	--hiljson	*
@@ -105,6 +106,12 @@ pypi	requestss	*
 from upstream (npm scopes keep their `@`, and a name may contain almost
 anything except a tab) — **except for `pypi`, see below**. Sort order is byte
 order over the whole line.
+
+`# seq` is required and is the artifact's own sequence number. It is inside the
+signed bytes deliberately — see "Signing" below. A client MUST refuse an
+artifact with no `# seq`, or one whose `# seq` disagrees with the pointer that
+sent it there. Header lines are only recognised in the leading comment block,
+so a package named `# seq 999` cannot forge one.
 
 ### PyPI names are normalized; every other ecosystem is verbatim
 
@@ -215,8 +222,38 @@ the bucket is control of what moat warns about — including the ability to
 silently empty the list and suppress every warning. TLS alone authenticates the
 CDN, not the contents.
 
-The `sha256` in the pointer is an integrity check against truncation and cache
-corruption. It is not a substitute for the signature.
+### What the signature does not cover, and what makes up for it
+
+Ed25519 is PureEdDSA: it hashes the message internally with SHA-512, so the
+signature already covers every byte and there is nothing to pre-hash. The
+`sha256` in the pointer is therefore **not** a tamper check — the signature is
+verified first, over the same bytes. It catches truncation and cache
+corruption, and binds the pointer to an artifact.
+
+But that binding is only worth as much as the pointer, and **`pointer.json` is
+not signed.** It is fetched on every tick, so a detached signature beside it
+would double the cost of the one request that has to stay free. Instead the
+facts that decide what a machine installs are carried inside the signed bytes:
+
+* the full artifact states `# seq`;
+* a delta states `# from` and `# to`.
+
+A client cross-checks those against the pointer and refuses any mismatch. That
+closes two attacks a bucket-level attacker would otherwise have, both of which
+end in a machine running a stale index while every signature verifies:
+
+| attack | what stops it |
+|---|---|
+| replay an old pointer + its genuine old artifact | the client refuses a `seq` lower than the one it holds |
+| a fresh-looking pointer naming an old, validly-signed artifact | `# seq` inside the signed bytes disagrees with `pointer.seq` |
+| apply a delta to the wrong base | `# from` disagrees with the local seq |
+
+A stale index is a suppression attack: the packages added since are the ones a
+warning would have been about.
+
+Sequence numbers are therefore **monotonic per machine**. A client never moves
+backwards, and an aggregator that needs to withdraw an artifact publishes a new
+higher sequence rather than reverting to an old one.
 
 ## Client contract
 
@@ -224,10 +261,13 @@ Per tick, `moat-feeds`:
 
 1. `GET /v1/pointer.json` with `If-None-Match`. On 304, stop — this is the
    common case and costs nothing.
-2. If `pointer.seq == local seq`, stop.
+2. If `pointer.seq < local seq`, refuse the pointer and stop: sequences never
+   go backwards. If `pointer.seq == local seq`, stop.
 3. If `pointer.deltas` contains the local seq, fetch that delta; else fetch the
    full artifact.
-4. Verify the ed25519 signature, then the sha256.
+4. Verify the ed25519 signature, then the sha256, then that the signed bytes
+   agree with the pointer — `# seq` for a full artifact, `# from`/`# to` for a
+   delta.
 5. Apply, and write `packages.txt` + `meta.json` atomically.
 
 On any error at any step: log, leave the existing files alone, exit 0.
@@ -241,7 +281,20 @@ On any error at any step: log, leave the existing files alone, exit 0.
 | delta chain broken | fall back to full artifact this tick |
 | sha256 mismatch | discard download, keep existing files, log at warn |
 | **signature invalid** | discard, keep existing files, log at **error** |
+| **`# seq` disagrees with the pointer** | discard, keep existing files, log at **error** |
+| **pointer offers an older `seq`** | refuse the pointer, keep existing files |
 | aggregator serving a very old `seq` | apply it; staleness is visible in `moatctl status` |
+
+## When the aggregator publishes
+
+Only when the folded index actually changed — decided by the diff against the
+previous artifact, not by comparing artifact bytes. `generated` and `seq` both
+live inside those bytes and move every run, so a byte comparison can never be
+equal and would mint a new sequence on every quiet tick. That would change the
+pointer every fifteen minutes, so no client would ever receive a 304 and the
+delta window would roll over in half a day.
+
+A tick where upstream moved but the fold is identical publishes nothing.
 
 ## Cadence
 
