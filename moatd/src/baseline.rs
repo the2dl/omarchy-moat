@@ -522,6 +522,29 @@ impl Baseline {
         if t.provenance != "official" {
             return Some(format!("actor is {}, not official", t.provenance));
         }
+        // An interpreter is not an identity.
+        //
+        // The tuple is (rule, actor exe, parent exe, file dir), and for
+        // `python3 build.py` the exe is `/usr/bin/python3` -- which is official,
+        // scores medium, recurs daily, and is therefore a model citizen by every
+        // gate above. The entry it earns says "python, under this parent, in
+        // this directory", and the NEXT script to match that shape inherits it
+        // without ever having been observed. Revocation re-checks the
+        // interpreter, which never stopped being official.
+        //
+        // This project's own rule is that an interpreter takes the provenance of
+        // its script (`provenance::is_interpreter`, and the allowlist's `script`
+        // matcher exists for exactly this). Learning cannot express that -- a
+        // learned entry is built from what was observed and deliberately never
+        // names a script (`TupleStat::spec`) -- so the honest move is to refuse
+        // rather than to write a grant broader than the evidence. A user who
+        // wants this can write the entry by hand, naming the script.
+        if crate::provenance::is_interpreter(crate::util::basename(&t.exe)) {
+            return Some(format!(
+                "{} is an interpreter: the tuple names the interpreter, not the code it ran,                  so a learned entry would cover scripts nobody has seen. Write the entry by                  hand with `script = ...` if this is expected.",
+                crate::util::basename(&t.exe)
+            ));
+        }
         if t.days.len() < self.learn_min_days {
             return Some(format!(
                 "seen on {} of {} distinct days",
@@ -1067,6 +1090,32 @@ mod tests {
         }
         // And it only happens once.
         assert_eq!(b.observe(&obs(3, "medium", "official", "common")), Learned::None);
+    }
+
+    /// A learned entry names the ACTOR, and for an interpreter the actor is
+    /// not the code that ran. `python3 build.py` is official, medium and
+    /// daily -- a model citizen by every other gate -- and the entry it would
+    /// earn covers any other script under the same parent and directory,
+    /// including ones nobody has ever seen. Revocation re-checks python3,
+    /// which never stops being official.
+    #[test]
+    fn an_interpreter_is_never_learned_because_the_tuple_does_not_name_the_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        let py = |day: u64| {
+            let mut o = obs(day, "medium", "official", "common");
+            o.exe = "/usr/bin/python3.14";
+            o.package = Some("python 3.14-1".into());
+            o
+        };
+        // Three official medium days: everything the restic tuple needed.
+        assert_eq!(b.observe(&py(0)), Learned::None);
+        assert_eq!(b.observe(&py(1)), Learned::None);
+        assert_eq!(
+            b.observe(&py(2)),
+            Learned::None,
+            "an interpreter tuple must not become an allowlist entry"
+        );
     }
 
     #[test]

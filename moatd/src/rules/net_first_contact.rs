@@ -150,7 +150,23 @@ impl UserRule for NetFirstContact {
         // destination after the first sighting, which is why that path never
         // needed this.
         if familiar {
-            let key = format!("{}\u{1}{}:{}", proc.exe, ip_s, port);
+            // Keyed by SESSION as well as destination.
+            //
+            // Without the session this was a global "already said", and a
+            // second process tree using the same interpreter and the same
+            // destination lost its network step entirely -- `return
+            // Vec::new()` below means correlation never sees the event, not
+            // merely that the badge stays quiet. That is the same trap
+            // `explain::dedupe_key` records for dropping `pid`: two trees
+            // doing one thing must stay two.
+            //
+            // Sessions, not exec_ids: a session is the unit the exfil gate
+            // already reasons in (`session_read_cred_within`), and keying on
+            // exec_id would re-report once per process, which is the noise
+            // this exists to stop. An unknown session falls back to 0, which
+            // groups the unknowns together rather than making each one novel.
+            let sid = ctx.table.get(exec_id).and_then(|p| p.sid).unwrap_or(0);
+            let key = format!("{}\u{1}{}\u{1}{}:{}", sid, proc.exe, ip_s, port);
             let said = self
                 .reported
                 .get_or_insert_with(|| crate::rules::Said::new(EXFIL_WINDOW_SECS * 10, 512));
@@ -479,6 +495,32 @@ mod tests {
             fired += rule.on_hook(&h, "e-kubectl", &ctx).len();
         }
         assert_eq!(fired, 1, "forty calls to one known address is one report, not forty");
+
+        // A DIFFERENT SESSION reaching the SAME destination still reports.
+        //
+        // The memory was global (`exe|ip:port`) until 2026-09-08, so a second
+        // process tree running the same interpreter to the same host lost its
+        // network step for ten minutes -- and `on_hook` returning empty means
+        // correlation never sees it, not merely that the badge stays quiet.
+        // Two trees doing one thing must stay two; that is the same rule
+        // `explain::dedupe_key` keeps `pid` for.
+        {
+            let mut t2 = ProcTable::new(8, 60);
+            t2.observe(&proc("e-other", 41999, "/usr/bin/kubectl", "get pods", None));
+            t2.set_session("e-other", Some(88), Some(0));
+            let mut creds2: HashMap<u32, u64> = HashMap::new();
+            creds2.insert(88u32, now - 10);
+            let ctx = RuleCtx {
+                rarity: &seen, cfg: &cfg, table: &t2, feeds: &feeds, homes: &[],
+                now, mode: "monitor",
+                armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &creds2,
+            };
+            assert_eq!(
+                rule.on_hook(&h, "e-other", &ctx).len(),
+                1,
+                "a second session must not inherit the first session's silence"
+            );
+        }
 
         // A DIFFERENT destination in the same session still reports: the memory
         // is per destination, not a mute button on the rule.

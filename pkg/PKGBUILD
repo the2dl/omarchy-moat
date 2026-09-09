@@ -14,7 +14,7 @@
 
 pkgname=omarchy-moat
 pkgver=0.1.0
-pkgrel=125
+pkgrel=126
 _tetragonver=1.7.1
 pkgdesc='eBPF supply-chain sensor for Omarchy: Tetragon policies, an alert daemon, a bubblewrap sandbox and pre-execution scanners for PKGBUILD, npm, cargo, pip and go'
 arch=('x86_64')
@@ -294,6 +294,14 @@ package() {
 	# state written by the daemon and is deliberately NOT shipped.
 	install -Dm644 "${tree}/moatd/etc/allowlist.d/omarchy-default.toml" \
 		"${pkgdir}/etc/moat/allowlist.d/omarchy-default.toml"
+	# Moat's own test-suite entries, shipped as an EXAMPLE and not loaded.
+	# `.example` is not `.toml`, so the loader ignores it. They were in
+	# default.toml until 2026-09-08, where they were a production grant keyed
+	# on source-tree naming -- anyone able to create a directory shaped like a
+	# moat checkout inherited an exec exclusion. Only people who build moat
+	# from source ever wanted them.
+	install -Dm644 "${tree}/moatd/etc/allowlist.d/moat-dev.toml.example" \
+		"${pkgdir}/usr/share/doc/omarchy-moat/moat-dev.toml.example"
 	# ship.toml holds no secret as shipped, which is why it is 0644 and
 	# readable: the header TEMPLATE is diffable, the token lives in its own
 	# 0600 file. An inline token makes moat-ship refuse to start until this

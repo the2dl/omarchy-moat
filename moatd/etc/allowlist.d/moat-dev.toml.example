@@ -1,0 +1,62 @@
+# Moat's own test suite -- NOT shipped as a default, on purpose.
+#
+# These lived in default.toml until 2026-09-08, where they were a production
+# grant keyed on source-tree naming: any writable directory shaped
+# `.../omarchy-moat/moatd/target/x/deps/moatd-1` inherited an exec exclusion,
+# and creating a directory is not a privilege. They only ever benefited people
+# who build moat from source, so they belong here.
+#
+# If you develop moat, copy this file into /etc/moat/allowlist.d/ and edit the
+# two paths to your actual checkout -- an ABSOLUTE path, not a leading `*`.
+# Everyone else should not have these rules at all.
+
+# Building moat from source runs its tests, and its tests exec their own
+# fixtures out of /tmp and the source tree -- 62 rows from one afternoon, none
+# of them a finding about anything. Both matchers must hit: the actor is moat's
+# own test binary in a moat build tree, AND the file is the fixture it ships.
+# Neither half alone would be safe, and on a machine that never builds moat
+# these match nothing at all.
+[[rule]]
+name = "moat-exec-untrusted-home"
+exe  = "*/omarchy-moat/moatd/target/*/deps/moatd-*"
+file = "*/omarchy-moat/moatd/testdata/*"
+
+# The same suite exec'ing its fake sensor out of a temp directory.
+[[rule]]
+name = "moat-exec-untrusted-tmpfs"
+exe  = "*/omarchy-moat/moatd/target/*/deps/moatd-*"
+file = "/tmp/*/tetra"
+
+# --- from omarchy-default.toml, same reason ---
+
+#   * the runner must be moat's own — `*/target/*/deps/moatd-*` is the hashed
+
+# test binary doing the exec, so the copied `nc` is `file`, not `exe`.
+[[rule]]
+name = "moat-exec-untrusted-tmpfs"
+file = "/tmp/.tmp*/nc"
+parent = "*/target/*/deps/moatd-*"
+
+# The same suite executes its own helpers (`moat-*`) out of a tempdir.
+[[rule]]
+name = "moat-exec-untrusted-tmpfs"
+file = "/tmp/.tmp*/moat-*"
+parent = "*/target/*/deps/moatd-*"
+
+# cargo test runner is the test, not an install script opening a shell.
+[[rule]]
+name = "moat-pkg-subtree-netcat-exec"
+exe = "/tmp/.tmp*/nc"
+parent = "*/target/*/deps/moatd-*"
+
+# ...and the same for the suite's own helpers.
+[[rule]]
+name = "moat-pkg-subtree-netcat-exec"
+exe = "/tmp/.tmp*/moat-*"
+parent = "*/target/*/deps/moatd-*"
+
+# directory — a chmod anywhere else, or by anything else, still alerts.
+[[rule]]
+name = "moat-priv-setuid-chmod"
+exe = "*/target/*/deps/moatd-*"
+file = "/tmp/.tmp*/*"

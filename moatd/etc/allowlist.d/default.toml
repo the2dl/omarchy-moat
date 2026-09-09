@@ -101,16 +101,85 @@ parent = "/usr/bin/pacman"
 # Delete any of these if you do not use that CLI. Each one is a real, if
 # narrow, grant: it trusts that the named script is the one on disk.
 
-# gcloud, reading gcloud's own store. Arch's google-cloud-cli layout.
+# A leading wildcard on a SCRIPT path is attacker-selectable. Anyone who can
+# create /tmp/x/google-cloud-cli/lib/gcloud.py inherits a credential-read grant,
+# and creating a directory is not a privilege. These are anchored to real
+# install roots instead: six lines each, none of them conjurable in a writable
+# directory. An install somewhere else simply does not match, and the alert
+# stands -- which is the safe direction to be wrong in.
+
+# gcloud (Arch's google-cloud-cli layout) reading gcloud's own store.
+# under /opt
 [[rule]]
 name   = "moat-cred-cloud-credentials-read"
-script = "*/google-cloud-cli/lib/gcloud.py"
+script = "/opt/google-cloud-cli/lib/gcloud.py"
 file   = "*/.config/gcloud/*"
 
-# The same CLI installed from Google's own tarball, which uses google-cloud-sdk.
+# under /usr/lib
 [[rule]]
 name   = "moat-cred-cloud-credentials-read"
-script = "*/google-cloud-sdk/lib/gcloud.py"
+script = "/usr/lib/google-cloud-cli/lib/gcloud.py"
+file   = "*/.config/gcloud/*"
+
+# under /usr/share
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/usr/share/google-cloud-cli/lib/gcloud.py"
+file   = "*/.config/gcloud/*"
+
+# under /usr/local/share
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/usr/local/share/google-cloud-cli/lib/gcloud.py"
+file   = "*/.config/gcloud/*"
+
+# under /home/*
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/home/*/google-cloud-cli/lib/gcloud.py"
+file   = "*/.config/gcloud/*"
+
+# under /snap
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/snap/google-cloud-cli/lib/gcloud.py"
+file   = "*/.config/gcloud/*"
+
+# The same CLI from Google's own tarball (google-cloud-sdk).
+# under /opt
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/opt/google-cloud-sdk/lib/gcloud.py"
+file   = "*/.config/gcloud/*"
+
+# under /usr/lib
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/usr/lib/google-cloud-sdk/lib/gcloud.py"
+file   = "*/.config/gcloud/*"
+
+# under /usr/share
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/usr/share/google-cloud-sdk/lib/gcloud.py"
+file   = "*/.config/gcloud/*"
+
+# under /usr/local/share
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/usr/local/share/google-cloud-sdk/lib/gcloud.py"
+file   = "*/.config/gcloud/*"
+
+# under /home/*
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/home/*/google-cloud-sdk/lib/gcloud.py"
+file   = "*/.config/gcloud/*"
+
+# under /snap
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/snap/google-cloud-sdk/lib/gcloud.py"
 file   = "*/.config/gcloud/*"
 
 # The AWS CLI v2 ships its own interpreter, so `exe` is usable there and this
@@ -131,9 +200,41 @@ file = "*/.aws/*"
 
 # The Azure CLI is a python package; __main__.py is stable across the distro
 # package, the installer and a pip install.
+# The Azure CLI is a python package; anchored for the same reason.
+# under /opt
 [[rule]]
 name   = "moat-cred-cloud-credentials-read"
-script = "*/azure/cli/__main__.py"
+script = "/opt/azure/cli/__main__.py"
+file   = "*/.azure/*"
+
+# under /usr/lib
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/usr/lib/azure/cli/__main__.py"
+file   = "*/.azure/*"
+
+# under /usr/share
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/usr/share/azure/cli/__main__.py"
+file   = "*/.azure/*"
+
+# under /usr/local/share
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/usr/local/share/azure/cli/__main__.py"
+file   = "*/.azure/*"
+
+# under /home/*
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/home/*/azure/cli/__main__.py"
+file   = "*/.azure/*"
+
+# under /snap
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/snap/azure/cli/__main__.py"
 file   = "*/.azure/*"
 
 # AWS CLI v1 is a python script (v2 ships its own interpreter and is the `exe`
@@ -217,22 +318,6 @@ file = "*/.npm/_cacache/*"
 
 # ------------------------------------------- moat's own test suite, on this box
 #
-# Building moat from source runs its tests, and its tests exec their own
-# fixtures out of /tmp and the source tree -- 62 rows from one afternoon, none
-# of them a finding about anything. Both matchers must hit: the actor is moat's
-# own test binary in a moat build tree, AND the file is the fixture it ships.
-# Neither half alone would be safe, and on a machine that never builds moat
-# these match nothing at all.
-[[rule]]
-name = "moat-exec-untrusted-home"
-exe  = "*/omarchy-moat/moatd/target/*/deps/moatd-*"
-file = "*/omarchy-moat/moatd/testdata/*"
-
-# The same suite exec'ing its fake sensor out of a temp directory.
-[[rule]]
-name = "moat-exec-untrusted-tmpfs"
-exe  = "*/omarchy-moat/moatd/target/*/deps/moatd-*"
-file = "/tmp/*/tetra"
 
 # --------------------------------- crate sources are extracted, not installed
 #

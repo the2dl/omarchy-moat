@@ -1028,3 +1028,48 @@ file   = "*/.config/gcloud/*"
     }
 }
 
+
+#[cfg(test)]
+mod shipped_shape {
+    use super::*;
+
+    /// A shipped `script` or `exe` glob may not begin with a wildcard.
+    ///
+    /// A leading `*` on the path of the code being trusted is
+    /// attacker-selectable: `script = "*/google-cloud-sdk/lib/gcloud.py"` is
+    /// inherited by anyone who can create that directory shape in /tmp, and
+    /// creating a directory is not a privilege. `file` globs are exempt --
+    /// they name the TARGET, which is usually under an unknown home, and
+    /// matching one is not by itself a grant to the actor.
+    #[test]
+    fn no_shipped_actor_glob_starts_with_a_wildcard() {
+        // `omarchy-default.toml` is exempt and stays that way. Its
+        // `*/target/*/deps/moatd-*` entries exist because without them a
+        // `cargo test` of moat pushed two chains to CRITICAL and triggered an
+        // automatic quarantine attempt on the repo's own moatctl -- a recorded
+        // incident, not a convenience. Both matchers must hit there (actor AND
+        // the fixture path), which is the mitigation available without knowing
+        // where a user checked the repo out.
+        for name in ["default.toml"] {
+            let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("etc/allowlist.d")
+                .join(name);
+            for r in Allowlist::load_file(&p).unwrap() {
+                for (field, val) in
+                    [("script", &r.spec.script), ("exe", &r.spec.exe)]
+                {
+                    let Some(v) = val else { continue };
+                    assert!(
+                        !v.starts_with('*'),
+                        "{}: {} {:?} on rule {:?} starts with a wildcard, so any writable \
+                         directory can be shaped to match it",
+                        name,
+                        field,
+                        v,
+                        r.spec.name
+                    );
+                }
+            }
+        }
+    }
+}
