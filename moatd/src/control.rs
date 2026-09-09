@@ -212,9 +212,21 @@ const ROOT_ONLY_SET_KEYS: &[&str] = &["mode", "sandbox", "contain", "kill", "con
 /// before deciding, and putting the evidence behind sudo is how the review
 /// stops happening.
 /// How many alerts one enumerated request may clear before it is recorded as a
-/// protection change. Sized off the real maximum: the largest incident card on
-/// this machine held 37 members, so 64 is comfortably above any honest close
-/// and far below "clear the badge".
+/// protection change -- when they are not all one card.
+///
+/// This used to be the whole test, sized off "the largest incident card on this
+/// machine held 37 members". That premise expired. On 2026-09-09 the same
+/// machine had a single card of 174 (`moat-cred-etc-shadow-read` /
+/// `/usr/bin/pg_isready`, a container health check), so closing ONE card the
+/// user was looking at raised a `high` "a protection was weakened" alert onto
+/// the badge they had just cleared -- and the only way to clear that was
+/// another ack.
+///
+/// A count was never the right question. What separates "closing a card" from
+/// "clearing the badge" is SHAPE: a card is one rule and one program, which is
+/// how the panel groups and how `needs_you` counts. Any number of alerts that
+/// all share those is one answer to one question. The count still guards the
+/// case that spans several.
 const BULK_ACK_NOTICE: usize = 64;
 
 const ROOT_ONLY_ACTIONS: &[(&str, &str, &str)] = &[
@@ -728,6 +740,10 @@ fn cmd_ack(d: &mut Daemon, req: &Value, id: &str) -> Value {
             let mut acked = 0usize;
             let mut matched = 0usize;
             let mut failed = Vec::new();
+            // (rule, program) of everything actually acked. One distinct pair
+            // is one card, however many members it has.
+            let mut shapes: std::collections::BTreeSet<(String, String)> =
+                std::collections::BTreeSet::new();
             for want in list.iter().filter_map(|v| v.as_str()) {
                 matched += 1;
                 // `mark` appends an update line without checking the id is
@@ -735,27 +751,36 @@ fn cmd_ack(d: &mut Daemon, req: &Value, id: &str) -> Value {
                 // acked and the panel would take a card off the badge that is
                 // still on it. The single-id path below has always checked;
                 // this one has to as well.
-                if d.find_alert(want).is_none() {
+                let Some(found) = d.find_alert(want) else {
                     failed.push(format!("{}: no such alert", want));
                     continue;
-                }
+                };
+                let shape = (found.rule.clone(), found.process.exe.clone());
                 match d.mark_by(want, "acked", Value::Bool(true), &who) {
-                    Ok(()) => acked += 1,
+                    Ok(()) => {
+                        acked += 1;
+                        shapes.insert(shape);
+                    }
                     Err(e) => failed.push(format!("{}: {}", want, e)),
                 }
             }
-            // A card is bounded -- the largest seen on this machine held 37
-            // members. Clearing substantially more than that in one request is
-            // not somebody closing a card, and it must leave the same record a
-            // blind `--all` does, or the enumerated path becomes the quiet way
-            // round the audit trail.
-            if acked > BULK_ACK_NOTICE {
+            // One card is one answer to one question, at any size. More than
+            // one card, in bulk, is not somebody closing a card, and it must
+            // leave the same record a blind `--all` does, or the enumerated
+            // path becomes the quiet way round the audit trail.
+            //
+            // Note what this does NOT weaken: `--all`, `--rule` and `--before`
+            // still record unconditionally, because those clear alerts nobody
+            // has read. This is only about ids the user named, having looked.
+            if shapes.len() > 1 && acked > BULK_ACK_NOTICE {
                 d.raise_protection_change(
                     &format!("clear {} alerts in one request", acked),
                     &who,
                     vec![format!(
-                        "{} ids were named explicitly; a card holds a few dozen at most",
-                        matched
+                        "{} ids were named explicitly, spanning {} rule/program pairs; one \
+                         card is one pair at any size, so this was not a card being closed",
+                        matched,
+                        shapes.len()
                     )],
                 );
             }
@@ -3819,6 +3844,84 @@ mod tests {
         assert!(
             changes(&d) > before,
             "a wholesale clear must leave a protection-change record"
+        );
+    }
+
+    /// A big card is still a card. The 2026-09-09 whack-a-mole.
+    ///
+    /// The bulk notice was a count, sized off "the largest card here held 37".
+    /// That stopped being true: the same machine grew a 174-member card
+    /// (`moat-cred-etc-shadow-read` / `/usr/bin/pg_isready`, a container health
+    /// check), so closing ONE card raised a `high` "a protection was weakened"
+    /// alert onto the badge that had just been cleared -- and clearing that
+    /// took another ack.
+    ///
+    /// The shape is the question, not the size: one rule and one program is
+    /// one card, and one card is one answer.
+    #[test]
+    fn closing_one_very_large_card_is_not_a_protection_change() {
+        use crate::alert::tests_support::demo_alert;
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let changes = |d: &Daemon| {
+            d.store.load().iter().filter(|a| a.rule == "moat-x-protection-changed").count()
+        };
+        let payload = |cmd: Value| -> Value {
+            let mut c = cmd;
+            c["_peer"] = json!("uid 1000, pid 4242 the panel");
+            c["_peer_uid"] = json!(1000);
+            c
+        };
+
+        // One card, far past the count that used to trip the notice.
+        let mut one_card = Vec::new();
+        for i in 0..BULK_ACK_NOTICE + 110 {
+            let mut a = demo_alert(&format!("01CARD{:020}", i));
+            a.rule = "moat-cred-etc-shadow-read".into();
+            a.process.exe = "/usr/bin/pg_isready".into();
+            d.store.append_alert(&a).unwrap();
+            one_card.push(a.id);
+        }
+        let before = changes(&d);
+        let r = dispatch(&mut d, &payload(json!({"cmd":"ack","ids":one_card})));
+        assert_eq!(r["ok"], true, "{r:?}");
+        assert_eq!(
+            r["acked"].as_u64().unwrap_or(0) as usize,
+            BULK_ACK_NOTICE + 110,
+            "the whole card was acked"
+        );
+        assert_eq!(
+            changes(&d),
+            before,
+            "closing one card is one answer to one question, at any size"
+        );
+
+        // Control: the same NUMBER of alerts spanning many cards still records.
+        // Without this, the assertion above would also pass if the notice had
+        // simply been deleted.
+        let mut many_cards = Vec::new();
+        for i in 0..BULK_ACK_NOTICE + 110 {
+            let mut a = demo_alert(&format!("01SPAN{:020}", i));
+            a.rule = format!("moat-made-up-rule-{}", i % 9);
+            a.process.exe = format!("/usr/bin/prog{}", i % 7);
+            d.store.append_alert(&a).unwrap();
+            many_cards.push(a.id);
+        }
+        dispatch(&mut d, &payload(json!({"cmd":"ack","ids":many_cards})));
+        assert!(
+            changes(&d) > before,
+            "clearing many cards at once is still recorded"
+        );
+        let rec = d
+            .store
+            .load()
+            .into_iter()
+            .rfind(|a| a.rule == "moat-x-protection-changed")
+            .expect("the record");
+        assert!(
+            rec.explain.evidence.iter().any(|e| e.contains("rule/program pairs")),
+            "and it says what made it look wholesale: {:?}",
+            rec.explain.evidence
         );
     }
 
