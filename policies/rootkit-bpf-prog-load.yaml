@@ -43,7 +43,13 @@ spec:
         - "/usr/lib/systemd/systemd"
         - "/usr/lib/systemd/systemd-networkd"
         - "/usr/lib/systemd/systemd-resolved"
+        # SYMLINK to ../../bin/udevadm, and matchBinaries compares the
+        # RESOLVED path, so this entry has never matched. Kept because it is
+        # what the intent reads as; /usr/bin/udevadm is what the kernel says.
+        # The same dead entry in rootkit-kernel-module-load.yaml SIGKILLed two
+        # udev workers on 2026-09-09. This copy had not fired yet.
         - "/usr/lib/systemd/systemd-udevd"
+        - "/usr/bin/udevadm"
         - "/usr/bin/dockerd"
         - "/usr/bin/containerd"
         - "/usr/bin/runc"

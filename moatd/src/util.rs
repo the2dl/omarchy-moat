@@ -64,6 +64,42 @@ pub fn unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// When this boot started, in epoch seconds, from `/proc/stat`'s `btime`.
+/// 0 when it cannot be read.
+///
+/// The point of comparison for a gap in the record: a heartbeat written BEFORE
+/// this value belongs to a previous boot, so the wall-clock distance between
+/// the two spans a shutdown and is not time anything went unobserved.
+pub fn boot_time() -> u64 {
+    let Ok(stat) = std::fs::read_to_string("/proc/stat") else {
+        return 0;
+    };
+    stat.lines()
+        .find_map(|l| l.strip_prefix("btime ")?.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Seconds this machine has been AWAKE since boot -- `CLOCK_MONOTONIC`, which
+/// does not advance across a suspend. 0 when the clock cannot be read.
+///
+/// `CLOCK_BOOTTIME` would include suspended time and `SystemTime` includes
+/// both suspend and shutdown; this is the only one of the three that measures
+/// "time during which code could have run". That is the quantity a gap in
+/// moat's record is actually about. It is system-wide and survives a process
+/// restart, resetting only on boot, which is what makes it comparable across
+/// the very restart being explained.
+pub fn awake_secs() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, fully initialised timespec we own.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return 0;
+    }
+    ts.tv_sec.max(0) as u64
+}
+
 pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
@@ -669,6 +705,32 @@ pub fn interpreter_of(path: &str) -> Option<String> {
     Some("the interpreter that runs it".to_string())
 }
 
+/// What the KERNEL will match when this path is executed, when the path is a
+/// SYMLINK. `None` means the path IS the name the kernel reports.
+///
+/// The third member of the family, after `interpreter_of` (a script runs as its
+/// interpreter) and `is_interpreter_path` (naming an interpreter grants every
+/// program it runs). Same question, third way to get it wrong: `matchBinaries`
+/// compares `d_path(current->mm->exe_file)`, which is the RESOLVED path, so an
+/// allowlist entry naming a symlink never matches anything.
+///
+/// It fails silently and in the dangerous direction. A dead entry in a `NotIn`
+/// kill list reads exactly like a live one and denies what it meant to permit.
+/// On 2026-09-09 `/usr/lib/systemd/systemd-udevd` -> `/usr/bin/udevadm` in
+/// `rootkit-kernel-module-load` SIGKILLed two udev workers loading an in-tree
+/// Logitech HID driver (`systemd-udevd[1070]: Worker [14202] terminated by
+/// signal 9`), leaving the device with no driver. The entry had never once
+/// matched, and nothing said so.
+///
+/// Only answerable for a path that exists here: a symlink on the target machine
+/// is not one this process can see if the package is not installed. `None` for
+/// an absent path means "cannot tell", not "safe" — see `dead_matchbinaries`.
+pub fn resolved_binary(path: &str) -> Option<String> {
+    let real = std::fs::canonicalize(path).ok()?;
+    let real = real.to_string_lossy();
+    (real != path).then(|| real.to_string())
+}
+
 /// Is this path an interpreter — a binary whose identity is borrowed from
 /// whatever it was handed?
 ///
@@ -722,6 +784,48 @@ pub fn is_interpreter_path(path: &str) -> bool {
             | "osascript"
             | "pwsh"
     )
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    /// The 2026-09-09 shutdown alert, as arithmetic.
+    ///
+    /// `moat-x-was-not-running` called a 4416-second hole "nothing was seen by
+    /// anything" when 73 of those minutes the machine was powered off. These
+    /// three clocks are what tells those apart, so each has to be the clock it
+    /// claims to be -- a silent 0 from either would make every gap read as
+    /// fully blind again.
+    #[test]
+    fn the_three_clocks_are_ordered_the_way_the_gap_maths_needs() {
+        let boot = boot_time();
+        let awake = awake_secs();
+        let wall = unix_secs();
+
+        assert!(boot > 0, "/proc/stat btime must be readable");
+        assert!(awake > 0, "CLOCK_MONOTONIC must be readable");
+        assert!(
+            boot < wall,
+            "the machine booted at {boot}, which is not before now ({wall})"
+        );
+        // Uptime including suspend is wall-minus-boot; awake time cannot
+        // exceed it, and equals it on a machine that never slept.
+        let since_boot = wall - boot;
+        assert!(
+            awake <= since_boot + 2,
+            "awake {awake}s exceeds time since boot {since_boot}s -- \
+             CLOCK_MONOTONIC is not measuring what this thinks it is"
+        );
+    }
+
+    /// A monotonic clock that does not advance cannot measure a gap.
+    #[test]
+    fn awake_time_advances() {
+        let a = awake_secs();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(awake_secs() > a, "CLOCK_MONOTONIC did not advance over 1.1s");
+    }
 }
 
 #[cfg(test)]

@@ -89,6 +89,47 @@ struct ChainGate {
     verdict: Result<(), String>,
 }
 
+/// A gap in moat's record, split by what could have happened during it.
+///
+/// `wall` is the clock distance; `blind` is the part of it the machine spent
+/// awake with nothing watching. The remainder is accounted for by
+/// `powered_off` and `suspended`. Only `blind` is a hole in the sense the
+/// alert means -- see `Daemon::downtime`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Downtime {
+    pub wall: u64,
+    pub blind: u64,
+    pub powered_off: u64,
+    pub suspended: u64,
+}
+
+impl Downtime {
+    /// The half-sentence that says where the unblind time went, or `None` when
+    /// all of it was blind and there is nothing to explain.
+    pub fn accounted_for(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.powered_off > 0 {
+            parts.push(format!("{} powered off or shutting down", mins(self.powered_off)));
+        }
+        if self.suspended > 0 {
+            parts.push(format!("{} suspended", mins(self.suspended)));
+        }
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
+}
+
+/// "73 minutes", "38 seconds" -- for evidence lines, where a bare second count
+/// is what made the 2026-09-09 alert unreadable.
+fn mins(secs: u64) -> String {
+    if secs < 90 {
+        format!("{secs} seconds")
+    } else if secs < 5400 {
+        format!("{} minutes", (secs + 30) / 60)
+    } else {
+        format!("{:.1} hours", secs as f64 / 3600.0)
+    }
+}
+
 pub struct Daemon {
     pub cfg: Config,
     pub cfg_path: PathBuf,
@@ -109,6 +150,11 @@ pub struct Daemon {
     /// The heartbeat found in state.json at startup: when moat last knew it was
     /// alive. 0 on a machine that has never run it.
     last_heartbeat: u64,
+    /// `CLOCK_MONOTONIC` as of that same heartbeat, so the awake time inside a
+    /// gap can be measured across the restart. 0 when the state file predates
+    /// this field or the machine has rebooted since (the clock resets on boot,
+    /// which is exactly why `downtime` checks `btime` first).
+    last_awake: u64,
     /// When something last read `status`. The panel polls it, so this is
     /// moatd's only evidence that a human could see an alert if one arrived.
     last_watched: u64,
@@ -360,6 +406,11 @@ impl Daemon {
             last_heartbeat: state
                 .as_ref()
                 .and_then(|s| s.get("heartbeat"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            last_awake: state
+                .as_ref()
+                .and_then(|s| s.get("awake"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             last_watched: now,
@@ -3798,8 +3849,76 @@ impl Daemon {
     /// wanted a window. Whichever it was, the hole belongs on the timeline,
     /// because nothing else records it: `Restart=always` brings the process
     /// back and says nothing about what was missed.
+    ///
+    /// This is the WALL gap, which is not the same as the blind window --
+    /// see `downtime`.
     pub fn downtime_secs(&self) -> u64 {
         self.started.saturating_sub(self.last_heartbeat)
+    }
+
+    /// The gap, split into time that could have hidden something and time that
+    /// could not.
+    ///
+    /// Wall-clock distance is the wrong measure and said so out loud on
+    /// 2026-09-09: moat reported "a 4416 second hole -- nothing that happened
+    /// in between was seen by anything" for a gap in which the machine was
+    /// powered off for 73 minutes. It had watched until five seconds before
+    /// shutdown and came back 38 seconds after the next boot. 38 seconds is
+    /// the number that was true, and it is under the alerting floor.
+    ///
+    /// The concern behind the rule is still real -- a reboot IS a way to buy an
+    /// unobserved window, and so is `pkill moatd`. So nothing here suppresses
+    /// anything; it measures the blind part and names the rest, which is what
+    /// makes a genuine hole legible instead of lost in a nightly shutdown.
+    ///
+    /// Two clocks do the splitting:
+    ///
+    /// * `btime` AFTER the last heartbeat means the machine rebooted inside the
+    ///   gap. Only `boot -> start` on THIS boot was blind. The remainder is
+    ///   shutdown plus power-off, and the sliver between the final heartbeat and
+    ///   the actual shutdown is not separable from here -- it is bounded by one
+    ///   heartbeat interval, so it is reported with the powered-off time rather
+    ///   than guessed at.
+    /// * Otherwise it is the same boot, and `CLOCK_MONOTONIC` gives the awake
+    ///   time directly: it does not advance across a suspend. A laptop asleep
+    ///   overnight has a large wall gap and a near-zero blind one.
+    ///
+    /// Missing inputs fall back to the wall gap -- an old `state.json` with no
+    /// `awake` key, or an unreadable `/proc/stat`. That direction is deliberate:
+    /// not knowing must over-report a hole, never hide one.
+    pub fn downtime(&self) -> Downtime {
+        let wall = self.downtime_secs();
+        let boot = crate::util::boot_time();
+
+        // Rebooted inside the gap.
+        if boot > 0 && self.last_heartbeat > 0 && boot > self.last_heartbeat {
+            let blind = self.started.saturating_sub(boot);
+            return Downtime {
+                wall,
+                blind: blind.min(wall),
+                powered_off: wall.saturating_sub(blind),
+                suspended: 0,
+            };
+        }
+
+        // Same boot: awake time is the blind time.
+        if self.last_awake > 0 {
+            let blind = crate::util::awake_secs().saturating_sub(self.last_awake);
+            return Downtime {
+                wall,
+                blind: blind.min(wall),
+                powered_off: 0,
+                suspended: wall.saturating_sub(blind.min(wall)),
+            };
+        }
+
+        // Nothing better to go on.
+        Downtime {
+            wall,
+            blind: wall,
+            powered_off: 0,
+            suspended: 0,
+        }
     }
 
     /// Say so, once, at the start of a run.
@@ -3810,22 +3929,42 @@ impl Daemon {
         if self.last_heartbeat == 0 {
             return; // first ever start: no record to have a hole in
         }
-        let gap = self.downtime_secs();
-        if gap < FLOOR {
+        // The BLIND window, not the wall gap. A machine that was off or asleep
+        // was not unobserved; see `downtime` for the 2026-09-09 case that made
+        // this distinction, where the two differed by 73 minutes.
+        let d = self.downtime();
+        if d.blind < FLOOR {
+            if let Some(why) = d.accounted_for() {
+                log::info!(
+                    "{} gap since the last heartbeat, {} -- {} blind, below the floor",
+                    mins(d.wall),
+                    why,
+                    mins(d.blind)
+                );
+            }
             return;
         }
-        let mins = gap / 60;
-        log::warn!("moat was not running for {} minutes before this start", mins);
-        let meta = crate::rules::was_down_meta(mins);
+        let minutes = d.blind / 60;
+        log::warn!("moat was not running for {} minutes before this start", minutes);
+        let meta = crate::rules::was_down_meta(minutes);
         let mut f = Finding::new(crate::rules::WAS_DOWN, meta, self_proc("startup"));
         f.hook = "userland".into();
         f.mode = self.mode.clone();
         f.extra_evidence.push(format!(
-            "last heartbeat {}, started {} -- a {} second hole",
+            "last heartbeat {}, started {} -- {} unwatched while the machine was awake",
             crate::util::rfc3339_of(self.last_heartbeat),
             crate::util::rfc3339_of(self.started),
-            gap
+            mins(d.blind)
         ));
+        // Say where the rest of the wall gap went, so a number smaller than the
+        // clock distance does not read as moat having lost track of time.
+        if let Some(why) = d.accounted_for() {
+            f.extra_evidence.push(format!(
+                "the full gap was {}, of which {}",
+                mins(d.wall),
+                why
+            ));
+        }
         self.in_meta_alert = true;
         let _ = self.emit(f);
         self.in_meta_alert = false;
@@ -4804,6 +4943,10 @@ impl Daemon {
             // how long moat was not running. Stopping the daemon needs root,
             // and a root-level shutdown left no trace at all before this.
             o.insert("heartbeat".into(), Value::from(util::unix_secs()));
+            // The same instant on the monotonic clock. Paired with `heartbeat`
+            // it says how much of a later gap the machine spent awake, which is
+            // the only part of it anything could have happened in.
+            o.insert("awake".into(), Value::from(util::awake_secs()));
             // Whether container activity reaches the badge. Set out here rather
             // than in the literal above, which is already at serde_json's macro
             // recursion limit.
@@ -7244,10 +7387,121 @@ esac
             .expect("the outage must be recorded");
         assert_eq!(a.severity, "high");
         assert!(
-            a.explain.evidence.iter().any(|e| e.contains("1200 second hole")),
+            a.explain
+                .evidence
+                .iter()
+                .any(|e| e.contains("20 minutes unwatched while the machine was awake")),
             "the record says how long: {:?}",
             a.explain.evidence
         );
+    }
+
+    /// The 2026-09-09 shutdown alert: a 73-minute hole that was not one.
+    ///
+    /// Moat wrote its last heartbeat five seconds before the machine powered
+    /// off and came back 38 seconds after the next boot. It reported "a 4416
+    /// second hole -- nothing that happened in between was seen by anything".
+    /// Nothing DID happen in between: the machine was off.
+    ///
+    /// Each negative below is paired with the positive that proves the fixture
+    /// can still raise the alert, because a silent `report_downtime` is also
+    /// what a broken one looks like.
+    #[test]
+    fn time_the_machine_was_off_or_asleep_is_not_a_hole_in_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        let boot = crate::util::boot_time();
+        assert!(boot > 0, "this test needs a readable /proc/stat btime");
+
+        // --- powered off -------------------------------------------------
+        // 73 minutes of wall gap, of which 38 seconds were on this boot.
+        d.started = boot + 38;
+        d.last_heartbeat = boot - 4378;
+        d.last_awake = 0;
+        let split = d.downtime();
+        assert_eq!(split.wall, 4416, "the clock distance is unchanged");
+        assert_eq!(split.blind, 38, "only boot -> start was unobserved");
+        assert_eq!(split.powered_off, 4378);
+
+        let n = d.store.load().len();
+        d.report_downtime();
+        assert_eq!(
+            d.store.load().len(),
+            n,
+            "38 blind seconds is under the floor: a shutdown is not an outage"
+        );
+
+        // Control: the same shutdown, but moat really was late back. Same
+        // branch, same fixture, one number different.
+        d.started = boot + 900;
+        d.report_downtime();
+        let a = d
+            .store
+            .load()
+            .into_iter()
+            .find(|a| a.rule == "moat-x-was-not-running")
+            .expect("15 unwatched minutes after a boot IS an outage");
+        assert!(
+            a.explain
+                .evidence
+                .iter()
+                .any(|e| e.contains("powered off or shutting down")),
+            "and it says where the rest of the gap went: {:?}",
+            a.explain.evidence
+        );
+
+        // --- suspended ---------------------------------------------------
+        let dir2 = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir2.path());
+        let awake = crate::util::awake_secs();
+        // Eight hours of wall gap on one boot, 30 seconds of it awake.
+        d.started = boot + 100_000;
+        d.last_heartbeat = d.started - 28_800;
+        d.last_awake = awake.saturating_sub(30);
+        let split = d.downtime();
+        assert_eq!(split.wall, 28_800);
+        assert_eq!(split.blind, 30, "a sleeping machine runs nothing");
+        assert_eq!(split.suspended, 28_770);
+
+        let n = d.store.load().len();
+        d.report_downtime();
+        assert_eq!(
+            d.store.load().len(),
+            n,
+            "a laptop asleep overnight is not an outage"
+        );
+
+        // Control: same overnight gap, but the machine was awake for ten
+        // minutes of it with nothing watching.
+        d.last_awake = awake.saturating_sub(600);
+        d.report_downtime();
+        let a = d
+            .store
+            .load()
+            .into_iter()
+            .find(|a| a.rule == "moat-x-was-not-running")
+            .expect("ten awake unwatched minutes IS an outage");
+        assert!(
+            a.explain.evidence.iter().any(|e| e.contains("suspended")),
+            "and it names the sleep: {:?}",
+            a.explain.evidence
+        );
+    }
+
+    /// Missing inputs must over-report, never hide. An old `state.json` has no
+    /// `awake` key, and that must read as "the whole gap was blind".
+    #[test]
+    fn a_state_file_with_no_awake_clock_falls_back_to_the_wall_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        // After this boot, so the reboot branch cannot claim it.
+        d.started = crate::util::boot_time() + 100_000;
+        d.last_heartbeat = d.started - 1200;
+        d.last_awake = 0;
+        let split = d.downtime();
+        assert_eq!(split.blind, 1200, "not knowing must not shrink the hole");
+        assert_eq!(split.wall, 1200);
+        assert_eq!(split.powered_off + split.suspended, 0);
     }
 
     /// Killing the panel must not be a silent way to switch Moat off.

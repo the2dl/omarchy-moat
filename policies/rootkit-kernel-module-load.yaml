@@ -46,7 +46,20 @@ spec:
         - "/usr/bin/mkinitcpio"
         - "/usr/bin/dkms"
         - "/usr/lib/systemd/systemd"
+        # SYMLINK to ../../bin/udevadm, and matchBinaries compares the
+        # RESOLVED path, so this entry has never matched anything. udev's
+        # built-in `kmod load` handler was therefore killed BY THIS RULE: on
+        # 2026-09-09, two SIGKILLed udev workers (systemd-udevd[1070]: "Worker
+        # [14202] terminated by signal 9") and a Logitech HID device left with
+        # no driver. The name is kept because it is what the intent reads as;
+        # /usr/bin/udevadm is what the kernel actually reports.
+        #
+        # udevadm is wider than the entry it repairs -- systemd-udevd could
+        # only ever be the daemon, udevadm is also the user CLI. It grants
+        # nothing new: anyone who can run udevadm as root to load a module can
+        # run modprobe, which resolves to the already-listed /usr/bin/kmod.
         - "/usr/lib/systemd/systemd-udevd"
+        - "/usr/bin/udevadm"
         - "/usr/lib/systemd/systemd-modules-load"
       matchArgs:
       - index: 1

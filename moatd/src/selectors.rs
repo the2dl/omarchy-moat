@@ -611,4 +611,156 @@ spec:
             }
         }
     }
+
+    /// A `matchBinaries` value that is a SYMLINK never matches, because the
+    /// kernel compares the resolved path. In a `NotIn` kill list that is not a
+    /// missing allowance, it is an active denial of the thing the entry names.
+    ///
+    /// 2026-09-09: `/usr/lib/systemd/systemd-udevd` -> `/usr/bin/udevadm` in
+    /// `rootkit-kernel-module-load` SIGKILLed two udev workers loading an
+    /// in-tree HID driver. The entry looked correct and had never matched.
+    ///
+    /// Only paths that exist HERE can be judged, so this test counts what it
+    /// actually checked and fails if that is zero — a scan that silently
+    /// examined nothing is the failure mode it exists to prevent.
+    #[test]
+    fn no_shipped_policy_names_a_symlink_in_an_exact_binary_list() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(|p| p.join("policies"));
+        let Some(dir) = dir.filter(|d| d.is_dir()) else {
+            return;
+        };
+
+        let mut checked = 0usize;
+        let mut dead: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let p = entry.path();
+            if p.extension().map(|e| e != "yaml").unwrap_or(true) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&p).unwrap();
+            let doc: Value = match serde_yaml::from_str(&text) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            for (op, values) in match_binaries_lists(&doc) {
+                if !matches!(op.as_str(), "In" | "NotIn" | "Equal" | "NotEqual") {
+                    continue;
+                }
+                for v in &values {
+                    // An absent path cannot be judged from here; that is what
+                    // the counter below is for.
+                    if !Path::new(v).exists() {
+                        continue;
+                    }
+                    checked += 1;
+                    if let Some(real) = crate::util::resolved_binary(v) {
+                        if !values.contains(&real) {
+                            dead.push(format!(
+                                "{}: {op} value {v} resolves to {real}, which is not in the \
+                                 same list -- the kernel will never match {v}",
+                                p.file_name().unwrap().to_string_lossy()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            checked > 0,
+            "scanned every shipped policy and could not judge a single binary path: \
+             none of them exist on this machine, so this test proved nothing"
+        );
+        assert!(dead.is_empty(), "dead matchBinaries entries:\n{}", dead.join("\n"));
+    }
+
+    /// The control for the scan above: prove the detector fires when a list
+    /// really does name a symlink. Without this, `dead.is_empty()` passing
+    /// says nothing about whether it CAN fail.
+    #[test]
+    fn the_symlink_scan_can_actually_fail() {
+        // Name is this test's alone: evidence.rs already uses "moat-symlink-<pid>",
+        // and sharing it made the two wipe each other's directory when the suite
+        // ran them in parallel.
+        let tmp = std::env::temp_dir()
+            .join(format!("moat-binlist-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let real = tmp.join("kmod");
+        std::fs::write(&real, b"\x7fELF").unwrap();
+        let link = tmp.join("modprobe");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let link_s = link.to_string_lossy().to_string();
+        let real_s = real.canonicalize().unwrap().to_string_lossy().to_string();
+
+        assert_eq!(
+            crate::util::resolved_binary(&link_s),
+            Some(real_s.clone()),
+            "a symlink must report the name the kernel will use"
+        );
+        assert_eq!(
+            crate::util::resolved_binary(&real_s),
+            None,
+            "a real binary IS what the kernel loads"
+        );
+        assert_eq!(
+            crate::util::resolved_binary(&tmp.join("nope").to_string_lossy()),
+            None,
+            "an absent path cannot be resolved, and must not be reported as a rename"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Every `(operator, values)` pair under any `matchBinaries` in the doc.
+    ///
+    /// A named seam rather than a walk inlined in the test body: a test that
+    /// reimplements the traversal it is testing tests the test. (Handoff
+    /// 2026-09-09: one guard that week passed with production deleted for
+    /// exactly that reason.)
+    fn match_binaries_lists(doc: &Value) -> Vec<(String, Vec<String>)> {
+        let mut out = Vec::new();
+        fn walk(v: &Value, out: &mut Vec<(String, Vec<String>)>) {
+            match v {
+                Value::Mapping(m) => {
+                    for (k, val) in m {
+                        if k.as_str() == Some("matchBinaries") {
+                            if let Some(seq) = val.as_sequence() {
+                                for e in seq {
+                                    let op = e
+                                        .get("operator")
+                                        .and_then(|o| o.as_str())
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    let vals = e
+                                        .get("values")
+                                        .and_then(|v| v.as_sequence())
+                                        .map(|s| {
+                                            s.iter()
+                                                .filter_map(|x| x.as_str())
+                                                .map(String::from)
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    out.push((op, vals));
+                                }
+                            }
+                        }
+                        walk(val, out);
+                    }
+                }
+                Value::Sequence(s) => {
+                    for e in s {
+                        walk(e, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(doc, &mut out);
+        out
+    }
 }
