@@ -170,17 +170,16 @@ async function publish(env, state, index, sources, log, statsExtra = {}) {
   const generated = isoNow();
 
   const keys = sortedKeys(index);
-  const artGz = await gzipStrings(artifactLines(index, generated, keys));
-  const sha = await sha256Hex(artGz);
 
-  if (state.artifact && sha === state.sha256) {
-    log.add('artifact unchanged, keeping seq', state.seq);
-    state.sources = sources;
-    await saveState(env, state);
-    return null;
-  }
-
-  // delta from the previous artifact, by merge join against the sorted keys
+  // Whether anything actually changed is decided by the DIFF, not by comparing
+  // artifact bytes. `generated` (and now `seq`) are inside those bytes and move
+  // every run, so a byte comparison was never once true: the no-op branch was
+  // dead, and a quiet tick still published a new sequence and a fresh 1.6 MB
+  // artifact. That is the property the whole cache story rests on -- if the
+  // pointer changes every 15 minutes, no client ever gets a 304.
+  //
+  // The merge join against the previous artifact is already being done for the
+  // delta, and an empty op list is an exact answer, so this costs nothing.
   let stepOps = null;
   if (state.artifact) {
     const prev = await env.FEED.get(state.artifact.replace(/^\//, ''));
@@ -188,7 +187,17 @@ async function publish(env, state, index, sources, log, statsExtra = {}) {
     else log.add('previous artifact missing from R2; publishing without a delta step');
   }
 
+  if (stepOps && stepOps.length === 0) {
+    log.add('index unchanged, keeping seq', state.seq);
+    state.sources = sources;
+    state.last = { kind: log.kind, at: generated, ...statsExtra };
+    await saveState(env, state);
+    return null;
+  }
+
   const seq = state.seq + 1;
+  const artGz = await gzipStrings(artifactLines(index, generated, keys, seq));
+  const sha = await sha256Hex(artGz);
   const sha12 = sha.slice(0, 12);
   const artName = `packages-${seq}-${sha12}.txt.gz`;
   await putSigned(env, signer, 'v1/' + artName, artGz, 'application/gzip');

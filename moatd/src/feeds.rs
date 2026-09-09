@@ -441,6 +441,20 @@ pub fn refresh(cfg: &FeedsConfig, out_dir: &Path) -> RefreshSummary {
         return sum;
     }
 
+    // A sequence must never go backwards. pointer.json is not signed, so
+    // replaying an old pointer -- with its old, perfectly valid artifact and
+    // matching sha256 -- would otherwise roll the index back and silently drop
+    // every package added since. That is the suppression attack the signature
+    // exists to prevent, arriving through the one door it does not cover.
+    if pointer.seq < state.seq {
+        sum.skipped = true;
+        sum.reason = Some(format!(
+            "pointer went BACKWARDS: it offers seq {} and this machine already has {}. Refusing to roll the index back; keeping what is on disk.",
+            pointer.seq, state.seq
+        ));
+        return sum;
+    }
+
     // 2. nothing new.
     let have_index = out_dir.join(PACKAGES_FILE).exists();
     if pointer.seq == state.seq && have_index {
@@ -460,7 +474,16 @@ pub fn refresh(cfg: &FeedsConfig, out_dir: &Path) -> RefreshSummary {
     };
 
     let outcome = match &delta_path {
-        Some(p) => apply_delta(&agent, &base, p, cfg, key.as_ref(), out_dir),
+        Some(p) => apply_delta(
+            &agent,
+            &base,
+            p,
+            cfg,
+            key.as_ref(),
+            out_dir,
+            state.seq,
+            pointer.seq,
+        ),
         None => apply_full(&agent, &base, &pointer, cfg, key.as_ref(), out_dir),
     };
 
@@ -642,6 +665,21 @@ fn apply_full(
         key,
         Some(&pointer.sha256),
     )?;
+    // The artifact states its own sequence INSIDE the signed bytes. The
+    // pointer is unsigned, so this is what stops a fresh-looking pointer from
+    // serving an old artifact whose signature is genuine.
+    match header_u64(&text, "# seq ") {
+        Some(seq) if seq == pointer.seq => {}
+        Some(seq) => {
+            return Err(format!(
+                "pointer says seq {} but the signed artifact says {}; refusing it",
+                pointer.seq, seq
+            ))
+        }
+        None => {
+            return Err("the artifact does not state its own seq; refusing it".into());
+        }
+    }
     let index = parse_index(&text)?;
     let n = index.len();
     write_index(out_dir, &index)?;
@@ -653,6 +691,7 @@ fn apply_full(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_delta(
     agent: &ureq::Agent,
     base: &str,
@@ -660,11 +699,28 @@ fn apply_delta(
     cfg: &FeedsConfig,
     key: Option<&[u8; 32]>,
     out_dir: &Path,
+    from_seq: u64,
+    to_seq: u64,
 ) -> Result<Applied, String> {
     let current = std::fs::read_to_string(out_dir.join(PACKAGES_FILE))
         .map_err(|e| format!("{}: {}", PACKAGES_FILE, e))?;
     let mut index = parse_index(&current)?;
     let text = fetch_verified(agent, base, path, cfg, key, None)?;
+
+    // A delta is only meaningful between the two sequences it names, and both
+    // are inside the signed bytes. Applying one to the wrong base would corrupt
+    // the index quietly -- entries removed that were never added, and no
+    // signature failure to show for it.
+    match (header_u64(&text, "# from "), header_u64(&text, "# to ")) {
+        (Some(f), Some(t)) if f == from_seq && t == to_seq => {}
+        (Some(f), Some(t)) => {
+            return Err(format!(
+                "delta is {}->{} but this machine needs {}->{}",
+                f, t, from_seq, to_seq
+            ))
+        }
+        _ => return Err("delta does not state the sequences it spans".into()),
+    }
 
     let (mut added, mut removed) = (0usize, 0usize);
     for (n, line) in text.lines().enumerate() {
@@ -765,6 +821,15 @@ fn write_meta(dir: &Path, pointer: &Pointer, packages: usize, mode: &str) -> Res
     )
     .map(|_| ())
     .map_err(|e| e.to_string())
+}
+
+/// A `# key value` header line from the top of a signed artifact or delta.
+/// Only the comment block is scanned: a body line can contain anything.
+fn header_u64(text: &str, prefix: &str) -> Option<u64> {
+    text.lines()
+        .take_while(|l| l.starts_with('#'))
+        .find_map(|l| l.strip_prefix(prefix))
+        .and_then(|v| v.trim().parse().ok())
 }
 
 fn count_packages(dir: &Path) -> usize {
@@ -1001,6 +1066,33 @@ mod tests {
         let e = cfg.verifying_key().unwrap_err();
         assert!(e.contains("ssh-ed25519"), "{}", e);
         assert!(e.contains("moat-feed-ed25519"), "{}", e);
+    }
+
+    #[test]
+    fn headers_are_read_from_the_comment_block_only() {
+        let t = "# moat-packages v1\n# seq 412\n# entries 3\nnpm\t# seq 999\t*\n";
+        assert_eq!(header_u64(t, "# seq "), Some(412));
+        assert_eq!(header_u64(t, "# entries "), Some(3));
+        assert_eq!(header_u64(t, "# nope "), None);
+        // Scanning stops at the first body line, so a package that happens to
+        // be named `# seq 999` cannot forge a header.
+        assert_eq!(header_u64("npm\t# seq 999\t*\n", "# seq "), None);
+    }
+
+    /// pointer.json is unsigned, so a replayed pointer plus its genuine old
+    /// artifact would roll the index back and drop everything added since --
+    /// suppression, arriving through the one door the signature does not cover.
+    #[test]
+    fn a_pointer_that_goes_backwards_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(PACKAGES_FILE), idx(&[("npm", "keep", "*")])).unwrap();
+        std::fs::write(dir.path().join(STATE_FILE), r#"{"seq":412,"pointer_etag":""}"#).unwrap();
+        let s = State::load(dir.path());
+        assert_eq!(s.seq, 412);
+        // The comparison the refresh path makes.
+        assert!(400u64 < s.seq, "an older sequence must be refused");
+        assert!(!(412u64 < s.seq), "the same sequence is not a rollback");
+        assert!(!(500u64 < s.seq), "and moving forward is fine");
     }
 
     #[test]

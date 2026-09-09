@@ -124,6 +124,57 @@ test('a tick with no upstream movement does not bump seq', async () => {
   assert.equal((await pointerOf(env)).seq, 1);
 });
 
+test('a record that changes without changing the index does not bump seq', async () => {
+  // The case the byte-comparison no-op branch was meant to catch and never
+  // did: upstream really did move -- the compare names a changed file, and the
+  // file's own `modified` timestamp is newer -- but the folded index is
+  // identical. Publishing here would mint a sequence, write a fresh artifact
+  // and change the pointer, so every client's next tick would be a delta fetch
+  // instead of a 304, for no new information at all.
+  const { env } = await newEnv();
+  let f = installFetch(baseRoutes());
+  try { await runFull(env); } finally { f.restore(); }
+  const before = await pointerOf(env);
+
+  // Same package, same spec, different `modified`.
+  const touched = JSON.stringify({
+    id: 'MAL-0001', modified: '2026-06-01T00:00:00Z',
+    affected: [{ package: { ecosystem: 'npm', name: 'evil' } }],
+  });
+  f = installFetch(baseRoutes([
+    [/api\.github\.com\/repos\/.*\/commits\/main/, () => ({ body: { sha: SHA_B } })],
+    [/compare/, () => ({ body: {
+      total_commits: 1, commits: [{ sha: SHA_B }],
+      files: [{ status: 'modified', filename: 'osv/malicious/npm/evil/MAL-0001.json' }],
+      merge_base_commit: { sha: SHA_A },
+    } })],
+    [/raw\.githubusercontent\.com\/.*MAL-0001\.json/, () => new Response(touched)],
+    [/raw\.githubusercontent\.com\/DataDog/, () => new Response(null, { status: 304 })],
+  ]));
+  try { await runTick(env); } finally { f.restore(); }
+
+  const after = await pointerOf(env);
+  assert.equal(after.seq, before.seq, 'no new sequence');
+  assert.equal(after.artifact, before.artifact, 'and the pointer still names the same artifact');
+  assert.equal(after.generated, before.generated, 'so a client 304s instead of refetching');
+});
+
+test('the signed artifact carries its own seq, and it matches the pointer', async () => {
+  // pointer.json is NOT signed. Without seq inside the signed bytes, a pointer
+  // could name a fresh sequence while serving an older, validly-signed
+  // artifact: every signature checks out and the client installs a stale index,
+  // losing whichever malicious packages were added since. The client
+  // cross-checks these two, so they have to agree.
+  const { env } = await newEnv();
+  const f = installFetch(baseRoutes());
+  try { await runFull(env); } finally { f.restore(); }
+  const p = await pointerOf(env);
+  const text = await unzip(await readObj(env, p.artifact.slice(1)));
+  const seqLine = text.split('\n').find((l) => l.startsWith('# seq '));
+  assert.ok(seqLine, 'the artifact must state its own sequence');
+  assert.equal(Number(seqLine.slice(6)), p.seq);
+});
+
 test('incremental tick applies adds, spec changes and removals', async () => {
   const { env, pub } = await newEnv();
   let f = installFetch(baseRoutes());
@@ -427,7 +478,12 @@ test('the delta path canonicalises pypi names, and does not drift from a rebuild
   try { await runFull(env2); } finally { f.restore(); }
   const pf = await pointerOf(env2);
   const fullText = await unzip(await readObj(env2, pf.artifact.slice(1)));
-  const strip = (t) => t.split('\n').filter((l) => !l.startsWith('# generated')).join('\n');
+  // `# generated` and `# seq` are both expected to differ -- the tick reached
+  // this content as sequence 2, the rebuild as sequence 1. What must not drift
+  // is the folded content itself.
+  const strip = (t) => t.split('\n')
+    .filter((l) => !l.startsWith('# generated') && !l.startsWith('# seq'))
+    .join('\n');
   assert.equal(strip(tickText), strip(fullText));
   assert.equal(pf.sha256.length, 64);
 });

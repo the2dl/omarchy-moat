@@ -185,7 +185,7 @@ pub struct Proposal {
 pub const REDEMOTE_PROPOSE_AT: u64 = 3;
 
 pub const REDEMOTED_REASON: &str =
-    "the noise guard has had to quieten this pattern repeatedly; Moat is not vouching for      it, only noting that you keep being asked about it";
+    "the noise guard has had to quieten this pattern repeatedly; Moat is not vouching for it, only noting that you keep being asked about it";
 
 /// A rule the noise guard put on the timeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -551,7 +551,7 @@ impl Baseline {
         // wants this can write the entry by hand, naming the script.
         if crate::provenance::path_is_not_identity(crate::util::basename(&t.exe)) {
             return Some(format!(
-                "{} is an interpreter: the tuple names the interpreter, not the code it ran,                  so a learned entry would cover scripts nobody has seen. Write the entry by                  hand with `script = ...` if this is expected.",
+                "{} is an interpreter: the tuple names the interpreter, not the code it ran, so a learned entry would cover scripts nobody has seen. Write the entry by hand with `script = ...` if this is expected.",
                 crate::util::basename(&t.exe)
             ));
         }

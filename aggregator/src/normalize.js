@@ -291,16 +291,24 @@ export function sortedKeys(index) {
 
 /** The artifact, line by line, without ever holding it whole.
  *  Pass `keys` when you already sorted them (the publisher needs them twice). */
-export function* artifactLines(index, generated, keys) {
+export function* artifactLines(index, generated, keys, seq) {
   yield '# moat-packages v1\n';
   yield '# generated ' + generated + '\n';
   yield '# entries ' + index.size + '\n';
+  // `seq` lives INSIDE the signed bytes on purpose. pointer.json is not
+  // signed, so without this a bucket attacker could point a fresh-looking
+  // pointer at an old, validly-signed artifact: every signature checks out and
+  // the client quietly installs a stale index, losing whichever malicious
+  // packages were added since. The client cross-checks pointer.seq against
+  // this line and refuses a mismatch. Omitted only by the local normaliser,
+  // which has no sequence to speak of.
+  if (seq !== undefined && seq !== null) yield '# seq ' + seq + '\n';
   for (const key of (keys || sortedKeys(index))) yield key + '\t' + index.get(key) + '\n';
 }
 
-export function serializeArtifact(index, generated) {
+export function serializeArtifact(index, generated, seq) {
   let out = '';
-  for (const l of artifactLines(index, generated)) out += l;
+  for (const l of artifactLines(index, generated, null, seq)) out += l;
   return out;
 }
 
