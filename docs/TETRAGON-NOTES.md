@@ -172,9 +172,37 @@ gets `acc_mode` = `ACC_MODE(flags)` (O_RDONLY→4, O_WRONLY→2, O_RDWR→6) | M
 ### At most 19 policies per LSM hook (verified the hard way, 2026-09-03)
 
 An LSM program is attached through a BPF trampoline, and a trampoline holds
-`BPF_MAX_TRAMP_LINKS = 38` programs. Tetragon attaches **two** per policy
+`BPF_MAX_TRAMP_LINKS` programs. Tetragon attaches **two** per policy
 (`generic_lsm_event` and `generic_lsm_output`), so the **20th** policy on one
 hook fails and takes the whole daemon down:
+
+The kernel constant, `include/linux/bpf.h` (not uapi, so it is not in
+`/usr/include`):
+
+```c
+/* Each call __bpf_prog_enter + call bpf_func + call __bpf_prog_exit is ~50
+ * bytes on x86.
+ */
+enum {
+#if defined(__s390x__)
+	BPF_MAX_TRAMP_LINKS = 27,
+#else
+	BPF_MAX_TRAMP_LINKS = 38,
+#endif
+};
+```
+
+It is a code-size ceiling, not a policy: the trampoline is generated as machine
+code into one page and each program costs ~50 bytes of call sequence. **On
+s390x it is 27, so the cap would be 13, not 19** — `check.py` hardcodes 38 and
+would pass a policy set that crash-loops there. moat is `arch=x86_64` only, so
+this is a wrong assumption waiting to be inherited rather than a live bug.
+
+The limit is per TRAMPOLINE, and there is one trampoline per attached function
+— which is why the cap is per hook and not per daemon. Only trampoline-attached
+programs count (fentry/fexit and LSM); kprobes go through ftrace and have no
+trampoline, which is what makes the escape hatch below work.
+
 
 ```
 sensor generic_lsm from collection moat-rootkit-bpffs-write failed to load:

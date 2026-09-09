@@ -122,7 +122,11 @@ MAX_MATCHARGS = 5
 MAX_ACTIONS_PER_SELECTOR = 2
 MAX_NUMERIC_VALUES = 4
 MAX_BINARY_SELECTOR_ENTRIES = 1
-# notes section 3: the BPF trampoline behind an LSM hook takes BPF_MAX_TRAMP_LINKS = 38
+# notes section 3: the BPF trampoline behind an LSM hook takes # x86_64 and most arches; s390x is 27, which would make the cap 13 rather than
+# 19. moat ships arch=x86_64 only, so 38 is right here -- but the number is the
+# kernel's (include/linux/bpf.h, not uapi), not ours, and it is a code-size
+# ceiling: the trampoline is generated into one page at ~50 bytes per program.
+BPF_MAX_TRAMP_LINKS = 38
 # programs, and Tetragon attaches two per policy (generic_lsm_event and
 # generic_lsm_output), so the 20th policy on one hook fails to load with E2BIG
 # ("argument list too long") and takes the whole daemon down with it. Kprobes are
