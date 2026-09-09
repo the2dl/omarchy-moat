@@ -315,6 +315,7 @@ pub fn dispatch(d: &mut Daemon, req: &Value) -> Value {
         "ack" => cmd_ack(d, req, &id()),
         "forget" => cmd_forget(d, req),
         "decisions" => cmd_decisions(d, req),
+        "neighbours" => cmd_neighbours(d),
         "kill" => cmd_kill(d, &id()),
         "quarantine" => cmd_quarantine(d, req, &id()),
         "ignore" => cmd_ignore(d, req, &id()),
@@ -565,6 +566,115 @@ fn cmd_decisions(d: &mut Daemon, req: &Value) -> Value {
         "spared": spared,
         "would_have_killed": would,
         "killed": killed,
+    }))
+}
+
+/// Per-rule cross-family neighbour rate, over the WHOLE store.
+///
+/// The measurement behind the open design question: should an ambiguous single
+/// event reach the badge only as part of a sequence? That is right for rules
+/// whose alerts routinely sit beside another family in one process tree, and
+/// switches a rule off entirely when they do not. Which rules are which is a
+/// fact about this machine, not something to reason out -- and on 2026-09-09
+/// the answer was that detection-tier rows chained at 0.4%, so gating all of
+/// them would have silenced almost everything.
+///
+/// Deliberately not `limit`ed. `feed` defaults to 500 and truncates in
+/// silence, which is how every number quoted before 2026-09-09 came out wrong.
+/// A rate is meaningless over an unknown fraction of the rows.
+///
+/// Read-only and unprivileged, for the same reason as `decisions`: this is
+/// evidence a person is asked to weigh, and evidence behind sudo does not get
+/// weighed.
+fn cmd_neighbours(d: &mut Daemon) -> Value {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    struct Row {
+        n: u64,
+        chained: u64,
+        cross: u64,
+        tier: BTreeSet<String>,
+        family: String,
+    }
+
+    let alerts = d.store.load();
+    let mut per: BTreeMap<String, Row> = BTreeMap::new();
+    for a in &alerts {
+        let r = per.entry(a.rule.clone()).or_insert_with(|| Row {
+            n: 0,
+            chained: 0,
+            cross: 0,
+            tier: BTreeSet::new(),
+            family: a.family.clone(),
+        });
+        r.n += 1;
+        r.tier.insert(a.tier.clone());
+        let Some(chain) = &a.chain else { continue };
+        r.chained += 1;
+        // A neighbour of the SAME family is not the thing being asked about:
+        // "netcat ran twice" is one story told twice, and gating on it would
+        // let a rule vouch for itself.
+        if chain.families.iter().any(|f| f != &a.family) {
+            r.cross += 1;
+        }
+    }
+
+    let pct = |num: u64, den: u64| -> f64 {
+        if den == 0 {
+            0.0
+        } else {
+            (num as f64) * 100.0 / (den as f64)
+        }
+    };
+
+    let rules: Vec<Value> = per
+        .iter()
+        .map(|(rule, r)| {
+            json!({
+                "rule": rule,
+                "family": r.family,
+                "tier": r.tier.iter().cloned().collect::<Vec<_>>().join(","),
+                "alerts": r.n,
+                "chained": r.chained,
+                "cross_family": r.cross,
+                "cross_family_pct": (pct(r.cross, r.n) * 10.0).round() / 10.0,
+            })
+        })
+        .collect();
+
+    let by_tier: Vec<Value> = ["detection", "signal"]
+        .iter()
+        .map(|tier| {
+            let rows: Vec<_> = alerts.iter().filter(|a| a.tier == *tier).collect();
+            let cross = rows
+                .iter()
+                .filter(|a| {
+                    a.chain
+                        .as_ref()
+                        .map(|c| c.families.iter().any(|f| f != &a.family))
+                        .unwrap_or(false)
+                })
+                .count() as u64;
+            json!({
+                "tier": tier,
+                "alerts": rows.len(),
+                "cross_family": cross,
+                "cross_family_pct": (pct(cross, rows.len() as u64) * 10.0).round() / 10.0,
+            })
+        })
+        .collect();
+
+    // The window matters as much as the rates: a store holding one hour of one
+    // developer's build is not evidence about a week of use, and a reader who
+    // is not told the span will treat it as though it were.
+    let first = alerts.first().map(|a| a.ts.clone());
+    let last = alerts.last().map(|a| a.ts.clone());
+    ok(json!({
+        "rules": rules,
+        "tiers": by_tier,
+        "total": alerts.len(),
+        "first_ts": first,
+        "last_ts": last,
     }))
 }
 

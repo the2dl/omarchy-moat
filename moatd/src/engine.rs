@@ -7566,6 +7566,90 @@ esac
         );
     }
 
+    /// The neighbour-rate measurement, and the distinction it exists to make.
+    ///
+    /// The open question is whether an ambiguous single event should reach the
+    /// badge only as part of a sequence. That is right for a rule whose alerts
+    /// routinely sit beside ANOTHER family in one process tree and switches a
+    /// rule off entirely when they do not, so the rate has to count
+    /// cross-family neighbours only: "netcat ran twice" is one story told
+    /// twice, and letting a rule vouch for itself would make every rule look
+    /// gateable.
+    #[test]
+    fn the_neighbour_rate_counts_other_families_and_not_a_rule_vouching_for_itself() {
+        use crate::alert::tests_support::demo_alert;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+
+        let chain_of = |families: &[&str]| crate::chain::Chain {
+            v: 1,
+            id: "01CH".into(),
+            ancestor: crate::alert::Ancestor {
+                pid: 5000,
+                exe: "/usr/bin/makepkg".into(),
+            },
+            families: families.iter().map(|s| s.to_string()).collect(),
+            severity: "high".into(),
+            severity_base: "high".into(),
+            severity_reason: "r".into(),
+            first_ts: "2026-09-05T14:44:22Z".into(),
+            last_ts: "2026-09-05T14:44:23Z".into(),
+            span_secs: 1,
+            steps: vec![],
+            steps_total: 0,
+            truncated: false,
+            members: vec![],
+            triggers_total: 0,
+            summary: String::new(),
+        };
+
+        let mut put = |id: &str, rule: &str, family: &str, chain| {
+            let mut a = demo_alert(id);
+            a.rule = rule.into();
+            a.family = family.into();
+            a.tier = "detection".into();
+            a.chain = chain;
+            d.store.append_alert(&a).unwrap();
+        };
+
+        // Gateable: a cred alert with an exec neighbour.
+        put("01A0", "moat-gateable", "cred", Some(chain_of(&["cred", "exec"])));
+        put("01A1", "moat-gateable", "cred", Some(chain_of(&["cred", "exec"])));
+
+        // NOT gateable, and the trap: chained, but only with itself.
+        put("01B0", "moat-alone", "cred", Some(chain_of(&["cred"])));
+        put("01B1", "moat-alone", "cred", Some(chain_of(&["cred"])));
+
+        // Not chained at all.
+        put("01C0", "moat-never", "cred", None);
+
+        let r = crate::control::dispatch(&mut d, &serde_json::json!({"cmd": "neighbours"}));
+        let rules = r["rules"].as_array().expect("rules");
+        let by = |name: &str| {
+            rules
+                .iter()
+                .find(|v| v["rule"] == name)
+                .unwrap_or_else(|| panic!("{name} missing from {rules:?}"))
+        };
+
+        assert_eq!(by("moat-gateable")["cross_family_pct"], 100.0);
+        assert_eq!(
+            by("moat-alone")["chained"], 2,
+            "it really was in a chain, which is what makes this the trap"
+        );
+        assert_eq!(
+            by("moat-alone")["cross_family_pct"],
+            0.0,
+            "a same-family neighbour is the rule vouching for itself"
+        );
+        assert_eq!(by("moat-never")["cross_family_pct"], 0.0);
+
+        // The window is reported, because a rate over an unstated span reads as
+        // though it were over a representative one.
+        assert!(r["first_ts"].is_string() && r["last_ts"].is_string());
+        assert_eq!(r["total"], 5);
+    }
+
     /// A modified package-owned file is said out loud, once.
     ///
     /// The demotion to `foreign` makes every OTHER alert about the file read

@@ -65,6 +65,11 @@ enum Cmd {
         #[arg(long, default_value_t = 50)]
         limit: u64,
     },
+    /// Per-rule cross-family neighbour rate: how often each rule's alerts sit
+    /// beside ANOTHER family in one process tree. The evidence for whether a
+    /// rule could be gated behind a sequence without switching it off -- read
+    /// it before gating, not after. Covers the whole store, not a page of it.
+    Neighbours,
     /// Make Moat forget what it has learned about one network destination, so
     /// the next connection there is a first contact again. Needs root, and is
     /// recorded. For a re-provisioned host, a changed network, or a lab.
@@ -358,6 +363,7 @@ fn main() -> ExitCode {
         Cmd::Explain { id } => json!({"cmd": "explain", "id": id}),
         Cmd::Forget { dst } => json!({"cmd": "forget", "dst": dst}),
         Cmd::Decisions { limit } => json!({"cmd": "decisions", "limit": limit}),
+        Cmd::Neighbours => json!({"cmd": "neighbours"}),
         Cmd::Feed { limit } => json!({"cmd": "feed", "limit": limit}),
         Cmd::Ack { ids, all, rule, before, chain } => json!({
             "cmd": "ack",
@@ -1045,6 +1051,50 @@ fn print_human(cmd: &Cmd, r: &Value) {
                     p["title"].as_str().unwrap_or("?")
                 );
             }
+        }
+        Cmd::Neighbours => {
+            let total = r["total"].as_u64().unwrap_or(0);
+            if total == 0 {
+                println!("no alerts in the store yet, so there is nothing to measure");
+                return;
+            }
+            println!(
+                "{} alerts, {} .. {}",
+                total,
+                r["first_ts"].as_str().unwrap_or("?"),
+                r["last_ts"].as_str().unwrap_or("?")
+            );
+            println!();
+            println!(
+                "{:<44} {:<10} {:>7} {:>8} {:>8}",
+                "rule", "tier", "alerts", "chained", "cross"
+            );
+            let mut rules = r["rules"].as_array().cloned().unwrap_or_default();
+            rules.sort_by_key(|v| std::cmp::Reverse(v["alerts"].as_u64().unwrap_or(0)));
+            for v in &rules {
+                println!(
+                    "{:<44} {:<10} {:>7} {:>8} {:>7.1}%",
+                    v["rule"].as_str().unwrap_or("?"),
+                    v["tier"].as_str().unwrap_or("?"),
+                    v["alerts"].as_u64().unwrap_or(0),
+                    v["chained"].as_u64().unwrap_or(0),
+                    v["cross_family_pct"].as_f64().unwrap_or(0.0)
+                );
+            }
+            println!();
+            for v in r["tiers"].as_array().cloned().unwrap_or_default() {
+                println!(
+                    "{:<10} {:>7} alerts, cross-family {:.1}%",
+                    v["tier"].as_str().unwrap_or("?"),
+                    v["alerts"].as_u64().unwrap_or(0),
+                    v["cross_family_pct"].as_f64().unwrap_or(0.0)
+                );
+            }
+            println!();
+            println!(
+                "A rule near 0% has no neighbour to be gated behind: requiring a sequence \
+                 would switch it off, not quieten it."
+            );
         }
         Cmd::Decisions { .. } => {
             let d = r["decisions"].as_array().cloned().unwrap_or_default();
