@@ -78,6 +78,14 @@ pub struct Target<'a> {
     pub file: Option<&'a str>,
     /// The script an interpreter was running, for the `node_modules` lookup.
     pub script: Option<&'a str>,
+    /// Did this run in a container?
+    ///
+    /// Every path on this struct is namespace-relative when it did. `/app/x`
+    /// in a container is not `/app/x` here, so copying "the file the alert
+    /// names" would copy an unrelated HOST file into an incident directory the
+    /// `moat` group can read -- an arbitrary read dressed as evidence. Only
+    /// `/proc/<pid>/...` is safe to follow, and only while the process lives.
+    pub in_container: bool,
     /// Nearest ancestor first: (pid, exe).
     pub ancestors: &'a [(u32, String)],
     /// `tree.txt`, built by the caller from the daemon's process table.
@@ -154,8 +162,28 @@ pub fn capture(t: &Target) -> Incident {
         let _ = util::secure_path(&files_dir, t.group, 0o750);
         // The executed binary, read through /proc so a deleted-on-disk dropper
         // is still captured.
+        // `/proc/<pid>/exe` resolves in the KERNEL's view and is correct for a
+        // container while the process lives. The literal path is not: it names
+        // a file in that container's filesystem, and following it here reaches
+        // a host file that merely shares the name. So the fallback is refused
+        // for a containerised actor rather than silently pointing somewhere
+        // else -- the binary is simply not captured, and `errors` says why.
         let live = format!("/proc/{}/exe", t.pid);
-        let src = if Path::new(&live).exists() { live } else { t.exe.to_string() };
+        let have_live = Path::new(&live).exists();
+        if !have_live && t.in_container {
+            errors.push(format!(
+                "actor binary not captured: {} ran in a container and has exited, so that path \
+                 names a file in its filesystem, not this one's",
+                t.exe
+            ));
+        }
+        let src = if have_live {
+            live
+        } else if t.in_container {
+            String::new()
+        } else {
+            t.exe.to_string()
+        };
         // Not the distro's own binaries.
         //
         // 190 of the 201 incident directories on this machine held an identical
@@ -191,10 +219,24 @@ pub fn capture(t: &Target) -> Incident {
         // by any $HOME-scoped sandbox or backup exclusion the user has set.
         // An EDR must not manufacture an unwatched second copy of the secrets
         // it exists to protect.
-        if let Some(f) = t
-            .file
-            .filter(|f| in_user_space(f, t.homes) && !crate::evidence::is_secret_path(f))
-        {
+        // And never a path a CONTAINER named. `in_user_space` asks whether the
+        // path looks like the user's, which a container path can satisfy by
+        // coincidence -- `/home/app/config` inside an image is not this
+        // machine's. Copying it would put an unrelated host file into an
+        // incident directory the `moat` group can read, which is an arbitrary
+        // read wearing the clothes of evidence.
+        if t.in_container {
+            if let Some(f) = t.file {
+                errors.push(format!(
+                    "file/: {} not copied — it was named inside a container, so that path is \
+                     not this machine's",
+                    f
+                ));
+            }
+        }
+        if let Some(f) = t.file.filter(|f| {
+            !t.in_container && in_user_space(f, t.homes) && !crate::evidence::is_secret_path(f)
+        }) {
             let name = if util::basename(f) == util::basename(t.exe) {
                 format!("alerted-{}", util::basename(f))
             } else {
@@ -943,6 +985,7 @@ mod tests {
         let exe = util::proc_exe(std::process::id()).unwrap();
         let homes = vec![home.to_string_lossy().to_string()];
         let inc = capture(&Target {
+            in_container: false,
             id: "01TESTTESTTESTTESTTESTTEST",
             base: dir.path(),
             group: "moat",
@@ -1185,5 +1228,77 @@ mod retention_tests {
         let gone = prune(dir.path(), 0, 2, util::unix_secs(), &keep_all);
         assert_eq!(gone.len(), 1);
         assert_eq!(gone[0], "01A", "with nothing answered left, the oldest goes");
+    }
+}
+
+#[cfg(test)]
+mod container_paths {
+    use super::*;
+
+    /// A path a container named is not this machine's path.
+    ///
+    /// `/proc/<pid>/exe` resolves in the kernel's view and is correct for a
+    /// container while the process lives. The literal path is not: following it
+    /// here reaches a HOST file that merely shares the name, and copying that
+    /// into an incident directory the `moat` group can read is an arbitrary
+    /// read wearing the clothes of evidence.
+    #[test]
+    fn a_container_named_file_is_not_copied_into_the_incident() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home/dan");
+        std::fs::create_dir_all(&home).unwrap();
+        // A host file that happens to share the container's path shape.
+        let victim = home.join("config.json");
+        std::fs::write(&victim, b"HOST SECRET").unwrap();
+        let homes = vec![home.to_string_lossy().to_string()];
+
+        let base = dir.path().join("incidents");
+        let inc = capture(&Target {
+            in_container: true,
+            id: "01CONTAINERTESTTESTTESTTES",
+            base: &base,
+            group: "moat",
+            rule: "moat-exec-untrusted-home",
+            severity: "high",
+            title: "t",
+            ts: "2026-09-09T00:00:00.000Z",
+            context: "service",
+            mode: "monitor",
+            pid: 999_999_9,
+            exe: "/app/server",
+            args: "",
+            cwd: "/",
+            file: Some(victim.to_string_lossy().as_ref()),
+            script: None,
+            ancestors: &[],
+            tree: "",
+            homes: &homes,
+        });
+
+        // `files` also holds the capture's own metadata (net.txt, process.json,
+        // tree.txt); what must be absent is the ARTEFACT.
+        assert!(
+            !inc.files.iter().any(|f| f.name.contains("config.json")),
+            "a container's path pulled in a host file: {:?}",
+            inc.files
+        );
+        // And its contents are nowhere in the incident directory.
+        for e in std::fs::read_dir(Path::new(&inc.dir).join("file")).into_iter().flatten().flatten()
+        {
+            let body = std::fs::read(e.path()).unwrap_or_default();
+            assert!(
+                !String::from_utf8_lossy(&body).contains("HOST SECRET"),
+                "host bytes reached {}",
+                e.path().display()
+            );
+        }
+        let meta = std::fs::read_to_string(Path::new(&inc.dir).join("meta.json")).unwrap();
+        assert!(
+            meta.contains("named inside a container"),
+            "and the refusal is recorded in meta.json: {}",
+            meta
+        );
+        // The host file is untouched and still where it was.
+        assert_eq!(std::fs::read(&victim).unwrap(), b"HOST SECRET");
     }
 }

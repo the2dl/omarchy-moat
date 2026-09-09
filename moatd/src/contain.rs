@@ -525,6 +525,12 @@ mod tests {
 /// * **`system.slice`.** systemd puts the machine's own services there:
 ///   moatd, tetragon, sshd, dbus, logind. A payload cannot move itself into it
 ///   without root, and with root this feature is already lost.
+/// `alert_uid` is THIS TARGET's uid, from the step that named it -- not the
+/// chain's. It used to be whatever the last trigger ran as, applied to every
+/// target, which on a chain spanning two users compared one against the
+/// other's id. The caller also verifies start time and executable
+/// (`control::verify_pid`) before signalling, because a pid is not an identity
+/// and can be recycled between the alert and the kill.
 pub fn refuse_to_kill(pid: u32, alert_uid: u32) -> Option<String> {
     if pid <= 1 {
         return Some("pid 1".into());
@@ -547,7 +553,7 @@ pub fn refuse_to_kill(pid: u32, alert_uid: u32) -> Option<String> {
     None
 }
 
-/// One process a chain justifies killing./// One process a chain justifies killing.
+/// One process a chain justifies killing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Target {
     pub pid: u32,

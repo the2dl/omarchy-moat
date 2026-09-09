@@ -1296,7 +1296,30 @@ impl Daemon {
         let mut named: Vec<String> = Vec::new();
         let mut doomed: Vec<u32> = Vec::new();
         for t in targets.iter().take(MAX_TARGETS) {
-            if let Some(why) = crate::contain::refuse_to_kill(t.pid, uid) {
+            // This target's OWN uid and identity, not the chain's.
+            //
+            // `uid` here is whatever the LAST trigger happened to run as, and
+            // it was being applied to every target: a chain spanning two users
+            // would check one of them against the other's id and either spare a
+            // process it should kill or, worse, pass a process it never
+            // established anything about.
+            //
+            // And a pid is not an identity. `maybe_enforce` verifies start time
+            // and executable before signalling, for the pid-reuse reason; the
+            // tree kill sends up to eight signals and did not. Between the
+            // alert and this loop a pid can be recycled, and the thing wearing
+            // it now is not the thing the chain was about.
+            let step_alert = self.find_alert(&t.alert);
+            let target_uid = step_alert.as_ref().map(|a| a.process.uid).unwrap_or(uid);
+            if let Some(a) = step_alert.as_ref() {
+                if let Err(why) =
+                    crate::control::verify_pid(t.pid, &a.process.start_ts, &t.exe)
+                {
+                    log::info!("chain {}: sparing pid {} ({})", c.id, t.pid, why);
+                    continue;
+                }
+            }
+            if let Some(why) = crate::contain::refuse_to_kill(t.pid, target_uid) {
                 // Same reasoning: a spared process is a decision, and a
                 // decision nobody can see cannot be reviewed.
                 log::info!("chain {}: sparing pid {} ({})", c.id, t.pid, why);
@@ -3557,6 +3580,12 @@ impl Daemon {
             // The alert's own mode, not the daemon's: meta.json sits beside a
             // record that says `mode: enforce` and must not say monitor.
             mode: &f.mode,
+            // The DISPLAY answer, deliberately, and the opposite direction to
+            // the enforcement one: here "maybe a container" must mean "do not
+            // follow that path", because following it copies a host file into
+            // an incident directory. Being wrong costs a missing artefact;
+            // being wrong the other way costs an arbitrary read.
+            in_container: self.containerised(&f.proc, &f.ancestry),
             pid: f.proc.pid,
             exe: &f.proc.exe,
             args: &f.proc.args,
