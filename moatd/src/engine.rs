@@ -179,7 +179,13 @@ pub struct Daemon {
     /// package file -- and an in-memory set turned that into a `high` alert on
     /// every restart, for ever. Once per change is the claim; once per boot is
     /// just noise wearing its clothes.
-    modified_reported: std::collections::BTreeSet<String>,
+    ///
+    /// Capped and insertion-ordered rather than a set, because it is written
+    /// into `state.json` and every distinct modification adds an entry that
+    /// never leaves. At the cap the OLDEST is forgotten, so a long-ago
+    /// modification can be reported a second time -- which is the right way
+    /// round: this bound may cost a duplicate alert, never a missing one.
+    modified_reported: std::collections::VecDeque<String>,
     /// Package directories still to be checked by the running sweep, and when
     /// the last one finished. `None` means no sweep is in progress.
     sweep: Option<Vec<PathBuf>>,
@@ -3992,7 +3998,7 @@ impl Daemon {
         // `classify_actor` made, so the alert names the file that was checked.
         let path = actor.script.clone().unwrap_or_else(|| proc.exe.clone());
         let key = format!("{}\0{}", path, why);
-        if !self.modified_reported.insert(key) {
+        if !self.remember_modified(key) {
             return;
         }
         // Written now rather than at the next periodic save: a crash between
@@ -4639,11 +4645,27 @@ impl Daemon {
         }
     }
 
+    /// Record a (path, reason) as reported. `false` when it already was.
+    ///
+    /// The cap is here rather than at the two call sites so they cannot
+    /// disagree about it.
+    fn remember_modified(&mut self, key: String) -> bool {
+        const MAX: usize = 512;
+        if self.modified_reported.contains(&key) {
+            return false;
+        }
+        self.modified_reported.push_back(key);
+        while self.modified_reported.len() > MAX {
+            self.modified_reported.pop_front();
+        }
+        true
+    }
+
     /// The sweep's half of the once-per-(path, reason) guard, so a file found
     /// by the sweep and then by an alert is one finding rather than two.
     fn report_swept(&mut self, path: &str, package: &str, why: &str) {
         let key = format!("{}\0{}", path, why);
-        if !self.modified_reported.insert(key) {
+        if !self.remember_modified(key) {
             return;
         }
         self.write_state();
@@ -8067,6 +8089,45 @@ esac
             "named by its package: {:?}",
             hits[0].explain.evidence
         );
+    }
+
+    /// The memory of what has been reported is bounded, and forgets the
+    /// OLDEST first.
+    ///
+    /// It is written into `state.json`, so without a cap a file edited over
+    /// and over grows that file for ever. The direction of the bound matters:
+    /// forgetting an old entry can cost a duplicate alert about something that
+    /// changed long ago, and can never cost a missing one about something that
+    /// changed just now.
+    #[test]
+    fn the_reported_memory_is_capped_and_forgets_the_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+
+        let first = "/usr/bin/first\0changed".to_string();
+        assert!(d.remember_modified(first.clone()), "new");
+        assert!(!d.remember_modified(first.clone()), "and only once");
+
+        // Fill past the cap. The first entry must be the one pushed out.
+        for i in 0..600 {
+            d.remember_modified(format!("/usr/bin/f{i}\0changed"));
+        }
+        assert!(
+            d.modified_reported.len() <= 512,
+            "bounded, not {}",
+            d.modified_reported.len()
+        );
+        assert!(
+            !d.modified_reported.contains(&first),
+            "the oldest is what leaves"
+        );
+        // The most recent survives: forgetting must not reach the new end.
+        assert!(d
+            .modified_reported
+            .contains(&"/usr/bin/f599\0changed".to_string()));
+        // And a forgotten entry is reportable again -- a duplicate alert, not
+        // a silence.
+        assert!(d.remember_modified(first), "reportable again once forgotten");
     }
 
     /// `sweep_secs = 0` means off, not "due every tick".
