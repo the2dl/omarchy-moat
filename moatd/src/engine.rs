@@ -4545,10 +4545,17 @@ impl Daemon {
     /// asking without being prompted.
     ///
     /// Incremental on purpose. Hashing every package-owned executable on this
-    /// machine is 8,615 files and 6.8 GiB: 4.6 seconds in one go, which is 4.6
-    /// seconds this single-threaded loop is not reading the sensor's log, and
-    /// dropped exec events are the one thing moat cannot recover. So it does
-    /// ONE package per tick and carries the rest to the next.
+    /// machine is 8,761 files and 6.8 GiB: about 5 seconds in one go, which is
+    /// 5 seconds this single-threaded loop is not reading the sensor's log,
+    /// and dropped exec events are the one thing moat cannot recover. So it
+    /// does ONE package per tick and carries the rest to the next.
+    ///
+    /// The number that matters is not the total but the WORST package, because
+    /// that is one tick's stall. Measured across all 1,124 packages installed
+    /// here: 0.191 s (libreoffice-fresh, 275 executables), against a `tick`
+    /// that runs every `state_interval_secs` -- 5 by default. The whole sweep
+    /// then takes about 1.6 hours of wall clock and no tick pays for more than
+    /// one package.
     ///
     /// Executables only. Config files are package-owned too and are MEANT to
     /// be edited -- that is what pacman's backup array and `.pacnew` exist for
