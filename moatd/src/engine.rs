@@ -243,6 +243,10 @@ pub struct Daemon {
     /// the last one finished. `None` means no sweep is in progress.
     sweep: Option<Vec<PathBuf>>,
     last_sweep: u64,
+    /// The last package directory the sweep finished, so an interrupted pass
+    /// resumes instead of restarting. Empty when no pass is in flight.
+    /// Persisted: the whole point is that it survives the restart.
+    sweep_cursor: String,
     /// Template stems that failed to render, from the last `render-policies`.
     pub policies_failed: Vec<String>,
     pub started: u64,
@@ -498,6 +502,12 @@ impl Daemon {
                 .and_then(|s| s.get("last_sweep"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
+            sweep_cursor: state
+                .as_ref()
+                .and_then(|s| s.get("sweep_cursor"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             modified_reported: state
                 .as_ref()
                 .and_then(|s| s.get("modified_reported"))
@@ -4648,6 +4658,21 @@ impl Daemon {
     /// be edited -- that is what pacman's backup array and `.pacnew` exist for
     /// -- so sweeping them would report the administrator's own work as
     /// tampering, every day, for ever.
+    ///
+    /// "Executable" was used as a proxy for "not a config file" and it is not
+    /// one: six backup-marked files on this machine are executable, among them
+    /// /etc/cron.hourly/snapper and sddm's Xsetup and Xstop, all of which exist
+    /// to be customised. The backup array is read directly now, because the
+    /// proxy fails on exactly the files people edit most.
+    ///
+    /// The sweep also RESUMES. Its queue used to live only in memory while
+    /// `last_sweep` advanced only on completion, so a daemon restarting more
+    /// often than a full pass takes -- ~1.6 hours here -- began again from the
+    /// same end of the same list every time. That is not merely wasted work:
+    /// the tail of the package set was never reached at all, and a permanent
+    /// blind spot is the one outcome a sweep must not have. The cursor is one
+    /// package name in `state.json`, so a restart costs at most the package
+    /// that was in flight.
     fn sweep_tick(&mut self, now: u64) {
         let every = self.cfg.thresholds.sweep_secs;
         if every == 0 {
@@ -4661,25 +4686,51 @@ impl Daemon {
             // that describe them, so the moment after one is the cheapest time
             // to be sure: everything legitimate matches again by construction.
             let due = self.last_sweep == 0 || now.saturating_sub(self.last_sweep) >= every;
-            if !due {
+            // A pass interrupted by a restart is finished before the clock is
+            // consulted again, or the packages after the cursor are never
+            // reached on a machine that restarts often.
+            let resuming = !self.sweep_cursor.is_empty();
+            if !due && !resuming {
                 return;
             }
             let Ok(rd) = std::fs::read_dir(&self.cfg.paths.pacman_local) else {
                 // No pacman database is not a finding; it is a machine this
                 // check does not apply to.
                 self.last_sweep = now;
+                self.sweep_cursor.clear();
                 return;
             };
-            let dirs: Vec<PathBuf> = rd
+            let mut dirs: Vec<PathBuf> = rd
                 .flatten()
                 .map(|e| e.path())
                 .filter(|p| p.join("mtree").is_file())
                 .collect();
+            // Sorted so that "everything after the cursor" is a meaningful
+            // statement at all -- readdir order is not stable across restarts.
+            dirs.sort();
+            let total = dirs.len();
+            if resuming {
+                let cursor = self.sweep_cursor.clone();
+                dirs.retain(|p| {
+                    p.file_name().map(|n| n.to_string_lossy().into_owned()) > Some(cursor.clone())
+                });
+                log::info!(
+                    "integrity sweep: resuming after {}, {} of {} packages left",
+                    cursor,
+                    dirs.len(),
+                    total
+                );
+            } else {
+                log::info!("integrity sweep: {} packages to check", total);
+            }
             if dirs.is_empty() {
                 self.last_sweep = now;
+                self.sweep_cursor.clear();
                 return;
             }
-            log::info!("integrity sweep: {} packages to check", dirs.len());
+            // `pop` takes from the end, so reverse to walk in sorted order and
+            // keep the cursor monotonic.
+            dirs.reverse();
             self.sweep = Some(dirs);
         }
 
@@ -4689,10 +4740,17 @@ impl Daemon {
         let Some(dir) = dirs.pop() else {
             self.sweep = None;
             self.last_sweep = now;
+            self.sweep_cursor.clear();
             log::info!("integrity sweep: finished");
             self.write_state();
             return;
         };
+        // Recorded before the work, not after: a package that makes the sweep
+        // crash must not be retried on every restart for ever.
+        self.sweep_cursor = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
 
         let label = self
             .provenance
@@ -4700,7 +4758,16 @@ impl Daemon {
             .label_of_dir(&dir)
             .unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into());
 
+        // Read once per package, not once per file.
+        let backup = crate::provenance::backup_paths(&dir);
+
         for (path, want) in crate::mtree::entries(&dir) {
+            // Pacman's backup array: files shipped by the package and expected
+            // to be edited. Their recorded digest is the shipped one, so it
+            // stops matching the moment anyone does what the file is for.
+            if backup.contains(&path) {
+                continue;
+            }
             let Ok(meta) = std::fs::symlink_metadata(&path) else {
                 continue;
             };
@@ -5345,6 +5412,7 @@ impl Daemon {
             // comment: without this a distribution's own post-install edit is
             // a high alert on every boot.
             o.insert("last_sweep".into(), Value::from(self.last_sweep));
+            o.insert("sweep_cursor".into(), Value::from(self.sweep_cursor.clone()));
             o.insert(
                 "modified_reported".into(),
                 Value::from(
@@ -8239,6 +8307,159 @@ esac
         // And a forgotten entry is reportable again -- a duplicate alert, not
         // a silence.
         assert!(d.remember_modified(first), "reportable again once forgotten");
+    }
+
+    /// An EXECUTABLE file in pacman's backup array is the administrator's to
+    /// edit, and the sweep must not call that tampering.
+    ///
+    /// "Executables only" was the proxy for "not a config file". It is not one:
+    /// /etc/cron.hourly/snapper and sddm's Xsetup are both executable, both
+    /// backup-marked, and both exist to be customised. Reported every pass, for
+    /// ever, they are the kind of false positive that gets a whole check
+    /// switched off.
+    #[test]
+    fn an_executable_config_file_in_the_backup_array_is_not_tampering() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pacman-local");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+
+        // Executable, package-owned, and in the backup array.
+        let hook = bin.join("snapper-hook");
+        std::fs::write(&hook, b"#!/bin/sh\nas shipped\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hook_s = hook.to_string_lossy().to_string();
+
+        // Executable, package-owned, NOT in the backup array: the control. If
+        // this stops reporting, the exclusion is too wide and the sweep is off.
+        let real = bin.join("snapper");
+        std::fs::write(&real, b"#!/bin/sh\nas shipped\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let real_s = real.to_string_lossy().to_string();
+
+        std::fs::create_dir_all(&db).unwrap();
+        crate::provenance::testkit::fake_local(
+            &db,
+            &[("snapper", "0.13.1-3", "pgp", &[&hook_s, &real_s])],
+        );
+        crate::provenance::testkit::fake_mtree(&db, "snapper-0.13.1-3", &[&hook_s, &real_s]);
+        crate::provenance::testkit::fake_backup(&db, "snapper-0.13.1-3", &[&hook_s]);
+
+        let (_, mut cfg) = dev_daemon(dir.path());
+        cfg.paths.pacman_local = db.clone();
+        let mut d = Daemon::new(cfg, &dir.path().join("moat.toml")).unwrap();
+        d.homes = vec!["/home/dan".into()];
+
+        // The administrator edits their hook, and someone trojans the binary.
+        std::fs::write(&hook, b"#!/bin/sh\nmy own customisation\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&real, b"#!/bin/sh\nsnapper | attacker\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        for i in 0..40 {
+            d.tick(1_000 + i, false);
+        }
+        let paths: Vec<String> = d
+            .store
+            .load()
+            .into_iter()
+            .filter(|a| a.rule == crate::rules::BINARY_MODIFIED)
+            .filter_map(|a| a.file.map(|f| f.path))
+            .collect();
+        assert!(
+            paths.iter().any(|p| p == &real_s),
+            "the trojaned binary must still be found: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p == &hook_s),
+            "but not the backup-marked hook, which is the administrator's to \
+             edit: {paths:?}"
+        );
+    }
+
+    /// A sweep interrupted by a restart resumes where it stopped.
+    ///
+    /// The queue lived only in memory while `last_sweep` advanced only on
+    /// completion, so a daemon restarting more often than a full pass takes
+    /// (~1.6 h here) began again at the same end of the same sorted list every
+    /// time. The packages after the cursor were never reached at all -- a
+    /// permanent blind spot, which is the one thing a sweep must not have.
+    #[test]
+    fn an_interrupted_sweep_resumes_instead_of_starting_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pacman-local");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&db).unwrap();
+
+        // Enough packages that a few ticks cannot finish the pass. Named so
+        // that sorted order is predictable and the LAST one is unambiguous.
+        let mut names = Vec::new();
+        for i in 0..12 {
+            let name = format!("pkg{:02}", i);
+            let f = bin.join(&name);
+            std::fs::write(&f, b"#!/bin/sh\nas shipped\n").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let fs_ = f.to_string_lossy().to_string();
+            crate::provenance::testkit::fake_local(&db, &[(&name, "1-1", "pgp", &[&fs_])]);
+            crate::provenance::testkit::fake_mtree(&db, &format!("{}-1-1", name), &[&fs_]);
+            names.push((name, fs_));
+        }
+
+        // The tampered file is in the LAST package by sort order, so it is
+        // reachable only if the sweep actually gets there.
+        let (last_name, last_path) = names.last().unwrap().clone();
+        std::fs::write(&last_path, b"#!/bin/sh\nthe trojan\n").unwrap();
+        std::fs::set_permissions(&last_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (_, cfg) = dev_daemon(dir.path());
+        let mut cfg = cfg;
+        cfg.paths.pacman_local = db.clone();
+        let toml = dir.path().join("moat.toml");
+
+        // Three ticks, then "restart": a fresh Daemon reading the same state.
+        let mut d = Daemon::new(cfg.clone(), &toml).unwrap();
+        d.homes = vec!["/home/dan".into()];
+        for i in 0..3 {
+            d.tick(1_000 + i, false);
+        }
+        let cursor = d.sweep_cursor.clone();
+        assert!(!cursor.is_empty(), "a pass is in flight");
+        assert_eq!(d.sweep.as_ref().map(|v| v.len()), Some(9), "3 of 12 done");
+        assert!(
+            !cursor.starts_with(&format!("{}-", last_name)),
+            "and it has NOT reached the last package yet, or this proves nothing"
+        );
+        d.write_state();
+        drop(d);
+
+        let mut d2 = Daemon::new(cfg, &toml).unwrap();
+        d2.homes = vec!["/home/dan".into()];
+        assert_eq!(d2.sweep_cursor, cursor, "the cursor survived the restart");
+
+        // More than the 9 packages left, and FEWER than the whole list of 12.
+        // A resumed pass finishes with room to spare; a pass that restarted at
+        // the beginning reaches pkg10 and never the tampered pkg11. Giving it
+        // more ticks than the list is long would let the broken behaviour pass
+        // too, which is how a test comes to prove nothing -- this one was
+        // written with 60 ticks first and did exactly that.
+        for i in 0..11 {
+            d2.tick(1_010 + i, false);
+        }
+        let paths: Vec<String> = d2
+            .store
+            .load()
+            .into_iter()
+            .filter(|a| a.rule == crate::rules::BINARY_MODIFIED)
+            .filter_map(|a| a.file.map(|f| f.path))
+            .collect();
+        assert!(
+            paths.iter().any(|p| p == &last_path),
+            "the sweep must reach the packages after the cursor: {paths:?}"
+        );
+        assert!(d2.sweep_cursor.is_empty(), "and the finished pass clears it");
     }
 
     /// `sweep_secs = 0` means off, not "due every tick".

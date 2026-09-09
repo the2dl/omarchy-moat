@@ -464,6 +464,41 @@ fn parse_files(text: &str) -> Vec<String> {
     out
 }
 
+/// The `%BACKUP%` section of a package's `files`, as absolute paths.
+///
+/// These are the files pacman expects the administrator to edit; each line is
+/// `path\tmd5`, and the md5 is the *shipped* one, which is precisely why it
+/// stops matching the moment anyone does what the file is there for. The
+/// integrity sweep has to skip them or it reports that editing as tampering,
+/// on every pass, for ever.
+pub fn backup_paths(pkg_dir: &Path) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(pkg_dir.join("files"))
+        .map(|t| parse_backup(&t))
+        .unwrap_or_default()
+}
+
+fn parse_backup(text: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let t = line.trim_end();
+        if t.starts_with('%') && t.ends_with('%') {
+            inside = t == "%BACKUP%";
+            continue;
+        }
+        if t.is_empty() || !inside {
+            continue;
+        }
+        // `path\tmd5`; the digest is not useful here, only the path.
+        let rel = t.split('\t').next().unwrap_or(t);
+        if rel.is_empty() {
+            continue;
+        }
+        out.insert(format!("/{}", rel));
+    }
+    out
+}
+
 /// Classifies exe paths, with a per-path cache keyed by inode and mtime.
 pub struct Classifier {
     local_dir: PathBuf,
@@ -725,6 +760,19 @@ pub(crate) mod testkit {
             }
             std::fs::write(d.join("files"), body).unwrap();
         }
+    }
+
+    /// Append a `%BACKUP%` section to a package already written by
+    /// [`fake_local`], marking paths as pacman backup files.
+    pub fn fake_backup(dir: &Path, pkg_dir: &str, paths: &[&str]) {
+        let f = dir.join(pkg_dir).join("files");
+        let mut body = std::fs::read_to_string(&f).unwrap_or_default();
+        body.push_str("\n%BACKUP%\n");
+        for p in paths {
+            // Real shape: `path\tmd5`, relative, no leading slash.
+            body.push_str(&format!("{}\t0123456789abcdef\n", p.trim_start_matches('/')));
+        }
+        std::fs::write(&f, body).unwrap();
     }
 
     /// Write a package's gzipped `mtree` recording the CURRENT bytes of each
@@ -1144,5 +1192,59 @@ mod integrity_tests {
             Some(want.sha256.as_str()),
             "this machine's /usr/bin/base32 is modified; the rest of this test cannot run"
         );
+    }
+}
+
+#[cfg(test)]
+mod backup_tests {
+    use super::parse_backup;
+
+    #[test]
+    fn the_backup_section_is_read_and_the_files_section_is_not() {
+        let files = "%FILES%\nusr/\nusr/bin/cat\netc/skel/.bashrc\n\n\
+                     %BACKUP%\netc/bash.bashrc\t3f31a9e9\netc/skel/.bashrc\t798c923f\n";
+        let b = parse_backup(files);
+        assert!(b.contains("/etc/bash.bashrc"));
+        assert!(b.contains("/etc/skel/.bashrc"));
+        assert!(
+            !b.contains("/usr/bin/cat"),
+            "%FILES% entries are not backups; treating them as such would \
+             switch the sweep off entirely"
+        );
+        assert_eq!(b.len(), 2);
+    }
+
+    #[test]
+    fn a_package_with_no_backup_section_yields_nothing() {
+        assert!(parse_backup("%FILES%\nusr/bin/cat\n").is_empty());
+        assert!(parse_backup("").is_empty());
+    }
+
+    /// The real database, when it is there: the point of the change is that
+    /// some backup-marked files are executable, so the sweep's "executables
+    /// only" filter does not already exclude them.
+    #[test]
+    fn the_real_database_has_executable_backup_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let local = std::path::Path::new("/var/lib/pacman/local");
+        if !local.is_dir() {
+            return;
+        }
+        let mut execs = 0;
+        let Ok(rd) = std::fs::read_dir(local) else {
+            return;
+        };
+        for e in rd.flatten() {
+            for p in super::backup_paths(&e.path()) {
+                if let Ok(m) = std::fs::metadata(&p) {
+                    if m.is_file() && m.permissions().mode() & 0o111 != 0 {
+                        execs += 1;
+                    }
+                }
+            }
+        }
+        // Not asserted as non-zero: a minimal container legitimately has none.
+        // This documents the measurement that motivated reading the array.
+        println!("executable backup-marked files on this machine: {}", execs);
     }
 }
