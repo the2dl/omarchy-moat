@@ -1390,6 +1390,10 @@ impl Daemon {
         const MAX_TARGETS: usize = 8;
         let mut named: Vec<String> = Vec::new();
         let mut doomed: Vec<crate::util::PidFd> = Vec::new();
+        // Live processes this kill could not reach. Kept separate from
+        // `named` because "we decided to spare it" and "we could not touch it"
+        // are different outcomes, and only one of them is a fault.
+        let mut unpinned: Vec<String> = Vec::new();
         for t in targets.iter().take(MAX_TARGETS) {
             // This target's OWN uid and identity, not the chain's.
             //
@@ -1426,13 +1430,32 @@ impl Daemon {
             // recycled underneath it. A handle opened here refers to this
             // process for as long as it is held, and to nothing at all once it
             // dies.
-            let Some(handle) = crate::util::PidFd::open(t.pid) else {
-                log::info!(
-                    "chain {}: sparing pid {} (it exited before it could be pinned)",
-                    c.id,
-                    t.pid
-                );
-                continue;
+            let handle = match crate::util::PidFd::try_open(t.pid) {
+                Ok(h) => h,
+                Err(crate::util::PinFailure::Gone) => {
+                    log::info!(
+                        "chain {}: sparing pid {} (it exited before it could be pinned)",
+                        c.id,
+                        t.pid
+                    );
+                    continue;
+                }
+                // Not "spared": still running, still unsignalled. This used to
+                // share the branch above and so reported a live process as one
+                // that had exited -- on a pre-5.3 kernel that made enforce mode
+                // a silent no-op, and under descriptor exhaustion it hid
+                // exactly the wide process tree a kill most needs to cover.
+                Err(why) => {
+                    log::error!(
+                        "chain {}: pid {} ({}) WAS NOT KILLED: {}",
+                        c.id,
+                        t.pid,
+                        t.exe,
+                        why
+                    );
+                    unpinned.push(format!("{} ({}): {}", t.pid, t.exe, why));
+                    continue;
+                }
             };
             if let Err(why) =
                 crate::control::verify_pid(t.pid, &step_alert.process.start_ts, &t.exe)
@@ -1450,6 +1473,23 @@ impl Daemon {
             doomed.push(handle);
         }
         if doomed.is_empty() {
+            if !unpinned.is_empty() {
+                log::error!(
+                    "chain {}: nothing could be killed; {} live process(es) could not be \
+                     pinned: {}",
+                    c.id,
+                    unpinned.len(),
+                    unpinned.join(", ")
+                );
+                self.record_decision(
+                    &c.id,
+                    &c.severity,
+                    &families,
+                    "kill_failed",
+                    "gate passed, but no implicated process could be pinned",
+                    &unpinned,
+                );
+            }
             return;
         }
         self.killed_chains.insert(c.id.clone());
@@ -1480,11 +1520,27 @@ impl Daemon {
         }
         let mut killed = 0usize;
         for h in &doomed {
-            if h.kill().is_ok() {
-                killed += 1;
+            match h.kill() {
+                Ok(()) => killed += 1,
+                // A pinned process that would not die is the one case where
+                // moat believed it had acted and had not. ESRCH here is benign
+                // (it died between the SIGSTOP and the SIGKILL); anything else
+                // means it is still running.
+                Err(e) => {
+                    log::error!("chain {}: pid {} survived SIGKILL: {}", c.id, h.pid, e);
+                    unpinned.push(format!("{}: {}", h.pid, e));
+                }
             }
         }
         log::warn!("killed {} process(es) for chain {}: {}", killed, c.id, named.join(", "));
+        if !unpinned.is_empty() {
+            log::error!(
+                "chain {}: {} implicated process(es) were NOT killed: {}",
+                c.id,
+                unpinned.len(),
+                unpinned.join(", ")
+            );
+        }
         self.record_decision(&c.id, &c.severity, &families, "killed", "gate passed", &named);
         self.raise_protection_change(
             &format!("end {} process(es) implicated in one sequence", killed),

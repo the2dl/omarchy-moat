@@ -1133,9 +1133,20 @@ fn cmd_kill(d: &mut Daemon, id: &str) -> Value {
     // Pin the process BEFORE verifying it, so the thing verified and the thing
     // signalled are the same process and not merely the same number. Opening
     // afterwards would leave the window this is here to close.
-    let handle = util::PidFd::open(pid);
+    let handle = util::PidFd::try_open(pid);
     if let Err(e) = verify_pid(pid, &alert.process.start_ts, &alert.process.exe) {
         return err(e);
+    }
+    // A kernel with no pidfd cannot pin anything, so every kill below would
+    // fail identically and the report would blame each pid in turn. Say the
+    // real reason once, at the top.
+    if matches!(handle, Err(util::PinFailure::Unsupported)) {
+        return err(format!(
+            "cannot kill pid {}: {}. Killing by pid number instead would risk \
+             signalling an unrelated process that reused the number.",
+            pid,
+            util::PinFailure::Unsupported
+        ));
     }
 
     // Children first, so a supervisor cannot respawn while we work upwards.
@@ -1157,22 +1168,25 @@ fn cmd_kill(d: &mut Daemon, id: &str) -> Value {
     const BATCH: usize = 64;
     let descendants = util::proc_descendants(pid);
     for chunk in descendants.chunks(BATCH) {
-        let handles: Vec<(u32, Option<util::PidFd>)> = chunk
+        let handles: Vec<(u32, Result<util::PidFd, util::PinFailure>)> = chunk
             .iter()
-            .map(|p| (*p, util::PidFd::open(*p)))
+            .map(|p| (*p, util::PidFd::try_open(*p)))
             .collect();
         for (p, h) in &handles {
             match h {
-                Some(h) => match h.kill() {
+                Ok(h) => match h.kill() {
                     Ok(()) => killed.push(*p),
                     Err(e) => failed.push(json!({"pid": p, "errno": e})),
                 },
-                // Gone before it could be pinned, or no descriptor to pin it
-                // with. Either way it was not signalled, and saying so is the
-                // difference between this and the silent version.
-                None => failed.push(json!({
+                // It was not signalled either way, but WHY decides whether that
+                // matters: a process that had already exited needs nothing,
+                // while one we ran out of descriptors for is still running.
+                // Reporting both as "could not be pinned" made a partial kill
+                // of a wide tree look like a clean one.
+                Err(why) => failed.push(json!({
                     "pid": p,
-                    "errno": "could not be pinned (already gone, or no descriptor available)"
+                    "errno": why.to_string(),
+                    "still_running": *why != util::PinFailure::Gone,
                 })),
             }
         }
@@ -1180,11 +1194,15 @@ fn cmd_kill(d: &mut Daemon, id: &str) -> Value {
     // The verified target last, and through the handle opened before the
     // verification -- one descriptor, held across all of the above.
     match handle {
-        Some(h) => match h.kill() {
+        Ok(h) => match h.kill() {
             Ok(()) => killed.push(pid),
             Err(e) => failed.push(json!({"pid": pid, "errno": e})),
         },
-        None => failed.push(json!({"pid": pid, "errno": "could not be pinned"})),
+        Err(why) => failed.push(json!({
+            "pid": pid,
+            "errno": why.to_string(),
+            "still_running": why != util::PinFailure::Gone,
+        })),
     }
     if killed.is_empty() {
         return err(format!(

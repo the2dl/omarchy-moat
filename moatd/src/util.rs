@@ -121,20 +121,72 @@ pub struct PidFd {
     pub pid: u32,
 }
 
+/// Why a pid could not be pinned. The distinction is not academic: `Gone` means
+/// there is nothing to kill and sparing it is correct, while `Unsupported` and
+/// `Exhausted` mean a live process was NOT signalled. Collapsing all three into
+/// `None` is how "enforce mode killed nothing" came to be logged as "it exited
+/// before it could be pinned" -- a sentence that is false in exactly the cases
+/// where something went wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinFailure {
+    /// ESRCH: the process is already gone.
+    Gone,
+    /// ENOSYS: kernel older than 5.3. No pidfd at all, for any process.
+    Unsupported,
+    /// EMFILE/ENFILE: out of descriptors. Transient, and likeliest on exactly
+    /// the wide process tree that a kill most needs to cover.
+    Exhausted,
+    Other(i32),
+}
+
+impl std::fmt::Display for PinFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PinFailure::Gone => write!(f, "it exited before it could be pinned"),
+            PinFailure::Unsupported => write!(
+                f,
+                "this kernel has no pidfd_open (pre-5.3), so no process can be pinned"
+            ),
+            PinFailure::Exhausted => write!(
+                f,
+                "out of file descriptors, so it could not be pinned (raise LimitNOFILE)"
+            ),
+            PinFailure::Other(e) => write!(
+                f,
+                "pidfd_open failed: {}",
+                std::io::Error::from_raw_os_error(*e)
+            ),
+        }
+    }
+}
+
 impl PidFd {
-    /// `None` when the process is already gone, or when the kernel has no
-    /// `pidfd_open` (pre-5.3) -- callers fall back to signalling by number,
-    /// which is what moat did everywhere before this existed.
-    pub fn open(pid: u32) -> Option<PidFd> {
+    /// `Err` carries *why*, because the caller's correct response differs:
+    /// a process that is `Gone` needs nothing, and one that could not be pinned
+    /// for any other reason is still running and still unsignalled.
+    pub fn try_open(pid: u32) -> Result<PidFd, PinFailure> {
         // SAFETY: a syscall with scalar arguments; no pointers are passed.
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
         if fd < 0 {
-            return None;
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            return Err(match e {
+                libc::ESRCH => PinFailure::Gone,
+                libc::ENOSYS => PinFailure::Unsupported,
+                libc::EMFILE | libc::ENFILE => PinFailure::Exhausted,
+                other => PinFailure::Other(other),
+            });
         }
-        Some(PidFd {
+        Ok(PidFd {
             fd: fd as libc::c_int,
             pid,
         })
+    }
+
+    /// `None` when the pid could not be pinned, for any reason. Prefer
+    /// [`PidFd::try_open`] anywhere the reason changes what should happen --
+    /// which is everywhere that goes on to kill something.
+    pub fn open(pid: u32) -> Option<PidFd> {
+        PidFd::try_open(pid).ok()
     }
 
     /// SIGKILL the pinned process. `Err` carries the errno text; ESRCH here
@@ -1125,6 +1177,15 @@ mod pidfd_tests {
                 held.len()
             );
             assert!(PidFd::open(me).is_none(), "exhausted, and it says so");
+            // And it must say WHICH failure. Reported as `Gone`, this would
+            // read as "the process exited" about a process that is running --
+            // which is precisely how a partial kill of a wide tree came to be
+            // logged as a clean one.
+            assert_eq!(
+                PidFd::try_open(me).err(),
+                Some(PinFailure::Exhausted),
+                "descriptor exhaustion must not be reported as a dead process"
+            );
             drop(held);
             assert!(
                 PidFd::open(me).is_some(),
@@ -1169,8 +1230,57 @@ mod pidfd_tests {
     /// the caller should mistake for "pinned nothing".
     #[test]
     fn an_absent_pid_cannot_be_pinned() {
-        // Well past /proc/sys/kernel/pid_max on any machine.
-        assert!(PidFd::open(u32::MAX - 1).is_none());
+        // Well past /proc/sys/kernel/pid_max on any machine. The kernel calls
+        // this EINVAL, not ESRCH -- the number is not a pid at all rather than
+        // a pid with nothing behind it -- so it stays `Other` and, crucially,
+        // does not claim a process exited.
+        let why = PidFd::try_open(u32::MAX - 1).err().expect("cannot be pinned");
+        assert!(matches!(why, PinFailure::Other(_)), "got {:?}", why);
+        assert!(!why.to_string().contains("exited"));
+    }
+
+    /// The `Gone` case, against a process that really did exit: this is the one
+    /// failure where sparing the pid is the correct answer, so it has to be
+    /// distinguishable from the ones where it is not.
+    #[test]
+    fn a_reaped_child_reports_gone() {
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let pid = child.id();
+        child.wait().expect("reap");
+        // Reaped, so the pid is free and holds no zombie. A pid this fresh
+        // being recycled inside these few microseconds would be a surprise;
+        // if it ever is, the open succeeds and this asserts nothing false.
+        if let Err(why) = PidFd::try_open(pid) {
+            assert_eq!(why, PinFailure::Gone, "a reaped child is Gone, not {:?}", why);
+            assert!(why.to_string().contains("exited"));
+        }
+    }
+
+    /// Every reason a pin can fail must describe itself, because these strings
+    /// are what a person reads when a kill did not happen. Only `Gone` may
+    /// claim the process exited.
+    #[test]
+    fn each_pin_failure_says_what_actually_happened() {
+        assert!(PinFailure::Gone.to_string().contains("exited"));
+
+        for f in [
+            PinFailure::Unsupported,
+            PinFailure::Exhausted,
+            PinFailure::Other(libc::EPERM),
+        ] {
+            let s = f.to_string();
+            assert!(
+                !s.contains("exited"),
+                "{:?} renders as {:?}, which claims a live process is dead",
+                f,
+                s
+            );
+            assert!(!s.is_empty());
+        }
+        assert!(PinFailure::Unsupported.to_string().contains("5.3"));
+        assert!(PinFailure::Exhausted.to_string().contains("LimitNOFILE"));
     }
 }
 
