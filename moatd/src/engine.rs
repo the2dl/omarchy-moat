@@ -947,7 +947,36 @@ impl Daemon {
             f.dedup();
             f
         };
-        let verdict = crate::contain::worth_killing_for(&c.severity, &facts);
+        let mut verdict = crate::contain::worth_killing_for(&c.severity, &facts);
+        // Enforcement stops at the namespace boundary, for chains too.
+        //
+        // `maybe_enforce` refuses a single-event kill into a container; this is
+        // the same refusal for the chain path, which owns containment, tree
+        // kills and quarantine. Without it the advertised contract ("moat never
+        // blocks anything inside a container") held for the kernel policies and
+        // for userland single events, and quietly did not hold for the one path
+        // that acts on a whole process tree -- the most damaging of the three.
+        //
+        // Recorded as a refusal, not a silent skip: `record_decision` writes
+        // every spared verdict to decisions.jsonl, and a week of refusals that
+        // are all correct is the argument for ever trusting the action.
+        if verdict.is_ok() {
+            if let Some(a) = c
+                .steps
+                .iter()
+                .filter(|s| s.is_trigger())
+                .find_map(|s| self.find_alert(&s.alert))
+            {
+                if let Some(p) = self.table.get(&a.exec_id) {
+                    let anc: Vec<ProcInfo> =
+                        self.table.ancestry(&a.exec_id).into_iter().cloned().collect();
+                    if self.containerised(p, &anc) {
+                        verdict = Err("this ran in a container, and moat does not enforce                                        across a namespace boundary"
+                            .to_string());
+                    }
+                }
+            }
+        }
         ChainGate {
             facts,
             families,
@@ -2715,7 +2744,7 @@ impl Daemon {
         // the fallback costs.
         let chain: Vec<String> = f.ancestry.iter().map(|a| a.exe.clone()).collect();
         let runtime_in_chain = crate::util::ancestry_looks_containerised(&chain);
-        let containerised = f.proc.in_container.unwrap_or(runtime_in_chain);
+        let containerised = self.containerised(&f.proc, &f.ancestry);
 
         // The package-install exemption is narrower than it first looked.
         //
@@ -3914,8 +3943,42 @@ impl Daemon {
     /// Returns whether the process was actually killed; the outcome is recorded
     /// as evidence either way, because "we tried and it was already gone" and
     /// "we killed it" are different facts.
+    /// Did this run in a container? The sensor when it answers, the ancestry
+    /// when it does not -- see `util::ancestry_looks_containerised` for why
+    /// both are needed and what the fallback costs.
+    ///
+    /// One place, because the answer now governs three different things (the
+    /// badge, userspace kills, containment) and three copies would drift.
+    pub fn containerised(&self, proc: &ProcInfo, ancestry: &[ProcInfo]) -> bool {
+        proc.in_container.unwrap_or_else(|| {
+            let chain: Vec<String> = ancestry.iter().map(|a| a.exe.clone()).collect();
+            crate::util::ancestry_looks_containerised(&chain)
+        })
+    }
+
     fn maybe_enforce(&self, f: &mut Finding) -> bool {
         if !f.request_kill {
+            return false;
+        }
+        // Enforcement stops at the namespace boundary, in userspace too.
+        //
+        // The kernel half of this has been true since the policy split
+        // (`render::split_container_enforcement`): a deny or a kill selector is
+        // scoped to the host mount namespace. The USERSPACE half was never
+        // written, so a userland rule armed with `set mode enforce --rule X`
+        // could SIGKILL a process inside a container -- while the Settings
+        // screen said, in as many words, "Moat never blocks anything inside a
+        // container either way". A promise the code does not keep is worse than
+        // a promise not made.
+        //
+        // A container is somebody else's process tree. Killing into it takes
+        // down a build step or a service replica with an errno its owner cannot
+        // trace back to this machine's security tool.
+        if self.containerised(&f.proc, &f.ancestry) {
+            f.extra_evidence.push(
+                "enforce mode: NOT killed — this ran in a container, and moat does not                  enforce across a namespace boundary"
+                    .into(),
+            );
             return false;
         }
         // `mode_for`, not `self.mode`. The rule asked because IT is armed --
@@ -7064,6 +7127,31 @@ esac
                 || !a.severity_reason.contains("never downgraded"),
             "the reason may not both escalate and demote: {}",
             a.severity_reason
+        );
+    }
+
+    /// The advertised contract, in userspace: "Moat never blocks anything
+    /// inside a container either way" is what the Settings screen says. The
+    /// kernel half has been true since the policy split; the userspace half
+    /// was never written, so a userland rule armed with `set mode enforce
+    /// --rule X` could SIGKILL into somebody else's process tree.
+    #[test]
+    fn a_userland_kill_is_refused_across_a_namespace_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, _) = dev_daemon(dir.path());
+
+        let mut actor = no_such_proc("e-c", 4_400_100, "/usr/bin/no-such-payload");
+        actor.in_container = Some(true);
+        let parent = no_such_proc("e-runc2", 4_400_000, "/usr/bin/runc");
+        let mut f = signal_finding(&actor, &parent, "/tmp/moat-tier-test-no-such-dir/x");
+        f.request_kill = true;
+        f.ancestry = vec![parent.clone()];
+
+        assert!(!d.maybe_enforce(&mut f), "a container process must not be killed");
+        assert!(
+            f.extra_evidence.iter().any(|e| e.contains("namespace boundary")),
+            "and the refusal says why: {:?}",
+            f.extra_evidence
         );
     }
 
