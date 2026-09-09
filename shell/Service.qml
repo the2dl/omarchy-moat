@@ -313,6 +313,8 @@ Item {
     /// meaningful -- `ingestFeed` builds fresh arrays every call, so without
     /// this every poll would rebuild every row on the page.
     property string _lastFeed: ""
+    /// An action landed during the post-action cooldown; answer it when it ends.
+    property bool _refreshPending: false
 
     signal alertsUpdated()
     signal actionFinished(string command, bool ok, string message)
@@ -877,6 +879,28 @@ Item {
         return root._enqueue("baseline-relearn");
     }
 
+    /// Refresh now, or once, soon -- never once per action in a burst.
+    ///
+    /// `refresh()` re-fetches the whole feed, re-parses it and rebuilds every
+    /// row: `ingestFeed` returns fresh arrays, so the identity guards in
+    /// `_apply` cannot hold and the model is invalidated wholesale. One of those
+    /// per ack is what makes the panel stutter under the user's own hand while
+    /// they close a stack of cards -- the act of clearing the backlog is what
+    /// stalls the thing clearing it.
+    ///
+    /// Leading edge on purpose: nothing updates a card locally, so it stays on
+    /// screen until the model says otherwise, and a delayed first refresh would
+    /// read as a dead button. Panel.qml already learned that lesson once, where
+    /// a 37-member card spawned 37 processes and repainted 37 times.
+    function _requestRefresh() {
+        if (actionRefreshTimer.running) {
+            root._refreshPending = true;
+            return ;
+        }
+        root.refresh();
+        actionRefreshTimer.start();
+    }
+
     function refresh() {
         // Explicit refresh goes to the socket like everything else; the log is
         // no longer the panel's read path.
@@ -1408,6 +1432,22 @@ Item {
     }
 
     Timer {
+        // The cooldown after an action's refresh. See `_requestRefresh`.
+
+        id: actionRefreshTimer
+
+        interval: 350
+        repeat: false
+        onTriggered: {
+            if (root._refreshPending) {
+                root._refreshPending = false;
+                root.refresh();
+                actionRefreshTimer.restart();
+            }
+        }
+    }
+
+    Timer {
         // Relative-time clock for the panel and the tooltip.
         interval: 30000
         running: true
@@ -1474,7 +1514,20 @@ Item {
             // moatd appends the resulting update line, so the FileView watch will
             // fire on its own — but ask anyway so a same-millisecond write is not
             // missed, and re-poll status because mode/sandbox/feeds live there.
-            root.refresh();
+            //
+            // COALESCED, because `refresh()` is not cheap: it re-fetches the whole
+            // feed, re-parses it and rebuilds every row (`ingestFeed` returns fresh
+            // arrays, so the identity guards in `_apply` cannot hold). Closing a
+            // stack of cards is a burst of acks, and one full cycle per ack is
+            // what makes the panel stutter under the user's own hand — the thing
+            // they are doing to make it quieter is what stalls it.
+            //
+            // LEADING edge, then a cooldown. The first action refreshes at once,
+            // because nothing here updates the card locally -- it disappears when
+            // the model does, so delaying the refresh would delay the only
+            // feedback the button gives. Actions arriving during the cooldown set
+            // a flag and are answered by one refresh when it ends.
+            root._requestRefresh();
             root._pump();
         }
 
