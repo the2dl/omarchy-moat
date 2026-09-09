@@ -575,8 +575,16 @@ What it drops is base exec/exit events -- which is ancestry. That is the input
 `chain.rs` correlates on, the input `context.rs` walks for a tty, and the source
 of `process.ns`. Losing it during a build is losing exactly the evidence needed
 to tell one build from another and to connect a malicious step to the tree it
-ran in. The limit is now `20000,1s`; it exists as flood protection, not as a
-noise control, and it must never be tuned down to quieten moat.
+ran in. The limit is now `20000,1s`. That figure was a guess when it was set and is
+no longer: measured 2026-09-09 against the live config, 8,000 forks pinned to
+one cpu ran at 2,940 forks/s = **5,880 events/s on that cpu**, and moatd saw
+16,661 events against ~16,000 expected -- no loss at all, against 88% loss at
+the old limit. So a real fork storm peaks around a third of the ceiling, and
+20,000 is roughly 3.4x headroom rather than an arbitrary round number.
+
+It exists as flood protection, not as a noise control, and it must never be
+tuned down to quieten moat. If it ever needs raising again, measure the same
+way -- pinned to one cpu -- and record the number here.
 
 Export filter object = `tetragon.Filter` JSON (snake_case): `event_set`, `binary_regex`,
 `parent_binary_regex`, `ancestor_binary_regex`, `arguments_regex`, `parent_arguments_regex`,

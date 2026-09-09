@@ -1000,7 +1000,24 @@ impl Daemon {
             // `runc` above an attack would otherwise make every one of its
             // descendants look containerised at once, and `all()` is no defence
             // against a shared spoofed ancestor.
+            // Complete evidence, or no exemption.
+            //
+            // `steps` is capped at `chain::MAX_STEPS` (12) and `truncated` says
+            // so; the members past the cap are still in `c.members` but without
+            // their roles, so "every trigger" here can only ever mean "every
+            // trigger MOAT STILL HAS". A later host trigger can sit outside it.
+            // Since this grants an exemption from enforcement, partial evidence
+            // must not be enough to earn one -- the same direction as
+            // `containerised_for_enforcement` treating unknown as not exempt.
+            //
+            // `filter_map(find_alert)` drops unresolvable steps for the same
+            // reason: a step whose alert is gone is not evidence of anything, so
+            // requiring the resolvable set to be non-empty AND complete is what
+            // makes `all()` mean what it says.
+            let resolvable = c.steps.iter().filter(|s| s.is_trigger()).count();
             let all_contained = !triggers.is_empty()
+                && !c.truncated
+                && triggers.len() == resolvable
                 && triggers.iter().all(|a| a.process.in_container == Some(true));
             if all_contained {
                 verdict = Err("every step of this ran in a container, and moat does not \
@@ -1085,6 +1102,21 @@ impl Daemon {
             if a.suppressed_by.is_some() || a.action_taken != "none" {
                 continue;
             }
+            // Host-only targets, per step. A path named by a container step is
+            // that container's file, and its name here is namespace-relative:
+            // moving `/app/server` because a container step said so would move
+            // a HOST file that merely shares the name. `chain_gate` only decides
+            // whether the chain may act at all; a mixed chain reaches this loop
+            // with container steps still in it.
+            if a.process.in_container == Some(true) {
+                log::info!(
+                    "chain {}: not quarantining the file named by {} -- it ran in a container, \
+                     and that path names a file in the container's filesystem, not this one's",
+                    c.id,
+                    a.rule
+                );
+                continue;
+            }
             if a.is_building_block() && !critical {
                 log::info!(
                     "chain {}: not quarantining the file named by {} -- it is a signal rule and \
@@ -1159,6 +1191,37 @@ impl Daemon {
         let spare_ancestor = ancestor_families.len() < 2;
 
         let targets = crate::contain::tree_targets(&c.steps, c.ancestor.pid, spare_ancestor);
+        // Host-only TARGETS, not merely a host-only decision.
+        //
+        // `chain_gate` refuses when every trigger is containerised, which stops
+        // a wholly-container chain acting at all. It says nothing about a MIXED
+        // chain: one host trigger permits the chain, and `tree_targets` then
+        // hands back every trigger pid including the ones in containers. The
+        // permit and the aim are different questions and only the first was
+        // being asked -- so a build step in a container could be killed because
+        // something on the host, in the same tree, looked bad.
+        //
+        // The sensor's answer only, as everywhere an action is decided
+        // (`containerised_for_enforcement`): a forged ancestor named `runc`
+        // must not be able to make a target un-killable either.
+        let targets: Vec<crate::contain::Target> = targets
+            .into_iter()
+            .filter(|t| {
+                let in_container = self
+                    .find_alert(&t.alert)
+                    .and_then(|a| a.process.in_container)
+                    .unwrap_or(false);
+                if in_container {
+                    log::info!(
+                        "chain {}: sparing pid {} — it is in a container, and moat does not \
+                         enforce across a namespace boundary",
+                        c.id,
+                        t.pid
+                    );
+                }
+                !in_container
+            })
+            .collect();
         // A cap, so a gate that is still wrong costs one build and not a day.
         const MAX_TARGETS: usize = 8;
         let mut named: Vec<String> = Vec::new();
@@ -3878,6 +3941,33 @@ impl Daemon {
         let path = self.cfg.paths.baseline_allowlist();
         let mut revoked = 0;
         for e in self.baseline.learned_entries() {
+            // An entry whose actor's PATH is not an identity for the code it
+            // ran is withdrawn whatever its provenance says.
+            //
+            // The gate that refuses to learn these was added on 2026-09-08;
+            // entries written before it are still on disk, still matching, and
+            // still covering scripts nobody observed. Re-checking provenance
+            // alone would never withdraw them, because `python3` does not stop
+            // being official -- that is the whole reason the entry was wrong.
+            if crate::provenance::path_is_not_identity(crate::util::basename(&e.exe)) {
+                let reason = format!(
+                    "{}: {} runs code chosen by its arguments, so this entry names the \
+                     runtime and not the code it ran -- it would cover scripts nobody has \
+                     seen. Write it by hand with `script = ...` if it is expected.",
+                    e.rule,
+                    crate::util::basename(&e.exe)
+                );
+                if let Some(t) = self.baseline.state.tuples.get(&e.key).cloned() {
+                    if let Some(idx) = crate::allowlist::find_index(&path, &t.spec()) {
+                        if let Err(err) = crate::allowlist::disable_rule(&path, idx, &reason) {
+                            log::warn!("{}: {}", path.display(), err);
+                        }
+                    }
+                }
+                self.baseline.mark_revoked(&e.key, &reason);
+                revoked += 1;
+                continue;
+            }
             let (prov, package) = self.provenance.classify_path(&e.exe);
             if prov.is_official() {
                 continue;
@@ -7617,6 +7707,64 @@ esac
         );
     }
 
+    /// A mixed chain acts on the HOST half only.
+    ///
+    /// `chain_gate` decides whether the chain may act at all; it says nothing
+    /// about what it aims at. One host trigger permits a mixed chain, and
+    /// `tree_targets` then returned every trigger pid including the
+    /// containerised ones -- so a container build step could be killed because
+    /// something on the host in the same tree looked bad. The permit and the
+    /// aim are different questions and only the first was being asked.
+    #[test]
+    fn a_mixed_chain_aims_only_at_its_host_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        let host = stored_alert(&mut d, "01QG0000000000000000000000", "moat-exec-untrusted-home",
+                                "exec", "/tmp/no-such-host", crate::rarity::Rarity::FirstSeen);
+        let cont = stored_alert(&mut d, "01QH0000000000000000000000", "moat-persist-autostart-write",
+                                "persist", "/tmp/no-such-cont", crate::rarity::Rarity::FirstSeen);
+        // Distinct pids: `stored_alert` derives one from the id LENGTH, and
+        // both ids are 26 characters, so without this both steps are pid
+        // 4300026 and the assertion below cannot tell them apart. It could not,
+        // on the first attempt.
+        let (mut host, mut cont) = (host, cont);
+        host.process.pid = 4_600_001;
+        cont.process.pid = 4_600_002;
+        for (al, v) in [(&host, Some(false)), (&cont, Some(true))] {
+            let mut stored = d.find_alert(&al.id).unwrap();
+            stored.process.in_container = v;
+            stored.process.pid = al.process.pid;
+            d.store.append_alert(&stored).unwrap();
+        }
+        let c = chain_over(&d, &[host.clone(), cont.clone()], "critical");
+
+        // The chain may act: one of its steps is on this machine.
+        let v = d.chain_gate(&c).verdict;
+        assert!(
+            v.as_ref().err().map(|e| !e.contains("namespace boundary")).unwrap_or(true),
+            "a mixed chain is not refused as containerised: {:?}",
+            v
+        );
+
+        // But the container step is not a target.
+        let targets = crate::contain::tree_targets(&c.steps, c.ancestor.pid, false);
+        let kept: Vec<u32> = targets
+            .into_iter()
+            .filter(|t| {
+                !d.find_alert(&t.alert)
+                    .and_then(|a| a.process.in_container)
+                    .unwrap_or(false)
+            })
+            .map(|t| t.pid)
+            .collect();
+        assert!(kept.contains(&host.process.pid), "the host step is still a target");
+        assert!(
+            !kept.contains(&cont.process.pid),
+            "the container step must not be killed: {:?}",
+            kept
+        );
+    }
+
     /// The chain path owns containment, tree kills and quarantine -- the three
     /// actions that hit a whole process tree. It must refuse across a namespace
     /// boundary, and it must refuse only when EVERY trigger is over there.
@@ -7665,6 +7813,39 @@ esac
             "refused, but not for being in a container: {}",
             why
         );
+
+        // A TRUNCATED chain earns no exemption, even with every visible step in
+        // a container: `steps` is capped at 12 and the members past the cap
+        // have no role, so "every trigger" can only mean "every trigger moat
+        // still has". A later host trigger can sit outside it, and an exemption
+        // granted on partial evidence is a hiding place.
+        {
+            let mut cut = c.clone();
+            cut.truncated = true;
+            let v = d.chain_gate(&cut).verdict;
+            assert!(
+                v.as_ref().err().map(|e| !e.contains("namespace boundary")).unwrap_or(true),
+                "a truncated chain must not be exempted as containerised: {:?}",
+                v
+            );
+        }
+
+        // An UNRESOLVABLE trigger earns no exemption either. A step whose
+        // alert is gone is not evidence that it ran in a container; without the
+        // completeness check, `filter_map` would silently drop it and `all()`
+        // would answer about a smaller set than the chain actually has.
+        {
+            let mut ghost = c.clone();
+            let mut phantom = ghost.steps[0].clone();
+            phantom.alert = "01ZZZZZZZZZZZZZZZZZZZZZZZZ".into();
+            ghost.steps.push(phantom);
+            let v = d.chain_gate(&ghost).verdict;
+            assert!(
+                v.as_ref().err().map(|e| !e.contains("namespace boundary")).unwrap_or(true),
+                "a chain with an unresolvable trigger must not be exempted: {:?}",
+                v
+            );
+        }
 
         // Now put ONE of them back on the host: the host half stays actionable.
         let mut host = d.find_alert(&a.id).unwrap();
@@ -9195,6 +9376,68 @@ esac
 
     /// LEARNING §1: a learned entry whose actor stops being official is
     /// disabled in place, with a reason and a low alert.
+    /// An entry learned BEFORE the interpreter gate is withdrawn on re-check.
+    ///
+    /// Provenance alone can never withdraw it: `python3` does not stop being
+    /// official, which is exactly why the entry was wrong. Without this, every
+    /// grant written before 2026-09-08 stays on disk, keeps matching, and keeps
+    /// covering scripts nobody observed.
+    #[test]
+    fn a_learned_interpreter_entry_is_withdrawn_even_though_it_is_still_official() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+
+        // Write the entry directly: the gate now refuses to create one, so the
+        // only way to have it is to have had it already.
+        for day in 0..3u64 {
+            d.baseline.observe(&Observation {
+                rule: "moat-cred-ssh-private-key-read",
+                exe: "/usr/bin/python3.14",
+                parent: "",
+                dir: "/home/dan/.ssh",
+                severity: "medium",
+                severity_base: "medium",
+                provenance: "official",
+                package: Some("python 3.14-1".into()),
+                context: "service",
+                rarity: "common",
+                suppressed: false,
+                demoted: false,
+                ts: format!("2026-09-0{}T10:00:00.000Z", day + 1),
+                now: util::unix_secs(),
+            });
+        }
+        // The gate refused, so force the state an older build would have left.
+        let key = d.baseline.state.tuples.keys().next().unwrap().clone();
+        d.baseline.state.tuples.get_mut(&key).unwrap().learned = true;
+        d.baseline.state.learned.insert(
+            key.clone(),
+            crate::baseline::LearnedEntry {
+                key: key.clone(),
+                rule: "moat-cred-ssh-private-key-read".into(),
+                exe: "/usr/bin/python3.14".into(),
+                written: util::now_rfc3339(),
+                revoked: None,
+            },
+        );
+        assert_eq!(d.baseline.learned_entries().len(), 1, "the old-build state");
+
+        assert_eq!(d.revoke_stale_learned_entries(), 1, "it must be withdrawn");
+        assert!(d.baseline.learned_entries().is_empty());
+        // FOR THE RIGHT REASON. Without a pacman fixture this exe also fails
+        // the provenance re-check, so `is_empty()` alone passes with the
+        // interpreter branch deleted -- it did, on the first attempt.
+        let why = d.baseline.state.learned[&key]
+            .revoked
+            .clone()
+            .expect("revoked with a reason");
+        assert!(
+            why.contains("runs code chosen by its arguments"),
+            "withdrawn, but not for naming a runtime instead of the code: {}",
+            why
+        );
+    }
+
     #[test]
     fn a_learned_entry_is_revoked_when_its_actor_stops_being_official() {
         let dir = tempfile::tempdir().unwrap();

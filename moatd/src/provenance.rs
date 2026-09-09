@@ -191,6 +191,38 @@ pub fn is_interpreter(comm: &str) -> bool {
         || matches!(comm, "node" | "nodejs" | "perl" | "ruby" | "deno" | "bun")
 }
 
+/// Is this binary's PATH an identity for the code it runs?
+///
+/// Broader than [`is_interpreter`], and used for a different question. That one
+/// decides where provenance comes from -- an interpreter takes its script's --
+/// and widening it would change how `env`, `timeout` and `nohup` resolve. This
+/// one decides only whether an allowlist entry naming the actor's path would
+/// describe the code that ran, and the answer is no for anything that executes
+/// something chosen by its arguments: `java -jar x.jar`, `dotnet y.dll`,
+/// `npx pkg`, `uv run z` and `busybox sh` are all the same problem as
+/// `python foo.py`.
+///
+/// The baseline refuses to learn these. A missing name here means moat learns
+/// an entry it should not have; a spurious one means it keeps asking. The
+/// second is the right way to be wrong, so the list errs wide.
+pub fn path_is_not_identity(comm: &str) -> bool {
+    if is_interpreter(comm) {
+        return true;
+    }
+    // JVM and .NET: the assembly is the code, the runtime is the path.
+    comm.starts_with("java")
+        || matches!(comm, "dotnet" | "mono" | "scala" | "kotlin" | "groovy" | "jruby")
+        // Runners that resolve a package and then execute it.
+        || matches!(comm, "npx" | "pnpx" | "bunx" | "tsx" | "ts-node")
+        || matches!(comm, "uv" | "uvx" | "pipx" | "poetry" | "pdm" | "hatch")
+        || matches!(comm, "php" | "lua" | "luajit" | "tclsh" | "wish")
+        || matches!(comm, "Rscript" | "julia" | "elixir" | "erl" | "escript")
+        // One binary, a hundred applets, and the applet is an argument.
+        || matches!(comm, "busybox" | "toybox")
+        // Wrappers whose whole job is to exec something else.
+        || matches!(comm, "env" | "nohup" | "setsid" | "timeout" | "stdbuf" | "nice" | "ionice")
+}
+
 /// The script an interpreter was handed: `argv[1]`, or the first non-flag
 /// argument that looks like a path. `None` for `-c`/`-e`/`-m` (that is code, not
 /// a file) and for a bare word that is not a path.
@@ -753,5 +785,39 @@ mod tests {
 
         let files = "%FILES%\nusr/\nusr/bin/\nusr/bin/cat\nusr/bin/ls\n\n%BACKUP%\netc/x\t1234\n";
         assert_eq!(parse_files(files), vec!["/usr/bin/cat", "/usr/bin/ls"]);
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::{is_interpreter, path_is_not_identity};
+
+    /// The two predicates answer different questions and must not be merged.
+    /// `is_interpreter` decides where PROVENANCE comes from, and widening it
+    /// would change how `env`, `timeout` and `nohup` resolve their scripts.
+    #[test]
+    fn the_wrapper_set_is_not_in_the_provenance_predicate() {
+        for w in ["env", "nohup", "setsid", "timeout", "npx", "java", "dotnet", "busybox"] {
+            assert!(!is_interpreter(w), "{} must not change provenance resolution", w);
+            assert!(path_is_not_identity(w), "{} must not be learnable", w);
+        }
+    }
+
+    #[test]
+    fn every_interpreter_is_also_not_an_identity() {
+        for i in ["bash", "sh", "python3.14", "node", "perl", "ruby", "deno", "bun"] {
+            assert!(is_interpreter(i));
+            assert!(path_is_not_identity(i), "{} is a superset of is_interpreter", i);
+        }
+    }
+
+    /// Compiled programs ARE their path, and must stay learnable -- otherwise
+    /// the baseline learns nothing at all and every recurring benign pattern
+    /// keeps asking.
+    #[test]
+    fn an_ordinary_binary_is_its_own_identity() {
+        for b in ["restic", "curl", "dockerd", "rustc", "cc", "ld", "git", "ssh", "gcc"] {
+            assert!(!path_is_not_identity(b), "{} must remain learnable", b);
+        }
     }
 }

@@ -539,7 +539,7 @@ impl Baseline {
         // names a script (`TupleStat::spec`) -- so the honest move is to refuse
         // rather than to write a grant broader than the evidence. A user who
         // wants this can write the entry by hand, naming the script.
-        if crate::provenance::is_interpreter(crate::util::basename(&t.exe)) {
+        if crate::provenance::path_is_not_identity(crate::util::basename(&t.exe)) {
             return Some(format!(
                 "{} is an interpreter: the tuple names the interpreter, not the code it ran,                  so a learned entry would cover scripts nobody has seen. Write the entry by                  hand with `script = ...` if this is expected.",
                 crate::util::basename(&t.exe)
