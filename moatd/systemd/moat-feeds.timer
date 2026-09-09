@@ -1,11 +1,16 @@
 [Unit]
-Description=Hourly refresh of Moat threat feeds
+Description=Refresh of the Moat malicious-package feed
 Documentation=man:moat-feeds(1)
 
 [Timer]
-OnCalendar=hourly
-# abuse.ch asks that clients not all arrive on the hour.
-RandomizedDelaySec=10min
+# Upstream itself only moves every 1-2 hours, so a shorter tick does not make
+# the data fresher — it cuts the worst-case lag between an advisory landing and
+# this machine seeing it from an hour to a few minutes. The common tick is a
+# 304 on a 200-byte pointer, so that costs essentially nothing.
+OnCalendar=*:0/15
+# Not optional: without jitter every machine fires on the quarter hour and the
+# aggregate looks like a thundering herd.
+RandomizedDelaySec=5min
 # Catch up after the machine was asleep or off.
 Persistent=true
 AccuracySec=1min

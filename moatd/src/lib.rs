@@ -35,7 +35,7 @@
 //! | `store`     | append-only `alerts.jsonl`, updates, receipts, rotation         |
 //! | `control`   | the `/run/moat/control.sock` protocol of CONTRACT §5        |
 //! | `engine`    | the run loop that wires all of the above together               |
-//! | `feeds`     | abuse.ch feed fetch + local feed cache                          |
+//! | `feeds`     | signed malicious-package index client + local feed cache        |
 //! | `telemetry` | selectable telemetry classes and `telemetry.jsonl`              |
 //! | `ship`      | `moat-ship`: NDJSON/syslog export, cursor, buffer, redaction    |
 

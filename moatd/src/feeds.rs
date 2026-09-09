@@ -2,60 +2,119 @@
 //!
 //! Two halves:
 //!
-//! * the **cache** (`Feeds`), which moatd memory-maps in the crudest way —
-//!   a `HashSet` of sha256 strings — and reloads when the file mtime changes;
-//! * the **fetcher**, run by `moat-feeds` from an hourly timer.
+//! * the **cache** (`Feeds`), which moatd reads from the feed directory and
+//!   reloads when the files move on disk;
+//! * the **client** (`refresh`), run by `moat-feeds` from a 15-minute timer.
 //!
-//! abuse.ch has required an `Auth-Key` header on every endpoint since 2025. With
-//! no key configured we log one line and exit 0, leaving the previous files in
-//! place: a machine with no key must not lose the feed it already has, and the
-//! timer must never fail hard (CONTRACT §6.7).
+//! This used to fetch abuse.ch MalwareBazaar / ThreatFox / URLhaus directly.
+//! All three require an `Auth-Key`, which meant a machine without a key had no
+//! feed at all — and the six scanners consulted no feed in the first place.
+//! It now pulls a signed, keyless **malicious-package index** from an
+//! aggregator, and the scanners read that file offline before an install runs.
+//! `docs/PACKAGE-FEED.md` is the format contract; this file implements the
+//! "Client contract" section of it.
+//!
+//! Three rules run through everything below:
+//!
+//! * a stale feed is not a broken feed — every failure path leaves the previous
+//!   files in place and exits 0, because the timer must never fail hard
+//!   (CONTRACT §6.7);
+//! * nothing is written until the signature verifies, because this file decides
+//!   what moat warns about;
+//! * the common tick is a 304 on a 200-byte object and must cost nothing.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-// Endpoints, verified against the abuse.ch API docs (2026-09).
-pub const MALWAREBAZAAR_URL: &str = "https://mb-api.abuse.ch/api/v1/";
-pub const THREATFOX_URL: &str = "https://threatfox-api.abuse.ch/api/v1/";
-pub const URLHAUS_URL: &str = "https://urlhaus-api.abuse.ch/v1/urls/recent/";
+/// Where the signed index is published. Overridable so a site can mirror it,
+/// and so the tests can point at a local fixture.
+pub const DEFAULT_BASE_URL: &str = "https://feed.omarchy-moat.org";
+
+/// Shipped with the package; the private half never leaves the aggregator.
+pub const DEFAULT_PUBLIC_KEY_PATH: &str = "/usr/share/moat/feed-key.pub";
+
+/// Files the client owns. `hashes.txt`, `domains.txt` and `urls.txt` are *not*
+/// in this list: nothing fetches them any more, they are operator-supplied, and
+/// a refresh must never touch them.
+const PACKAGES_FILE: &str = "packages.txt";
+const META_FILE: &str = "meta.json";
+const STATE_FILE: &str = "state.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FeedsConfig {
-    /// abuse.ch Auth-Key (https://auth.abuse.ch/). Empty disables fetching.
-    pub auth_key: String,
-    pub malwarebazaar: bool,
-    pub threatfox: bool,
-    pub urlhaus: bool,
-    pub malwarebazaar_url: String,
-    pub threatfox_url: String,
-    pub urlhaus_url: String,
-    /// ThreatFox window, 1..7 (the API refuses more).
-    pub threatfox_days: u32,
-    /// URLhaus `limit/N/`, max 1000.
-    pub urlhaus_limit: u32,
+    /// Set false to pin the machine to whatever it already has on disk.
+    pub enabled: bool,
+    pub base_url: String,
+    /// ed25519 public key, hex or base64, 32 bytes. Empty means read
+    /// `public_key_path`.
+    pub public_key: String,
+    pub public_key_path: String,
+    /// Refuse to apply an unsigned or badly-signed artifact. Turning this off
+    /// means trusting whoever can answer for `base_url`; it exists for local
+    /// mirror testing, not for production.
+    pub require_signature: bool,
     pub timeout_secs: u64,
-    /// Cap on how many sha256 we keep; the file is read into memory.
-    pub max_hashes: usize,
+    /// Guards against a hostile or broken server handing us an endless body.
+    pub max_artifact_bytes: u64,
+    pub max_pointer_bytes: u64,
+
+    // --- accepted and ignored -------------------------------------------
+    // The abuse.ch settings, kept only so that an upgraded machine whose
+    // /etc/moat/feeds.toml predates this change still parses. Dropping them
+    // would make `deny_unknown_fields` reject the old file, and because
+    // pacman leaves the existing config in place and writes a .pacnew, the
+    // refresh would fail on every tick with nothing but a journal line to
+    // say why. `legacy_keys_present` reports them so the failure is loud
+    // once rather than silent forever.
+    #[serde(default, skip_serializing)]
+    auth_key: Option<String>,
+    #[serde(default, skip_serializing)]
+    malwarebazaar: Option<bool>,
+    #[serde(default, skip_serializing)]
+    threatfox: Option<bool>,
+    #[serde(default, skip_serializing)]
+    urlhaus: Option<bool>,
+    #[serde(default, skip_serializing)]
+    malwarebazaar_url: Option<String>,
+    #[serde(default, skip_serializing)]
+    threatfox_url: Option<String>,
+    #[serde(default, skip_serializing)]
+    urlhaus_url: Option<String>,
+    #[serde(default, skip_serializing)]
+    threatfox_days: Option<u32>,
+    #[serde(default, skip_serializing)]
+    urlhaus_limit: Option<u32>,
+    #[serde(default, skip_serializing)]
+    max_hashes: Option<usize>,
 }
 
 impl Default for FeedsConfig {
     fn default() -> Self {
         Self {
-            auth_key: String::new(),
-            malwarebazaar: true,
-            threatfox: true,
-            urlhaus: true,
-            malwarebazaar_url: MALWAREBAZAAR_URL.into(),
-            threatfox_url: THREATFOX_URL.into(),
-            urlhaus_url: URLHAUS_URL.into(),
-            threatfox_days: 3,
-            urlhaus_limit: 1000,
+            enabled: true,
+            base_url: DEFAULT_BASE_URL.into(),
+            public_key: String::new(),
+            public_key_path: DEFAULT_PUBLIC_KEY_PATH.into(),
+            require_signature: true,
             timeout_secs: 30,
-            max_hashes: 500_000,
+            // The full index is ~1.6 MB gzipped; 64 MB is room to grow by a
+            // factor of forty before anyone has to think about it again.
+            max_artifact_bytes: 64 * 1024 * 1024,
+            max_pointer_bytes: 256 * 1024,
+            auth_key: None,
+            malwarebazaar: None,
+            threatfox: None,
+            urlhaus: None,
+            malwarebazaar_url: None,
+            threatfox_url: None,
+            urlhaus_url: None,
+            threatfox_days: None,
+            urlhaus_limit: None,
+            max_hashes: None,
         }
     }
 }
@@ -69,14 +128,59 @@ impl FeedsConfig {
         }
     }
 
-    pub fn key(&self) -> Option<&str> {
-        let k = self.auth_key.trim();
-        if k.is_empty() || k == "PUT-YOUR-ABUSE-CH-AUTH-KEY-HERE" {
-            None
-        } else {
-            Some(k)
-        }
+    /// Names any abuse.ch-era settings still in the file. They do nothing now;
+    /// saying so once is the difference between an obvious no-op and a user
+    /// believing a key still buys them a feed.
+    pub fn legacy_keys_present(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.auth_key.is_some() { v.push("auth_key"); }
+        if self.malwarebazaar.is_some() { v.push("malwarebazaar"); }
+        if self.threatfox.is_some() { v.push("threatfox"); }
+        if self.urlhaus.is_some() { v.push("urlhaus"); }
+        if self.malwarebazaar_url.is_some() { v.push("malwarebazaar_url"); }
+        if self.threatfox_url.is_some() { v.push("threatfox_url"); }
+        if self.urlhaus_url.is_some() { v.push("urlhaus_url"); }
+        if self.threatfox_days.is_some() { v.push("threatfox_days"); }
+        if self.urlhaus_limit.is_some() { v.push("urlhaus_limit"); }
+        if self.max_hashes.is_some() { v.push("max_hashes"); }
+        v
     }
+
+    /// The pinned verification key, from the config or the shipped file.
+    pub fn verifying_key(&self) -> Result<Option<[u8; 32]>, String> {
+        let raw = if !self.public_key.trim().is_empty() {
+            self.public_key.trim().to_string()
+        } else {
+            match std::fs::read_to_string(&self.public_key_path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(format!("{}: {}", self.public_key_path, e)),
+            }
+        };
+        // The file may carry a comment line, as minisign-style keys do.
+        let body = raw
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("untrusted comment:"))
+            .unwrap_or("");
+        if body.is_empty() {
+            return Ok(None);
+        }
+        let bytes = decode_key(body).ok_or_else(|| {
+            format!(
+                "{}: public key is neither 64 hex chars nor base64 of 32 bytes",
+                self.public_key_path
+            )
+        })?;
+        Ok(Some(bytes))
+    }
+}
+
+fn decode_key(s: &str) -> Option<[u8; 32]> {
+    if let Some(v) = crate::util::from_hex(s) {
+        return v.try_into().ok();
+    }
+    crate::util::from_base64(s).and_then(|v| v.try_into().ok())
 }
 
 // ------------------------------------------------------------------- the cache
@@ -84,6 +188,9 @@ impl FeedsConfig {
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct FeedMeta {
     pub updated: Option<String>,
+    pub seq: u64,
+    pub packages: usize,
+    /// Operator-supplied since abuse.ch was dropped; see docs/PACKAGE-FEED.md.
     pub hashes: usize,
     pub domains: usize,
     pub urls: usize,
@@ -94,7 +201,7 @@ pub struct Feeds {
     pub hashes: HashSet<String>,
     pub domains: HashSet<String>,
     pub meta: FeedMeta,
-    stamp: Option<(u64, u64)>,
+    stamp: Option<Vec<(u64, u64)>>,
 }
 
 impl Feeds {
@@ -102,13 +209,25 @@ impl Feeds {
         let hashes = read_set(&dir.join("hashes.txt"));
         let domains = read_set(&dir.join("domains.txt"));
         let urls = read_set(&dir.join("urls.txt"));
-        let updated = std::fs::read_to_string(dir.join("meta.json"))
+        let meta_json = std::fs::read_to_string(dir.join(META_FILE))
             .ok()
-            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-            .and_then(|v| v.get("updated")?.as_str().map(str::to_string));
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+        let get_u = |k: &str| -> u64 {
+            meta_json
+                .as_ref()
+                .and_then(|v| v.get(k))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        };
         Feeds {
             meta: FeedMeta {
-                updated,
+                updated: meta_json
+                    .as_ref()
+                    .and_then(|v| v.get("updated"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                seq: get_u("seq"),
+                packages: get_u("packages") as usize,
                 hashes: hashes.len(),
                 domains: domains.len(),
                 urls: urls.len(),
@@ -119,7 +238,9 @@ impl Feeds {
         }
     }
 
-    /// mtime+size poll (default every 60 s): reload only when something moved.
+    /// mtime+size poll: reload only when something actually moved. The daemon
+    /// deliberately does not hold the 242k package entries in memory — the
+    /// scanners read `packages.txt` directly, and moatd only reports on it.
     pub fn reload_if_changed(&mut self, dir: &Path) -> bool {
         let now = stamp(dir);
         if now == self.stamp {
@@ -134,10 +255,17 @@ impl Feeds {
     }
 }
 
-fn stamp(dir: &Path) -> Option<(u64, u64)> {
+fn stamp(dir: &Path) -> Option<Vec<(u64, u64)>> {
     use std::os::unix::fs::MetadataExt;
-    let m = std::fs::metadata(dir.join("hashes.txt")).ok()?;
-    Some((m.mtime() as u64, m.size()))
+    let mut out = Vec::new();
+    // Watch the operator-supplied files too: they change without a refresh.
+    for f in [PACKAGES_FILE, META_FILE, "hashes.txt", "domains.txt", "urls.txt"] {
+        match std::fs::metadata(dir.join(f)) {
+            Ok(m) => out.push((m.mtime() as u64, m.size())),
+            Err(_) => out.push((0, 0)),
+        }
+    }
+    Some(out)
 }
 
 fn read_set(path: &Path) -> HashSet<String> {
@@ -151,284 +279,479 @@ fn read_set(path: &Path) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-// ----------------------------------------------------------------- the fetcher
+// ------------------------------------------------------------------- the state
+
+/// What we carry between ticks. Kept separate from `meta.json` because that one
+/// is a status surface other things read; this one is ours.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct State {
+    seq: u64,
+    pointer_etag: String,
+}
+
+impl State {
+    fn load(dir: &Path) -> State {
+        std::fs::read_to_string(dir.join(STATE_FILE))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, dir: &Path) -> Result<(), String> {
+        crate::util::atomic_write(
+            &dir.join(STATE_FILE),
+            format!("{}\n", serde_json::to_string_pretty(self).unwrap_or_default()).as_bytes(),
+            0o644,
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+}
+
+// ----------------------------------------------------------------- the pointer
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Pointer {
+    pub version: u32,
+    pub seq: u64,
+    #[serde(default)]
+    pub generated: String,
+    #[serde(default)]
+    pub entries: usize,
+    pub artifact: String,
+    pub sha256: String,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub deltas: BTreeMap<String, String>,
+}
+
+// ------------------------------------------------------------------ the client
 
 #[derive(Debug, Default, Serialize)]
 pub struct RefreshSummary {
     pub skipped: bool,
     pub reason: Option<String>,
-    pub hashes: usize,
-    pub domains: usize,
-    pub urls: usize,
+    /// "full", "delta", "unchanged" or "none".
+    pub mode: String,
+    pub seq: u64,
+    pub packages: usize,
+    pub added: usize,
+    pub removed: usize,
     pub errors: Vec<String>,
 }
 
-/// Fetch every enabled source and write the four files atomically.
-/// Errors from individual sources are collected, never propagated: a
-/// half-reachable network must still refresh what it can.
+/// One tick. Never propagates an error: the caller exits 0 regardless.
 pub fn refresh(cfg: &FeedsConfig, out_dir: &Path) -> RefreshSummary {
-    let mut sum = RefreshSummary::default();
-    let Some(key) = cfg.key() else {
-        sum.skipped = true;
-        sum.reason = Some(
-            "no abuse.ch auth_key in feeds.toml; get one at https://auth.abuse.ch/ \
-             and set auth_key. Existing feed files are left untouched."
-                .into(),
-        );
-        return sum;
+    let mut sum = RefreshSummary {
+        mode: "none".into(),
+        ..Default::default()
     };
+
+    if !cfg.enabled {
+        sum.skipped = true;
+        sum.reason = Some("feeds.enabled = false; leaving existing files alone".into());
+        return sum;
+    }
+
+    if let Err(e) = std::fs::create_dir_all(out_dir) {
+        sum.skipped = true;
+        sum.reason = Some(format!("{}: {}", out_dir.display(), e));
+        return sum;
+    }
+
+    let key = match cfg.verifying_key() {
+        Ok(k) => k,
+        Err(e) => {
+            sum.skipped = true;
+            sum.reason = Some(e);
+            return sum;
+        }
+    };
+    if key.is_none() && cfg.require_signature {
+        sum.skipped = true;
+        sum.reason = Some(format!(
+            "no feed public key at {} and require_signature is on; \
+             refusing to apply an unverifiable index",
+            cfg.public_key_path
+        ));
+        return sum;
+    }
 
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(cfg.timeout_secs)))
-        .user_agent(concat!("moat-feeds/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!(
+            "moat-feeds/",
+            env!("CARGO_PKG_VERSION"),
+            " (+https://github.com/dlussier/omarchy-moat)"
+        ))
         .build()
         .into();
 
-    let mut hashes: HashSet<String> = HashSet::new();
-    let mut domains: HashSet<String> = HashSet::new();
-    let mut urls: HashSet<String> = HashSet::new();
+    let mut state = State::load(out_dir);
+    let base = cfg.base_url.trim_end_matches('/').to_string();
 
-    if cfg.malwarebazaar {
-        match post_form(
-            &agent,
-            &cfg.malwarebazaar_url,
-            key,
-            "query=get_recent&selector=time",
-        ) {
-            Ok(body) => collect_malwarebazaar(&body, &mut hashes, &mut sum.errors),
-            Err(e) => sum.errors.push(format!("malwarebazaar: {}", e)),
+    // 1. the pointer, conditionally.
+    let (pointer, etag) = match fetch_pointer(&agent, &base, &state.pointer_etag, cfg) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            sum.mode = "unchanged".into();
+            sum.seq = state.seq;
+            sum.packages = count_packages(out_dir);
+            return sum;
         }
-    }
-    if cfg.threatfox {
-        let days = cfg.threatfox_days.clamp(1, 7);
-        let body = format!("{{\"query\":\"get_iocs\",\"days\":{}}}", days);
-        match post_json(&agent, &cfg.threatfox_url, key, &body) {
-            Ok(body) => collect_threatfox(&body, &mut hashes, &mut domains, &mut urls, &mut sum.errors),
-            Err(e) => sum.errors.push(format!("threatfox: {}", e)),
+        Err(e) => {
+            sum.skipped = true;
+            sum.reason = Some(format!("pointer: {}", e));
+            return sum;
         }
-    }
-    if cfg.urlhaus {
-        let limit = cfg.urlhaus_limit.clamp(1, 1000);
-        let url = format!("{}/limit/{}/", cfg.urlhaus_url.trim_end_matches('/'), limit);
-        match get(&agent, &url, key) {
-            Ok(body) => collect_urlhaus(&body, &mut domains, &mut urls, &mut sum.errors),
-            Err(e) => sum.errors.push(format!("urlhaus: {}", e)),
-        }
-    }
+    };
 
-    // A total failure must not blank the cache the daemon is using.
-    if hashes.is_empty() && domains.is_empty() && urls.is_empty() {
+    if pointer.version != 1 {
         sum.skipped = true;
-        sum.reason = Some("every source failed or returned nothing; keeping the previous files".into());
+        sum.reason = Some(format!(
+            "pointer announces format version {}; this build understands 1. \
+             Leaving the existing index in place.",
+            pointer.version
+        ));
         return sum;
     }
 
-    if hashes.len() > cfg.max_hashes {
-        let keep: HashSet<String> = hashes.iter().take(cfg.max_hashes).cloned().collect();
-        hashes = keep;
+    // 2. nothing new.
+    let have_index = out_dir.join(PACKAGES_FILE).exists();
+    if pointer.seq == state.seq && have_index {
+        state.pointer_etag = etag;
+        let _ = state.save(out_dir);
+        sum.mode = "unchanged".into();
+        sum.seq = state.seq;
+        sum.packages = count_packages(out_dir);
+        return sum;
     }
 
-    sum.hashes = hashes.len();
-    sum.domains = domains.len();
-    sum.urls = urls.len();
+    // 3. delta if we can chain to it, full otherwise.
+    let delta_path = if have_index && state.seq > 0 {
+        pointer.deltas.get(&state.seq.to_string()).cloned()
+    } else {
+        None
+    };
 
-    if let Err(e) = write_all(out_dir, &hashes, &domains, &urls) {
+    let outcome = match &delta_path {
+        Some(p) => apply_delta(&agent, &base, p, cfg, key.as_ref(), out_dir),
+        None => apply_full(&agent, &base, &pointer, cfg, key.as_ref(), out_dir),
+    };
+
+    let mut outcome = match outcome {
+        Ok(o) => o,
+        Err(e) if delta_path.is_some() => {
+            // A broken delta chain is a fall-back case, not a failure.
+            sum.errors.push(format!("delta: {}; falling back to full", e));
+            match apply_full(&agent, &base, &pointer, cfg, key.as_ref(), out_dir) {
+                Ok(o) => o,
+                Err(e) => {
+                    sum.skipped = true;
+                    sum.reason = Some(format!("full: {}", e));
+                    return sum;
+                }
+            }
+        }
+        Err(e) => {
+            sum.skipped = true;
+            sum.reason = Some(format!("full: {}", e));
+            return sum;
+        }
+    };
+    outcome.mode = if delta_path.is_some() && sum.errors.is_empty() {
+        "delta"
+    } else {
+        "full"
+    }
+    .into();
+
+    // 4. commit.
+    state.seq = pointer.seq;
+    state.pointer_etag = etag;
+    if let Err(e) = state.save(out_dir) {
         sum.errors.push(e);
     }
+    if let Err(e) = write_meta(out_dir, &pointer, outcome.packages, &outcome.mode) {
+        sum.errors.push(e);
+    }
+
+    sum.mode = outcome.mode;
+    sum.seq = pointer.seq;
+    sum.packages = outcome.packages;
+    sum.added = outcome.added;
+    sum.removed = outcome.removed;
     sum
 }
 
-fn write_all(
-    dir: &Path,
-    hashes: &HashSet<String>,
-    domains: &HashSet<String>,
-    urls: &HashSet<String>,
-) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    write_set(&dir.join("hashes.txt"), hashes)?;
-    write_set(&dir.join("domains.txt"), domains)?;
-    write_set(&dir.join("urls.txt"), urls)?;
-    let meta = serde_json::json!({
-        "updated": crate::util::now_rfc3339(),
-        "hashes": hashes.len(),
-        "domains": domains.len(),
-        "urls": urls.len(),
-        "sources": ["malwarebazaar", "threatfox", "urlhaus"],
-    });
-    crate::util::atomic_write(
-        &dir.join("meta.json"),
-        format!("{}\n", serde_json::to_string_pretty(&meta).unwrap_or_default()).as_bytes(),
-        0o644,
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+struct Applied {
+    mode: String,
+    packages: usize,
+    added: usize,
+    removed: usize,
 }
 
-fn write_set(path: &Path, set: &HashSet<String>) -> Result<(), String> {
-    let mut v: Vec<&String> = set.iter().collect();
-    v.sort();
-    let mut body = String::with_capacity(v.len() * 65);
-    for x in v {
-        body.push_str(x);
-        body.push('\n');
+fn fetch_pointer(
+    agent: &ureq::Agent,
+    base: &str,
+    etag: &str,
+    cfg: &FeedsConfig,
+) -> Result<Option<(Pointer, String)>, String> {
+    let url = format!("{}/v1/pointer.json", base);
+    let mut req = agent.get(&url);
+    if !etag.is_empty() {
+        req = req.header("If-None-Match", etag);
     }
-    crate::util::atomic_write(path, body.as_bytes(), 0o644)
-        .map(|_| ())
-        .map_err(|e| format!("{}: {}", path.display(), e))
-}
-
-fn post_form(agent: &ureq::Agent, url: &str, key: &str, body: &str) -> Result<String, String> {
-    agent
-        .post(url)
-        .header("Auth-Key", key)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .send(body)
-        .map_err(|e| e.to_string())?
+    let mut resp = req.call().map_err(|e| e.to_string())?;
+    if resp.status() == 304 {
+        return Ok(None);
+    }
+    let new_etag = resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = resp
         .body_mut()
+        .with_config()
+        .limit(cfg.max_pointer_bytes)
         .read_to_string()
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let p: Pointer = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    Ok(Some((p, new_etag)))
 }
 
-fn post_json(agent: &ureq::Agent, url: &str, key: &str, body: &str) -> Result<String, String> {
-    agent
-        .post(url)
-        .header("Auth-Key", key)
-        .header("Content-Type", "application/json")
-        .send(body)
-        .map_err(|e| e.to_string())?
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| e.to_string())
-}
-
-fn get(agent: &ureq::Agent, url: &str, key: &str) -> Result<String, String> {
-    agent
-        .get(url)
-        .header("Auth-Key", key)
+/// Fetch `path` and its detached signature, verify both, return the plain text.
+fn fetch_verified(
+    agent: &ureq::Agent,
+    base: &str,
+    path: &str,
+    cfg: &FeedsConfig,
+    key: Option<&[u8; 32]>,
+    expect_sha256: Option<&str>,
+) -> Result<String, String> {
+    let url = format!("{}{}", base, path);
+    let gz = agent
+        .get(&url)
         .call()
         .map_err(|e| e.to_string())?
         .body_mut()
-        .read_to_string()
-        .map_err(|e| e.to_string())
+        .with_config()
+        .limit(cfg.max_artifact_bytes)
+        .read_to_vec()
+        .map_err(|e| e.to_string())?;
+
+    // Signature first: it is the check that matters, so nothing else runs
+    // before it succeeds.
+    if let Some(k) = key {
+        let sig = agent
+            .get(&format!("{}.sig", url))
+            .call()
+            .map_err(|e| format!("signature: {}", e))?
+            .body_mut()
+            .with_config()
+            .limit(4096)
+            .read_to_vec()
+            .map_err(|e| format!("signature: {}", e))?;
+        verify_ed25519(k, &gz, &sig)?;
+    } else if cfg.require_signature {
+        return Err("no public key available".into());
+    }
+
+    if let Some(want) = expect_sha256 {
+        let got = crate::util::sha256_hex(&gz);
+        if !got.eq_ignore_ascii_case(want) {
+            return Err(format!("sha256 mismatch: pointer said {}, got {}", want, got));
+        }
+    }
+
+    let mut text = String::new();
+    use std::io::Read;
+    flate2::read::GzDecoder::new(&gz[..])
+        .read_to_string(&mut text)
+        .map_err(|e| format!("gunzip: {}", e))?;
+    Ok(text)
 }
 
-// -------------------------------------------------------------- response shapes
-// Parsers are separate from transport so they can be unit tested on canned
-// bodies; the API shapes are documented at bazaar/threatfox/urlhaus .abuse.ch.
-
-pub fn collect_malwarebazaar(body: &str, hashes: &mut HashSet<String>, errors: &mut Vec<String>) {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        errors.push("malwarebazaar: response was not JSON".into());
-        return;
+fn verify_ed25519(key: &[u8; 32], msg: &[u8], sig: &[u8]) -> Result<(), String> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    // Accept a raw 64-byte signature or its hex/base64 text form, so the
+    // aggregator can publish whichever is convenient.
+    let raw: Vec<u8> = if sig.len() == 64 {
+        sig.to_vec()
+    } else {
+        let s = std::str::from_utf8(sig)
+            .map_err(|_| "signature is neither 64 raw bytes nor text".to_string())?
+            .trim();
+        let s = s
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with("untrusted comment:"))
+            .unwrap_or("");
+        crate::util::from_hex(s)
+            .or_else(|| crate::util::from_base64(s))
+            .ok_or_else(|| "signature is not decodable".to_string())?
     };
-    match v.get("query_status").and_then(|s| s.as_str()) {
-        Some("ok") => {}
-        Some(other) => {
-            errors.push(format!("malwarebazaar: query_status={}", other));
-            return;
-        }
-        None => {}
-    }
-    for item in array(&v, "data") {
-        if let Some(h) = item.get("sha256_hash").and_then(|h| h.as_str()) {
-            hashes.insert(h.to_ascii_lowercase());
-        }
-    }
+    let sig: [u8; 64] = raw
+        .try_into()
+        .map_err(|_| "signature is not 64 bytes".to_string())?;
+    let vk = VerifyingKey::from_bytes(key).map_err(|e| format!("bad public key: {}", e))?;
+    vk.verify(msg, &Signature::from_bytes(&sig))
+        .map_err(|_| "SIGNATURE DID NOT VERIFY".to_string())
 }
 
-pub fn collect_threatfox(
-    body: &str,
-    hashes: &mut HashSet<String>,
-    domains: &mut HashSet<String>,
-    urls: &mut HashSet<String>,
-    errors: &mut Vec<String>,
-) {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        errors.push("threatfox: response was not JSON".into());
-        return;
-    };
-    if let Some(status) = v.get("query_status").and_then(|s| s.as_str()) {
-        if status != "ok" {
-            errors.push(format!("threatfox: query_status={}", status));
-            return;
-        }
-    }
-    for item in array(&v, "data") {
-        let Some(ioc) = item.get("ioc").and_then(|i| i.as_str()) else {
+fn apply_full(
+    agent: &ureq::Agent,
+    base: &str,
+    pointer: &Pointer,
+    cfg: &FeedsConfig,
+    key: Option<&[u8; 32]>,
+    out_dir: &Path,
+) -> Result<Applied, String> {
+    let text = fetch_verified(
+        agent,
+        base,
+        &pointer.artifact,
+        cfg,
+        key,
+        Some(&pointer.sha256),
+    )?;
+    let index = parse_index(&text)?;
+    let n = index.len();
+    write_index(out_dir, &index)?;
+    Ok(Applied {
+        mode: "full".into(),
+        packages: n,
+        added: n,
+        removed: 0,
+    })
+}
+
+fn apply_delta(
+    agent: &ureq::Agent,
+    base: &str,
+    path: &str,
+    cfg: &FeedsConfig,
+    key: Option<&[u8; 32]>,
+    out_dir: &Path,
+) -> Result<Applied, String> {
+    let current = std::fs::read_to_string(out_dir.join(PACKAGES_FILE))
+        .map_err(|e| format!("{}: {}", PACKAGES_FILE, e))?;
+    let mut index = parse_index(&current)?;
+    let text = fetch_verified(agent, base, path, cfg, key, None)?;
+
+    let (mut added, mut removed) = (0usize, 0usize);
+    for (n, line) in text.lines().enumerate() {
+        if line.is_empty() || line.starts_with('#') {
             continue;
-        };
-        match item.get("ioc_type").and_then(|t| t.as_str()).unwrap_or("") {
-            "sha256_hash" => {
-                hashes.insert(ioc.to_ascii_lowercase());
-            }
-            "domain" => {
-                domains.insert(ioc.to_ascii_lowercase());
-            }
-            // `ip:port`; the port is not useful without the address family.
-            "ip:port" => {
-                let ip = ioc.rsplit_once(':').map(|(a, _)| a).unwrap_or(ioc);
-                domains.insert(ip.trim_matches(['[', ']']).to_ascii_lowercase());
-            }
-            "url" => {
-                urls.insert(ioc.to_string());
-                if let Some(h) = host_of(ioc) {
-                    domains.insert(h);
+        }
+        let mut f = line.split('\t');
+        let op = f.next().unwrap_or("");
+        let eco = f.next().unwrap_or("");
+        let name = f.next().unwrap_or("");
+        if eco.is_empty() || name.is_empty() {
+            return Err(format!("delta line {}: malformed", n + 1));
+        }
+        let k = format!("{}\t{}", eco, name);
+        match op {
+            "+" => {
+                let spec = f.next().unwrap_or("");
+                if spec.is_empty() {
+                    return Err(format!("delta line {}: '+' with no spec", n + 1));
+                }
+                if index.insert(k, spec.to_string()).is_none() {
+                    added += 1;
                 }
             }
-            _ => {}
-        }
-    }
-}
-
-pub fn collect_urlhaus(
-    body: &str,
-    domains: &mut HashSet<String>,
-    urls: &mut HashSet<String>,
-    errors: &mut Vec<String>,
-) {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        errors.push("urlhaus: response was not JSON".into());
-        return;
-    };
-    if let Some(status) = v.get("query_status").and_then(|s| s.as_str()) {
-        if status != "ok" {
-            errors.push(format!("urlhaus: query_status={}", status));
-            return;
-        }
-    }
-    for item in array(&v, "urls") {
-        if let Some(u) = item.get("url").and_then(|u| u.as_str()) {
-            urls.insert(u.to_string());
-            if let Some(h) = item
-                .get("host")
-                .and_then(|h| h.as_str())
-                .map(|h| h.to_ascii_lowercase())
-                .or_else(|| host_of(u))
-            {
-                domains.insert(h);
+            "-" => {
+                if index.remove(&k).is_some() {
+                    removed += 1;
+                }
             }
+            other => return Err(format!("delta line {}: unknown op {:?}", n + 1, other)),
         }
     }
+
+    let n = index.len();
+    write_index(out_dir, &index)?;
+    Ok(Applied {
+        mode: "delta".into(),
+        packages: n,
+        added,
+        removed,
+    })
 }
 
-fn array<'a>(v: &'a serde_json::Value, key: &str) -> &'a [serde_json::Value] {
-    v.get(key)
-        .and_then(|d| d.as_array())
-        .map(|a| a.as_slice())
-        .unwrap_or(&[])
+/// `ecosystem\tname` -> spec.
+type Index = BTreeMap<String, String>;
+
+fn parse_index(text: &str) -> Result<Index, String> {
+    let mut out = Index::new();
+    for (n, line) in text.lines().enumerate() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut f = line.splitn(3, '\t');
+        let (eco, name, spec) = (f.next(), f.next(), f.next());
+        match (eco, name, spec) {
+            (Some(e), Some(nm), Some(s)) if !e.is_empty() && !nm.is_empty() && !s.is_empty() => {
+                out.insert(format!("{}\t{}", e, nm), s.to_string());
+            }
+            _ => return Err(format!("index line {}: malformed", n + 1)),
+        }
+    }
+    if out.is_empty() {
+        return Err("index parsed to zero entries; refusing to install it".into());
+    }
+    Ok(out)
 }
 
-/// Minimal host extraction; we never need a full URL parser here.
-fn host_of(url: &str) -> Option<String> {
-    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let host = rest.split(['/', '?', '#']).next()?;
-    let host = host.rsplit_once('@').map(|(_, h)| h).unwrap_or(host);
-    let host = if host.starts_with('[') {
-        host.split(']').next()?.trim_start_matches('[')
-    } else {
-        host.split(':').next()?
-    };
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+fn write_index(dir: &Path, index: &Index) -> Result<(), String> {
+    let mut body = String::with_capacity(index.len() * 32 + 128);
+    body.push_str("# moat-packages v1\n");
+    body.push_str(&format!("# generated {}\n", crate::util::now_rfc3339()));
+    body.push_str(&format!("# entries {}\n", index.len()));
+    for (k, v) in index {
+        body.push_str(k);
+        body.push('\t');
+        body.push_str(v);
+        body.push('\n');
+    }
+    crate::util::atomic_write(&dir.join(PACKAGES_FILE), body.as_bytes(), 0o644)
+        .map(|_| ())
+        .map_err(|e| format!("{}: {}", PACKAGES_FILE, e))
+}
+
+fn write_meta(dir: &Path, pointer: &Pointer, packages: usize, mode: &str) -> Result<(), String> {
+    let meta = serde_json::json!({
+        "updated": crate::util::now_rfc3339(),
+        "seq": pointer.seq,
+        "generated": pointer.generated,
+        "packages": packages,
+        "mode": mode,
+        "source": "malicious-package index (OSSF malicious-packages + DataDog dataset)",
+        "hash_feed": "operator-supplied; abuse.ch was dropped, see docs/PACKAGE-FEED.md",
+    });
+    crate::util::atomic_write(
+        &dir.join(META_FILE),
+        format!("{}\n", serde_json::to_string_pretty(&meta).unwrap_or_default()).as_bytes(),
+        0o644,
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+fn count_packages(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join(PACKAGES_FILE))
+        .map(|t| {
+            t.lines()
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// Where `moat-feeds` and the daemon agree the config lives.
@@ -442,109 +765,184 @@ pub fn default_config_path() -> PathBuf {
 mod tests {
     use super::*;
 
-    #[test]
-    fn no_key_skips_without_touching_files() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("hashes.txt"), "deadbeef\n").unwrap();
-        let sum = refresh(&FeedsConfig::default(), dir.path());
-        assert!(sum.skipped);
-        assert!(sum.reason.unwrap().contains("auth_key"));
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("hashes.txt")).unwrap(),
-            "deadbeef\n"
-        );
+    fn idx(pairs: &[(&str, &str, &str)]) -> String {
+        let mut s = String::from("# moat-packages v1\n");
+        for (e, n, sp) in pairs {
+            s.push_str(&format!("{}\t{}\t{}\n", e, n, sp));
+        }
+        s
     }
 
     #[test]
-    fn placeholder_key_counts_as_no_key() {
-        let mut c = FeedsConfig {
-            auth_key: "PUT-YOUR-ABUSE-CH-AUTH-KEY-HERE".into(),
+    fn disabled_leaves_files_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(PACKAGES_FILE), idx(&[("npm", "x", "*")])).unwrap();
+        let cfg = FeedsConfig {
+            enabled: false,
             ..Default::default()
         };
-        assert!(c.key().is_none());
-        c.auth_key = "  real-key  ".into();
-        assert_eq!(c.key(), Some("real-key"));
+        let sum = refresh(&cfg, dir.path());
+        assert!(sum.skipped);
+        assert!(std::fs::read_to_string(dir.path().join(PACKAGES_FILE))
+            .unwrap()
+            .contains("npm\tx\t*"));
     }
 
     #[test]
-    fn malwarebazaar_shape() {
-        let body = r#"{"query_status":"ok","data":[
-            {"sha256_hash":"AABBCC","file_name":"x"},
-            {"sha256_hash":"ddeeff"}]}"#;
-        let mut h = HashSet::new();
-        let mut e = Vec::new();
-        collect_malwarebazaar(body, &mut h, &mut e);
-        assert!(e.is_empty());
-        assert!(h.contains("aabbcc") && h.contains("ddeeff"));
-    }
-
-    #[test]
-    fn malwarebazaar_error_status_is_reported() {
-        let mut h = HashSet::new();
-        let mut e = Vec::new();
-        collect_malwarebazaar(r#"{"query_status":"unauthorized"}"#, &mut h, &mut e);
-        assert!(h.is_empty());
-        assert!(e[0].contains("unauthorized"));
-    }
-
-    #[test]
-    fn threatfox_splits_by_ioc_type() {
-        let body = r#"{"query_status":"ok","data":[
-          {"ioc":"evil.example","ioc_type":"domain"},
-          {"ioc":"1.2.3.4:8080","ioc_type":"ip:port"},
-          {"ioc":"http://bad.example/a.bin","ioc_type":"url"},
-          {"ioc":"ABC123","ioc_type":"sha256_hash"},
-          {"ioc":"x","ioc_type":"md5_hash"}]}"#;
-        let (mut h, mut d, mut u, mut e) = (HashSet::new(), HashSet::new(), HashSet::new(), Vec::new());
-        collect_threatfox(body, &mut h, &mut d, &mut u, &mut e);
-        assert!(e.is_empty());
-        assert!(h.contains("abc123"));
-        assert!(d.contains("evil.example"));
-        assert!(d.contains("1.2.3.4"));
-        assert!(d.contains("bad.example"));
-        assert!(u.contains("http://bad.example/a.bin"));
-        assert_eq!(h.len(), 1, "md5 is not usable against process.binary");
-    }
-
-    #[test]
-    fn urlhaus_shape() {
-        let body = r#"{"query_status":"ok","urls":[
-          {"url":"http://1.2.3.4:8080/x.exe","host":"1.2.3.4"},
-          {"url":"https://drop.example/y"}]}"#;
-        let (mut d, mut u, mut e) = (HashSet::new(), HashSet::new(), Vec::new());
-        collect_urlhaus(body, &mut d, &mut u, &mut e);
-        assert!(e.is_empty());
-        assert_eq!(u.len(), 2);
-        assert!(d.contains("1.2.3.4") && d.contains("drop.example"));
-    }
-
-    #[test]
-    fn host_extraction() {
-        assert_eq!(host_of("http://a.example/x").as_deref(), Some("a.example"));
-        assert_eq!(host_of("https://u:p@b.example:8443/x").as_deref(), Some("b.example"));
-        assert_eq!(host_of("http://[2001:db8::1]/x").as_deref(), Some("2001:db8::1"));
-        assert_eq!(host_of("").as_deref(), None);
-    }
-
-    #[test]
-    fn cache_reloads_only_on_change() {
+    fn missing_key_with_require_signature_refuses() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("hashes.txt"), "AABB\n\n# comment\n").unwrap();
+        let cfg = FeedsConfig {
+            public_key_path: dir.path().join("nope.pub").display().to_string(),
+            ..Default::default()
+        };
+        let sum = refresh(&cfg, dir.path());
+        assert!(sum.skipped);
+        assert!(sum.reason.unwrap().contains("public key"));
+        assert!(!dir.path().join(PACKAGES_FILE).exists());
+    }
+
+    #[test]
+    fn index_round_trips() {
+        let text = idx(&[
+            ("npm", "--hiljson", "*"),
+            ("npm", "@scope/pkg", ">=1.1.2"),
+            ("crates.io", "append-only-vec", "=0.1.9"),
+        ]);
+        let i = parse_index(&text).unwrap();
+        assert_eq!(i.len(), 3);
+        assert_eq!(i.get("crates.io\tappend-only-vec").unwrap(), "=0.1.9");
+        assert_eq!(i.get("npm\t@scope/pkg").unwrap(), ">=1.1.2");
+    }
+
+    #[test]
+    fn a_name_containing_spaces_survives() {
+        // Only the tab is structural; upstream names are otherwise arbitrary.
+        let i = parse_index(&idx(&[("npm", "weird name", "*")])).unwrap();
+        assert!(i.contains_key("npm\tweird name"));
+    }
+
+    #[test]
+    fn empty_index_is_rejected() {
+        // An index that parses to nothing would silently disarm every scanner.
+        assert!(parse_index("# moat-packages v1\n").is_err());
+        assert!(parse_index("").is_err());
+    }
+
+    #[test]
+    fn malformed_index_line_is_rejected() {
+        assert!(parse_index("npm\tonlytwo\n").is_err());
+    }
+
+    #[test]
+    fn delta_applies_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = idx(&[("npm", "keep", "*"), ("npm", "drop", "*"), ("npm", "bump", "=1.0.0")]);
+        let mut index = parse_index(&start).unwrap();
+
+        let delta = "# moat-packages-delta v1\n\
+                     # from 1\n# to 2\n\
+                     +\tnpm\tnew\t*\n\
+                     +\tnpm\tbump\t=1.0.0|=2.0.0\n\
+                     -\tnpm\tdrop\n";
+        let apply = |index: &mut Index| {
+            for line in delta.lines() {
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let mut f = line.split('\t');
+                let op = f.next().unwrap();
+                let eco = f.next().unwrap();
+                let name = f.next().unwrap();
+                let k = format!("{}\t{}", eco, name);
+                match op {
+                    "+" => {
+                        index.insert(k, f.next().unwrap().to_string());
+                    }
+                    "-" => {
+                        index.remove(&k);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        };
+        apply(&mut index);
+        let once = index.clone();
+        apply(&mut index);
+        assert_eq!(once, index, "applying a delta twice must be a no-op");
+
+        assert!(!index.contains_key("npm\tdrop"));
+        assert_eq!(index.get("npm\tbump").unwrap(), "=1.0.0|=2.0.0");
+        assert_eq!(index.get("npm\tnew").unwrap(), "*");
+        assert_eq!(index.len(), 3);
+
+        write_index(dir.path(), &index).unwrap();
+        let back = parse_index(&std::fs::read_to_string(dir.path().join(PACKAGES_FILE)).unwrap())
+            .unwrap();
+        assert_eq!(back, index, "write then parse must round-trip");
+    }
+
+    #[test]
+    fn cache_reports_counts_and_reloads_on_change() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(PACKAGES_FILE), idx(&[("npm", "a", "*")])).unwrap();
+        std::fs::write(dir.path().join(META_FILE), r#"{"seq":7,"packages":1}"#).unwrap();
+        std::fs::write(dir.path().join("hashes.txt"), "AABB\n").unwrap();
+
         let mut f = Feeds::load(dir.path());
-        assert!(f.hash_hit("aabb"));
-        assert!(f.hash_hit("AABB"), "lookups are case insensitive");
-        assert_eq!(f.meta.hashes, 1);
+        assert_eq!(f.meta.seq, 7);
+        assert_eq!(f.meta.packages, 1);
+        assert!(f.hash_hit("aabb"), "operator-supplied hashes still match");
         assert!(!f.reload_if_changed(dir.path()));
+
+        // An operator dropping in their own hashes must be noticed.
         std::fs::write(dir.path().join("hashes.txt"), "aabb\nccdd\n").unwrap();
         assert!(f.reload_if_changed(dir.path()));
         assert_eq!(f.meta.hashes, 2);
     }
 
     #[test]
+    fn signature_verification_actually_rejects() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let vk = sk.verifying_key().to_bytes();
+        let msg = b"the index bytes";
+        let sig = sk.sign(msg).to_bytes();
+
+        assert!(verify_ed25519(&vk, msg, &sig).is_ok());
+        assert!(verify_ed25519(&vk, b"tampered", &sig).is_err());
+
+        let mut bad = sig;
+        bad[0] ^= 0xff;
+        assert!(verify_ed25519(&vk, msg, &bad).is_err());
+
+        // A different key must not verify: this is the bucket-compromise case.
+        let other = SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes();
+        assert!(verify_ed25519(&other, msg, &sig).is_err());
+    }
+
+    #[test]
+    fn public_key_reads_hex_and_base64_and_skips_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = [3u8; 32];
+        let hex = raw.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let p = dir.path().join("k.pub");
+
+        std::fs::write(&p, format!("untrusted comment: moat feed\n{}\n", hex)).unwrap();
+        let cfg = FeedsConfig {
+            public_key_path: p.display().to_string(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.verifying_key().unwrap().unwrap(), raw);
+
+        std::fs::write(&p, format!("# a comment\n{}\n", crate::util::to_base64(&raw))).unwrap();
+        assert_eq!(cfg.verifying_key().unwrap().unwrap(), raw);
+    }
+
+    #[test]
     fn shipped_feeds_toml_parses() {
         let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("etc/feeds.toml");
         let c = FeedsConfig::load(&p).expect("etc/feeds.toml must parse");
-        assert!(c.key().is_none(), "shipped file must not carry a key");
-        assert_eq!(c.malwarebazaar_url, MALWAREBAZAAR_URL);
+        assert!(c.require_signature, "shipped config must verify signatures");
+        assert!(!c.base_url.is_empty());
     }
 }

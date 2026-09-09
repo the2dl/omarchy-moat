@@ -44,7 +44,7 @@ pub struct Paths {
     /// `moat-feeds` binary, spawned by `feeds refresh`.
     pub feeds_bin: PathBuf,
     /// `feeds.toml`. moatd never fetches anything; it reads this only to
-    /// answer "is an abuse.ch key configured at all", which is the difference
+    /// answer "is the feed fetcher switched on at all", which is the difference
     /// between a feature that is failing and one nobody switched on.
     pub feeds_config: PathBuf,
     /// `policies/check.py`, re-run by `moatd telemetry apply` before any

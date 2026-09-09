@@ -5064,17 +5064,25 @@ impl Daemon {
             "policies_failed": self.policies_failed,
             "feeds": {
                 "updated": self.feeds.meta.updated,
+                // The malicious-package index: what the six scanners consult.
+                "seq": self.feeds.meta.seq,
+                "packages": self.feeds.meta.packages,
+                // Operator-supplied since abuse.ch was dropped. Reported
+                // separately from `packages` so that "you have no hash feed"
+                // does not read as "you have no feed" -- the hash feed now has
+                // no keyless source, and that is a deliberate trade, not a
+                // fault. See docs/PACKAGE-FEED.md.
                 "hashes": self.feeds.meta.hashes,
                 "domains": self.feeds.meta.domains,
                 "urls": self.feeds.meta.urls,
-                // Whether an abuse.ch key is set at all. Without this, "never
-                // updated" is all anyone can say -- and it reads as a fault
-                // when the truth is usually that an optional feature was never
-                // switched on. The reason lived only in the journal of a
-                // service that exits successfully, which is nobody's first
-                // place to look.
+                "hashes_source": "operator-supplied",
+                // Whether the fetcher is switched on at all. Without this,
+                // "never updated" is all anyone can say -- and it reads as a
+                // fault when the truth may be that it was deliberately pinned.
+                // The reason lived only in the journal of a service that exits
+                // successfully, which is nobody's first place to look.
                 "configured": crate::feeds::FeedsConfig::load(&self.cfg.paths.feeds_config)
-                    .map(|c| c.key().is_some())
+                    .map(|c| c.enabled)
                     .unwrap_or(false),
             },
             "unacked": unacked,

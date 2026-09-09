@@ -140,14 +140,26 @@ fn permission_denied_names_the_group_command() {
     }
 }
 
-/// `moat-feeds` must exit 0 with no key and leave existing files alone.
+/// `moat-feeds` must exit 0 and leave existing files alone when it cannot
+/// verify what it would install. This is the timer's core contract
+/// (CONTRACT §6.7): a feed that cannot be trusted is a stale feed, not an
+/// error, and never an empty one.
 #[test]
-fn moat_feeds_without_a_key_is_a_no_op() {
+fn moat_feeds_without_a_verifiable_index_is_a_no_op() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("feeds.toml");
-    std::fs::write(&cfg, "auth_key = \"\"\n").unwrap();
+    // No public key on disk, and require_signature defaults on.
+    std::fs::write(
+        &cfg,
+        format!(
+            "public_key_path = \"{}\"\n",
+            dir.path().join("absent.pub").display()
+        ),
+    )
+    .unwrap();
     let out_dir = dir.path().join("feeds");
     std::fs::create_dir_all(&out_dir).unwrap();
+    std::fs::write(out_dir.join("packages.txt"), "npm\tevil\t*\n").unwrap();
     std::fs::write(out_dir.join("hashes.txt"), "cafebabe\n").unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_moat-feeds"))
@@ -161,9 +173,59 @@ fn moat_feeds_without_a_key_is_a_no_op() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("\"skipped\":true"), "{}", stdout);
     assert_eq!(
+        std::fs::read_to_string(out_dir.join("packages.txt")).unwrap(),
+        "npm\tevil\t*\n",
+        "the index must survive a refresh it could not verify"
+    );
+    assert_eq!(
         std::fs::read_to_string(out_dir.join("hashes.txt")).unwrap(),
         "cafebabe\n",
-        "existing feed files must survive"
+        "operator-supplied files are never touched by a refresh"
+    );
+}
+
+/// An upgraded machine keeps its old /etc/moat/feeds.toml (pacman writes a
+/// .pacnew rather than replacing it). The abuse.ch settings in that file must
+/// not make the config unparsable, or the feed would freeze with nothing but a
+/// journal line to explain it.
+#[test]
+fn a_pre_upgrade_abuse_ch_config_still_parses() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("feeds.toml");
+    std::fs::write(
+        &cfg,
+        "auth_key = \"deadbeef\"\n\
+         malwarebazaar = true\n\
+         threatfox = true\n\
+         urlhaus = true\n\
+         threatfox_days = 3\n\
+         urlhaus_limit = 1000\n\
+         timeout_secs = 30\n\
+         max_hashes = 500000\n",
+    )
+    .unwrap();
+    let out_dir = dir.path().join("feeds");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_moat-feeds"))
+        .args(["--config", cfg.to_str().unwrap()])
+        .args(["--out-dir", out_dir.to_str().unwrap()])
+        .arg("--json")
+        .output()
+        .expect("failed to run moat-feeds");
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("unknown field"),
+        "the old config must still parse: {}",
+        stdout
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("auth_key") && stderr.contains("no longer does anything"),
+        "and it must say the old settings are dead: {}",
+        stderr
     );
 }
 

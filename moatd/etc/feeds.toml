@@ -1,38 +1,29 @@
-# /etc/moat/feeds.toml — threat feed configuration for `moat-feeds`.
+# /etc/moat/feeds.toml — malicious-package feed configuration for `moat-feeds`.
 #
-# Contains a credential once you fill it in, so the package installs this
-# root:root 0600.
+# No credential lives here any more. moat used to fetch abuse.ch
+# (MalwareBazaar / ThreatFox / URLhaus), which requires an Auth-Key, so a
+# machine without a key had no feed at all. It now pulls a signed, keyless
+# malicious-package index that the six scanners read offline before an install
+# runs. See docs/PACKAGE-FEED.md.
 
-# abuse.ch has required an Auth-Key header on every endpoint since 2025.
-# Get a free key at https://auth.abuse.ch/ and paste it here.
-#
-# With no key, `moat-feeds` logs one line, exits 0, and leaves the existing
-# feed files alone — the timer never fails and you never lose the cache you
-# already have. Only `moat-x-new-exec-ioc` depends on the feed; every other
-# rule works without it.
-auth_key = ""
+enabled = true
 
-# Sources. MalwareBazaar gives recent sample sha256 (the only one the IOC rule
-# uses today); ThreatFox and URLhaus fill domains.txt and urls.txt, which the
-# plugin can show and future rules can use.
-malwarebazaar = true
-threatfox = true
-urlhaus = true
+# Where the signed index is published. Override to point at a mirror.
+base_url = "https://feed.omarchy-moat.org"
 
-# Endpoints, as documented at bazaar.abuse.ch/api, threatfox.abuse.ch/api and
-# urlhaus-api.abuse.ch. Override only if abuse.ch moves them.
-malwarebazaar_url = "https://mb-api.abuse.ch/api/v1/"
-threatfox_url = "https://threatfox-api.abuse.ch/api/v1/"
-urlhaus_url = "https://urlhaus-api.abuse.ch/v1/urls/recent/"
+# The index decides what moat warns about, so it is verified before it is
+# applied. Turning this off means trusting whoever can answer for base_url;
+# it exists for local mirror testing, not for production.
+require_signature = true
 
-# ThreatFox window in days; the API refuses more than 7.
-threatfox_days = 3
-
-# URLhaus rows per fetch; the API caps this at 1000.
-urlhaus_limit = 1000
+# ed25519 public key, shipped with the package. Set `public_key` inline
+# (hex or base64) to override the file.
+public_key_path = "/usr/share/moat/feed-key.pub"
+public_key = ""
 
 # Per-request timeout.
 timeout_secs = 30
 
-# Upper bound on hashes kept in hashes.txt; the daemon holds them in memory.
-max_hashes = 500000
+# Ceilings on what a server may hand us. The full index is ~1.6 MB gzipped.
+max_artifact_bytes = 67108864
+max_pointer_bytes = 262144

@@ -6,7 +6,7 @@
 //! `/dev/shm` — and only once per (path, mtime, size), because hashing every
 //! exec on a build machine would be absurd.
 //!
-//! A hit against `feeds/hashes.txt` (abuse.ch MalwareBazaar + ThreatFox) is as
+//! A hit against `feeds/hashes.txt` (operator-supplied; see docs/PACKAGE-FEED.md) is as
 //! close to certainty as this system gets, hence `critical`.
 
 use std::collections::HashMap;
@@ -71,7 +71,7 @@ impl UserRule for NewExecIoc {
             "exec",
             "critical",
             "Executed file matches a known-malware hash",
-            "The sha256 of this binary is in the abuse.ch feed of samples seen in the wild. \
+            "The sha256 of this binary is in the local hash feed of samples seen in the wild. \
              That is not a heuristic: this exact file has been submitted as malware.",
             "Almost never. A false positive needs a hash collision with a sample someone \
              uploaded — far more likely is that a security tool or a malware sample you are \
@@ -109,11 +109,11 @@ impl UserRule for NewExecIoc {
             sha256: Some(sha.clone()),
         });
         f.ioc = Some(IocRef {
-            source: "abuse.ch".into(),
+            source: "hash-feed".into(),
             matched: format!("sha256:{}", sha),
         });
         f.what_override = Some(format!(
-            "{} is a known-malware binary: its sha256 is in the abuse.ch feed.",
+            "{} is a known-malware binary: its sha256 is in the local hash feed.",
             exe
         ));
         f.extra_evidence = vec![format!(

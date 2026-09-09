@@ -11,7 +11,7 @@ Three binaries from one crate:
 |------------------|---------------------------------------------------------------------|
 | `moatd`      | `render-policies` (ExecStartPre), `wait-sensor` (ExecStartPost) and `run` (the daemon) |
 | `moatctl`    | thin CLI over the control socket                                    |
-| `moat-feeds` | hourly abuse.ch indicator fetch                                     |
+| `moat-feeds` | 15-minute refresh of the signed malicious-package index             |
 
 ```
 cargo build --release && cargo test && cargo clippy
@@ -539,8 +539,9 @@ version; the reference:
 | `digest.enabled` | `true` | first-boot value; `state.json` wins after that |
 | `digest.weekday` / `hour` | `monday` / 9 | local time, not UTC |
 
-`/etc/moat/feeds.toml` holds the abuse.ch `auth_key` (0600) and the
-endpoints; `/etc/moat/allowlist.d/default.toml` ships sensible defaults with
+`/etc/moat/feeds.toml` holds the feed `base_url` and the pinned signing key —
+no credential, since the index is keyless; `/etc/moat/allowlist.d/default.toml`
+ships sensible defaults with
 a comment explaining each, and `user.toml` is what `moatctl ignore` writes.
 
 ### Allowlist shape
@@ -562,20 +563,37 @@ line directly above a `[[rule]]` is what `moatctl allowlist` shows.
 
 ## 7. Feeds
 
-`moat-feeds` fetches, per the abuse.ch API docs:
+`moat-feeds` refreshes a **signed malicious-package index** every 15 minutes.
+`docs/PACKAGE-FEED.md` is the format contract; the short version:
 
-| source | endpoint | method |
+| step | endpoint | notes |
 |---|---|---|
-| MalwareBazaar | `https://mb-api.abuse.ch/api/v1/` | POST `query=get_recent&selector=time` |
-| ThreatFox | `https://threatfox-api.abuse.ch/api/v1/` | POST `{"query":"get_iocs","days":N}` |
-| URLhaus | `https://urlhaus-api.abuse.ch/v1/urls/recent/limit/N/` | GET |
+| poll | `GET /v1/pointer.json` | `If-None-Match`; the common tick is a 304 on ~200 bytes |
+| delta | `GET /v1/delta-<from>-<to>-<sha>.txt.gz` | when the local seq is in `pointer.deltas` |
+| full | `GET /v1/packages-<seq>-<sha>.txt.gz` | first run, or a broken delta chain |
 
-All three require an `Auth-Key` header (free, https://auth.abuse.ch/). **With no
-key configured it logs one line, exits 0, and leaves the existing files alone** —
-the timer never fails and an offline machine never loses the cache it has.
-Writes to `hashes.txt`, `domains.txt`, `urls.txt` and `meta.json` are atomic,
-and a run where every source failed writes nothing rather than blanking the
-cache. The daemon polls the mtime of `hashes.txt` every 60 s and reloads.
+Every artifact is ed25519-signed and **verified before anything is written**,
+because this file decides what moat warns about: without a signature, control of
+the bucket would be control of the warnings — including silently emptying the
+list to suppress them. The pinned public key is `/usr/share/moat/feed-key.pub`.
+
+The result is `packages.txt`: ~242,000 lines of `ecosystem<TAB>name<TAB>spec`,
+which the six scanners bisect **offline** before an install runs. The spec
+distinguishes "every version of this package is malicious" (86% of records)
+from specific compromised versions — flattening that would warn on every
+install of an ordinarily-legitimate package that was once compromised, which
+trains people to ignore the warning.
+
+**Any failure leaves the previous index in place and exits 0**; the timer never
+fails hard and an offline machine never loses what it has. A signature that does
+not verify is logged at error rather than warn — it is not routine staleness.
+
+`hashes.txt`, `domains.txt` and `urls.txt` are no longer fetched by anything.
+They are still read if an operator drops them in, and `moat-x-new-exec-ioc`
+still matches `hashes.txt`. There is no keyless replacement for the sha256 feed:
+OSV malicious-package records identify packages, not file hashes. That is a real
+reduction in what moat detects, and the deliberate price of not requiring an API
+key to get any feed at all.
 
 ---
 
@@ -1035,7 +1053,7 @@ src/
   store.rs      append-only alerts.jsonl with rotation
   control.rs    the socket protocol and every command
   engine.rs     shared state and the run loop
-  feeds.rs      abuse.ch fetch + local feed cache
+  feeds.rs      signed package-index client + local feed cache
   util.rs       atomic writes, /proc, hashing, human homes
   bin/          moatd, moatctl, moat-feeds
 systemd/        moatd.service, moat-feeds.{service,timer},

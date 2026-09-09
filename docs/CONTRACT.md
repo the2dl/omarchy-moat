@@ -54,7 +54,7 @@ Tetragon itself is **upstream, unmodified**, v1.7.1, from
                                            prefix match and no policy hot-reload).
 /etc/moat/moat.toml                moatd config (root:root 0644)
 /etc/moat/allowlist.d/*.toml           user-editable allowlists, merged
-/etc/moat/feeds.toml                   feed URLs, optional abuse.ch auth key
+/etc/moat/feeds.toml                   feed base URL + pinned signing key
 /etc/moat/sandbox.conf                 sandbox deny/allow paths
 /etc/moat/scanner-allow.conf           scanner allow file, shared by all three
                                            scanners (host=/rule=/pkg=),
@@ -75,7 +75,7 @@ Tetragon itself is **upstream, unmodified**, v1.7.1, from
                                            /etc/moat/sandbox.enabled exists
 /usr/lib/systemd/system/tetragon.service   hardened, After=local-fs
 /usr/lib/systemd/system/moatd.service  Requires+After tetragon
-/usr/lib/systemd/system/moat-feeds.{service,timer}   hourly, RandomizedDelaySec=10min
+/usr/lib/systemd/system/moat-feeds.{service,timer}   */15, RandomizedDelaySec=5min
 /usr/lib/systemd/system/moat-ship.service  User=moat-ship, group `moat`, NO
                                            capabilities; not enabled by default
 /usr/lib/sysusers.d/moat.conf          creates group `moat` and user `moat-ship`
@@ -194,7 +194,7 @@ One JSON object per line, UTF-8, no pretty printing. Fields:
   },
   "file":  { "path": "/home/dan/.ssh/id_rsa", "sha256": null },          // optional
   "net":   { "dst_ip": "1.2.3.4", "dst_port": 443, "domain": null },      // optional
-  "ioc":   { "source": "malwarebazaar", "matched": "sha256:..." },        // optional
+  "ioc":   { "source": "hash-feed", "matched": "sha256:..." },            // optional
   "rotate": ["ssh-key"],
   "explain": {
     "what": "node read your private SSH key.",
@@ -712,11 +712,22 @@ sudoers rule.
    `set-mode` calls failed, nothing retried or checked, and every surface went
    on saying ARMED for the rest of the day (NOTES §7.1).
 6. Serve the control socket. Write `state.json` every 5 s.
-7. `moat-feeds` (separate binary or subcommand, run by the timer): fetch
-   abuse.ch MalwareBazaar recent sha256 list, ThreatFox recent IOCs (domains,
-   ips, urls), URLhaus recent. abuse.ch requires an `Auth-Key` header since
-   2025; read it from `feeds.toml`, and if absent, skip with a clear log line
-   and leave existing files in place. Atomic write. Never fail the timer hard.
+7. `moat-feeds` (separate binary, run by the `*/15` timer): refresh the signed
+   malicious-package index that the six scanners read offline. `GET
+   /v1/pointer.json` conditionally; on 304 or an unchanged `seq`, stop. Else
+   fetch a delta if the local seq is in `pointer.deltas`, the full artifact
+   otherwise. **Verify the ed25519 signature before anything is written**, then
+   the sha256. Atomic write of `packages.txt` + `meta.json`. Never fail the
+   timer hard: every error path leaves the previous index in place and exits 0.
+   A signature that does not verify is the one condition logged at error rather
+   than warn — it is not routine staleness.
+
+   The abuse.ch sources (MalwareBazaar / ThreatFox / URLhaus) were removed:
+   all three require an `Auth-Key`, so the common machine had no feed at all,
+   while the scanners — the part of moat that actually sees `npm install` —
+   consulted no feed whatsoever. `hashes.txt`, `domains.txt` and `urls.txt` are
+   still *read* if an operator supplies them, and are never written by a
+   refresh. See `docs/PACKAGE-FEED.md`.
 
 ## 7. Plugin responsibilities (shell/)
 

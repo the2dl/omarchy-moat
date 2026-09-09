@@ -1,4 +1,5 @@
-//! `moat-feeds` — fetches the abuse.ch feeds, run hourly by a timer.
+//! `moat-feeds` — refreshes the malicious-package index, run every 15
+//! minutes by a timer.
 //!
 //! Exit status is always 0: the timer must never fail hard (CONTRACT §6.7).
 //! Problems are logged; `--json` prints a machine-readable summary for the
@@ -15,13 +16,13 @@ use moatd::feeds::{self, FeedsConfig};
 #[command(
     name = "moat-feeds",
     version,
-    about = "Fetch abuse.ch MalwareBazaar / ThreatFox / URLhaus indicators"
+    about = "Refresh the signed malicious-package index the scanners read"
 )]
 struct Cli {
     /// feeds.toml (default /etc/moat/feeds.toml, or $MOAT_FEEDS_CONFIG).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Where hashes.txt, domains.txt, urls.txt and meta.json are written.
+    /// Where packages.txt, meta.json and state.json are written.
     #[arg(long)]
     out_dir: Option<PathBuf>,
     /// moat.toml, used only to find the default out-dir.
@@ -56,6 +57,18 @@ fn main() -> std::process::ExitCode {
         }
     };
 
+    let legacy = cfg.legacy_keys_present();
+    if !legacy.is_empty() {
+        log::warn!(
+            "{}: {} no longer does anything -- moat no longer fetches abuse.ch \
+             (it required an Auth-Key, so most machines had no feed at all). \
+             The malicious-package index is keyless; see docs/PACKAGE-FEED.md. \
+             Compare your file against the shipped feeds.toml.pacnew.",
+            cfg_path.display(),
+            legacy.join(", ")
+        );
+    }
+
     let out_dir = match cli.out_dir {
         Some(p) => p,
         None => {
@@ -70,17 +83,26 @@ fn main() -> std::process::ExitCode {
             "feeds not refreshed: {}",
             sum.reason.clone().unwrap_or_default()
         );
+    } else if sum.mode == "unchanged" {
+        log::debug!("feed already at seq {}", sum.seq);
     } else {
         log::info!(
-            "feeds updated in {}: {} hashes, {} domains, {} urls",
+            "feed updated in {} ({}): seq {}, {} packages (+{} -{})",
             out_dir.display(),
-            sum.hashes,
-            sum.domains,
-            sum.urls
+            sum.mode,
+            sum.seq,
+            sum.packages,
+            sum.added,
+            sum.removed
         );
     }
     for e in &sum.errors {
-        log::warn!("feed source failed: {}", e);
+        // A failed signature is the one case that is not routine staleness.
+        if e.contains("SIGNATURE DID NOT VERIFY") {
+            log::error!("{}: refusing to apply, keeping the existing index", e);
+        } else {
+            log::warn!("feed refresh: {}", e);
+        }
     }
 
     if cli.json {

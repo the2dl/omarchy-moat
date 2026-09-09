@@ -622,10 +622,13 @@ hardcoded `/usr/bin/moatctl`, `/var/lib/moat/alerts.jsonl`,
    has no real files, so only the refusal path is covered here. The move, the
    `chmod 000` and the `meta.json` are covered by `moatd`'s unit tests.
 
-4. **The feeds seam is untested against the network.** `moat-feeds` without an
-   abuse.ch `Auth-Key` is a clean no-op and `status.feeds` reads `never`, which
-   the plugin renders correctly. Nothing verifies the parse of a real
-   MalwareBazaar / ThreatFox / URLhaus response.
+4. **The feeds seam is untested against the live aggregator.** `moat-feeds`
+   with no verifiable index is a clean no-op and `status.feeds` reads `never`,
+   which the plugin renders correctly. The full path — pointer, artifact,
+   ed25519 verification, apply — is covered end to end against a local fixture
+   server, including the tamper cases (a swapped artifact under a stale
+   signature is refused, and the previous index survives). What is *not*
+   covered is the real deployed aggregator, which does not exist yet.
 
 5. **`process_uprobe` is in the export-allowlist but the daemon does not parse
    it.** No shipped policy uses a uprobe, so the events would be silently
