@@ -74,6 +74,10 @@ pub struct Actor {
     /// The script an interpreter was handed, when the interpreter rule applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script: Option<String>,
+    /// Why this actor is not `official` despite its package being one: the
+    /// bytes on disk no longer match the sha256 the package recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<String>,
 }
 
 impl Actor {
@@ -89,6 +93,9 @@ impl Actor {
                 script
             ));
         }
+        if let Some(m) = &self.modified {
+            s.push_str(&format!(" -- {}", m));
+        }
         if self.package.is_none() && self.script.is_none() {
             s.push_str(match self.provenance {
                 Provenance::User => ", no package owns this path",
@@ -98,6 +105,22 @@ impl Actor {
         }
         s
     }
+}
+
+/// What `classify_path` concluded about one path.
+///
+/// A struct rather than a tuple because two of its three fields are
+/// `Option<String>` and a call site that swapped them would still compile.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PathClass {
+    pub provenance: Provenance,
+    /// `"coreutils 9.11-2"`, when a package owns the path.
+    pub package: Option<String>,
+    /// Set only when the package's own recorded sha256 was read and did NOT
+    /// match the bytes on disk. `None` covers both "matched" and "could not
+    /// check", which are different things to a reader but the same thing to a
+    /// verdict: neither is evidence of a change.
+    pub modified: Option<String>,
 }
 
 /// One row of `/var/lib/pacman/local/<pkg>/desc`.
@@ -267,8 +290,8 @@ fn absolutize(tok: &str, cwd: &str) -> Option<String> {
 struct CacheEntry {
     ino: u64,
     mtime: i64,
-    provenance: Provenance,
-    package: Option<String>,
+    size: u64,
+    class: PathClass,
 }
 
 /// The local pacman database, parsed once.
@@ -277,6 +300,11 @@ pub struct PacmanDb {
     /// Absolute path -> index into `pkgs`.
     owners: HashMap<String, usize>,
     pkgs: Vec<PkgInfo>,
+    /// `/var/lib/pacman/local/<pkg>` per entry of `pkgs`, so the per-file
+    /// checksums in its `mtree` can be read on demand. Not preloaded: this
+    /// machine has 60,920 owned files under /usr/bin and /usr/lib alone, and
+    /// their digests are only ever wanted one at a time.
+    dirs: Vec<PathBuf>,
     /// mtime of the local database directory when it was read.
     pub db_mtime: i64,
     pub packages: usize,
@@ -307,6 +335,7 @@ impl PacmanDb {
             };
             let idx = db.pkgs.len();
             db.pkgs.push(info);
+            db.dirs.push(dir.clone());
             if let Ok(files) = std::fs::read_to_string(dir.join("files")) {
                 for p in parse_files(&files) {
                     db.owners.insert(p, idx);
@@ -342,6 +371,15 @@ impl PacmanDb {
 
     pub fn owner(&self, path: &str) -> Option<&PkgInfo> {
         self.owners.get(path).and_then(|i| self.pkgs.get(*i))
+    }
+
+    /// The local database directory of the package owning `path`, for reading
+    /// its `mtree`.
+    pub fn owner_dir(&self, path: &str) -> Option<&Path> {
+        self.owners
+            .get(path)
+            .and_then(|i| self.dirs.get(*i))
+            .map(|p| p.as_path())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -471,54 +509,139 @@ impl Classifier {
         true
     }
 
-    /// Classify one path. Cached by `(path, inode, mtime)`.
-    pub fn classify_path(&mut self, path: &str) -> (Provenance, Option<String>) {
+    /// Classify one path. Cached by `(path, inode, mtime, size)`.
+    ///
+    /// The cache key is cheap metadata, which is what makes hashing affordable
+    /// -- a binary is read once and not again until it changes. Note what that
+    /// does and does not buy: a file rewritten IN PLACE with the same size and
+    /// its mtime restored (`touch -r`) keeps its key and so keeps its cached
+    /// verdict. That evades the cache, not the check; the first classification
+    /// after a restart reads the bytes again. Size is in the same `stat` as
+    /// the rest, so including it costs nothing and removes the easiest of the
+    /// three to fake.
+    pub fn classify_path(&mut self, path: &str) -> PathClass {
         if path.is_empty() {
-            return (Provenance::Unknown, None);
+            return PathClass {
+                provenance: Provenance::Unknown,
+                ..Default::default()
+            };
         }
         let stat = stat_of(path);
         if let Some(hit) = self.cache.get(path) {
-            if let Some((ino, mtime)) = stat {
-                if hit.ino == ino && hit.mtime == mtime {
-                    return (hit.provenance, hit.package.clone());
+            if let Some((ino, mtime, size)) = stat {
+                if hit.ino == ino && hit.mtime == mtime && hit.size == size {
+                    return hit.class.clone();
                 }
             } else if hit.ino == 0 {
-                return (hit.provenance, hit.package.clone());
+                return hit.class.clone();
             }
         }
-        let (prov, package) = self.classify_uncached(path);
-        let (ino, mtime) = stat.unwrap_or((0, 0));
+        let class = self.classify_uncached(path);
+        let (ino, mtime, size) = stat.unwrap_or((0, 0, 0));
         self.cache.insert(
             path.to_string(),
             CacheEntry {
                 ino,
                 mtime,
-                provenance: prov,
-                package: package.clone(),
+                size,
+                class: class.clone(),
             },
         );
-        (prov, package)
+        class
     }
 
-    fn classify_uncached(&self, path: &str) -> (Provenance, Option<String>) {
+    fn classify_uncached(&self, path: &str) -> PathClass {
         if let Some(pkg) = self.db.owner(path) {
             let trusted_repo = pkg.repo.is_some();
             // `%VALIDATION% none` means the package was installed without any
             // signature or checksum check, so its repo line proves nothing.
             let validated = !pkg.validation.is_empty() && pkg.validation != "none";
-            let prov = if trusted_repo && validated {
-                Provenance::Official
-            } else {
-                Provenance::Foreign
+            if !(trusted_repo && validated) {
+                return PathClass {
+                    provenance: Provenance::Foreign,
+                    package: Some(pkg.label()),
+                    modified: None,
+                };
+            }
+            // Everything above is about the PACKAGE, decided when it was
+            // installed. None of it is a claim about the bytes in front of us
+            // now, and `official` is what quiets a rule -- so ask.
+            let modified = self.contents_changed(path, &pkg.label());
+            return PathClass {
+                provenance: if modified.is_some() {
+                    // Package-owned, and no longer what the package shipped.
+                    // Not `official`, and deliberately not silently `unknown`
+                    // either: the package is still the right thing to name.
+                    Provenance::Foreign
+                } else {
+                    Provenance::Official
+                },
+                package: Some(pkg.label()),
+                modified,
             };
-            return (prov, Some(pkg.label()));
         }
         let mut roots: Vec<String> = self.homes.clone();
         roots.extend(USER_ROOTS.iter().map(|s| s.to_string()));
         if crate::util::under_any(path, &roots) {
-            return (Provenance::User, None);
+            return PathClass {
+                provenance: Provenance::User,
+                ..Default::default()
+            };
         }
-        (Provenance::Unknown, None)
+        PathClass {
+            provenance: Provenance::Unknown,
+            ..Default::default()
+        }
+    }
+
+    /// `Some(sentence)` only when the package recorded a sha256 for this path
+    /// and the file on disk does not match it.
+    ///
+    /// `None` for every other outcome, and they are not all the same: matched,
+    /// no mtree, no digest for this path (a directory or symlink), too large
+    /// to read, unreadable. Only a PROVEN difference may change a
+    /// classification -- treating "could not check" as "changed" would demote
+    /// half the filesystem the first time a package shipped without an mtree.
+    fn contents_changed(&self, path: &str, label: &str) -> Option<String> {
+        // A cap so one enormous package-owned blob cannot stall the alert
+        // path. Above it we make no claim rather than a slow one; the file
+        // stays `official`, which is the pre-existing behaviour, not a new
+        // hole. Alert-path work, once per (path, inode, mtime, size).
+        const MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+        let dir = self.db.owner_dir(path)?;
+        let want = crate::mtree::lookup(dir, path)?;
+        let meta = std::fs::metadata(path).ok()?;
+        if meta.len() > MAX_BYTES {
+            log::debug!(
+                "provenance: {} is {} bytes, over the verification cap; not checked",
+                path,
+                meta.len()
+            );
+            return None;
+        }
+        // Size first: it comes free with the stat we already have, and a
+        // difference is conclusive without reading the file at all.
+        if meta.len() != want.size {
+            return Some(format!(
+                "the bytes on disk are {} where {} recorded {}, so this is not the file the \
+                 package shipped",
+                meta.len(),
+                label,
+                want.size
+            ));
+        }
+        let have = crate::mtree::sha256_file(path)?;
+        if have == want.sha256 {
+            return None;
+        }
+        Some(format!(
+            "the sha256 on disk ({}) is not the one {} recorded ({}), so this is not the file \
+             the package shipped",
+            &have[..12.min(have.len())],
+            label,
+            &want.sha256[..12.min(want.sha256.len())]
+        ))
     }
 
     /// The actor of an event: an interpreter takes its script's class, anything
@@ -526,19 +649,21 @@ impl Classifier {
     pub fn classify_actor(&mut self, exe: &str, args: &str, cwd: &str) -> Actor {
         if is_interpreter(basename(exe)) {
             if let Some(script) = script_arg(args, cwd) {
-                let (prov, package) = self.classify_path(&script);
+                let c = self.classify_path(&script);
                 return Actor {
-                    provenance: prov,
-                    package,
+                    provenance: c.provenance,
+                    package: c.package,
                     script: Some(script),
+                    modified: c.modified,
                 };
             }
         }
-        let (provenance, package) = self.classify_path(exe);
+        let c = self.classify_path(exe);
         Actor {
-            provenance,
-            package,
+            provenance: c.provenance,
+            package: c.package,
             script: None,
+            modified: c.modified,
         }
     }
 
@@ -548,10 +673,10 @@ impl Classifier {
     }
 }
 
-fn stat_of(path: &str) -> Option<(u64, i64)> {
+fn stat_of(path: &str) -> Option<(u64, i64, u64)> {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::metadata(path).ok()?;
-    Some((m.ino(), m.mtime()))
+    Some((m.ino(), m.mtime(), m.size()))
 }
 
 #[cfg(test)]
@@ -588,6 +713,33 @@ pub(crate) mod testkit {
             }
             std::fs::write(d.join("files"), body).unwrap();
         }
+    }
+
+    /// Write a package's gzipped `mtree` recording the CURRENT bytes of each
+    /// named path, so a test can then change one and watch the check notice.
+    ///
+    /// Real format, not a stub: the parser this feeds is the one a security
+    /// decision rests on, so a fixture that invented an easier grammar would
+    /// prove nothing about the file pacman writes.
+    pub fn fake_mtree(dir: &Path, pkg_dir: &str, paths: &[&str]) {
+        use std::io::Write;
+        let mut body = String::from("#mtree
+/set type=file uid=0 gid=0 mode=755
+");
+        for p in paths {
+            let bytes = std::fs::read(p).unwrap();
+            let sha = crate::mtree::sha256_file(p).unwrap();
+            body.push_str(&format!(
+                "./{} time=1784093337.0 size={} sha256digest={}\n",
+                p.trim_start_matches('/'),
+                bytes.len(),
+                sha
+            ));
+        }
+        let f = std::fs::File::create(dir.join(pkg_dir).join("mtree")).unwrap();
+        let mut gz = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+        gz.write_all(body.as_bytes()).unwrap();
+        gz.finish().unwrap();
     }
 
     pub fn classifier(dir: &Path, sl: &str, homes: &[&str]) -> Classifier {
@@ -634,21 +786,23 @@ mod tests {
     fn a_trusted_repo_package_is_official_and_names_itself() {
         let dir = tempfile::tempdir().unwrap();
         let mut c = fixture(dir.path());
-        let (p, pkg) = c.classify_path("/usr/bin/cat");
+        let c_ = c.classify_path("/usr/bin/cat");
+        let (p, pkg) = (c_.provenance, c_.package);
         assert_eq!(p, Provenance::Official);
         assert_eq!(pkg.as_deref(), Some("coreutils 9.11-2"));
-        assert_eq!(c.classify_path("/usr/bin/Hyprland").0, Provenance::Official);
+        assert_eq!(c.classify_path("/usr/bin/Hyprland").provenance, Provenance::Official);
     }
 
     #[test]
     fn an_aur_package_is_foreign_however_installed() {
         let dir = tempfile::tempdir().unwrap();
         let mut c = fixture(dir.path());
-        let (p, pkg) = c.classify_path("/usr/bin/aurbin");
+        let c_ = c.classify_path("/usr/bin/aurbin");
+        let (p, pkg) = (c_.provenance, c_.package);
         assert_eq!(p, Provenance::Foreign, "the 2026 AUR wave shipped owned binaries");
         assert_eq!(pkg.as_deref(), Some("some-aur-thing 1.2-1"));
         // And a package with no validation is foreign even if a repo has the name.
-        assert_eq!(c.classify_path("/usr/bin/fake").0, Provenance::Foreign);
+        assert_eq!(c.classify_path("/usr/bin/fake").provenance, Provenance::Foreign);
     }
 
     #[test]
@@ -663,10 +817,10 @@ mod tests {
             "/opt/thing/bin/t",
             "/usr/local/bin/u",
         ] {
-            assert_eq!(c.classify_path(p).0, Provenance::User, "{}", p);
+            assert_eq!(c.classify_path(p).provenance, Provenance::User, "{}", p);
         }
-        assert_eq!(c.classify_path("/usr/bin/not-a-package").0, Provenance::Unknown);
-        assert_eq!(c.classify_path("").0, Provenance::Unknown);
+        assert_eq!(c.classify_path("/usr/bin/not-a-package").provenance, Provenance::Unknown);
+        assert_eq!(c.classify_path("").provenance, Provenance::Unknown);
     }
 
     #[test]
@@ -736,7 +890,7 @@ mod tests {
     fn a_pacman_transaction_invalidates_the_cache() {
         let dir = tempfile::tempdir().unwrap();
         let mut c = fixture(dir.path());
-        assert_eq!(c.classify_path("/usr/bin/newthing").0, Provenance::Unknown);
+        assert_eq!(c.classify_path("/usr/bin/newthing").provenance, Provenance::Unknown);
         assert!(!c.refresh_if_changed(), "nothing changed yet");
 
         fake_local(dir.path(), &[("newpkg", "1-1", "sha256", &["/usr/bin/newthing"])]);
@@ -744,7 +898,8 @@ mod tests {
         std::fs::write(dir.path().join(".touch"), b"x").unwrap();
         c.db.db_mtime -= 1;
         assert!(c.refresh_if_changed());
-        let (p, pkg) = c.classify_path("/usr/bin/newthing");
+        let c_ = c.classify_path("/usr/bin/newthing");
+        let (p, pkg) = (c_.provenance, c_.package);
         assert_eq!(p, Provenance::Foreign, "not in any trusted repo listing");
         assert_eq!(pkg.as_deref(), Some("newpkg 1-1"));
     }
@@ -758,8 +913,8 @@ mod tests {
             Box::new(NoRepos),
         );
         assert!(c.db().is_empty());
-        assert_eq!(c.classify_path("/tmp/x").0, Provenance::User);
-        assert_eq!(c.classify_path("/usr/bin/cat").0, Provenance::Unknown);
+        assert_eq!(c.classify_path("/tmp/x").provenance, Provenance::User);
+        assert_eq!(c.classify_path("/usr/bin/cat").provenance, Provenance::Unknown);
     }
 
     #[test]
@@ -819,5 +974,163 @@ mod identity_tests {
         for b in ["restic", "curl", "dockerd", "rustc", "cc", "ld", "git", "ssh", "gcc"] {
             assert!(!path_is_not_identity(b), "{} must remain learnable", b);
         }
+    }
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::*;
+    use super::testkit::*;
+
+    /// A binary whose bytes no longer match its package is not `official`.
+    ///
+    /// `%VALIDATION%` records how the PACKAGE was validated when it was
+    /// installed -- a signature over the tarball, checked once. It has never
+    /// said anything about the file on disk now, so before this a trojaned
+    /// `/usr/bin/curl` inside a pgp-validated package classified as
+    /// `official`, and `official` is what quiets a rule.
+    #[test]
+    fn a_package_owned_file_whose_bytes_changed_is_no_longer_official() {
+        let db = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let exe = bin.path().join("curl");
+        std::fs::write(&exe, b"#!/bin/sh\nreal curl\n").unwrap();
+        let exe_s = exe.to_string_lossy().to_string();
+
+        fake_local(db.path(), &[("curl", "8.9.1-1", "pgp", &[&exe_s])]);
+        fake_mtree(db.path(), "curl-8.9.1-1", &[&exe_s]);
+
+        let sl = "core curl 8.9.1-1 [installed]\n";
+        let mut c = classifier(db.path(), sl, &["/home/dan"]);
+
+        // Control: untouched, this is exactly the path that used to be the
+        // only outcome. If this is not `official` the fixture is broken and
+        // the negative below would prove nothing.
+        let before = c.classify_path(&exe_s);
+        assert_eq!(before.provenance, Provenance::Official);
+        assert_eq!(before.modified, None, "nothing to report about an intact file");
+
+        // Now trojan it, exactly as an attacker would: same package, same
+        // `desc`, same `%VALIDATION% pgp`. Only the bytes differ.
+        std::fs::write(&exe, b"#!/bin/sh\ncurl | attacker\n").unwrap();
+        let after = c.classify_path(&exe_s);
+        assert_eq!(
+            after.provenance,
+            Provenance::Foreign,
+            "a modified official binary must not stay official"
+        );
+        assert_eq!(
+            after.package.as_deref(),
+            Some("curl 8.9.1-1"),
+            "the package is still the right thing to name"
+        );
+        let why = after.modified.expect("and the reason must be recorded");
+        assert!(
+            why.contains("not the file the package shipped"),
+            "{why}"
+        );
+
+        // The reason reaches the alert, which is the only place a person sees it.
+        let actor = Actor {
+            provenance: after.provenance,
+            package: after.package.clone(),
+            script: None,
+            modified: Some(why),
+        };
+        assert!(
+            actor.evidence().contains("not the file the package shipped"),
+            "{}",
+            actor.evidence()
+        );
+    }
+
+    /// Absence of a checksum is not evidence of a change.
+    ///
+    /// Packages without an mtree, paths not listed in one, directories and
+    /// symlinks all yield no digest. Reading any of those as "modified" would
+    /// demote most of the filesystem the first time it happened -- the exact
+    /// failure the 2026-09-09 handoff warns about, where a check that cannot
+    /// be performed must refuse rather than guess in either direction.
+    #[test]
+    fn a_file_with_no_recorded_digest_keeps_its_package_classification() {
+        let db = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let exe = bin.path().join("nomtree");
+        std::fs::write(&exe, b"whatever\n").unwrap();
+        let exe_s = exe.to_string_lossy().to_string();
+
+        // A package with no mtree at all.
+        fake_local(db.path(), &[("nomtree", "1-1", "pgp", &[&exe_s])]);
+        let sl = "core nomtree 1-1 [installed]\n";
+        let mut c = classifier(db.path(), sl, &["/home/dan"]);
+        let cl = c.classify_path(&exe_s);
+        assert_eq!(
+            cl.provenance,
+            Provenance::Official,
+            "no mtree means no claim, not a demotion"
+        );
+        assert_eq!(cl.modified, None);
+
+        // An mtree that does not mention this path.
+        fake_mtree(db.path(), "nomtree-1-1", &[]);
+        let db2 = tempfile::tempdir().unwrap();
+        fake_local(db2.path(), &[("nomtree", "1-1", "pgp", &[&exe_s])]);
+        fake_mtree(db2.path(), "nomtree-1-1", &[]);
+        let mut c2 = classifier(db2.path(), sl, &["/home/dan"]);
+        assert_eq!(c2.classify_path(&exe_s).provenance, Provenance::Official);
+    }
+
+    /// A size difference is conclusive without reading the file, and must be
+    /// reported as its own reason rather than as a checksum mismatch.
+    #[test]
+    fn a_size_difference_is_caught_before_the_file_is_hashed() {
+        let db = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let exe = bin.path().join("grep");
+        std::fs::write(&exe, b"aaaa").unwrap();
+        let exe_s = exe.to_string_lossy().to_string();
+        fake_local(db.path(), &[("grep", "3.11-1", "pgp", &[&exe_s])]);
+        fake_mtree(db.path(), "grep-3.11-1", &[&exe_s]);
+        let mut c = classifier(db.path(), "core grep 3.11-1 [installed]\n", &["/home/dan"]);
+        assert_eq!(c.classify_path(&exe_s).provenance, Provenance::Official);
+
+        std::fs::write(&exe, b"aaaaaaaaaaaa").unwrap();
+        let cl = c.classify_path(&exe_s);
+        assert_eq!(cl.provenance, Provenance::Foreign);
+        let why = cl.modified.expect("a reason");
+        assert!(why.contains("bytes on disk are 12"), "{why}");
+        assert!(why.contains("recorded 4"), "{why}");
+    }
+
+    /// The real database: an untouched Arch binary must still be `official`.
+    ///
+    /// The fixtures above prove the mechanism. Only this proves it does not
+    /// misfire on the machine it will run on -- 60,915 of 60,920 files under
+    /// /usr/bin and /usr/lib matched when this was written, so a check that
+    /// demoted real binaries would be both wrong and very loud.
+    #[test]
+    fn an_untouched_system_binary_on_this_machine_is_still_official() {
+        let local = std::path::Path::new("/var/lib/pacman/local");
+        if !local.is_dir() || !std::path::Path::new("/usr/bin/base32").exists() {
+            return;
+        }
+        // The real digest must be readable, or this test proves nothing.
+        let dir = std::fs::read_dir(local)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with("coreutils-"))
+                    .unwrap_or(false)
+            })
+            .expect("coreutils is installed");
+        let want = crate::mtree::lookup(&dir, "/usr/bin/base32")
+            .expect("and records a digest for /usr/bin/base32");
+        assert_eq!(
+            crate::mtree::sha256_file("/usr/bin/base32").as_deref(),
+            Some(want.sha256.as_str()),
+            "this machine's /usr/bin/base32 is modified; the rest of this test cannot run"
+        );
     }
 }

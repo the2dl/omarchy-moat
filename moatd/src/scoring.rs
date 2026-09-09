@@ -672,6 +672,7 @@ mod tests {
             provenance: Provenance::Official,
             package: Some("hyprland 0.52.0-1".into()),
             script: None,
+            modified: None,
         }
     }
 
@@ -680,6 +681,7 @@ mod tests {
             provenance: Provenance::User,
             package: None,
             script: None,
+            modified: None,
         }
     }
 
@@ -890,6 +892,7 @@ mod tests {
             provenance: Provenance::Official,
             package: Some("quickshell 0.3.1-1".into()),
             script: None,
+            modified: None,
         };
         let s = score("medium", &f, &qs, Context::Service, true);
         assert_eq!(s.matrix_row, Some("exec-opaque-dir"));

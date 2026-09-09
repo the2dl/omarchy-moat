@@ -543,6 +543,7 @@ pub mod tests_support {
                 provenance: crate::provenance::Provenance::User,
                 package: None,
                 script: None,
+                modified: None,
             },
             context: crate::context::Context::PkgInstall,
             severity_base: "high".into(),

@@ -4311,7 +4311,8 @@ impl Daemon {
                 self.in_meta_alert = false;
                 continue;
             }
-            let (prov, package) = self.provenance.classify_path(&e.exe);
+            let c = self.provenance.classify_path(&e.exe);
+            let (prov, package) = (c.provenance, c.package);
             if prov.is_official() {
                 continue;
             }
@@ -10304,7 +10305,7 @@ esac
             &d.homes,
             Box::new(PacmanSl { bin: cfg.paths.pacman.clone() }),
         );
-        assert!(d.provenance.classify_path("/usr/bin/restic").0.is_official());
+        assert!(d.provenance.classify_path("/usr/bin/restic").provenance.is_official());
 
         // Learn an entry for it.
         let now = util::unix_secs();
@@ -10350,7 +10351,7 @@ esac
             Box::new(PacmanSl { bin: cfg.paths.pacman.clone() }),
         );
         assert_eq!(
-            d.provenance.classify_path("/usr/bin/restic").0,
+            d.provenance.classify_path("/usr/bin/restic").provenance,
             crate::provenance::Provenance::Foreign
         );
         // on_pacman_change only acts on a real mtime move, so drive the check.

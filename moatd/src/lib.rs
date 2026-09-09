@@ -57,6 +57,7 @@ pub mod evidence;
 pub mod explain;
 pub mod feeds;
 pub mod incident;
+pub mod mtree;
 pub mod policy;
 pub mod receipt;
 pub mod proctable;

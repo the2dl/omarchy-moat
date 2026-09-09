@@ -764,6 +764,7 @@ dependencies = [
  "chrono",
  "clap",
  "env_logger",
+ "flate2",
  "globset",
  "libc",
  "log",
