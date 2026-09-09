@@ -562,9 +562,14 @@ class TestItNeverExecutesWhatItReads(unittest.TestCase):
 
     # Grepping for these words is useless: half of them are in the detection
     # regexes. Parse the scanner instead and look at what it can actually do.
+    # Standard library only, and only modules that cannot run a program or
+    # open a socket.  mmap/calendar/time are here for the malicious-package
+    # feed: the feed is a local file read by binary search over an mmap, and
+    # calendar/time only turn its meta.json timestamp into an age.
     ALLOWED_IMPORTS = {
-        "__future__", "argparse", "base64", "binascii", "dataclasses",
-        "fnmatch", "json", "os", "re", "sys", "unicodedata",
+        "__future__", "argparse", "base64", "binascii", "calendar",
+        "dataclasses", "fnmatch", "json", "mmap", "os", "re", "sys", "time",
+        "unicodedata",
     }
     FORBIDDEN_CALLS = {"eval", "exec", "compile", "__import__", "input",
                        "breakpoint", "execfile"}

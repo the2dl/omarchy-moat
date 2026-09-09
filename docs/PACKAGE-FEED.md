@@ -103,7 +103,34 @@ pypi	requestss	*
 
 `ecosystem` is one of the canonical lowercase names below. `name` is verbatim
 from upstream (npm scopes keep their `@`, and a name may contain almost
-anything except a tab). Sort order is byte order over the whole line.
+anything except a tab) — **except for `pypi`, see below**. Sort order is byte
+order over the whole line.
+
+### PyPI names are normalized; every other ecosystem is verbatim
+
+`pypi` names are emitted PEP 503 normalized — lowercased, with runs of `-`, `_`
+and `.` collapsed to a single `-`:
+
+    re.sub(r"[-_.]+", "-", name).lower()
+
+PyPI treats those spellings as the same package, so the feed must carry exactly
+one of them or a lookup cannot find it. Consumers binary-search this file in
+byte order, which rules out normalizing at lookup time: the *feed* side has to
+be canonical.
+
+This is not hypothetical. 21 of the 12,166 PyPI records upstream carry
+uppercase, `_` or `.` — `CalcBoxLite`, `M-AT-STAR-Tools`, `EZBEAMER`. Emitted
+verbatim, `pip install calcboxlite` installs the malicious package and matches
+nothing in the feed. Only the exact upstream spelling matched, which is the one
+spelling a person is least likely to type.
+
+Normalization can collide: two upstream records can fold to one key (it happens
+twice today, `roblox-com` and `sentinelone`). Their clauses are merged with the
+usual union, so `*` still absorbs.
+
+**Every other ecosystem is left verbatim.** npm registry names are already
+lowercase; crates.io, Go and Maven treat case and separators as significant, so
+folding them would merge genuinely distinct packages.
 
 ### The spec field
 

@@ -44,11 +44,14 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import calendar
 import fnmatch
 import json
+import mmap
 import os
 import re
 import sys
+import time
 import unicodedata
 from dataclasses import dataclass
 
@@ -254,6 +257,17 @@ RULES: dict[str, tuple[str, str, str]] = {
         "`pkg={pkg} rule={id}` in " + ALLOW_USER + ".",
     ),
 
+    "feed.malicious-package": (
+        SEV_HIGH,
+        "this package and version is named in the malicious-package feed: a "
+        "published record that this exact release is malicious or was "
+        "compromised",
+        "Do not install it. Remove the dependency, or pin a version outside "
+        "the range the finding names, then re-run. `pkg={pkg} rule={id}` in "
+        + ALLOW_USER + " overrides, but only do that if you know the record "
+        "is wrong.",
+    ),
+
     # ---- cargo ------------------------------------------------------------
     "exec.build-rs-network": (
         SEV_HIGH,
@@ -385,6 +399,399 @@ RULES: dict[str, tuple[str, str, str]] = {
 }
 
 # --------------------------------------------------------------------------
+# malicious-package feed  (moat-packages v1)
+#
+# One local file, `<state_dir>/feeds/packages.txt`, maintained by the
+# moat-feeds timer:  <ecosystem>\t<name>\t<spec>, sorted by byte order over
+# the whole line, ~242k lines / 7 MB.  Read offline, never fetched here.
+#
+# It is read by binary search over an mmap, not loaded into a dict.  These
+# scanners run in the hot path of an install; paying 7 MB of parsing on every
+# `npm install` is how a scanner gets turned off.  A lookup is ~18 probes.
+#
+# A missing feed is a normal state, not an error: on a fresh install the timer
+# has not ticked yet.  Everything here degrades to "no matches" and says so
+# through warn(); nothing in this section can fail a scan or block an install.
+#
+# The spec grammar (docs/PACKAGE-FEED.md):
+#
+#   *          every version of this package
+#   =V         exactly V              (string equality; never needs a compare)
+#   >=V        V and everything after
+#   >=I,<F     introduced I, fixed F
+#   >=I,<=L    introduced I, last affected L
+#   a | b      clauses OR-ed
+#
+# 86% of records are `*`, but 32,866 name specific versions, and those include
+# ordinarily-legitimate packages compromised for one release.  Matching those
+# on name alone would warn on every install of a popular package forever, so
+# a version that is outside the range must produce no finding at all.  Where
+# the version cannot be compared confidently the contract says to report it
+# with reduced confidence rather than drop it, so an uncomparable range is a
+# medium finding instead of a high one.
+# --------------------------------------------------------------------------
+
+FEED_DIR = "/var/lib/moat/feeds"
+FEED_NAME = "packages.txt"
+FEED_META = "meta.json"
+FEED_STALE_DAYS = 7
+FEED_MAX_SPECS = 8          # lines accepted for one key; the format says 1
+
+
+def feed_dir() -> str:
+    return os.environ.get("MOAT_SCANNER_FEED_DIR") or FEED_DIR
+
+
+# ---- version comparison ---------------------------------------------------
+
+SEMVER_RE = re.compile(
+    r"^\s*[vV]?(\d+)(?:\.(\d+))?(?:\.(\d+))?"
+    r"(?:-([0-9A-Za-z.\-]+))?"
+    r"(?:\+[0-9A-Za-z.\-]+)?\s*$"
+)
+
+
+def semver_key(v: str):
+    """npm / crates.io / go.  -> comparable tuple, or None if not a semver."""
+    m = SEMVER_RE.match(v or "")
+    if not m:
+        return None
+    nums = tuple(int(m.group(i) or 0) for i in (1, 2, 3))
+    pre = m.group(4)
+    if pre is None:
+        return (nums, 1, ())          # a release outranks any prerelease
+    parts = []
+    for p in pre.split("."):
+        if p.isdigit():
+            parts.append((0, int(p), ""))
+        else:
+            parts.append((1, 0, p))
+    return (nums, 0, tuple(parts))
+
+
+PEP440_RE = re.compile(
+    r"^\s*[vV]?(?:(\d+)!)?(\d+(?:\.\d+)*)"
+    r"([-_.]?(?:a|b|c|rc|alpha|beta|pre|preview)[-_.]?\d*)?"
+    r"([-_.]?(?:post|rev|r)[-_.]?\d*|-\d+)?"
+    r"([-_.]?dev[-_.]?\d*)?"
+    r"(?:\+[0-9A-Za-z.\-]+)?\s*$",
+    re.I,
+)
+PEP440_PRE_RE = re.compile(
+    r"^[-_.]?(a|b|c|rc|alpha|beta|pre|preview)[-_.]?(\d*)$", re.I)
+PEP440_POST_RE = re.compile(r"^(?:[-_.]?(?:post|rev|r)[-_.]?(\d*)|-(\d+))$", re.I)
+PEP440_DEV_RE = re.compile(r"^[-_.]?dev[-_.]?(\d*)$", re.I)
+PEP440_LETTER = {"alpha": "a", "beta": "b", "c": "rc", "pre": "rc",
+                 "preview": "rc"}
+
+
+def pep440_key(v: str):
+    """PyPI.  A working subset of PEP 440; -> None when it does not parse."""
+    m = PEP440_RE.match(v or "")
+    if not m:
+        return None
+    epoch = int(m.group(1) or 0)
+    rel = tuple(int(x) for x in m.group(2).split("."))
+    while len(rel) > 1 and rel[-1] == 0:
+        rel = rel[:-1]                # 1.0 and 1.0.0 are the same release
+    pre_s, post_s, dev_s = m.group(3), m.group(4), m.group(5)
+
+    if pre_s:
+        pm = PEP440_PRE_RE.match(pre_s)
+        if not pm:
+            return None
+        letter = pm.group(1).lower()
+        pre = (1, PEP440_LETTER.get(letter, letter), int(pm.group(2) or 0))
+    elif dev_s and not post_s:
+        pre = (0, "", 0)              # 1.0.dev1 sorts before 1.0a1
+    else:
+        pre = (2, "", 0)              # a final release
+
+    if post_s:
+        pm = PEP440_POST_RE.match(post_s)
+        if not pm:
+            return None
+        post = (1, int(pm.group(1) or pm.group(2) or 0))
+    else:
+        post = (0, 0)
+
+    if dev_s:
+        dm = PEP440_DEV_RE.match(dev_s)
+        if not dm:
+            return None
+        dev = (0, int(dm.group(1) or 0))
+    else:
+        dev = (1, 0)
+
+    return (epoch, rel, pre, post, dev)
+
+
+# Ecosystems whose versions this file can order.  An ecosystem that is not
+# here still honours `*` and `=V`; its ranges become reduced-confidence.
+VERSION_KEY = {
+    "npm": semver_key,
+    "crates.io": semver_key,
+    "go": semver_key,
+    "pypi": pep440_key,
+}
+
+# clause match outcomes
+FEED_YES = 2      # matched, and we could compare
+FEED_MAYBE = 1    # would match but the versions are not comparable here
+FEED_NO = 0       # definitely outside the spec
+
+
+def _cmp_part(part: str, version: str, keyfn):
+    """One `>=V` / `<V` / `<=V` / `=V` / `*` term. -> FEED_YES/MAYBE/NO."""
+    part = part.strip()
+    if not part:
+        return FEED_NO
+    if part == "*":
+        return FEED_YES
+    for op in (">=", "<=", "!=", ">", "<", "="):
+        if part.startswith(op):
+            want = part[len(op):].strip()
+            break
+    else:
+        op, want = "=", part          # a bare version means equality
+    if not want:
+        return FEED_NO
+
+    if op == "=":
+        # Exact string equality, per the contract: this never needs a
+        # comparator, and it is what keeps a compromised release of a popular
+        # package from warning on every other version of it.
+        if version and version == want:
+            return FEED_YES
+        if not version:
+            return FEED_MAYBE         # we do not know what will be installed
+        if keyfn is not None:
+            a, b = keyfn(version), keyfn(want)
+            if a is not None and b is not None:
+                return FEED_YES if a == b else FEED_NO
+        return FEED_NO
+
+    if not version or keyfn is None:
+        return FEED_MAYBE
+    a, b = keyfn(version), keyfn(want)
+    if a is None or b is None:
+        return FEED_MAYBE
+    if op == ">=":
+        return FEED_YES if a >= b else FEED_NO
+    if op == ">":
+        return FEED_YES if a > b else FEED_NO
+    if op == "<=":
+        return FEED_YES if a <= b else FEED_NO
+    if op == "<":
+        return FEED_YES if a < b else FEED_NO
+    if op == "!=":
+        return FEED_YES if a != b else FEED_NO
+    return FEED_MAYBE
+
+
+def spec_match(spec: str, version: str, ecosystem: str):
+    """-> (FEED_YES|FEED_MAYBE, clause) for the clause that matched, else None.
+
+    Clauses are OR-ed; the comma-separated terms inside one clause are AND-ed.
+    A confident match wins over an unsure one, so the strongest evidence is
+    what gets reported.
+    """
+    keyfn = VERSION_KEY.get(ecosystem)
+    best = None
+    for clause in (spec or "").split("|"):
+        clause = clause.strip()
+        if not clause:
+            continue
+        worst = FEED_YES
+        for part in clause.split(","):
+            got = _cmp_part(part, version, keyfn)
+            if got == FEED_NO:
+                worst = FEED_NO
+                break
+            worst = min(worst, got)
+        if worst == FEED_YES:
+            return FEED_YES, clause
+        if worst == FEED_MAYBE and best is None:
+            best = (FEED_MAYBE, clause)
+    return best
+
+
+# ---- the index ------------------------------------------------------------
+
+
+class PackageFeed:
+    """Binary search over the sorted feed file, via mmap.
+
+    Never raises and never blocks: if the file is missing, empty or
+    unreadable, `available` is False and every lookup returns [].
+    """
+
+    def __init__(self, path: str = "", meta_path: str = "") -> None:
+        self.path = path or os.path.join(feed_dir(), FEED_NAME)
+        self.meta_path = meta_path or os.path.join(feed_dir(), FEED_META)
+        self.available = False
+        self.note = ""
+        self._mm = None
+        self._fh = None
+        self._size = 0
+        self._open()
+
+    def _open(self) -> None:
+        try:
+            self._fh = open(self.path, "rb")
+            size = os.fstat(self._fh.fileno()).st_size
+            if size <= 0:
+                raise ValueError("empty")
+            self._mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+            self._size = size
+            self.available = True
+        except (OSError, ValueError) as exc:
+            self.close()
+            self.note = ("malicious-package feed unavailable (%s: %s); "
+                         "package names were not checked against it"
+                         % (self.path, exc.__class__.__name__))
+            return
+        self.note = self._age_note()
+
+    def _age_note(self) -> str:
+        """Staleness, from meta.json when it is there, else the file's mtime."""
+        stamp = 0.0
+        try:
+            with open(self.meta_path, "rb") as fh:
+                meta = json.loads(fh.read(64 * 1024).decode("utf-8", "replace"))
+            if isinstance(meta, dict):
+                for key in ("generated", "updated", "fetched"):
+                    val = meta.get(key)
+                    if isinstance(val, str):
+                        stamp = _iso_epoch(val) or stamp
+                        if stamp:
+                            break
+                if not stamp and isinstance(meta.get("epoch"), (int, float)):
+                    stamp = float(meta["epoch"])
+        except (OSError, ValueError, UnicodeError):
+            pass
+        if not stamp:
+            try:
+                stamp = os.stat(self.path).st_mtime
+            except OSError:
+                return ""
+        days = (time.time() - stamp) / 86400.0
+        if days > FEED_STALE_DAYS:
+            return ("malicious-package feed is %d days old (%s); "
+                    "`systemctl start moat-feeds` refreshes it"
+                    % (int(days), self.path))
+        return ""
+
+    def close(self) -> None:
+        for obj in (self._mm, self._fh):
+            try:
+                if obj is not None:
+                    obj.close()
+            except (OSError, ValueError, BufferError):
+                pass
+        self._mm = self._fh = None
+        self.available = False
+
+    # -- binary search ------------------------------------------------------
+
+    def _line_start(self, pos: int) -> int:
+        if pos <= 0:
+            return 0
+        nl = self._mm.rfind(b"\n", 0, pos)
+        return 0 if nl < 0 else nl + 1
+
+    def _lower_bound(self, key: bytes) -> int:
+        """Offset of the first line >= key.  lo and hi are always line starts."""
+        lo, hi = 0, self._size
+        while lo < hi:
+            mid = (lo + hi) // 2
+            start = self._line_start(mid)
+            end = self._mm.find(b"\n", start)
+            if end < 0:
+                end = self._size
+            if self._mm[start:end] < key:
+                lo = end + 1          # end >= start >= lo, so this advances
+            else:
+                hi = start            # start <= mid < hi, so this shrinks
+        return lo
+
+    def specs(self, ecosystem: str, name: str) -> list[str]:
+        """Every spec recorded for this exact key.  [] when there is none."""
+        if not self.available or not ecosystem or not name:
+            return []
+        try:
+            key = ("%s\t%s\t" % (ecosystem, name)).encode("utf-8", "replace")
+        except (UnicodeError, ValueError):
+            return []
+        try:
+            pos = self._lower_bound(key)
+            out: list[str] = []
+            while pos < self._size and len(out) < FEED_MAX_SPECS:
+                end = self._mm.find(b"\n", pos)
+                if end < 0:
+                    end = self._size
+                line = self._mm[pos:end]
+                if not line.startswith(key):
+                    break
+                spec = line[len(key):].decode("utf-8", "replace").strip()
+                if spec:
+                    out.append(spec)
+                pos = end + 1
+            return out
+        except (ValueError, OSError):
+            return []
+
+    def match(self, ecosystem: str, name: str, version: str):
+        """-> (FEED_YES|FEED_MAYBE, spec, clause) for the best match, else None.
+
+        A malformed line contributes nothing; it can never turn into a match.
+        """
+        best = None
+        for cand in feed_name_variants(ecosystem, name):
+            for spec in self.specs(ecosystem, cand):
+                got = spec_match(spec, version, ecosystem)
+                if not got:
+                    continue
+                level, clause = got
+                if level == FEED_YES:
+                    return FEED_YES, spec, clause
+                if best is None:
+                    best = (FEED_MAYBE, spec, clause)
+        return best
+
+
+PY_NORMALIZE_RE = re.compile(r"[-_.]+")
+
+
+def feed_name_variants(ecosystem: str, name: str) -> list[str]:
+    """PyPI names are case- and separator-insensitive (PEP 503), so `Flask_X`
+    and `flask-x` are one package; every other ecosystem is verbatim."""
+    if ecosystem != "pypi" or not name:
+        return [name]
+    norm = PY_NORMALIZE_RE.sub("-", name).lower()
+    return [name] if norm == name else [name, norm]
+
+
+_ISO_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})")
+
+
+def _iso_epoch(text: str) -> float:
+    """The one timestamp shape the feed writes; 0.0 if it is anything else."""
+    m = _ISO_RE.match(text.strip())
+    if not m:
+        return 0.0
+    try:
+        return calendar.timegm(
+            tuple(int(g) for g in m.groups()) + (0, 0, 0))
+    except (ValueError, OverflowError):
+        return 0.0
+
+# moat's own ecosystem names -> the feed's canonical ones.
+FEED_ECOSYSTEM = {"cargo": "crates.io", "python": "pypi", "go": "go"}
+
+
+# --------------------------------------------------------------------------
 # findings
 # --------------------------------------------------------------------------
 
@@ -415,9 +822,15 @@ class Finding:
 
 
 class Scanner:
-    def __init__(self) -> None:
+    def __init__(self, feed: PackageFeed | None = None) -> None:
         self.findings: list[Finding] = []
         self._seen: set[tuple[str, str, int]] = set()
+        # Opened once per run - a stat, an open and an mmap.  Every lookup is
+        # a binary search against it, so no part of a scan scales with the
+        # size of the feed, and a missing feed is simply an empty one.
+        self.feed = feed if feed is not None else PackageFeed()
+        self.feed_seen: set[tuple[str, str]] = set()   # decided, with a version
+        self.feed_pending: list[tuple] = []            # declared, no version yet
 
     def add(
         self,
@@ -452,6 +865,66 @@ class Scanner:
                 host=host,
             )
         )
+
+
+def feed_check(sc: Scanner, ecosystem: str, name: str, version: str,
+               file: str, line: int, label: str = "") -> bool:
+    """Check one dependency against the malicious-package feed.
+
+    `label` says where the dependency came from (a lockfile, a transitive
+    edge, a declared range) and goes into the evidence, because "you never
+    named this package and it is still being installed" is the shape that
+    matters most and the reader cannot see it from the name alone.
+    """
+    if not name:
+        return False
+    key = (ecosystem, name)
+    if not version:
+        # A declared range is not a version.  Hold it: a lockfile or a pin
+        # elsewhere in the same project may still say exactly what will be
+        # installed, and that answer is the one worth reporting.  feed_flush()
+        # reports whatever is still unresolved when the scan ends.
+        sc.feed_pending.append((ecosystem, name, file, line, label))
+        return False
+    if key in sc.feed_seen:
+        return False
+    sc.feed_seen.add(key)
+    return feed_report(sc, ecosystem, name, version, file, line, label)
+
+
+def feed_flush(sc: Scanner) -> None:
+    """Report held declarations that nothing resolved to a concrete version."""
+    pending, sc.feed_pending = sc.feed_pending, []
+    for ecosystem, name, file, line, label in pending:
+        key = (ecosystem, name)
+        if key in sc.feed_seen:
+            continue
+        sc.feed_seen.add(key)
+        feed_report(sc, ecosystem, name, "", file, line, label)
+
+
+def feed_report(sc: Scanner, ecosystem: str, name: str, version: str,
+                file: str, line: int, label: str = "") -> bool:
+    got = sc.feed.match(ecosystem, name, version)
+    if not got:
+        return False
+    level, spec, clause = got
+    shown = "%s@%s" % (name, version) if version else name
+    where = " (%s)" % label if label else ""
+    if level == FEED_YES:
+        sev, why = SEV_HIGH, None
+    else:
+        sev = SEV_MEDIUM
+        why = ("the malicious-package feed names %s at `%s`, but this scanner "
+               "cannot compare %s versions well enough to say whether %s falls "
+               "inside that range, so this is unconfirmed rather than clear"
+               % (name, spec, ecosystem,
+                  version or "the version that will be installed"))
+    sc.add("feed.malicious-package", file, line,
+           "%s %s%s named by the package feed: %s" % (
+               ecosystem, shown, where, clause),
+           severity=sev, why=why, pkg=name)
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -1345,8 +1818,20 @@ def scan_cargo_manifest(sc: Scanner, path: str, display: str, root: str,
         kind, sub = got
         if sub:
             dep_name, fields = sub, {e.key: e.value}
+            registry = e.key not in ("path", "git")
+            dep_req = toml_str(e.value) if e.key == "version" else ""
         else:
             dep_name, fields = e.key, toml_inline(e.value)
+            registry = not (toml_str(fields.get("path", ""))
+                            or toml_str(fields.get("git", "")))
+            dep_req = toml_str(fields.get("version", "")) or toml_str(e.value)
+
+        # A version requirement is a range, not a version, so this is held and
+        # only reported for crates Cargo.lock did not already resolve.
+        if dep_name and registry:
+            feed_check(sc, "crates.io", dep_name, "", display, e.line,
+                       "%s, requirement %s" % (kind, dep_req or "unpinned"))
+
         if not fields:
             continue
 
@@ -1492,6 +1977,10 @@ def scan_cargo_lock(sc: Scanner, path: str, display: str, pkg: str) -> None:
     for block, line in blocks:
         name = block.get("name", "")
         source = block.get("source", "")
+        if source.startswith("registry+") or source.startswith("sparse+"):
+            # The lock is the only place that says which version is built.
+            feed_check(sc, "crates.io", name, block.get("version", ""),
+                       display, line, "Cargo.lock")
         if not source:
             continue  # a path dependency or the workspace itself
         if source.startswith("registry+") or source.startswith("sparse+"):
@@ -1567,6 +2056,9 @@ def scan_cargo(sc: Scanner, root: str, display: str, deep: bool, warn) -> None:
 
     pkg = root_pkg or os.path.basename(os.path.abspath(root))
 
+    # Order does not matter for the feed: a manifest's version *requirement*
+    # is held (feed_pending) and only reported if no concrete version - which
+    # is what the lock carries - resolved the same crate first.
     lock = os.path.join(root, "Cargo.lock")
     if os.path.isfile(lock):
         scan_cargo_lock(sc, lock, rel_display(root, display, lock), pkg)
@@ -1636,6 +2128,40 @@ REQ_DIRECT_RE = re.compile(
 )
 
 
+PY_REQ_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._\-]*)")
+# Only `==` / `===` says which version installs.  `>=`, `~=` and `!=` are
+# ranges, and guessing a version out of a range is how a scanner starts
+# warning about packages nobody is installing.
+PY_REQ_PIN_RE = re.compile(r"(?<![!<>~=])===?\s*([^\s,;\)\]'\"]+)")
+PY_REQ_LIST_RE = re.compile(
+    r"\b(?:install_requires|setup_requires|requires)\s*=\s*\[([^\]]{0,8000})\]")
+PY_STR_RE = re.compile(r"'([^'\\\n]{1,200})'|\"([^\"\\\n]{1,200})\"")
+
+
+def python_requirement(req: str) -> tuple[str, str]:
+    """('name', 'pinned version' or '') from a PEP 508 requirement string."""
+    req = req.split("#", 1)[0].split(";", 1)[0].strip()
+    if not req or req.startswith("-") or "://" in req or "@" in req.split("[")[0]:
+        return "", ""          # an option line or a direct URL, handled above
+    m = PY_REQ_NAME_RE.match(req)
+    if not m:
+        return "", ""
+    ver = ""
+    pm = PY_REQ_PIN_RE.search(req)
+    if pm:
+        ver = pm.group(1).strip()
+        if "*" in ver:         # `==1.2.*` is a range wearing an `==`
+            ver = ""
+    return m.group(1), ver
+
+
+def feed_check_requirement(sc: Scanner, req: str, display: str, line: int,
+                           label: str) -> None:
+    name, ver = python_requirement(req)
+    if name:
+        feed_check(sc, "pypi", name, ver, display, line, label)
+
+
 def python_project_name(root: str) -> str:
     for fn, pat in (
         ("pyproject.toml", r'^\s*name\s*=\s*["\']([^"\']+)'),
@@ -1664,6 +2190,14 @@ def scan_setup_py(sc: Scanner, path: str, display: str, pkg: str) -> None:
     for m in re.finditer(r"\bsetup_requires\s*=", text):
         sc.add("py.setup-requires", display, line_at(text, m.start()),
                text.splitlines()[line_at(text, m.start()) - 1], pkg=pkg)
+    # The literal requirement lists only.  A name built at runtime is not
+    # something a static reader can resolve, and inventing one would be worse
+    # than reporting nothing.
+    for m in PY_REQ_LIST_RE.finditer(text):
+        no = line_at(text, m.start())
+        for sm in PY_STR_RE.finditer(m.group(1)):
+            feed_check_requirement(sc, sm.group(1) or sm.group(2) or "",
+                                   display, no, "setup.py " + m.group(0).split("=")[0].strip())
 
 
 def scan_pyproject(sc: Scanner, path: str, display: str, root: str,
@@ -1701,8 +2235,16 @@ def scan_pyproject(sc: Scanner, path: str, display: str, root: str,
                                             net_rule="exec.setup-py-network",
                                             net_re=PY_NET_RE)
 
+        if (e.key == "dependencies" and e.section == "project") or (
+                e.section == "project.optional-dependencies"):
+            for req in toml_array(e.value):
+                feed_check_requirement(sc, req, display, e.line,
+                                       "[%s] %s" % (e.section, e.key))
+
         if e.section == "build-system" and e.key == "requires":
             for req in toml_array(e.value):
+                feed_check_requirement(sc, req, display, e.line,
+                                       "[build-system] requires")
                 m = REQ_DIRECT_RE.search(req)
                 if not m:
                     continue
@@ -1775,6 +2317,7 @@ def scan_requirements(sc: Scanner, path: str, display: str, pkg: str) -> None:
             continue
         m = REQ_DIRECT_RE.search(line)
         if not m:
+            feed_check_requirement(sc, line, display, no, "requirement")
             continue
         url = m.group(1)
         if check_url(sc, url, display, no, raw, pkg=pkg):
@@ -1903,6 +2446,7 @@ def scan_python(sc: Scanner, root: str, display: str, deep: bool, warn) -> None:
 # go
 # ==========================================================================
 
+GO_REQUIRE_RE = re.compile(r"^(\S+)\s+(v\S+)")
 GO_GENERATE_RE = re.compile(r"^//go:generate\s+(.+?)\s*$", re.M)
 GO_LINKNAME_RE = re.compile(r"^//go:linkname\s+(.+?)\s*$", re.M)
 GO_REPLACE_RE = re.compile(
@@ -1936,6 +2480,7 @@ def scan_go_mod(sc: Scanner, path: str, display: str) -> str:
     module = m.group(1) if m else os.path.basename(here)
 
     in_block = False
+    in_require = False
     for no, raw in enumerate(text.splitlines(), start=1):
         line = raw.split("//", 1)[0].strip()
         if not line:
@@ -1946,6 +2491,27 @@ def scan_go_mod(sc: Scanner, path: str, display: str) -> str:
         if in_block and line == ")":
             in_block = False
             continue
+        # require gives a concrete version (v1.2.3, or a pseudo-version), not
+        # a range, so this is the one Go source the feed can match exactly.
+        if not in_block:
+            if line.startswith("require") and line.endswith("("):
+                in_require = True
+                continue
+            if in_require:
+                if line == ")":
+                    in_require = False
+                    continue
+                rq = GO_REQUIRE_RE.match(line)
+                if rq:
+                    feed_check(sc, "go", rq.group(1), rq.group(2), display, no,
+                               "go.mod require")
+                continue
+            if line.startswith("require "):
+                rq = GO_REQUIRE_RE.match(line[len("require "):].strip())
+                if rq:
+                    feed_check(sc, "go", rq.group(1), rq.group(2), display, no,
+                               "go.mod require")
+                continue
         if not (in_block or line.startswith("replace")):
             continue
         rm = GO_REPLACE_RE.match(line)
@@ -2124,6 +2690,10 @@ def scan_paths(paths: list[str], ecosystems: list[str], deep: bool = False,
             scan_file(sc, path)
             continue
         warn("%s: no such file or directory" % path)
+    feed_flush(sc)
+    if sc.feed.note:
+        warn(sc.feed.note)
+    sc.feed.close()
     findings = sc.findings
     findings.sort(key=lambda f: (-SEV_RANK[f.severity], f.file, f.line, f.id))
     return findings

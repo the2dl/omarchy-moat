@@ -1,0 +1,21 @@
+# moat-packages v1
+# generated 2026-09-09T18:36:13Z
+# entries 14
+crates.io	evil-crate	*
+crates.io	ranged-crate	>=2.0.0,<2.1.0
+crates.io	serde-plus	=1.0.99
+go	github.com/evil/mod	>=1.2.0,<1.2.5
+not-an-ecosystem-line-at-all
+npm		*
+npm	@scope/evil-scoped	*
+npm	chalk-next	=5.3.0
+npm	colors-fix	>=1.4.1
+npm	empty-spec	
+npm	event-stream	>=3.3.6,<=3.3.6
+npm	left-pad-evil	=1.0.0|=2.0.0
+npm	no-spec-field
+npm	weird-clause	>=not-a-version
+pypi	flask-evil	*
+pypi	ranged-pypi	>=2.0,<3.0
+pypi	requestss	*
+pypi	safe-elsewhere	=9.9.9
