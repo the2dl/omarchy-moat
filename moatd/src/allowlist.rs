@@ -497,6 +497,12 @@ pub fn disable_rule(path: &Path, index: usize, reason: &str) -> Result<String, S
 }
 
 /// Index of the first `[[rule]]` block in `path` matching `spec`, 1-based.
+/// `load_file` for callers outside this module (the baseline's approval
+/// backfill needs a rule's COMMENT, which `find_index` does not return).
+pub fn load_file_pub(path: &Path) -> Result<Vec<Rule>, String> {
+    Allowlist::load_file(path)
+}
+
 pub fn find_index(path: &Path, spec: &RuleSpec) -> Option<usize> {
     let rules = Allowlist::load_file(path).ok()?;
     rules.iter().position(|r| &r.spec == spec).map(|i| i + 1)

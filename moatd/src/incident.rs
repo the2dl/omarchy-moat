@@ -254,9 +254,22 @@ pub fn capture(t: &Target) -> Incident {
     }
 
     // --- pkg.json ----------------------------------------------------------
+    // `pkg_json` resolves cwd, script and exe against THIS filesystem: it hashes
+    // lockfiles and reads fields out of package.json. Handed a container's cwd
+    // it walks host directories that happen to share the name, so a container's
+    // `npm install` in /app would have moat hashing whatever /app is here. Same
+    // refusal as the two file captures above, recorded the same way.
     if t.context == "pkg-install" {
-        let pkg = pkg_json(t.cwd, t.script.or(Some(t.args)).unwrap_or(""), t.exe);
-        step(&mut errors, "pkg.json", write_json(&dir.join("pkg.json"), &pkg, t.group));
+        if t.in_container {
+            errors.push(format!(
+                "pkg.json: not built — {} ran in a container, so its cwd and script name \
+                 paths in that filesystem, not this one's",
+                t.exe
+            ));
+        } else {
+            let pkg = pkg_json(t.cwd, t.script.or(Some(t.args)).unwrap_or(""), t.exe);
+            step(&mut errors, "pkg.json", write_json(&dir.join("pkg.json"), &pkg, t.group));
+        }
     }
 
     // --- the manifest, last, so it can list everything else ----------------
@@ -1262,7 +1275,7 @@ mod container_paths {
             severity: "high",
             title: "t",
             ts: "2026-09-09T00:00:00.000Z",
-            context: "service",
+            context: "pkg-install",
             mode: "monitor",
             pid: 999_999_9,
             exe: "/app/server",
@@ -1282,6 +1295,13 @@ mod container_paths {
             "a container's path pulled in a host file: {:?}",
             inc.files
         );
+        // Nor is pkg.json built from a container's cwd: `pkg_json` hashes
+        // lockfiles and reads package.json fields against THIS filesystem.
+        assert!(
+            !Path::new(&inc.dir).join("pkg.json").exists(),
+            "pkg.json was built from a container's paths"
+        );
+
         // And its contents are nowhere in the incident directory.
         for e in std::fs::read_dir(Path::new(&inc.dir).join("file")).into_iter().flatten().flatten()
         {

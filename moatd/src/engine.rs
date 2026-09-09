@@ -845,6 +845,15 @@ impl Daemon {
             if a.suppressed_by.is_some() {
                 continue;
             }
+            // A path a container named is not this machine's path. Reading it
+            // here opens a HOST file that merely shares the name and writes
+            // what it found onto the alert -- the same mistake `incident`
+            // made, in the other reader nobody had looked at. The DISPLAY
+            // answer, like capture: this reads rather than acts, so "might be
+            // a container" has to mean "do not open it".
+            if Self::may_be_container_path(&a) {
+                continue;
+            }
             // Analysed once. `note_chain` re-enters every time the chain grows,
             // for up to an hour, and without this a five-step chain would read
             // its files once per growth for the whole window.
@@ -1309,15 +1318,25 @@ impl Daemon {
             // tree kill sends up to eight signals and did not. Between the
             // alert and this loop a pid can be recycled, and the thing wearing
             // it now is not the thing the chain was about.
-            let step_alert = self.find_alert(&t.alert);
-            let target_uid = step_alert.as_ref().map(|a| a.process.uid).unwrap_or(uid);
-            if let Some(a) = step_alert.as_ref() {
-                if let Err(why) =
-                    crate::control::verify_pid(t.pid, &a.process.start_ts, &t.exe)
-                {
-                    log::info!("chain {}: sparing pid {} ({})", c.id, t.pid, why);
-                    continue;
-                }
+            let Some(step_alert) = self.find_alert(&t.alert) else {
+                // No record, no kill. This used to fall back to the CHAIN's uid
+                // and skip verification entirely -- so the one target moat knew
+                // least about was the one it checked least. An unresolvable
+                // step is not evidence about the process wearing that pid now.
+                log::info!(
+                    "chain {}: sparing pid {} — its step's alert could not be read, so \
+                     nothing is established about it",
+                    c.id,
+                    t.pid
+                );
+                continue;
+            };
+            let target_uid = step_alert.process.uid;
+            if let Err(why) =
+                crate::control::verify_pid(t.pid, &step_alert.process.start_ts, &t.exe)
+            {
+                log::info!("chain {}: sparing pid {} ({})", c.id, t.pid, why);
+                continue;
             }
             if let Some(why) = crate::contain::refuse_to_kill(t.pid, target_uid) {
                 // Same reasoning: a spared process is a decision, and a
@@ -4063,6 +4082,37 @@ impl Daemon {
             // could withdraw one: a person read that proposal and approved it,
             // and a heuristic added later does not get to overrule them. It
             // withdraws what the LEARNER wrote and nothing else.
+            // Old approvals have no `accepted_by`: the field was added on
+            // 2026-09-09 and every entry written before it deserialises as
+            // None, which would make a person's approval indistinguishable from
+            // something the learner wrote. The DISK remembers, though --
+            // `Baseline::accept` writes "accepted by <who>" into the block's
+            // comment -- so that is the backfill, and it runs before the
+            // withdrawal reads the field.
+            if e.accepted_by.is_none() {
+                if let Some(t) = self.baseline.state.tuples.get(&e.key).cloned() {
+                    if let Ok(rules) = crate::allowlist::load_file_pub(&path) {
+                        if let Some(r) = rules.iter().find(|r| r.spec == t.spec()) {
+                            if r.comment.contains("accepted by ") {
+                                let who = r
+                                    .comment
+                                    .split("accepted by ")
+                                    .nth(1)
+                                    .and_then(|w| w.split_whitespace().next())
+                                    .unwrap_or("someone")
+                                    .to_string();
+                                log::info!(
+                                    "baseline: {} was approved by {}; not withdrawing it",
+                                    e.key,
+                                    who
+                                );
+                                self.baseline.mark_accepted_by(&e.key, &who);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             if e.accepted_by.is_none()
                 && crate::provenance::path_is_not_identity(crate::util::basename(&e.exe))
             {
@@ -4138,15 +4188,34 @@ impl Daemon {
                 prov,
                 package.map(|p| format!(", package {}", p)).unwrap_or_default()
             );
-            if let Some(t) = self.baseline.state.tuples.get(&e.key).cloned() {
-                match crate::allowlist::find_index(&path, &t.spec()) {
-                    Some(idx) => {
-                        if let Err(err) = crate::allowlist::disable_rule(&path, idx, &reason) {
+            // Marked revoked ONLY if the block is actually gone -- the same
+            // discipline as the runtime-path branch above, which had it and
+            // this one did not. `mark_revoked` removes the entry from
+            // `learned_entries`, so a failed rewrite here recorded a withdrawal
+            // that never happened and stopped the next re-check retrying it.
+            let disabled = match self.baseline.state.tuples.get(&e.key).cloned() {
+                Some(t) => match crate::allowlist::find_index(&path, &t.spec()) {
+                    Some(idx) => match crate::allowlist::disable_rule(&path, idx, &reason) {
+                        Ok(_) => true,
+                        Err(err) => {
                             log::warn!("{}: {}", path.display(), err);
+                            false
                         }
+                    },
+                    None => {
+                        log::debug!("baseline: no block in {} for {}", path.display(), e.key);
+                        true
                     }
-                    None => log::debug!("baseline: no block in {} for {}", path.display(), e.key),
-                }
+                },
+                None => true,
+            };
+            if !disabled {
+                log::warn!(
+                    "baseline: {} still grants {}; will retry on the next re-check",
+                    path.display(),
+                    e.key
+                );
+                continue;
             }
             self.baseline.mark_revoked(&e.key, &reason);
             revoked += 1;
@@ -4231,6 +4300,26 @@ impl Daemon {
     pub fn containerised(&self, proc: &ProcInfo, ancestry: &[ProcInfo]) -> bool {
         proc.in_container.unwrap_or_else(|| {
             let chain: Vec<String> = ancestry.iter().map(|a| a.exe.clone()).collect();
+            crate::util::ancestry_looks_containerised(&chain)
+        })
+    }
+
+    /// Might the paths this ALERT names belong to a container?
+    ///
+    /// The READER's question, and the mirror image of [`Daemon::may_act_on`].
+    /// Both ask about the same fact and take opposite defaults, on purpose:
+    ///
+    /// * acting on a container is refused only on the SENSOR's word, because an
+    ///   exemption granted on a forged ancestor is immunity from enforcement;
+    /// * reading a container's path is refused on ANY hint, because following
+    ///   it opens a host file that merely shares the name, and a forged hint
+    ///   costs a missing artefact rather than a disclosure.
+    ///
+    /// Two functions rather than one with a flag, so a call site cannot pick
+    /// the wrong default by leaving an argument at its zero value.
+    pub fn may_be_container_path(a: &Alert) -> bool {
+        a.process.in_container.unwrap_or_else(|| {
+            let chain: Vec<String> = a.process.ancestry.iter().map(|x| x.exe.clone()).collect();
             crate::util::ancestry_looks_containerised(&chain)
         })
     }
@@ -9758,6 +9847,79 @@ esac
                 .unwrap_or(false),
             "startup did not re-check the learned set: {:?}",
             why
+        );
+    }
+
+    /// An approval recorded only on DISK still counts.
+    ///
+    /// `accepted_by` was added on 2026-09-09; every entry written before it
+    /// deserialises as None, which would make a person's approval look like
+    /// something the learner wrote and expose it to the runtime-path
+    /// withdrawal. `accept` has always written "accepted by <who>" into the
+    /// block's comment, so the record survived even though the field did not.
+    #[test]
+    fn an_old_approval_is_recovered_from_the_block_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, cfg) = dev_daemon(dir.path());
+        for day in 0..3u64 {
+            d.baseline.observe(&Observation {
+                rule: "moat-cred-ssh-private-key-read",
+                exe: "/usr/bin/python3.14",
+                parent: "",
+                dir: "/home/dan/.ssh",
+                severity: "medium",
+                severity_base: "medium",
+                provenance: "official",
+                package: Some("python 3.14-1".into()),
+                context: "service",
+                rarity: "common",
+                suppressed: false,
+                demoted: false,
+                ts: format!("2026-09-0{}T10:00:00.000Z", day + 1),
+                now: util::unix_secs(),
+            });
+        }
+        let key = d.baseline.state.tuples.keys().next().unwrap().clone();
+        let spec = d.baseline.state.tuples[&key].spec();
+        let path = cfg.paths.baseline_allowlist();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // The shape an older moat left behind: the approval in the COMMENT and
+        // nothing in the state file.
+        std::fs::write(
+            &path,
+            format!(
+                "# learned on 2026-09-01 — accepted by dan
+{}",
+                crate::allowlist::render_block(&spec)
+            ),
+        )
+        .unwrap();
+        d.baseline.state.learned.insert(
+            key.clone(),
+            crate::baseline::LearnedEntry {
+                key: key.clone(),
+                rule: "moat-cred-ssh-private-key-read".into(),
+                exe: "/usr/bin/python3.14".into(),
+                written: util::now_rfc3339(),
+                revoked: None,
+                accepted_by: None,
+            },
+        );
+
+        d.revoke_stale_learned_entries();
+
+        let why = d.baseline.state.learned[&key].revoked.clone();
+        assert!(
+            why.as_deref()
+                .map(|w| !w.contains("runs code chosen by its arguments"))
+                .unwrap_or(true),
+            "an approval recorded on disk was overruled: {:?}",
+            why
+        );
+        assert_eq!(
+            d.baseline.state.learned[&key].accepted_by.as_deref(),
+            Some("dan"),
+            "and the field is backfilled so the next pass does not have to re-read the file"
         );
     }
 

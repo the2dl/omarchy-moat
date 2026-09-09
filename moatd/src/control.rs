@@ -1034,7 +1034,21 @@ pub fn verify_pid(pid: u32, start_ts: &str, exe: &str) -> Result<(), String> {
     let Some(live) = util::proc_start_nanos(pid) else {
         return Err(format!("pid {} is gone", pid));
     };
-    if let Some(want) = util::rfc3339_to_nanos(start_ts) {
+    // An unparseable start time is not a pass.
+    //
+    // This used to be `if let Some(want) = ...`, so a timestamp the parser did
+    // not understand skipped the comparison entirely -- and the start time is
+    // the STRONG half of this check, the one thing that actually catches a
+    // recycled pid. A check that cannot be performed must refuse, or the
+    // hardest cases are the ones it waves through.
+    let Some(want) = util::rfc3339_to_nanos(start_ts) else {
+        return Err(format!(
+            "pid {}: the alert's start time {:?} cannot be read, so this pid cannot be shown \
+             to be the same process; refusing to kill",
+            pid, start_ts
+        ));
+    };
+    {
         // The alert stores milliseconds and clocks drift a little; 2 s is
         // generous and still far below any realistic pid recycle.
         if (live - want).abs() > 2_000_000_000 {
@@ -1044,7 +1058,17 @@ pub fn verify_pid(pid: u32, start_ts: &str, exe: &str) -> Result<(), String> {
             ));
         }
     }
-    if let Some(live_exe) = util::proc_exe(pid) {
+    // The same for an unreadable /proc/<pid>/exe: it means the process is gone
+    // or is not ours to read, and either way nothing has been established.
+    let Some(live_exe) = util::proc_exe(pid) else {
+        return Err(format!(
+            "pid {}: cannot read its executable, so it cannot be shown to be the process in \
+             this alert; refusing to kill",
+            pid
+        ));
+    };
+    {
+        let live_exe = live_exe;
         let live_exe = live_exe.trim_end_matches(" (deleted)");
         // `binary_aliases` already answers this, and has since 2026-09-05:
         // tetragon reports the path a process was INVOKED by, /proc/<pid>/exe
@@ -4012,9 +4036,15 @@ mod tests {
     fn a_symlinked_interpreter_is_still_the_process_the_alert_names() {
         // This process is the only pid whose start time we can be sure of.
         let me = std::process::id();
-        // An unparseable start stamp skips the start-time half deliberately:
-        // this test is about the exe comparison and nothing else.
-        let ts = "";
+        // A REAL start stamp for this process. It used to be `""`, which
+        // skipped the start-time half so the test could be about the exe
+        // comparison alone -- and that only worked because an unparseable
+        // stamp was a pass. It is a refusal now (a check that cannot be
+        // performed must not wave the hardest cases through), so the stamp
+        // has to be the true one.
+        let secs = (crate::util::proc_start_nanos(me).expect("own start") / 1_000_000_000) as u64;
+        let ts_owned = crate::util::rfc3339_of(secs);
+        let ts = ts_owned.as_str();
         let real = crate::util::proc_exe(me).expect("own exe");
 
         // Named by its resolved path: always was fine.
@@ -5200,5 +5230,36 @@ mod tests {
     fn a_missing_socket_explains_the_group_setup() {
         let e = request(Path::new("/nonexistent/control.sock"), &json!({"cmd":"status"})).unwrap_err();
         assert!(e.contains("moatd running"));
+    }
+}
+
+#[cfg(test)]
+mod verify_refuses_when_it_cannot_check {
+    use super::verify_pid;
+
+    /// A check that cannot be performed must refuse.
+    ///
+    /// Both halves used to be `if let Some(..)`: an unparseable start stamp
+    /// skipped the start-time comparison, and an unreadable /proc/<pid>/exe
+    /// skipped the executable one. The start time is the strong half -- the
+    /// only thing that actually catches a recycled pid -- so waving it through
+    /// on absence meant the hardest cases were the ones least checked.
+    #[test]
+    fn an_unreadable_start_time_is_a_refusal_not_a_pass() {
+        let me = std::process::id();
+        let real = crate::util::proc_exe(me).expect("own exe");
+        let err = verify_pid(me, "", &real).expect_err("must refuse");
+        assert!(err.contains("cannot be read"), "{}", err);
+        let err = verify_pid(me, "not-a-timestamp", &real).expect_err("must refuse");
+        assert!(err.contains("cannot be read"), "{}", err);
+    }
+
+    /// And a pid that is gone is refused before either half runs.
+    #[test]
+    fn a_dead_pid_is_refused() {
+        // A pid that cannot exist: above the kernel's maximum.
+        let err = verify_pid(u32::MAX, "2026-09-09T00:00:00.000Z", "/usr/bin/x")
+            .expect_err("must refuse");
+        assert!(err.contains("is gone"), "{}", err);
     }
 }

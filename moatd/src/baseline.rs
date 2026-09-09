@@ -933,6 +933,19 @@ impl Baseline {
             .collect()
     }
 
+    /// Backfill a human approval recovered from the on-disk comment.
+    ///
+    /// `accepted_by` was added on 2026-09-09; entries written before it
+    /// deserialise as None and would otherwise look like something the learner
+    /// wrote. `accept` has always written "accepted by <who>" into the block's
+    /// comment, so the record survived even though the field did not.
+    pub fn mark_accepted_by(&mut self, key: &str, who: &str) {
+        if let Some(e) = self.state.learned.get_mut(key) {
+            e.accepted_by = Some(who.to_string());
+            self.dirty = true;
+        }
+    }
+
     pub fn mark_revoked(&mut self, key: &str, reason: &str) {
         if let Some(e) = self.state.learned.get_mut(key) {
             e.revoked = Some(reason.to_string());
