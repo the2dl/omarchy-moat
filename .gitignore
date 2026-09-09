@@ -4,3 +4,7 @@ pkg/src/
 pkg/pkg/
 pkg/*.tar.gz
 __pycache__/
+.dev.vars
+.dev.vars.*
+feed-key
+feed-key.pub
