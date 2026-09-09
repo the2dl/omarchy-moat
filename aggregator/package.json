@@ -1,0 +1,16 @@
+{
+  "name": "omarchy-moat-aggregator",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker that normalises the OSSF and Datadog malicious-package feeds into moat-packages v1 artifacts in R2",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test test/",
+    "keygen": "node scripts/keygen.mjs",
+    "seed": "node scripts/seed.mjs",
+    "normalize": "node scripts/normalize-local.mjs",
+    "bench": "node scripts/bench.mjs",
+    "deploy": "wrangler deploy"
+  }
+}

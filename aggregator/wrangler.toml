@@ -1,0 +1,40 @@
+name = "moat-feed-aggregator"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = false
+
+# Everything the Worker publishes and every piece of state it keeps lives here.
+# Create it once with:  npx wrangler r2 bucket create moat-feed
+[[r2_buckets]]
+binding = "FEED"
+bucket_name = "moat-feed"
+
+[triggers]
+# The 15-minute tick is a delta: GitHub compare since the last commit, a
+# handful of raw files, republish. Its cron interval is under an hour, so it
+# gets 30 s of CPU.
+#
+# The daily job re-reads the 44 MB tarball. Its interval is >= 1 h, which is
+# what buys it the 15-minute CPU limit. Do not shorten it below an hour.
+crons = ["*/15 * * * *", "17 4 * * *"]
+
+[vars]
+FULL_CRON = "17 4 * * *"   # must match the daily entry in crons above
+DELTA_WINDOW = "48"        # sequences of deltas kept in pointer.json
+KEEP_ARTIFACTS = "4"       # full artifacts kept before pruning
+USER_AGENT = "omarchy-moat-aggregator/1 (+https://github.com/dlussier/omarchy-moat)"
+
+[observability]
+enabled = true
+
+# Secrets (npx wrangler secret put NAME):
+#   FEED_SIGNING_KEY  required; base64 of the 32-byte ed25519 seed from scripts/keygen.mjs
+#   GITHUB_TOKEN      strongly recommended; a fine-grained token with no scopes
+#                     is enough, and lifts the API limit from 60/hr per shared
+#                     Cloudflare egress IP to 5000/hr for this Worker.
+
+# Serve the feed from your own hostname. Clients set base_url in feeds.toml to
+# match, so this is the one value the fleet is pinned to.
+# [[routes]]
+# pattern = "feed.example.org/v1/*"
+# zone_name = "example.org"
