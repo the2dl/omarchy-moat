@@ -142,23 +142,141 @@ does not treat *execution* of an existing cap-holding binary as notable. A
 `gsr-kms-server` exec with an unexpected parent is a much stronger signal than
 most of what currently reaches the badge.
 
-## Proposal
+## The constraints this has to fit
 
-Ordered by value per unit of noise. Nothing here is implemented yet.
+Read out of `TETRAGON-NOTES.md` before designing anything, because two of them
+decide the shape:
 
-1. **Parse `process.cap`.** Free, like `binary_properties` was. Nothing else
-   works without it, and it makes every existing alert richer.
-2. **`matchCapabilityChanges` policy.** The escalation moment. Expected to be
-   near-silent on a desktop, which is what makes it worth having loud.
-3. **`/proc/sys` write policy** covering `core_pattern`, `modprobe`,
-   `unprivileged_userns_clone`. Nothing legitimate writes these outside boot.
-4. **Root-executed config policy**: polkit, PAM, udev rules, `ld.so.conf.d`,
-   `uevent_helper`. One path list, same shape as `persist-system-unit-write`.
-5. **Cap-holding binary execs as a chain step**, keyed off the capability set
-   rather than a hardcoded list, so it tracks the machine rather than this
-   audit.
-6. **`matchNamespaceChanges` as a chain step only.** Never its own alert. See §3
-   for why.
+**19 policies per LSM hook, and the 20th kills the daemon.** An LSM program is
+attached through a BPF trampoline holding `BPF_MAX_TRAMP_LINKS = 38`; Tetragon
+attaches two per policy, so the 20th fails with `E2BIG`, Tetragon exits 255,
+systemd restarts it, and it fails at the same policy for ever. `moatd` follows
+it down through `PartOf=`. Each restart re-walks `/proc` and re-emits an exec
+event per live process, so the crash loop *manufactures* alerts while the sensor
+is dead. `policies/check.py` enforces the cap at build time.
+
+Current budget, measured:
+
+| LSM hook | policies | free |
+|---|---:|---:|
+| `file_post_open` | 8 | **11** |
+| `bprm_check_security`, `path_chmod` | 2 each | 17 |
+| `socket_connect`, `ptrace_access_check`, `inode_setxattr`, `path_unlink`, `path_rename`, `path_truncate`, `bpf` | 1 each | 18 |
+
+So there is room to add enforcing file rules — the prevention half of this is
+actually on the table, which it would not have been at 18/19.
+
+**The escalation hooks exist.** `TETRAGON-NOTES.md` §6 lists LSM `capset` and
+`task_fix_setuid` as present in kallsyms and BTF on this kernel, alongside
+`bprm_creds_from_file` and `task_prctl`. `security_task_setuid` does **not**
+exist; `task_fix_setuid` is the one. Both are unused hooks, so each starts at
+1/19.
+
+**`CapabilitiesGained` is a real operator** in the CRD enum, and `check.py`
+already validates `matchCapabilityChanges` and `matchNamespaceChanges` as
+selector fields. Nothing new has to be taught to the toolchain.
+
+**A new policy needs no plumbing.** `render.rs` generates the export allowlist
+from the rendered policy names, and severity/title come from the
+`moat.omarchy/*` annotations, so a policy file is self-describing to the daemon.
+
+## The build
+
+Ordered by value per unit of noise. Each item names what it costs against the
+budget above.
+
+### 1. Parse `process.cap` — moatd only, no policy
+
+`event.rs::Process` parses `uid`, `auid`, `ns.mnt` and `binary_properties` and
+stops. The capability sets are on every event already.
+
+Cost: nothing. No hook, no sensor restart, no budget. It is the same free win
+`exec_properties.rs` took from `binary_properties`, and everything below reads
+better for having it — "held CAP_DAC_OVERRIDE" on an existing alert is evidence
+moat already had and never showed.
+
+Do this first: items 2 and 6 are worth much less without it.
+
+### 2. `moat-priv-capability-gained` — LSM `capset`, 1/19
+
+`matchCapabilityChanges` with `CapabilitiesGained`. The escalation moment, which
+nothing currently sees: `moat-x-exec-privileges-raised` covers privilege gained
+*at exec*, and this covers a `capset` by a running process — how most kernel
+LPEs actually end.
+
+Detection only. The capability is already granted by the time the hook reports,
+so `Override` here would be theatre; the honest action is `Post`.
+
+Expected near-silent: dropping capabilities is constant on a desktop and
+`CapabilitiesGained` does not fire on it. That is what earns it a loud severity.
+
+### 3. `moat-priv-sysctl-write` — LSM `file_post_open`, 9/19
+
+`Prefix "/proc/sys/kernel/"` with `Mask ["2"]` (write-open). Targets that matter:
+`core_pattern`, `modprobe`, `unprivileged_userns_clone`, `kexec_load_disabled`,
+`yama/ptrace_scope`, `kptr_restrict`.
+
+**This is the prevention story.** Nothing legitimately writes these after boot
+except `systemd-sysctl` and `sysctl`, both nameable in `matchBinaries NotIn`, so
+an `Override` here is defensible in a way it is not for most rules. Ship it
+monitor-first anyway, per §7 of the notes and every enforcing rule before it.
+
+Unverified and worth checking on the first run: that Tetragon resolves procfs
+paths in the `file` arg the way it resolves ordinary ones. The notes do not say,
+and the project's habit is to mark that rather than assume it.
+
+### 4. `moat-priv-root-config-write` — LSM `file_post_open`, 10/19
+
+One `Prefix` list, the same shape as `persist-system-unit-write`. String
+`Prefix` values are map-backed with no four-value cap, so one selector covers
+all of it:
+
+```
+/etc/polkit-1/rules.d/        polkit rules are JS run by a root daemon
+/usr/share/polkit-1/actions/  and the actions they authorise
+/etc/pam.d/                   a module line runs in every authentication
+/etc/udev/rules.d/            RUN+= executes as root on a device event
+/usr/lib/udev/rules.d/
+/etc/ld.so.conf.d/            a library search path for everything
+/sys/kernel/uevent_helper     run as root on every uevent
+```
+
+Monitor first, and probably monitor for a long time: package transactions write
+several of these legitimately, and the kernel selector cannot see moat's
+`pkg-install` context — enforcement would have to name `pacman` and friends in
+`matchBinaries NotIn`, which is a bigger promise than it looks.
+
+### 5. `moat-priv-uid-transition` — LSM `task_fix_setuid`, 1/19
+
+A process changing uid, with the known helpers excluded. The classic outcome
+half of an escalation, and the noisiest thing here: `su`, `sudo`, `login`,
+`systemd` starting user services, `dbus-daemon-launch-helper`, polkit agents and
+every container runtime do this legitimately and often.
+
+Deliberately last, and deliberately timeline-first. Measure for a week before
+deciding it deserves the badge — this is exactly the shape that became
+`exec-untrusted-tmpfs`, which "fires on every build: 300+ alerts came out of
+moat's own test suite during one afternoon".
+
+### 6. Cap-holding exec as a chain step — moatd only, no policy
+
+With item 1 done, exec events carry the permitted set. A binary with a non-empty
+permitted set executing under an unexpected parent is a stronger signal than
+most of what reaches the badge today, and this machine has `gsr-kms-server` with
+`cap_sys_admin=ep` sitting there.
+
+Keyed off the capability set on the event, not a hardcoded list, so it tracks
+the machine instead of this audit. Chain step, low on its own.
+
+### Deferred: `matchNamespaceChanges`
+
+Not built. See §3 above: it belongs in `chain.rs` as a step and nowhere near an
+alert of its own.
+
+### Budget after all of it
+
+`file_post_open` 10/19, `capset` 1/19, `task_fix_setuid` 1/19. Nine slots still
+free on the busiest hook.
 
 ## What prevention would mean, and why it is mostly not on offer
 
