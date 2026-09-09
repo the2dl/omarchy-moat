@@ -14,7 +14,7 @@
 
 pkgname=omarchy-moat
 pkgver=0.1.0
-pkgrel=144
+pkgrel=145
 _tetragonver=1.7.1
 pkgdesc='eBPF supply-chain sensor for Omarchy: Tetragon policies, an alert daemon, a bubblewrap sandbox and pre-execution scanners for PKGBUILD, npm, cargo, pip and go'
 arch=('x86_64')
@@ -284,7 +284,11 @@ package() {
 
 	# --- configuration ------------------------------------------------
 	install -Dm644 "${tree}/moatd/etc/moat.toml" "${pkgdir}/etc/moat/moat.toml"
-	# feeds.toml holds the abuse.ch Auth-Key; only root reads it.
+	# feeds.toml carries no credential any more -- the package index is keyless
+	# and signed -- but it does carry the base_url and the pinned key path, so
+	# it stays root-only. When the aggregator is deployed, its public key is
+	# installed here too, at /usr/share/moat/feed-key.pub, and until it exists
+	# moat-feeds refuses to apply anything (see docs/PACKAGE-FEED.md).
 	install -Dm600 "${tree}/moatd/etc/feeds.toml"    "${pkgdir}/etc/moat/feeds.toml"
 	install -Dm644 "${tree}/moatd/etc/allowlist.d/default.toml" \
 		"${pkgdir}/etc/moat/allowlist.d/default.toml"
