@@ -557,6 +557,33 @@ pub fn baseline_revoked_meta(rule: &str) -> PolicyMeta {
     )
 }
 
+/// `moat-x-binary-modified`: a package-owned file no longer holds the bytes
+/// its package recorded (BASELINE §1).
+pub const BINARY_MODIFIED: &str = "moat-x-binary-modified";
+
+pub fn binary_modified_meta(path: &str, package: &str) -> PolicyMeta {
+    meta(
+        BINARY_MODIFIED,
+        "x",
+        "high",
+        &format!("{} is not the file {} shipped", path, package),
+        "Every installed package records a sha256 for each of its files in pacman's own \
+         database. This file's bytes no longer match the one recorded for it. A package \
+         signature is checked once, when the package is installed, and says nothing about the \
+         file afterwards -- so replacing a trusted binary in place is a way to run as something \
+         the machine already trusts. Until this is explained, the actor is treated as `foreign` \
+         rather than `official`, which is why other alerts about it read louder than usual.",
+        "A file patched in place after install: a shebang rewritten by a distribution hook, a \
+         cache a package regenerates on first use, a binary you edited or replaced yourself, or \
+         a package that was reinstalled while its database entry was not. `pacman -Qkk <package>` \
+         shows the same answer independently, and `pacman -S <package>` restores the shipped \
+         file.",
+        &[],
+        &["ignore"],
+        "exe",
+    )
+}
+
 /// Does any ancestor (or the process itself) match one of these globs?
 ///
 /// Both the ancestor's binary and each of its arguments are tried, because a

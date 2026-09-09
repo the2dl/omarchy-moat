@@ -166,6 +166,12 @@ pub struct Daemon {
     /// Chains already decided on. A chain grows for up to an hour and
     /// `note_chain` re-enters on every growth; one decision per chain.
     killed_chains: std::collections::BTreeSet<String>,
+    /// `<path>\0<reason>` for every modified package-owned file already
+    /// reported. The classification is consulted on every alert, so without
+    /// this one tampered binary would raise `moat-x-binary-modified` as often
+    /// as anything else mentions it. Keyed on the reason too, so a file that
+    /// changes AGAIN is reported again.
+    modified_reported: std::collections::BTreeSet<String>,
     /// Template stems that failed to render, from the last `render-policies`.
     pub policies_failed: Vec<String>,
     pub started: u64,
@@ -415,6 +421,7 @@ impl Daemon {
             last_unwatched_alert: 0,
             kernel_exclusions: exclusions_at_start,
             killed_chains: std::collections::BTreeSet::new(),
+            modified_reported: std::collections::BTreeSet::new(),
             contain: crate::contain::ContainStore::from_state(
                 state.as_ref().and_then(|s| s.get("contain")),
             ),
@@ -2743,6 +2750,12 @@ impl Daemon {
 
         // --- 1. who acted, and from where (BASELINE §1 and §2b) -------------
         f.actor = self.provenance.classify_proc(&f.proc);
+        // A package-owned file that is not the file its package shipped is its
+        // own finding, not just a modifier on this one. Demoting the actor to
+        // `foreign` makes every OTHER alert about it read louder, which is
+        // right, but on a quiet machine nothing else may ever fire -- and then
+        // the most interesting fact moat knows would never be said out loud.
+        self.report_modified_binary(&f.actor, &f.proc);
         f.context = context::classify(&self.table, &f.exec_id, &self.cfg.context);
         f.extra_evidence.push(context::evidence(
             &self.table,
@@ -3915,6 +3928,49 @@ impl Daemon {
             powered_off: 0,
             suspended: 0,
         }
+    }
+
+    /// Raise `moat-x-binary-modified` the first time a path's bytes are found
+    /// not to match what its package recorded.
+    ///
+    /// Once per (path, reason): the classifier is consulted while building
+    /// every alert, so an unguarded emit here would turn one tampered file
+    /// into a flood. A file that changes a second time gets a new reason and
+    /// so is reported again.
+    fn report_modified_binary(
+        &mut self,
+        actor: &crate::provenance::Actor,
+        proc: &crate::proctable::ProcInfo,
+    ) {
+        let Some(why) = actor.modified.clone() else {
+            return;
+        };
+        // The classified path is the script when an interpreter took its
+        // script's provenance, and the executable otherwise -- the same choice
+        // `classify_actor` made, so the alert names the file that was checked.
+        let path = actor.script.clone().unwrap_or_else(|| proc.exe.clone());
+        let key = format!("{}\0{}", path, why);
+        if !self.modified_reported.insert(key) {
+            return;
+        }
+        let package = actor.package.clone().unwrap_or_else(|| "its package".into());
+        log::warn!("{} is not the file {} shipped: {}", path, package, why);
+        let meta = crate::rules::binary_modified_meta(&path, &package);
+        let mut f = Finding::new(crate::rules::BINARY_MODIFIED, meta, proc.clone());
+        f.hook = "userland".into();
+        f.mode = self.mode.clone();
+        f.file = Some(crate::alert::FileRef {
+            path: path.clone(),
+            sha256: None,
+        });
+        f.extra_evidence.push(why);
+        f.extra_evidence.push(format!(
+            "pacman's own check agrees or disagrees independently: `pacman -Qkk {}`",
+            package.split_whitespace().next().unwrap_or(&package)
+        ));
+        self.in_meta_alert = true;
+        let _ = self.emit(f);
+        self.in_meta_alert = false;
     }
 
     /// Say so, once, at the start of a run.
@@ -7482,6 +7538,103 @@ esac
             a.explain.evidence.iter().any(|e| e.contains("suspended")),
             "and it names the sleep: {:?}",
             a.explain.evidence
+        );
+    }
+
+    /// A modified package-owned file is said out loud, once.
+    ///
+    /// The demotion to `foreign` makes every OTHER alert about the file read
+    /// louder, which is right and is not enough: on a quiet machine nothing
+    /// else may ever fire about it, and then the most interesting thing moat
+    /// knows would live only in a field nobody reads.
+    #[test]
+    fn a_modified_package_file_is_reported_once_and_again_only_if_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        let p = self_proc("exec");
+        let why = "the bytes on disk are 10733 where power-profiles-daemon 0.30-1 recorded                    10741, so this is not the file the package shipped";
+        let actor = crate::provenance::Actor {
+            provenance: crate::provenance::Provenance::Foreign,
+            package: Some("power-profiles-daemon 0.30-1".into()),
+            script: None,
+            modified: Some(why.into()),
+        };
+
+        // Control: an intact actor says nothing, so the emit below is caused by
+        // `modified` and not merely by calling the function.
+        let intact = crate::provenance::Actor {
+            modified: None,
+            ..actor.clone()
+        };
+        let n = d.store.load().len();
+        d.report_modified_binary(&intact, &p);
+        assert_eq!(d.store.load().len(), n, "an intact file is not an event");
+
+        d.report_modified_binary(&actor, &p);
+        let hits: Vec<_> = d
+            .store
+            .load()
+            .into_iter()
+            .filter(|a| a.rule == crate::rules::BINARY_MODIFIED)
+            .collect();
+        assert_eq!(hits.len(), 1, "reported");
+        assert_eq!(hits[0].severity, "high");
+        assert!(
+            hits[0].explain.evidence.iter().any(|e| e.contains("10741")),
+            "the reason is carried, not just the rule name: {:?}",
+            hits[0].explain.evidence
+        );
+        assert!(
+            hits[0]
+                .explain
+                .evidence
+                .iter()
+                .any(|e| e.contains("pacman -Qkk power-profiles-daemon")),
+            "and a way to check it independently: {:?}",
+            hits[0].explain.evidence
+        );
+
+        // The classifier is consulted while building EVERY alert, so the same
+        // file must not raise this again.
+        for _ in 0..5 {
+            d.report_modified_binary(&actor, &p);
+        }
+        assert_eq!(
+            d.store
+                .load()
+                .iter()
+                .filter(|a| a.rule == crate::rules::BINARY_MODIFIED)
+                .count(),
+            1,
+            "one tampered file is one finding, not one per alert that mentions it"
+        );
+
+        // A file that changes AGAIN passes this guard -- the reason is part of
+        // the key -- and then meets the engine's own 60-second fold, which keys
+        // the `x` family on (rule, title). Same file, same title, so inside the
+        // window it becomes a count on the existing row rather than a second
+        // one. That is the documented behaviour of that fold, not something
+        // this rule should route around: past 60 seconds it is a row of its own.
+        let changed_again = crate::provenance::Actor {
+            modified: Some(
+                "the sha256 on disk (deadbeef0000) is not the one power-profiles-daemon \
+                 0.30-1 recorded (38532d5fb065)"
+                    .into(),
+            ),
+            ..actor.clone()
+        };
+        d.report_modified_binary(&changed_again, &p);
+        let rows: Vec<_> = d
+            .store
+            .load()
+            .into_iter()
+            .filter(|a| a.rule == crate::rules::BINARY_MODIFIED)
+            .collect();
+        assert_eq!(rows.len(), 1, "folded inside the 60s window");
+        assert_eq!(
+            rows[0].count,
+            Some(2),
+            "but counted, so the second change is not lost"
         );
     }
 

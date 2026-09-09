@@ -175,6 +175,9 @@ pub const NEVER_DEMOTE: &[&str] = &[
     "moat-x-noisy-rule",
     "moat-x-baseline-revoked",
     "moat-x-sensor-mismatch",
+    // A trusted binary that is not the one its package shipped is exactly the
+    // case an injected verdict would most want quietened.
+    "moat-x-binary-modified",
     "moat-x-new-exec-ioc",
     // An agent must never be able to quieten the record of protection being
     // switched off -- that is the one alert whose whole purpose is to survive.

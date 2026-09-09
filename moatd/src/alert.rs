@@ -118,6 +118,7 @@ pub const PROTECTED_META_RULES: &[&str] = &[
     "moat-x-nobody-is-watching",
     "moat-x-baseline-revoked",
     "moat-x-noisy-rule",
+    "moat-x-binary-modified",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
