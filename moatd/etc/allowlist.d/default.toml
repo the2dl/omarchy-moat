@@ -402,9 +402,22 @@ file = "/home/*/.cache/spotify/*"
 
 # The same process under its own /proc/self/exe name, which is how the
 # Chromium utility subprocesses re-exec themselves.
+#
+# `/proc/self/exe` IS NOT AN IDENTITY. Every process that re-execs itself
+# reports that same string, so on its own this entry read "anything that
+# re-execs itself may read Spotify's cookie jar" -- and re-execing yourself is
+# one line of code. The file glob was the only thing standing between that and
+# a session token, and a file glob says which secret, not who may have it.
+#
+# `parent` supplies the missing half: the shipped binary must be somewhere in
+# the ancestry, so the claim is "a subprocess of the real Spotify", which is
+# what the comment above always meant. Note what this still does not prove --
+# anything Spotify itself launches inherits the allowance -- so it is a
+# narrower bar, not an identity check. `exe` and `file` alone were no bar.
 [[rule]]
 name = "moat-cred-browser-secrets-read"
 exe = "/proc/self/exe"
+parent = "/opt/spotify/spotify"
 file = "/home/*/.cache/spotify/*"
 
 # Spotify's config half, same argument.

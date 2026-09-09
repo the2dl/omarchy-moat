@@ -1034,6 +1034,53 @@ file   = "*/.config/gcloud/*"
     /// alerts were unsuppressed. The candidates below are copied from real
     /// alerts, field for field, so an entry that reads plausibly but cannot
     /// fire is caught here instead of on the badge.
+    /// `/proc/self/exe` is a name every process can wear.
+    ///
+    /// The Spotify entry allowed it so Chromium's utility subprocesses -- which
+    /// re-exec themselves through that path -- could read Spotify's own cache
+    /// without raising a cookie-jar theft. With only `exe` and `file`, that
+    /// read "anything that re-execs itself may read Spotify's session token",
+    /// and re-execing yourself is one line of code. Handoff item 4.
+    #[test]
+    fn re_execing_yourself_does_not_make_you_spotify() {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("etc/allowlist.d/default.toml");
+        let al = Allowlist {
+            rules: Allowlist::load_file(&p).unwrap(),
+            ..Default::default()
+        };
+        let jar = "/home/dan/.cache/spotify/Cookies";
+        let cand = |parents: Vec<String>| Candidate {
+            rule: "moat-cred-browser-secrets-read",
+            exe: "/proc/self/exe",
+            file: Some(jar),
+            parents,
+            script: None,
+        };
+
+        // Control: the case the entry exists for still works. If this stops
+        // matching, the negative below proves nothing -- it would just mean
+        // the entry never matches anything.
+        assert!(
+            al.find(&cand(vec![
+                "/opt/spotify/spotify".into(),
+                "/usr/bin/bash".into()
+            ]))
+            .is_some(),
+            "a subprocess of the real Spotify is still excused"
+        );
+
+        // The hole: any process at all, re-exec'd through /proc/self/exe.
+        assert!(
+            al.find(&cand(vec!["/usr/bin/bash".into(), "/usr/bin/sshd".into()]))
+                .is_none(),
+            "a self-re-exec with no Spotify above it must not be excused"
+        );
+        assert!(
+            al.find(&cand(vec![])).is_none(),
+            "and neither must one with no ancestry at all"
+        );
+    }
+
     #[test]
     fn the_shipped_entries_match_the_candidates_the_engine_really_builds() {
         let p =
