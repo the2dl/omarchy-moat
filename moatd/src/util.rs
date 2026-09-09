@@ -1019,6 +1019,80 @@ mod pidfd_tests {
         let _ = victim.wait();
     }
 
+    /// Handles are file descriptors, and a process tree is not bounded.
+    ///
+    /// `cmd_kill` pins every descendant before signalling it, and
+    /// `proc_descendants` returns the whole tree. Opening one handle per
+    /// descendant AT ONCE meant a tree wider than RLIMIT_NOFILE ran out of
+    /// descriptors -- so the widest trees, which is what a fork bomb and a
+    /// build both look like, were the ones a kill silently missed.
+    ///
+    /// The ceiling on this machine is 524,288, far too high to reach politely,
+    /// so the check runs in a CHILD with the limit lowered. Lowering it in this
+    /// process would apply to every other test in the binary, which cargo runs
+    /// as threads beside this one.
+    #[test]
+    fn descriptors_run_out_and_the_failure_is_visible() {
+        const MARK: &str = "MOAT_PIDFD_NOFILE_INNER";
+        const LIMIT: u64 = 96;
+
+        if std::env::var(MARK).is_ok() {
+            let me = std::process::id();
+            let mut held: Vec<PidFd> = Vec::new();
+            for _ in 0..LIMIT * 2 {
+                match PidFd::open(me) {
+                    Some(h) => held.push(h),
+                    None => break,
+                }
+            }
+            // The refusal is a `None` -- exactly what a `filter_map` throws
+            // away without a word. That is why `cmd_kill` batches and reports.
+            assert!(
+                held.len() < (LIMIT * 2) as usize,
+                "the kernel handed out {} descriptors under a limit of {LIMIT}",
+                held.len()
+            );
+            assert!(PidFd::open(me).is_none(), "exhausted, and it says so");
+            drop(held);
+            assert!(
+                PidFd::open(me).is_some(),
+                "and the descriptors really were released on drop"
+            );
+            return;
+        }
+
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe().expect("test binary");
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args([
+            "--exact",
+            "util::pidfd_tests::descriptors_run_out_and_the_failure_is_visible",
+            "--nocapture",
+        ])
+        .env(MARK, "1");
+        // SAFETY: `setrlimit` is async-signal-safe and touches only this
+        // about-to-exec child.
+        unsafe {
+            cmd.pre_exec(|| {
+                let rl = libc::rlimit {
+                    rlim_cur: LIMIT,
+                    rlim_max: LIMIT,
+                };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let out = cmd.output().expect("run the child");
+        assert!(
+            out.status.success(),
+            "the low-descriptor check failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// A pid that was never running cannot be pinned, and that is not an error
     /// the caller should mistake for "pinned nothing".
     #[test]

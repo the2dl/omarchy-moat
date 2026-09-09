@@ -1121,19 +1121,45 @@ fn cmd_kill(d: &mut Daemon, id: &str) -> Value {
     // each one as it is found is the whole of what can be done for them, and it
     // is enough -- a pid recycled after the walk cannot be reached through a
     // handle opened before it.
-    let mut targets: Vec<util::PidFd> = util::proc_descendants(pid)
-        .into_iter()
-        .filter_map(util::PidFd::open)
-        .collect();
-    // The verified target last, and through the handle opened above it.
-    if let Some(h) = handle {
-        targets.push(h);
-    }
-    for h in &targets {
-        match h.kill() {
-            Ok(()) => killed.push(h.pid),
-            Err(e) => failed.push(json!({"pid": h.pid, "errno": e})),
+    //
+    // In BATCHES, because `proc_descendants` is unbounded and a handle is a
+    // file descriptor. Holding one per descendant at once meant a tree wider
+    // than RLIMIT_NOFILE started failing to open them -- and the first version
+    // of this dropped those silently, so a process that spawned enough children
+    // would have had some of them survive a kill that reported success. Wide
+    // trees are not the unlikely case here; they are what a build looks like,
+    // and what something trying not to die would do on purpose.
+    const BATCH: usize = 64;
+    let descendants = util::proc_descendants(pid);
+    for chunk in descendants.chunks(BATCH) {
+        let handles: Vec<(u32, Option<util::PidFd>)> = chunk
+            .iter()
+            .map(|p| (*p, util::PidFd::open(*p)))
+            .collect();
+        for (p, h) in &handles {
+            match h {
+                Some(h) => match h.kill() {
+                    Ok(()) => killed.push(*p),
+                    Err(e) => failed.push(json!({"pid": p, "errno": e})),
+                },
+                // Gone before it could be pinned, or no descriptor to pin it
+                // with. Either way it was not signalled, and saying so is the
+                // difference between this and the silent version.
+                None => failed.push(json!({
+                    "pid": p,
+                    "errno": "could not be pinned (already gone, or no descriptor available)"
+                })),
+            }
         }
+    }
+    // The verified target last, and through the handle opened before the
+    // verification -- one descriptor, held across all of the above.
+    match handle {
+        Some(h) => match h.kill() {
+            Ok(()) => killed.push(pid),
+            Err(e) => failed.push(json!({"pid": pid, "errno": e})),
+        },
+        None => failed.push(json!({"pid": pid, "errno": "could not be pinned"})),
     }
     if killed.is_empty() {
         return err(format!(
