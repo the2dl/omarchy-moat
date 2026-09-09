@@ -2469,19 +2469,6 @@ impl Daemon {
     pub fn emit(&mut self, mut f: Finding) -> Option<String> {
         let now = util::unix_secs();
 
-        // Record a credential read against its session, for the exfil-context
-        // gate in `net_first_contact` (see `cred_read_sessions`). A suppressed
-        // read is the user's own tool doing its job and does not count.
-        if f.meta.family == "cred" && f.suppressed_by.is_none() {
-            if let Some(sid) = self.table.get(&f.exec_id).and_then(|p| p.sid) {
-                // Drop entries older than the window the gate cares about, so
-                // the map is bounded by live sessions rather than uptime.
-                self.cred_read_sessions
-                    .retain(|_, t| now.saturating_sub(*t) <= 120);
-                self.cred_read_sessions.insert(sid, now);
-            }
-        }
-
         // --- 0. the mode that governed THIS rule ---------------------------
         // Stamped here, once, for every finding whatever path built it. The
         // policy path already did this; the userland rules (`RuleCtx::finding`)
@@ -2549,6 +2536,36 @@ impl Daemon {
             );
             log::debug!("{} suppressed by allowlist entry {}", f.rule, by);
             f.suppressed_by = Some(by);
+        }
+
+        // Record a credential read against its session, for the exfil-context
+        // gate in `net_first_contact` (see `cred_read_sessions`). A suppressed
+        // read is the user's own tool doing its job and does not count.
+        //
+        // This has to run AFTER step 4, and until 2026-09-08 it ran before it.
+        // The `suppressed_by.is_none()` test was written to mean "the allowlist
+        // did not excuse this read", but at the top of `emit` the allowlist has
+        // not been consulted yet, so the field was still None for every finding
+        // and the guard never once refused. Every allowlisted credential read
+        // -- gcloud reading its own store, an app reading its own profile --
+        // armed the exfil context, and the next ordinary connection from that
+        // session became a first-contact report it should not have been.
+        //
+        // NOT covered by a test, deliberately rather than by omission: the
+        // replay fixture's processes are synthetic, `sid` is read from /proc,
+        // and no /proc entry exists for a fake pid -- so `cred_read_sessions`
+        // stays empty in that fixture whether the guard fires or not, and a
+        // test written against it passes with the guard deleted (measured).
+        // Verified instead by reading the order: step 4 assigns `suppressed_by`
+        // above. Covering it needs a cred finding built with a real session id.
+        if f.meta.family == "cred" && f.suppressed_by.is_none() {
+            if let Some(sid) = self.table.get(&f.exec_id).and_then(|p| p.sid) {
+                // Drop entries older than the window the gate cares about, so
+                // the map is bounded by live sessions rather than uptime.
+                self.cred_read_sessions
+                    .retain(|_, t| now.saturating_sub(*t) <= 120);
+                self.cred_read_sessions.insert(sid, now);
+            }
         }
 
         // --- 5. the noise guard's demotion is not a suppression -------------
