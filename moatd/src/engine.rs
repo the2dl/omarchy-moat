@@ -2696,16 +2696,30 @@ impl Daemon {
         // (common) case where it said nothing. See
         // `util::ancestry_looks_containerised` for why both are needed and what
         // the fallback costs.
-        let containerised = f.proc.in_container.unwrap_or_else(|| {
-            let chain: Vec<String> =
-                f.ancestry.iter().map(|a| a.exe.clone()).collect();
-            crate::util::ancestry_looks_containerised(&chain)
-        });
+        let chain: Vec<String> = f.ancestry.iter().map(|a| a.exe.clone()).collect();
+        let runtime_in_chain = crate::util::ancestry_looks_containerised(&chain);
+        let containerised = f.proc.in_container.unwrap_or(runtime_in_chain);
+
+        // The package-install exemption is narrower than it first looked.
+        //
+        // It exists because moat's own sandbox runs npm, pip, cargo and makepkg
+        // under bwrap, and a HOST build hidden by a namespace moat itself
+        // created was the 2026-09-08 makepkg bug. But `cargo build` inside a
+        // `docker build` is ALSO pkg-install, and exempting that put a
+        // containerised cargo on the badge with the switch off.
+        //
+        // bwrap is not a container runtime and never appears in
+        // `CONTAINER_RUNTIMES`; runc, containerd-shim and dockerd do. So a
+        // runtime in the ancestry means a real container and the exemption does
+        // not apply; container-ness known ONLY from the namespace is the
+        // sandbox case, and there the install still wins.
+        let sandbox_not_container = !runtime_in_chain;
+        let protected_install = sandbox_not_container
+            && (f.context == crate::context::Context::PkgInstall || f.pkg_install_escalation());
         if !self.inspect_containers
             && alert.surface == "alerts"
             && containerised
-            && f.context != crate::context::Context::PkgInstall
-            && !f.pkg_install_escalation()
+            && !protected_install
         {
             alert.surface = "timeline".into();
             alert.severity_reason = format!(
@@ -7032,6 +7046,33 @@ esac
             !a.severity_reason.contains("container inspection is off")
                 || !a.severity_reason.contains("never downgraded"),
             "the reason may not both escalate and demote: {}",
+            a.severity_reason
+        );
+    }
+
+    /// The other half of the pair. moat's sandbox is bwrap and leaves no
+    /// container runtime in the ancestry; a `docker build` leaves runc and
+    /// containerd-shim. A `cargo build` inside a container is pkg-install too,
+    /// and on 2026-09-08 the sandbox exemption put one on the badge with the
+    /// container switch off.
+    #[test]
+    fn a_package_install_inside_a_real_container_is_still_quietened() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.thresholds.dedupe_secs = 0;
+
+        let actor = no_such_proc("e-cargo", 4_300_100, "/usr/bin/no-such-cargo");
+        // A real container runtime in the chain is what separates this from
+        // the sandbox: `runc` is in CONTAINER_RUNTIMES, `bwrap` is not.
+        let parent = no_such_proc("e-runc", 4_300_000, "/usr/bin/runc");
+
+        let mut f = signal_finding(&actor, &parent, "/tmp/moat-tier-test-no-such-dir/x");
+        f.ancestry = vec![parent.clone()];
+        let id = d.emit(f).expect("recorded");
+        let a = d.find_alert(&id).unwrap();
+        assert_eq!(
+            a.surface, "timeline",
+            "a container build is watched, not asked about: {}",
             a.severity_reason
         );
     }
