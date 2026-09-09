@@ -82,6 +82,44 @@ pub fn lookup(pkg_dir: &Path, abs_path: &str) -> Option<Entry> {
     None
 }
 
+/// Every path in a package's mtree that carries a digest, absolute.
+///
+/// One decompression for the whole package. `lookup` opens and decompresses
+/// the mtree per call, which is right for a single question and wrong for a
+/// sweep: asking it about 8,615 files would decompress a thousand mtrees
+/// thousands of times over.
+pub fn entries(pkg_dir: &Path) -> Vec<(String, Entry)> {
+    let Ok(file) = std::fs::File::open(pkg_dir.join("mtree")) else {
+        return Vec::new();
+    };
+    let rd = std::io::BufReader::new(flate2::read::GzDecoder::new(file));
+    let mut out = Vec::new();
+    for line in rd.lines().map_while(Result::ok) {
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('/') {
+            continue;
+        }
+        let mut fields = line.split(' ');
+        let Some(raw) = fields.next() else { continue };
+        let Some(rel) = raw.strip_prefix("./") else {
+            continue;
+        };
+        let mut sha256 = None;
+        let mut size = 0u64;
+        for f in fields {
+            if let Some(v) = f.strip_prefix("sha256digest=") {
+                sha256 = Some(v.to_string());
+            } else if let Some(v) = f.strip_prefix("size=") {
+                size = v.parse().unwrap_or(0);
+            }
+        }
+        if let Some(sha256) = sha256 {
+            out.push((format!("/{}", unescape(rel)), Entry { sha256, size }));
+        }
+    }
+    out
+}
+
 /// `\133` -> `[`, `\\` -> `\`. Anything else after a backslash is left as
 /// written, so an unrecognised escape can never turn one path into another.
 fn unescape(s: &str) -> String {

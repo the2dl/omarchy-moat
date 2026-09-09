@@ -180,6 +180,10 @@ pub struct Daemon {
     /// every restart, for ever. Once per change is the claim; once per boot is
     /// just noise wearing its clothes.
     modified_reported: std::collections::BTreeSet<String>,
+    /// Package directories still to be checked by the running sweep, and when
+    /// the last one finished. `None` means no sweep is in progress.
+    sweep: Option<Vec<PathBuf>>,
+    last_sweep: u64,
     /// Template stems that failed to render, from the last `render-policies`.
     pub policies_failed: Vec<String>,
     pub started: u64,
@@ -429,6 +433,12 @@ impl Daemon {
             last_unwatched_alert: 0,
             kernel_exclusions: exclusions_at_start,
             killed_chains: std::collections::BTreeSet::new(),
+            sweep: None,
+            last_sweep: state
+                .as_ref()
+                .and_then(|s| s.get("last_sweep"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
             modified_reported: state
                 .as_ref()
                 .and_then(|s| s.get("modified_reported"))
@@ -3990,19 +4000,33 @@ impl Daemon {
         // which is the thing this set exists to prevent.
         self.write_state();
         let package = actor.package.clone().unwrap_or_else(|| "its package".into());
+        self.emit_modified(&path, &package, &why, proc.clone());
+    }
+
+    /// The finding itself, shared by the classification path and the sweep.
+    ///
+    /// The sweep has no process to attribute to -- nothing ran -- so it passes
+    /// moat's own, which is what `self_proc` is for elsewhere in this family.
+    fn emit_modified(
+        &mut self,
+        path: &str,
+        package: &str,
+        why: &str,
+        proc: crate::proctable::ProcInfo,
+    ) {
         log::warn!("{} is not the file {} shipped: {}", path, package, why);
-        let meta = crate::rules::binary_modified_meta(&path, &package);
-        let mut f = Finding::new(crate::rules::BINARY_MODIFIED, meta, proc.clone());
+        let meta = crate::rules::binary_modified_meta(path, package);
+        let mut f = Finding::new(crate::rules::BINARY_MODIFIED, meta, proc);
         f.hook = "userland".into();
         f.mode = self.mode.clone();
         f.file = Some(crate::alert::FileRef {
-            path: path.clone(),
+            path: path.to_string(),
             sha256: None,
         });
-        f.extra_evidence.push(why);
+        f.extra_evidence.push(why.to_string());
         f.extra_evidence.push(format!(
             "pacman's own check agrees or disagrees independently: `pacman -Qkk {}`",
-            package.split_whitespace().next().unwrap_or(&package)
+            package.split_whitespace().next().unwrap_or(package)
         ));
         self.in_meta_alert = true;
         let _ = self.emit(f);
@@ -4503,6 +4527,124 @@ impl Daemon {
         // `verify_tick` stands down for exactly that window.
         self.arm_tick(now);
         self.verify_tick(now);
+        self.sweep_tick(now);
+    }
+
+    /// Check package-owned executables against their recorded checksums, a
+    /// little at a time.
+    ///
+    /// The classification path only ever reads a file something ELSE already
+    /// alerted about, so a trojaned binary that sits quietly is never looked
+    /// at -- and sitting quietly is what a good one does. This closes that by
+    /// asking without being prompted.
+    ///
+    /// Incremental on purpose. Hashing every package-owned executable on this
+    /// machine is 8,615 files and 6.8 GiB: 4.6 seconds in one go, which is 4.6
+    /// seconds this single-threaded loop is not reading the sensor's log, and
+    /// dropped exec events are the one thing moat cannot recover. So it does
+    /// ONE package per tick and carries the rest to the next.
+    ///
+    /// Executables only. Config files are package-owned too and are MEANT to
+    /// be edited -- that is what pacman's backup array and `.pacnew` exist for
+    /// -- so sweeping them would report the administrator's own work as
+    /// tampering, every day, for ever.
+    fn sweep_tick(&mut self, now: u64) {
+        const EVERY: u64 = 24 * 3_600;
+
+        if self.sweep.is_none() {
+            // A pacman transaction rewrites both the files and the checksums
+            // that describe them, so the moment after one is the cheapest time
+            // to be sure: everything legitimate matches again by construction.
+            let due = self.last_sweep == 0 || now.saturating_sub(self.last_sweep) >= EVERY;
+            if !due {
+                return;
+            }
+            let Ok(rd) = std::fs::read_dir(&self.cfg.paths.pacman_local) else {
+                // No pacman database is not a finding; it is a machine this
+                // check does not apply to.
+                self.last_sweep = now;
+                return;
+            };
+            let dirs: Vec<PathBuf> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.join("mtree").is_file())
+                .collect();
+            if dirs.is_empty() {
+                self.last_sweep = now;
+                return;
+            }
+            log::info!("integrity sweep: {} packages to check", dirs.len());
+            self.sweep = Some(dirs);
+        }
+
+        let Some(dirs) = self.sweep.as_mut() else {
+            return;
+        };
+        let Some(dir) = dirs.pop() else {
+            self.sweep = None;
+            self.last_sweep = now;
+            log::info!("integrity sweep: finished");
+            self.write_state();
+            return;
+        };
+
+        let label = self
+            .provenance
+            .db()
+            .label_of_dir(&dir)
+            .unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into());
+
+        for (path, want) in crate::mtree::entries(&dir) {
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            // Symlinks have no digest of their own and directories are not
+            // files; both are already absent from `entries`, but a path can
+            // have BECOME one since the package was installed.
+            if !meta.is_file() {
+                continue;
+            }
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+            if meta.len() != want.size {
+                self.report_swept(&path, &label, &format!(
+                    "the bytes on disk are {} where {} recorded {}, so this is not the file the \
+                     package shipped",
+                    meta.len(),
+                    label,
+                    want.size
+                ));
+                continue;
+            }
+            let Some(have) = crate::mtree::sha256_file(&path) else {
+                continue;
+            };
+            if have != want.sha256 {
+                self.report_swept(&path, &label, &format!(
+                    "the sha256 on disk ({}) is not the one {} recorded ({}), so this is not the \
+                     file the package shipped",
+                    &have[..12.min(have.len())],
+                    label,
+                    &want.sha256[..12.min(want.sha256.len())]
+                ));
+            }
+        }
+    }
+
+    /// The sweep's half of the once-per-(path, reason) guard, so a file found
+    /// by the sweep and then by an alert is one finding rather than two.
+    fn report_swept(&mut self, path: &str, package: &str, why: &str) {
+        let key = format!("{}\0{}", path, why);
+        if !self.modified_reported.insert(key) {
+            return;
+        }
+        self.write_state();
+        self.in_meta_alert = true;
+        self.emit_modified(path, package, why, self_proc("integrity sweep"));
+        self.in_meta_alert = false;
     }
 
     pub fn baseline_tick(&mut self, now: u64, force_save: bool) {
@@ -5064,6 +5206,7 @@ impl Daemon {
             // Which modified files have already been reported. See the field's
             // comment: without this a distribution's own post-install edit is
             // a high alert on every boot.
+            o.insert("last_sweep".into(), Value::from(self.last_sweep));
             o.insert(
                 "modified_reported".into(),
                 Value::from(
@@ -7792,6 +7935,133 @@ esac
             rows[0].count,
             Some(2),
             "but counted, so the second change is not lost"
+        );
+    }
+
+    /// A trojaned binary that never runs is still found.
+    ///
+    /// The classification path only reads a file something else already
+    /// alerted about, so a binary that sits quietly is never looked at -- and
+    /// sitting quietly is what a good one does. The sweep asks unprompted.
+    #[test]
+    fn the_sweep_finds_a_modified_binary_that_nothing_has_alerted_about() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pacman-local");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+
+        // Two executables, because the two halves of the check fail
+        // differently: a size difference is conclusive without reading the
+        // file, and a same-size edit is only caught by the digest. A trojan
+        // that keeps the length is the one a size check alone waves through.
+        let quiet = bin.join("curl");
+        std::fs::write(&quiet, b"#!/bin/sh\nthe real one\n").unwrap();
+        std::fs::set_permissions(&quiet, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let quiet_s = quiet.to_string_lossy().to_string();
+
+        let samesize = bin.join("wget");
+        std::fs::write(&samesize, b"#!/bin/sh\nthe real one\n").unwrap();
+        std::fs::set_permissions(&samesize, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let samesize_s = samesize.to_string_lossy().to_string();
+
+        // A package file with NO execute bit: config files are package-owned
+        // and are meant to be edited, so the sweep must not report them.
+        let conf = bin.join("curlrc");
+        std::fs::write(&conf, b"original\n").unwrap();
+        std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let conf_s = conf.to_string_lossy().to_string();
+
+        std::fs::create_dir_all(&db).unwrap();
+        crate::provenance::testkit::fake_local(
+            &db,
+            &[("curl", "8.9.1-1", "pgp", &[&quiet_s, &samesize_s, &conf_s])],
+        );
+        crate::provenance::testkit::fake_mtree(
+            &db,
+            "curl-8.9.1-1",
+            &[&quiet_s, &samesize_s, &conf_s],
+        );
+
+        let (_, mut cfg) = dev_daemon(dir.path());
+        cfg.paths.pacman_local = db.clone();
+        let mut d = Daemon::new(cfg, &dir.path().join("moat.toml")).unwrap();
+        d.homes = vec!["/home/dan".into()];
+
+        // Control: nothing has been touched, so a full sweep says nothing. If
+        // this reported, the positive below would prove nothing.
+        let n = d.store.load().len();
+        for i in 0..40 {
+            d.tick(1_000 + i, false);
+        }
+        assert_eq!(d.store.load().len(), n, "an intact package is silent");
+
+        // Now trojan the binary and edit the config, and let a new sweep run.
+        std::fs::write(&quiet, b"#!/bin/sh\ncurl | attacker\n").unwrap();
+        std::fs::set_permissions(&quiet, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Same length as "the real one", so only the digest can tell.
+        std::fs::write(&samesize, b"#!/bin/sh\nthe FAKE one\n").unwrap();
+        std::fs::set_permissions(&samesize, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&samesize).unwrap().len(),
+            23,
+            "the same-size trojan must really be the same size"
+        );
+        std::fs::write(&conf, b"edited by the administrator\n").unwrap();
+
+        let later = 1_000 + 25 * 3_600;
+        for i in 0..40 {
+            d.tick(later + i, false);
+        }
+        let hits: Vec<_> = d
+            .store
+            .load()
+            .into_iter()
+            .filter(|a| a.rule == crate::rules::BINARY_MODIFIED)
+            .collect();
+        let paths: Vec<&str> = hits
+            .iter()
+            .filter_map(|a| a.file.as_ref().map(|f| f.path.as_str()))
+            .collect();
+        assert!(
+            paths.contains(&quiet_s.as_str()),
+            "the resized trojan: {paths:?}"
+        );
+        assert!(
+            paths.contains(&samesize_s.as_str()),
+            "and the same-size one, which only the digest catches: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&conf_s.as_str()),
+            "but not the config file, which is package-owned and meant to be edited: {paths:?}"
+        );
+        assert_eq!(hits.len(), 2, "two findings, no more");
+
+        // The two are caught by different halves and must SAY so. Removing the
+        // size check does not change what is detected -- a resized file fails
+        // the digest too -- so its only observable effect is the reason given,
+        // and a reason that quotes the wrong evidence is a reason a person
+        // cannot check.
+        let reason_for = |p: &str| -> String {
+            hits.iter()
+                .find(|a| a.file.as_ref().map(|f| f.path.as_str()) == Some(p))
+                .map(|a| a.explain.evidence.join(" | "))
+                .unwrap_or_default()
+        };
+        assert!(
+            reason_for(&quiet_s).contains("bytes on disk are"),
+            "the resized one is reported by size, without being read: {}",
+            reason_for(&quiet_s)
+        );
+        assert!(
+            reason_for(&samesize_s).contains("sha256 on disk"),
+            "the same-size one can only be reported by digest: {}",
+            reason_for(&samesize_s)
+        );
+        assert!(
+            hits[0].explain.evidence.iter().any(|e| e.contains("curl 8.9.1-1")),
+            "named by its package: {:?}",
+            hits[0].explain.evidence
         );
     }
 

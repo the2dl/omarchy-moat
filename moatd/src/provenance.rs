@@ -373,6 +373,18 @@ impl PacmanDb {
         self.owners.get(path).and_then(|i| self.pkgs.get(*i))
     }
 
+    /// `"coreutils 9.11-2"` for a local-database DIRECTORY, so a sweep walking
+    /// `/var/lib/pacman/local` can name what it found in the same words an
+    /// alert would. Falls back to the directory name for a package whose
+    /// `desc` did not parse.
+    pub fn label_of_dir(&self, dir: &Path) -> Option<String> {
+        self.dirs
+            .iter()
+            .position(|d| d == dir)
+            .and_then(|i| self.pkgs.get(i))
+            .map(|p| p.label())
+    }
+
     /// The local database directory of the package owning `path`, for reading
     /// its `mtree`.
     pub fn owner_dir(&self, path: &str) -> Option<&Path> {
