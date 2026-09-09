@@ -784,10 +784,14 @@ file   = "*/.config/gcloud/*"
         };
         assert_eq!(
             al.len(),
-            10,
-            "two test-suite rules x two path globs, the omarchy-shell plugin exec \
-             entry, the agent-usage credential read, the three scanner suites' \
-             fake toolchains, the incident-writer chmod — nothing else. Moat's own \
+            5,
+            "the omarchy-shell plugin exec entry, the agent-usage credential read, \
+             the three scanner suites' fake toolchains — nothing else. The nine \
+             moat-test-suite entries moved to moat-dev.toml.example on 2026-09-09: \
+             every one matched a path an attacker can create (/tmp/.tmp*/nc, \
+             */target/*/deps/moatd-*), and they were shipped to everyone to protect \
+             a case only moat's own developers hit, which additionally needs \
+             `contain.enabled` -- off by default. Moat's own \
              triage pass has NO entry: see the note at the end of \
              omarchy-default.toml"
         );
@@ -871,6 +875,177 @@ file   = "*/.config/gcloud/*"
             );
         }
 
+    }
+
+    /// The shipped entries must be written against the fields `engine::emit`
+    /// actually fills in, or they are decoration.
+    ///
+    /// On 2026-09-05 the two tmpfs entries named `exe = "/tmp/.tmp*/nc"` and
+    /// `exe = "/tmp/.tmp*/moat-*"`. For a `bprm_check_security` finding the
+    /// actor is the CALLER — the cargo test binary — and the executed path is
+    /// `file`, so those two entries could never match anything: 50 of 50 such
+    /// alerts were unsuppressed. The candidates below are copied from real
+    /// alerts, field for field, so an entry that reads plausibly but cannot
+    /// fire is caught here instead of on the badge.
+    #[test]
+    fn the_shipped_entries_match_the_candidates_the_engine_really_builds() {
+        let p =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("etc/allowlist.d/omarchy-default.toml");
+        let al = Allowlist {
+            rules: Allowlist::load_file(&p).unwrap(),
+            ..Default::default()
+        };
+        let runner = "/home/dan/Projects/omarchy-moat/moatd/target/release/deps/moatd-decac2790eaa7887";
+        let shim = "/home/dan/Projects/omarchy-moat/pkg/src/omarchy-moat-tree/sandbox/shims/cargo";
+
+        // The `cargo test` tempdir case moved to moat-dev.toml.example on
+        // 2026-09-09 and is asserted there
+        // (`dev_example::the_dev_example_still_covers_moats_own_test_suite`).
+        // What matters HERE is that the shipped file no longer covers it: a
+        // /tmp path an attacker can create must not be excused on everyone's
+        // machine to spare moat's own developers a test failure.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-exec-untrusted-tmpfs",
+                exe: runner,
+                file: Some("/tmp/.tmpFIBj5s/nc"),
+                parents: vec![runner.into(), "/usr/bin/cargo".into(), "/usr/bin/bash".into()],
+                script: None,
+            })
+            .is_none(),
+            "the shipped file must no longer excuse an attacker-creatable /tmp path"
+        );
+
+        // The scanner suites: bash execs the fake toolchain the shim built, and
+        // the shim script itself is what identifies the run in the ancestry.
+        for file in [
+            "/tmp/moat-shim-test.n_b42zuu/bin/moat-scan-npm",
+            "/tmp/moat-build-shim-test.2o96mi62/bin/moat-scan-cargo",
+            "/tmp/moat-sandbox-test.FkzONpNE/bin/moat-shim-probe",
+        ] {
+            assert!(
+                al.find(&Candidate {
+                    rule: "moat-exec-untrusted-tmpfs",
+                    exe: "/usr/bin/bash",
+                    file: Some(file),
+                    parents: vec![
+                        "/usr/bin/bash".into(),
+                        shim.into(),
+                        "/usr/bin/python3".into(),
+                        "/usr/bin/makepkg".into(),
+                    ],
+                script: None,
+            })
+                .is_some(),
+                "the shim-suite case: {}",
+                file
+            );
+        }
+
+        // The incident writer chmodding its own fixtures also moved to the dev
+        // example: its actor glob was `*/target/*/deps/moatd-*`, which matches
+        // any project with a target/ directory, not just moat's.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-priv-setuid-chmod",
+                exe: runner,
+                file: Some("/tmp/.tmpgdwbQe/incidents/01M1SR6NRX4JVX1R993SAX2XYX/.pkg.json.663928.tmp"),
+                parents: vec!["/usr/bin/cargo".into(), "/usr/bin/bash".into()],
+                script: None,
+            })
+            .is_none(),
+            "the setuid entry moved to moat-dev.toml.example"
+        );
+
+        // And the shape this file exists to keep alerting on: a payload dropped
+        // in /tmp by an install script. No moat runner, no shim, no prefix.
+        for rule in [
+            "moat-exec-untrusted-tmpfs",
+            "moat-pkg-subtree-netcat-exec",
+            "moat-priv-setuid-chmod",
+        ] {
+            assert!(
+                al.find(&Candidate {
+                    rule,
+                    exe: "/usr/bin/bash",
+                    file: Some("/tmp/x/payload"),
+                    parents: vec!["/usr/bin/makepkg".into(), "/usr/bin/bash".into()],
+                script: None,
+            })
+                .is_none(),
+                "a dropper must still alert: {}",
+                rule
+            );
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod shipped_shape {
+    use super::*;
+
+    /// A shipped `script` or `exe` glob may not begin with a wildcard.
+    ///
+    /// A leading `*` on the path of the code being trusted is
+    /// attacker-selectable: `script = "*/google-cloud-sdk/lib/gcloud.py"` is
+    /// inherited by anyone who can create that directory shape in /tmp, and
+    /// creating a directory is not a privilege. `file` globs are exempt --
+    /// they name the TARGET, which is usually under an unknown home, and
+    /// matching one is not by itself a grant to the actor.
+    #[test]
+    fn no_shipped_actor_glob_starts_with_a_wildcard() {
+        // Both shipped files, since 2026-09-09. `omarchy-default.toml` was
+        // exempt because its `*/target/*/deps/moatd-*` entries prevented a
+        // recorded incident -- a `cargo test` of moat reaching critical and
+        // quarantining the repo's own moatctl. But that incident needs
+        // `contain.enabled`, which is off by default, so the population at risk
+        // is people who build moat AND turned containment on; they can install
+        // moat-dev.toml.example. Shipping an attacker-creatable /tmp glob to
+        // everyone to spare that group a test failure was the wrong trade.
+        for name in ["default.toml", "omarchy-default.toml"] {
+            let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("etc/allowlist.d")
+                .join(name);
+            for r in Allowlist::load_file(&p).unwrap() {
+                for (field, val) in
+                    [("script", &r.spec.script), ("exe", &r.spec.exe)]
+                {
+                    let Some(v) = val else { continue };
+                    assert!(
+                        !v.starts_with('*'),
+                        "{}: {} {:?} on rule {:?} starts with a wildcard, so any writable \
+                         directory can be shaped to match it",
+                        name,
+                        field,
+                        v,
+                        r.spec.name
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod dev_example {
+    use super::*;
+
+    /// The moat-test-suite entries still WORK -- they are just not shipped.
+    ///
+    /// They moved out of omarchy-default.toml on 2026-09-09 because every one
+    /// matched a path an attacker can create, and they only ever helped people
+    /// building moat with `contain.enabled` on. This keeps the coverage that
+    /// proved they match what the suite actually does, against the file that
+    /// now holds them.
+    #[test]
+    fn the_dev_example_still_covers_moats_own_test_suite() {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("etc/allowlist.d/moat-dev.toml.example");
+        let al = Allowlist {
+            rules: Allowlist::parse(&std::fs::read_to_string(&p).unwrap(), &p).unwrap(),
+            ..Default::default()
+        };
         let parent = "/home/dan/Projects/omarchy-moat/moatd/target/debug/deps/moatd-16a3beb0";
         // The netcat rule is a userland rule whose actor IS the copied binary,
         // so there the executed path arrives as `exe`.
@@ -928,148 +1103,73 @@ file   = "*/.config/gcloud/*"
             );
         }
     }
-
-    /// The shipped entries must be written against the fields `engine::emit`
-    /// actually fills in, or they are decoration.
-    ///
-    /// On 2026-09-05 the two tmpfs entries named `exe = "/tmp/.tmp*/nc"` and
-    /// `exe = "/tmp/.tmp*/moat-*"`. For a `bprm_check_security` finding the
-    /// actor is the CALLER — the cargo test binary — and the executed path is
-    /// `file`, so those two entries could never match anything: 50 of 50 such
-    /// alerts were unsuppressed. The candidates below are copied from real
-    /// alerts, field for field, so an entry that reads plausibly but cannot
-    /// fire is caught here instead of on the badge.
-    #[test]
-    fn the_shipped_entries_match_the_candidates_the_engine_really_builds() {
-        let p =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("etc/allowlist.d/omarchy-default.toml");
-        let al = Allowlist {
-            rules: Allowlist::load_file(&p).unwrap(),
-            ..Default::default()
-        };
-        let runner = "/home/dan/Projects/omarchy-moat/moatd/target/release/deps/moatd-decac2790eaa7887";
-        let shim = "/home/dan/Projects/omarchy-moat/pkg/src/omarchy-moat-tree/sandbox/shims/cargo";
-
-        // `cargo test` execs a copied `sleep` named `nc` out of a tempdir. The
-        // exec'ing process appears at the head of its own ancestry.
-        assert!(
-            al.find(&Candidate {
-                rule: "moat-exec-untrusted-tmpfs",
-                exe: runner,
-                file: Some("/tmp/.tmpFIBj5s/nc"),
-                parents: vec![runner.into(), "/usr/bin/cargo".into(), "/usr/bin/bash".into()],
-                script: None,
-            })
-            .is_some(),
-            "the cargo tempdir nc case"
-        );
-
-        // The scanner suites: bash execs the fake toolchain the shim built, and
-        // the shim script itself is what identifies the run in the ancestry.
-        for file in [
-            "/tmp/moat-shim-test.n_b42zuu/bin/moat-scan-npm",
-            "/tmp/moat-build-shim-test.2o96mi62/bin/moat-scan-cargo",
-            "/tmp/moat-sandbox-test.FkzONpNE/bin/moat-shim-probe",
-        ] {
-            assert!(
-                al.find(&Candidate {
-                    rule: "moat-exec-untrusted-tmpfs",
-                    exe: "/usr/bin/bash",
-                    file: Some(file),
-                    parents: vec![
-                        "/usr/bin/bash".into(),
-                        shim.into(),
-                        "/usr/bin/python3".into(),
-                        "/usr/bin/makepkg".into(),
-                    ],
-                script: None,
-            })
-                .is_some(),
-                "the shim-suite case: {}",
-                file
-            );
-        }
-
-        // The incident writer chmodding its own fixtures. `path_chmod` does not
-        // put the actor in its own ancestry, which is why this entry is scoped
-        // by exe.
-        assert!(
-            al.find(&Candidate {
-                rule: "moat-priv-setuid-chmod",
-                exe: runner,
-                file: Some("/tmp/.tmpgdwbQe/incidents/01M1SR6NRX4JVX1R993SAX2XYX/.pkg.json.663928.tmp"),
-                parents: vec!["/usr/bin/cargo".into(), "/usr/bin/bash".into()],
-                script: None,
-            })
-            .is_some(),
-            "the setuid case"
-        );
-
-        // And the shape this file exists to keep alerting on: a payload dropped
-        // in /tmp by an install script. No moat runner, no shim, no prefix.
-        for rule in [
-            "moat-exec-untrusted-tmpfs",
-            "moat-pkg-subtree-netcat-exec",
-            "moat-priv-setuid-chmod",
-        ] {
-            assert!(
-                al.find(&Candidate {
-                    rule,
-                    exe: "/usr/bin/bash",
-                    file: Some("/tmp/x/payload"),
-                    parents: vec!["/usr/bin/makepkg".into(), "/usr/bin/bash".into()],
-                script: None,
-            })
-                .is_none(),
-                "a dropper must still alert: {}",
-                rule
-            );
-        }
-    }
 }
 
-
 #[cfg(test)]
-mod shipped_shape {
+mod cloud_cli_paths {
     use super::*;
 
-    /// A shipped `script` or `exe` glob may not begin with a wildcard.
+    fn shipped() -> Allowlist {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("etc/allowlist.d/default.toml");
+        Allowlist { rules: Allowlist::load_file(&p).unwrap(), ..Default::default() }
+    }
+
+    fn matches(script: &str, file: &str) -> bool {
+        shipped()
+            .find(&Candidate {
+                rule: "moat-cred-cloud-credentials-read",
+                exe: "/usr/bin/python3.14",
+                file: Some(file),
+                parents: vec![],
+                script: Some(script),
+            })
+            .is_some()
+    }
+
+    /// An entry that cannot match is not a safe entry, it is a wrong one.
     ///
-    /// A leading `*` on the path of the code being trusted is
-    /// attacker-selectable: `script = "*/google-cloud-sdk/lib/gcloud.py"` is
-    /// inherited by anyone who can create that directory shape in /tmp, and
-    /// creating a directory is not a privilege. `file` globs are exempt --
-    /// they name the TARGET, which is usually under an unknown home, and
-    /// matching one is not by itself a grant to the actor.
+    /// The first anchored version used `/opt/azure/cli/__main__.py`, which is
+    /// not where any distro puts it: Arch ships
+    /// `/opt/azure-cli/lib/python3.14/site-packages/azure/cli/__main__.py`.
+    /// It failed safe -- and would have gone on alerting forever while looking
+    /// like it had been handled.
     #[test]
-    fn no_shipped_actor_glob_starts_with_a_wildcard() {
-        // `omarchy-default.toml` is exempt and stays that way. Its
-        // `*/target/*/deps/moatd-*` entries exist because without them a
-        // `cargo test` of moat pushed two chains to CRITICAL and triggered an
-        // automatic quarantine attempt on the repo's own moatctl -- a recorded
-        // incident, not a convenience. Both matchers must hit there (actor AND
-        // the fixture path), which is the mitigation available without knowing
-        // where a user checked the repo out.
-        for name in ["default.toml"] {
-            let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("etc/allowlist.d")
-                .join(name);
-            for r in Allowlist::load_file(&p).unwrap() {
-                for (field, val) in
-                    [("script", &r.spec.script), ("exe", &r.spec.exe)]
-                {
-                    let Some(v) = val else { continue };
-                    assert!(
-                        !v.starts_with('*'),
-                        "{}: {} {:?} on rule {:?} starts with a wildcard, so any writable \
-                         directory can be shaped to match it",
-                        name,
-                        field,
-                        v,
-                        r.spec.name
-                    );
-                }
-            }
+    fn the_real_cloud_cli_layouts_match() {
+        assert!(
+            matches(
+                "/opt/azure-cli/lib/python3.14/site-packages/azure/cli/__main__.py",
+                "/home/dan/.azure/msal_token_cache.json"
+            ),
+            "Arch's azure-cli layout"
+        );
+        assert!(
+            matches(
+                "/usr/lib/python3.14/site-packages/azure/cli/__main__.py",
+                "/home/dan/.azure/config"
+            ),
+            "a system-python install"
+        );
+        assert!(
+            matches("/opt/google-cloud-cli/lib/gcloud.py", "/home/dan/.config/gcloud/creds.db"),
+            "Arch's google-cloud-cli layout"
+        );
+    }
+
+    /// And the anchoring still holds: a writable root must not match.
+    #[test]
+    fn an_attacker_shaped_tree_does_not_match() {
+        for script in [
+            "/tmp/x/azure/cli/__main__.py",
+            "/home/dan/azure-cli/lib/python3.14/site-packages/azure/cli/__main__.py",
+            "/tmp/google-cloud-cli/lib/gcloud.py",
+            "/home/dan/.local/google-cloud-sdk/lib/gcloud.py",
+        ] {
+            assert!(
+                !matches(script, "/home/dan/.azure/config")
+                    && !matches(script, "/home/dan/.config/gcloud/creds.db"),
+                "a writable root matched: {}",
+                script
+            );
         }
     }
 }

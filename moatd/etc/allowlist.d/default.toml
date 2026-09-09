@@ -200,35 +200,6 @@ file = "*/.aws/*"
 # The Azure CLI is a python package; __main__.py is stable across the distro
 # package, the installer and a pip install.
 # The Azure CLI is a python package; anchored for the same reason.
-# under /opt
-[[rule]]
-name   = "moat-cred-cloud-credentials-read"
-script = "/opt/azure/cli/__main__.py"
-file   = "*/.azure/*"
-
-# under /usr/lib
-[[rule]]
-name   = "moat-cred-cloud-credentials-read"
-script = "/usr/lib/azure/cli/__main__.py"
-file   = "*/.azure/*"
-
-# under /usr/share
-[[rule]]
-name   = "moat-cred-cloud-credentials-read"
-script = "/usr/share/azure/cli/__main__.py"
-file   = "*/.azure/*"
-
-# under /usr/local/share
-[[rule]]
-name   = "moat-cred-cloud-credentials-read"
-script = "/usr/local/share/azure/cli/__main__.py"
-file   = "*/.azure/*"
-
-# under /snap
-[[rule]]
-name   = "moat-cred-cloud-credentials-read"
-script = "/snap/azure/cli/__main__.py"
-file   = "*/.azure/*"
 
 # AWS CLI v1 is a python script (v2 ships its own interpreter and is the `exe`
 # rule above). Anchored to the real install prefixes, not `*/bin/aws`, which
@@ -441,3 +412,32 @@ file = "/home/*/.cache/spotify/*"
 name = "moat-cred-browser-secrets-read"
 exe = "/opt/spotify/spotify"
 file = "/home/*/.config/spotify/*"
+
+# The Azure CLI is a python package, and its __main__.py sits deep inside a
+# site-packages tree whose python version moves. The first anchored version of
+# these entries was `/opt/azure/cli/__main__.py`, which is not where any distro
+# puts it -- so they could never match, which is a safe failure and still a
+# wrong entry. `*` crosses `/` in this matcher, so one wildcard in the middle
+# spans the version directory while the ROOT stays root-owned.
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/opt/azure-cli/*/azure/cli/__main__.py"
+file   = "*/.azure/*"
+
+# A distro or pip install under the system python.
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/usr/lib/python*/site-packages/azure/cli/__main__.py"
+file   = "*/.azure/*"
+
+# The same under /usr/share, which some packagings use.
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/usr/share/azure-cli/*/azure/cli/__main__.py"
+file   = "*/.azure/*"
+
+# Snap keeps a revision directory and a `current` symlink to it.
+[[rule]]
+name   = "moat-cred-cloud-credentials-read"
+script = "/snap/azure-cli/*/azure/cli/__main__.py"
+file   = "*/.azure/*"
