@@ -320,7 +320,6 @@ mod tests {
         // The other half, and what keeps the rule affordable: your registry
         // and your NAS are used repeatedly over hours and go quiet, exactly as
         // the rule's own documentation promises.
-        let cfg = Config::default();
         let mut seen = RarityStore::default();
         let t = Tuple::net("/usr/bin/node", "192.168.44.122", 4873, None);
         for i in 0..8u64 {

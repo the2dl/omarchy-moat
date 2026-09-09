@@ -811,7 +811,6 @@ mod tests {
     /// backlog, so a day of quickshell plugin execs showed as "1,854" next to a
     /// badge of 13. Nothing here filters anything — it names what is already
     /// there.
-    #[test]
     /// `needs_you` counts THINGS TO DECIDE ABOUT, not rows.
     ///
     /// 2026-09-07: a chain that reaches `high` re-stamps every trigger member
@@ -877,6 +876,7 @@ mod tests {
         assert_eq!(rows, 78, "78 rows behind those three decisions");
     }
 
+    #[test]
     fn the_ledger_splits_the_file_into_needs_you_recorded_and_suppressed() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = store(dir.path(), 1 << 20);

@@ -994,6 +994,22 @@ file   = "*/.config/gcloud/*"
             "the shipped file must no longer excuse an attacker-creatable /tmp path"
         );
 
+        // The shim half of the same move. `parent = "*/sandbox/shims/*"` is a
+        // path an attacker can create too, so it left with the runner entry --
+        // and the variable for it outlived its assertion, which is how a gap
+        // this shape goes unnoticed.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-exec-untrusted-tmpfs",
+                exe: shim,
+                file: Some("/tmp/moat-shim-test.aBcD/nc"),
+                parents: vec![shim.into(), "/usr/bin/bash".into()],
+                script: None,
+            })
+            .is_none(),
+            "the shipped file must no longer excuse a shim-parented /tmp path"
+        );
+
 
         // The incident writer chmodding its own fixtures also moved to the dev
         // example: its actor glob was `*/target/*/deps/moatd-*`, which matches

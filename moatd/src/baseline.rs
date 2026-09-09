@@ -1340,7 +1340,6 @@ mod tests {
 
     // ----------------------------------------------------------- noise guard
 
-    #[test]
     /// A pattern that keeps coming back becomes a decision, not a habit.
     ///
     /// The noise guard forgets on purpose, so an unofficial pattern that
@@ -1381,6 +1380,7 @@ mod tests {
         assert!(props[0].toml.contains(rule), "{}", props[0].toml);
     }
 
+    #[test]
     fn a_noisy_pattern_is_demoted_exactly_once_and_only_that_pattern() {
         let dir = tempfile::tempdir().unwrap();
         let mut b = baseline(dir.path(), NOW);

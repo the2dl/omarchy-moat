@@ -456,7 +456,6 @@ mod tests {
 
 #[cfg(test)]
 mod symlink_tests {
-    use super::*;
 
     /// The 2026-09-04 privilege escalation, pinned.
     ///

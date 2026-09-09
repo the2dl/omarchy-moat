@@ -680,8 +680,7 @@ pub fn worth_killing_for(severity: &str, triggers: &[StepFact]) -> Result<(), St
 #[cfg(test)]
 mod kill_tests {
     use super::*;
-    use crate::alert::Ancestor;
-    use crate::chain::{Chain, Step};
+    use crate::chain::Step;
 
     fn step(pid: u32, exe: &str, family: &str, role: &str) -> Step {
         Step {
@@ -694,27 +693,6 @@ mod kill_tests {
             pid,
             exe: exe.into(),
             role: role.into(),
-        }
-    }
-
-    fn chain(steps: Vec<Step>, severity: &str, families: Vec<&str>) -> Chain {
-        Chain {
-            v: 1,
-            id: "01CH".into(),
-            ancestor: Ancestor { pid: 5000, exe: "/usr/bin/makepkg".into() },
-            families: families.into_iter().map(String::from).collect(),
-            severity: severity.into(),
-            severity_base: "high".into(),
-            severity_reason: "r".into(),
-            first_ts: "2026-09-05T14:44:22Z".into(),
-            last_ts: "2026-09-05T14:44:23Z".into(),
-            span_secs: 1,
-            steps,
-            steps_total: 0,
-            truncated: false,
-            members: Vec::new(),
-            triggers_total: 0,
-            summary: "s".into(),
         }
     }
 

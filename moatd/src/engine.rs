@@ -83,8 +83,6 @@ struct ChainGate {
     facts: Vec<crate::contain::StepFact>,
     /// The trigger families, sorted and deduped, for the decisions record.
     families: Vec<String>,
-    /// The uid every trigger ran as, for `refuse_to_kill`.
-    uid: u32,
     /// `Ok` to act; `Err(why)` is the sentence both refusals print.
     verdict: Result<(), String>,
 }
@@ -985,13 +983,11 @@ impl Daemon {
         // Facts from the alerts, not from the steps: a step carries no rarity,
         // and rarity is what separates a build from a first run.
         let mut facts: Vec<crate::contain::StepFact> = Vec::new();
-        let mut uid = 0u32;
         for step in c.steps.iter().filter(|s| s.is_trigger()) {
             let Some(a) = self.find_alert(&step.alert) else { continue };
             if a.suppressed_by.is_some() {
                 continue;
             }
-            uid = a.process.uid;
             facts.push(crate::contain::StepFact {
                 family: a.family.clone(),
                 novel: matches!(
@@ -1088,7 +1084,6 @@ impl Daemon {
         ChainGate {
             facts,
             families,
-            uid,
             verdict,
         }
     }
@@ -1310,7 +1305,7 @@ impl Daemon {
             .collect()
     }
 
-    fn maybe_kill_tree(&mut self, c: &crate::chain::Chain, now: u64) {
+    fn maybe_kill_tree(&mut self, c: &crate::chain::Chain) {
         let mode = self.cfg.contain.kill.clone();
         if mode == "off" {
             return;
@@ -1324,7 +1319,7 @@ impl Daemon {
         }
 
         let gate = self.chain_gate(c);
-        let (facts, families, uid) = (gate.facts, gate.families, gate.uid);
+        let (facts, families) = (gate.facts, gate.families);
         if let Err(why) = gate.verdict {
             self.record_decision(&c.id, &c.severity, &families, "spared", &why, &[]);
             // INFO, not DEBUG. The refusals are the whole point of `log` mode:
@@ -1358,8 +1353,9 @@ impl Daemon {
         for t in targets.iter().take(MAX_TARGETS) {
             // This target's OWN uid and identity, not the chain's.
             //
-            // `uid` here is whatever the LAST trigger happened to run as, and
-            // it was being applied to every target: a chain spanning two users
+            // The chain carried one uid -- whatever the LAST trigger happened
+            // to run as -- and it was being applied to every target: a chain
+            // spanning two users
             // would check one of them against the other's id and either spare a
             // process it should kill or, worse, pass a process it never
             // established anything about.
@@ -3271,7 +3267,7 @@ impl Daemon {
             .collect();
 
         self.maybe_contain(&c, now);
-        self.maybe_kill_tree(&c, now);
+        self.maybe_kill_tree(&c);
         if crate::alert::severity_rank(&c.severity) >= crate::alert::severity_rank("high") {
             // Content analysis first: quarantine moves the file into moat's own
             // store, which the analyser refuses to read, so the order is not a
@@ -6469,13 +6465,13 @@ mod tests {
             triggers_total: 0,
             summary: "s".into(),
         };
-        d.maybe_kill_tree(&c, util::unix_secs());
+        d.maybe_kill_tree(&c);
         assert!(d.killed_chains.is_empty());
 
         // In `log` a chain with no usable targets is still not recorded, so a
         // later growth of the same chain can still be judged.
         d.cfg.contain.kill = "log".into();
-        d.maybe_kill_tree(&c, util::unix_secs());
+        d.maybe_kill_tree(&c);
         assert!(d.killed_chains.is_empty(), "nothing to decide is not a decision");
     }
 
