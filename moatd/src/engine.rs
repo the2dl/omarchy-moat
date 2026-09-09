@@ -4324,7 +4324,7 @@ impl Daemon {
                 // attempt; marking it costs the grant.
                 let disabled = match self.baseline.state.tuples.get(&e.key).cloned() {
                     Some(t) => match crate::allowlist::find_index(&path, &t.spec()) {
-                        Some(idx) => match crate::allowlist::disable_rule(&path, idx, &reason) {
+                        Ok(Some(idx)) => match crate::allowlist::disable_rule(&path, idx, &reason) {
                             Ok(_) => true,
                             Err(err) => {
                                 log::warn!("{}: {}", path.display(), err);
@@ -4333,7 +4333,21 @@ impl Daemon {
                         },
                         // No block to disable: nothing is granting anything, so
                         // the entry is safe to mark.
-                        None => true,
+                        Ok(None) => true,
+                        // Could not read the file, so whether it still grants
+                        // this is unknown -- and an unknown grant must not be
+                        // recorded as withdrawn. Same reasoning as the failed
+                        // write above: retry beats a permanent false success.
+                        Err(err) => {
+                            log::warn!(
+                                "{}: cannot tell whether it still grants {} ({}); not marking \
+                                 it revoked",
+                                path.display(),
+                                e.key,
+                                err
+                            );
+                            false
+                        }
                     },
                     None => true,
                 };
@@ -4387,16 +4401,27 @@ impl Daemon {
             // that never happened and stopped the next re-check retrying it.
             let disabled = match self.baseline.state.tuples.get(&e.key).cloned() {
                 Some(t) => match crate::allowlist::find_index(&path, &t.spec()) {
-                    Some(idx) => match crate::allowlist::disable_rule(&path, idx, &reason) {
+                    Ok(Some(idx)) => match crate::allowlist::disable_rule(&path, idx, &reason) {
                         Ok(_) => true,
                         Err(err) => {
                             log::warn!("{}: {}", path.display(), err);
                             false
                         }
                     },
-                    None => {
+                    Ok(None) => {
                         log::debug!("baseline: no block in {} for {}", path.display(), e.key);
                         true
+                    }
+                    // Unreadable is not absent. See the runtime-path branch.
+                    Err(err) => {
+                        log::warn!(
+                            "{}: cannot tell whether it still grants {} ({}); not marking it \
+                             revoked",
+                            path.display(),
+                            e.key,
+                            err
+                        );
+                        false
                     }
                 },
                 None => true,
@@ -10402,7 +10427,7 @@ esac
         std::fs::write(&path, format!("# learned\n{}", crate::allowlist::render_block(&spec)))
             .unwrap();
         assert!(
-            crate::allowlist::find_index(&path, &spec).is_some(),
+            matches!(crate::allowlist::find_index(&path, &spec), Ok(Some(_))),
             "precondition: the block is findable, or this tests the wrong branch"
         );
 

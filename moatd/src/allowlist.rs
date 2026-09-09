@@ -503,9 +503,34 @@ pub fn load_file_pub(path: &Path) -> Result<Vec<Rule>, String> {
     Allowlist::load_file(path)
 }
 
-pub fn find_index(path: &Path, spec: &RuleSpec) -> Option<usize> {
-    let rules = Allowlist::load_file(path).ok()?;
-    rules.iter().position(|r| &r.spec == spec).map(|i| i + 1)
+/// Three answers, not two.
+///
+/// `Ok(Some(i))` found it; `Ok(None)` read the file and it is not there;
+/// `Err(why)` could not read or parse the file at all, so nothing is known
+/// either way.
+///
+/// This used to return `Option<usize>` and fold the last two together. The
+/// caller that matters is the baseline revoke path, which reads "no block" as
+/// "nothing is granting anything, so the entry is safe to mark withdrawn" --
+/// correct for `Ok(None)` and exactly backwards for a corrupt file, where the
+/// grant may still be live and live grants are what this is trying to remove.
+/// It is the same shape as the failed-write case the code beside it already
+/// guards, reached by a different route.
+pub fn find_index(path: &Path, spec: &RuleSpec) -> Result<Option<usize>, String> {
+    // A file that is not there grants nothing, which is a real answer and not
+    // a failure to get one. Only a file that EXISTS and cannot be read or
+    // parsed leaves the question open -- collapsing those two was the first
+    // version of this fix, and it stopped a legitimate withdrawal.
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let rules = Allowlist::parse(&text, path)?;
+    Ok(rules
+        .iter()
+        .position(|r| &r.spec == spec)
+        .map(|i| i + 1))
 }
 
 /// Remove the `index`-th (1-based) `[[rule]]` block from `path`.
@@ -767,6 +792,46 @@ exe = "/usr/bin/gnome-keyring-daemon"
         assert!(!is_removable(Path::new("/x/default.toml")));
     }
 
+    /// Three answers, and the difference between two of them is a live grant.
+    ///
+    /// The baseline revoke path reads "not there" as "nothing is granting
+    /// anything, so mark the entry withdrawn". For a file that will not parse
+    /// that is exactly backwards: the grant may still be live, and
+    /// `mark_revoked` drops the entry from `learned_entries` so the next
+    /// re-check never retries it. A corrupt file would have quietly become a
+    /// permanent grant that moat's own records described as withdrawn.
+    #[test]
+    fn a_file_that_will_not_parse_is_not_the_same_as_a_rule_that_is_not_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = RuleSpec {
+            name: "moat-cred-ssh-private-key-read".into(),
+            exe: Some("/usr/bin/restic".into()),
+            ..Default::default()
+        };
+
+        // Control: a real file that really does hold the block. Without this
+        // the negatives below could pass with `find_index` always failing.
+        let good = dir.path().join("good.toml");
+        std::fs::write(&good, SAMPLE).unwrap();
+        assert_eq!(find_index(&good, &spec), Ok(Some(1)), "the block is there");
+
+        // Absent file: a real answer. Nothing grants anything.
+        let gone = dir.path().join("not-created.toml");
+        assert_eq!(
+            find_index(&gone, &spec),
+            Ok(None),
+            "a file that does not exist grants nothing"
+        );
+
+        // Present and unparseable: no answer at all.
+        let bad = dir.path().join("bad.toml");
+        std::fs::write(&bad, "[[rule]]\nname = \"unterminated").unwrap();
+        assert!(
+            find_index(&bad, &spec).is_err(),
+            "a corrupt file must not answer 'not there'"
+        );
+    }
+
     #[test]
     fn find_index_locates_a_block_by_its_spec() {
         let dir = tempfile::tempdir().unwrap();
@@ -775,9 +840,13 @@ exe = "/usr/bin/gnome-keyring-daemon"
         let b = RuleSpec { name: "r-b".into(), ..Default::default() };
         append_rule(&p, "a", &a).unwrap();
         append_rule(&p, "b", &b).unwrap();
-        assert_eq!(find_index(&p, &a), Some(1));
-        assert_eq!(find_index(&p, &b), Some(2));
-        assert_eq!(find_index(&p, &RuleSpec { name: "nope".into(), ..Default::default() }), None);
+        assert_eq!(find_index(&p, &a), Ok(Some(1)));
+        assert_eq!(find_index(&p, &b), Ok(Some(2)));
+        assert_eq!(
+            find_index(&p, &RuleSpec { name: "nope".into(), ..Default::default() }),
+            Ok(None),
+            "parsed, and genuinely not there"
+        );
     }
 
     /// An interpreter's SCRIPT is what an allowlist entry may name, so a grant
