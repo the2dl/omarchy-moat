@@ -48,6 +48,10 @@ pub struct Entry {
 /// carries no digest (a directory or a symlink). All three mean "no claim",
 /// never "mismatch" -- the caller must not read absence as tampering.
 pub fn lookup(pkg_dir: &Path, abs_path: &str) -> Option<Entry> {
+    // No traversal check needed here and one would be misleading: this asks
+    // about a path the CALLER already has, and an mtree entry that walks
+    // elsewhere simply fails to equal it. `entries` is the direction that
+    // needs the guard, because there the mtree chooses the path.
     let want = abs_path.strip_prefix('/')?;
     let file = std::fs::File::open(pkg_dir.join("mtree")).ok()?;
     let rd = std::io::BufReader::new(flate2::read::GzDecoder::new(file));
@@ -114,10 +118,38 @@ pub fn entries(pkg_dir: &Path) -> Vec<(String, Entry)> {
             }
         }
         if let Some(sha256) = sha256 {
-            out.push((format!("/{}", unescape(rel)), Entry { sha256, size }));
+            let path = format!("/{}", unescape(rel));
+            // An mtree describes ONE package's files, and every one of them is
+            // under `/`. A `..` component would make it describe someone
+            // else's -- and the sweep would then read, hash and raise an alert
+            // about a file the package never owned, on the package's say-so.
+            // A hostile AUR package writes its own mtree, so this is not a
+            // hypothetical the root ownership of the file rules out.
+            if !path_stays_put(&path) {
+                log::warn!(
+                    "mtree in {}: ignoring {:?}, which walks out of the filesystem it \
+                     describes",
+                    pkg_dir.display(),
+                    path
+                );
+                continue;
+            }
+            out.push((path, Entry { sha256, size }));
         }
     }
     out
+}
+
+/// Does this path name what it appears to name, without walking anywhere?
+///
+/// `..` is the whole question. `.` and empty components are harmless noise but
+/// are refused too, because a path that needs normalising before it can be
+/// compared is a path two pieces of code will normalise differently.
+fn path_stays_put(path: &str) -> bool {
+    use std::path::Component;
+    std::path::Path::new(path)
+        .components()
+        .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
 }
 
 /// `\133` -> `[`, `\\` -> `\`. Anything else after a backslash is left as
@@ -191,6 +223,45 @@ mod tests {
         assert_eq!(unescape("a\\13"), "a\\13");
         assert_eq!(unescape("a\\19b"), "a\\19b");
         assert_eq!(unescape("a\\777b"), "a\\777b");
+    }
+
+    /// A package describes its own files. An mtree that walks out of them
+    /// would make the sweep read, hash and raise an alert about a file the
+    /// package never owned -- on that package's say-so.
+    ///
+    /// Not ruled out by the file being root-owned: a hostile AUR package
+    /// writes its own mtree, and `%VALIDATION%` says nothing about content.
+    #[test]
+    fn an_mtree_cannot_describe_files_outside_the_package() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let body = [
+            "#mtree",
+            "/set type=file uid=0 gid=0 mode=755",
+            "./usr/bin/mine time=1.0 size=4 sha256digest=aa",
+            "./../../etc/shadow time=1.0 size=4 sha256digest=bb",
+            "./usr/../../root/.ssh/id_rsa time=1.0 size=4 sha256digest=cc",
+        ]
+        .join("\n");
+        let f = std::fs::File::create(dir.path().join("mtree")).unwrap();
+        let mut gz = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+        gz.write_all(body.as_bytes()).unwrap();
+        gz.finish().unwrap();
+
+        let got = entries(dir.path());
+        let paths: Vec<&str> = got.iter().map(|(p, _)| p.as_str()).collect();
+        // Control: the honest entry is still returned, so the refusals below
+        // are the guard and not a parser that stopped working.
+        assert!(paths.contains(&"/usr/bin/mine"), "{paths:?}");
+        assert_eq!(paths.len(), 1, "and nothing that walks out: {paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.contains("shadow") || p.contains("id_rsa")),
+            "{paths:?}"
+        );
+
+        assert!(path_stays_put("/usr/bin/curl"));
+        assert!(!path_stays_put("/usr/../etc/shadow"));
+        assert!(!path_stays_put("/../etc/shadow"));
     }
 
     /// The parser against the real pacman database, if this machine has one.
