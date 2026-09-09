@@ -113,3 +113,28 @@ parent = "*/target/*/deps/moatd-*"
 name = "moat-priv-setuid-chmod"
 exe = "*/target/*/deps/moatd-*"
 file = "/tmp/.tmp*/*"
+
+# --- the scanner shim suites, moved 2026-09-09 ---
+#
+# Same reasoning as the entries above: `/tmp/moat-sandbox-test.*/*` and
+# `parent = "*/sandbox/shims/*"` are both paths an attacker can create, and
+# requiring two attacker-chosen names together does not make either evidence.
+# They exist for `scanner/tests/`, which only runs when developing moat.
+
+# outside a shim, or any other tmpfs path, still fires.
+[[rule]]
+name = "moat-exec-untrusted-tmpfs"
+file = "/tmp/moat-sandbox-test.*/*"
+parent = "*/sandbox/shims/*"
+
+# scoping and the same limits: the exec is done by bash as often as by the shim.
+[[rule]]
+name = "moat-exec-untrusted-tmpfs"
+file = "/tmp/moat-shim-test.*/*"
+parent = "*/sandbox/shims/*"
+
+# machine that develops moat.
+[[rule]]
+name = "moat-exec-untrusted-tmpfs"
+file = "/tmp/moat-build-shim-test.*/*"
+parent = "*/sandbox/shims/*"

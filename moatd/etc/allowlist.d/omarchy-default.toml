@@ -90,33 +90,15 @@ file = "/home/*/.claude/.credentials.json"
 # which is the rule, exercised on purpose. Scoped by ancestry rather than by
 # actor for the same reason as the plugin entry above: the exec is done by bash
 # or env as often as by the shim itself. A binary under that prefix executed
-# outside a shim, or any other tmpfs path, still fires.
-[[rule]]
-name = "moat-exec-untrusted-tmpfs"
-file = "/tmp/moat-sandbox-test.*/*"
-parent = "*/sandbox/shims/*"
-
 # `scanner/tests/test_npm_shim.py` is the same idea for the node shims: it
 # builds a fake `npm`/`yarn`/`pnpm`/`bun` toolchain under
 # /tmp/moat-shim-test.* with `tempfile.mkdtemp(prefix="moat-shim-test.")` and
 # runs the shipped shims against it, from `python3 -m unittest` in the
 # PKGBUILD's check(). The entry above only named the sandbox suite's prefix, so
 # on 2026-09-05 these were 348 unsuppressed alerts in one day. Same ancestry
-# scoping and the same limits: the exec is done by bash as often as by the shim.
-[[rule]]
-name = "moat-exec-untrusted-tmpfs"
-file = "/tmp/moat-shim-test.*/*"
-parent = "*/sandbox/shims/*"
-
 # ...and `scanner/tests/test_build_shim.py` for the build shims
 # (cargo/pip/pip3/uv/go), under its own /tmp/moat-build-shim-test.* prefix:
 # 784 unsuppressed alerts on 2026-09-05, the single noisiest shape on the
-# machine that develops moat.
-[[rule]]
-name = "moat-exec-untrusted-tmpfs"
-file = "/tmp/moat-build-shim-test.*/*"
-parent = "*/sandbox/shims/*"
-
 # `cargo test` runs the incident writer against a real directory tree, and
 # writing an incident chmods the files it drops — which is `moat-priv-setuid-chmod`
 # doing its job on moat's own test fixtures. Two of those on 2026-09-05 were

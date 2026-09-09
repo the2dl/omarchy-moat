@@ -86,6 +86,46 @@ pub struct Allowlist {
     pub failed: Vec<String>,
 }
 
+/// Collapse `.` and `..` without touching the filesystem.
+///
+/// Component-wise, so a file honestly named `..config` or a directory `a..b` is
+/// left alone -- only a whole `..` component walks up. A leading `..` on a
+/// relative path is kept: there is nothing above it to remove, and inventing
+/// one would change which file the string names.
+///
+/// Deliberately NOT `Path::canonicalize`: this runs on attacker-chosen paths on
+/// the alert path, and canonicalising would follow symlinks and stat the disk
+/// for every candidate.
+fn normalize_lexical(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => match out.last() {
+                Some(&last) if last != ".." => {
+                    out.pop();
+                }
+                // Above the root there is nothing; above a relative start, keep it.
+                _ => {
+                    if !absolute {
+                        out.push("..");
+                    }
+                }
+            },
+            p => out.push(p),
+        }
+    }
+    let joined = out.join("/");
+    if absolute {
+        format!("/{}", joined)
+    } else if joined.is_empty() {
+        ".".to_string()
+    } else {
+        joined
+    }
+}
+
 fn compile(pattern: &str) -> Result<GlobMatcher, String> {
     Glob::new(pattern)
         .map(|g| g.compile_matcher())
@@ -148,7 +188,38 @@ impl Allowlist {
 
     /// First matching rule, or `None`.
     pub fn find(&self, c: &Candidate) -> Option<&Rule> {
-        self.rules.iter().find(|r| r.matches(c))
+        // Matched on the NORMALISED path, always.
+        //
+        // These globs are lexical and `*` crosses `/`, so
+        // `/usr/lib/python*/site-packages/...` also matched
+        // `/usr/lib/python3.14/../../../tmp/site-packages/...`: a string that
+        // satisfies a root-owned anchor and resolves under /tmp. Anchoring the
+        // root is the entire mechanism keeping these entries out of attacker
+        // reach, and traversal walks straight past it.
+        //
+        // Normalising rather than refusing, because `..` here is not by itself
+        // suspicious: `script_arg` absolutises a relative script against cwd
+        // without collapsing it, so `python ../../opt/google-cloud-cli/lib/
+        // gcloud.py` legitimately arrives as `/usr/bin/../../opt/...`. Refusing
+        // those would make gcloud alert on its own store. Collapsing keeps that
+        // working and closes the bypass in the same move.
+        //
+        // Lexical, never `canonicalize`: this runs on attacker-chosen paths in
+        // the alert path, and resolving through the filesystem would follow
+        // symlinks and touch disk on every candidate.
+        let (exe, file, script) = (
+            normalize_lexical(c.exe),
+            c.file.map(normalize_lexical),
+            c.script.map(normalize_lexical),
+        );
+        let c = Candidate {
+            rule: c.rule,
+            exe: &exe,
+            file: file.as_deref(),
+            parents: c.parents.clone(),
+            script: script.as_deref(),
+        };
+        self.rules.iter().find(|r| r.matches(&c))
     }
 
     pub fn len(&self) -> usize {
@@ -784,9 +855,10 @@ file   = "*/.config/gcloud/*"
         };
         assert_eq!(
             al.len(),
-            5,
-            "the omarchy-shell plugin exec entry, the agent-usage credential read, \
-             the three scanner suites' fake toolchains — nothing else. The nine \
+            2,
+            "the omarchy-shell plugin exec entry and the agent-usage credential \
+             read — nothing else. The twelve moat-test-suite entries moved to \
+             moat-dev.toml.example on 2026-09-09: every one matched a path an \
              moat-test-suite entries moved to moat-dev.toml.example on 2026-09-09: \
              every one matched a path an attacker can create (/tmp/.tmp*/nc, \
              */target/*/deps/moatd-*), and they were shipped to everyone to protect \
@@ -916,31 +988,6 @@ file   = "*/.config/gcloud/*"
             "the shipped file must no longer excuse an attacker-creatable /tmp path"
         );
 
-        // The scanner suites: bash execs the fake toolchain the shim built, and
-        // the shim script itself is what identifies the run in the ancestry.
-        for file in [
-            "/tmp/moat-shim-test.n_b42zuu/bin/moat-scan-npm",
-            "/tmp/moat-build-shim-test.2o96mi62/bin/moat-scan-cargo",
-            "/tmp/moat-sandbox-test.FkzONpNE/bin/moat-shim-probe",
-        ] {
-            assert!(
-                al.find(&Candidate {
-                    rule: "moat-exec-untrusted-tmpfs",
-                    exe: "/usr/bin/bash",
-                    file: Some(file),
-                    parents: vec![
-                        "/usr/bin/bash".into(),
-                        shim.into(),
-                        "/usr/bin/python3".into(),
-                        "/usr/bin/makepkg".into(),
-                    ],
-                script: None,
-            })
-                .is_some(),
-                "the shim-suite case: {}",
-                file
-            );
-        }
 
         // The incident writer chmodding its own fixtures also moved to the dev
         // example: its actor glob was `*/target/*/deps/moatd-*`, which matches
@@ -1008,9 +1055,15 @@ mod shipped_shape {
                 .join("etc/allowlist.d")
                 .join(name);
             for r in Allowlist::load_file(&p).unwrap() {
-                for (field, val) in
-                    [("script", &r.spec.script), ("exe", &r.spec.exe)]
-                {
+                // `parent` too: an ancestry glob is an actor pattern like any
+                // other, and `parent = "*/sandbox/shims/*"` sat in the shipped
+                // set for a day after this test was written because the field
+                // list did not name it.
+                for (field, val) in [
+                    ("script", &r.spec.script),
+                    ("exe", &r.spec.exe),
+                    ("parent", &r.spec.parent),
+                ] {
                     let Some(v) = val else { continue };
                     assert!(
                         !v.starts_with('*'),
@@ -1046,6 +1099,33 @@ mod dev_example {
             rules: Allowlist::parse(&std::fs::read_to_string(&p).unwrap(), &p).unwrap(),
             ..Default::default()
         };
+        let shim = "/home/dan/Projects/omarchy-moat/pkg/src/omarchy-moat-tree/sandbox/shims/cargo";
+        // The scanner suites: bash execs the fake toolchain the shim built, and
+        // the shim script itself is what identifies the run in the ancestry.
+        for file in [
+            "/tmp/moat-shim-test.n_b42zuu/bin/moat-scan-npm",
+            "/tmp/moat-build-shim-test.2o96mi62/bin/moat-scan-cargo",
+            "/tmp/moat-sandbox-test.FkzONpNE/bin/moat-shim-probe",
+        ] {
+            assert!(
+                al.find(&Candidate {
+                    rule: "moat-exec-untrusted-tmpfs",
+                    exe: "/usr/bin/bash",
+                    file: Some(file),
+                    parents: vec![
+                        "/usr/bin/bash".into(),
+                        shim.into(),
+                        "/usr/bin/python3".into(),
+                        "/usr/bin/makepkg".into(),
+                    ],
+                script: None,
+            })
+                .is_some(),
+                "the shim-suite case: {}",
+                file
+            );
+        }
+
         let parent = "/home/dan/Projects/omarchy-moat/moatd/target/debug/deps/moatd-16a3beb0";
         // The netcat rule is a userland rule whose actor IS the copied binary,
         // so there the executed path arrives as `exe`.
@@ -1135,19 +1215,17 @@ mod cloud_cli_paths {
     /// like it had been handled.
     #[test]
     fn the_real_cloud_cli_layouts_match() {
+        // No azure assertion: there is no azure entry, on purpose. Its launcher
+        // re-execs python with `-m azure.cli`, and `script_arg` returns None for
+        // `-m`, so no `script =` entry can match the real invocation however
+        // well its path is spelled. Two anchored attempts were wrong before
+        // that was noticed; the reasoning is recorded in default.toml.
         assert!(
-            matches(
+            !matches(
                 "/opt/azure-cli/lib/python3.14/site-packages/azure/cli/__main__.py",
-                "/home/dan/.azure/msal_token_cache.json"
-            ),
-            "Arch's azure-cli layout"
-        );
-        assert!(
-            matches(
-                "/usr/lib/python3.14/site-packages/azure/cli/__main__.py",
                 "/home/dan/.azure/config"
             ),
-            "a system-python install"
+            "an azure entry is back; check it can actually fire before keeping it"
         );
         assert!(
             matches("/opt/google-cloud-cli/lib/gcloud.py", "/home/dan/.config/gcloud/creds.db"),
@@ -1171,5 +1249,57 @@ mod cloud_cli_paths {
                 script
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod traversal {
+    use super::*;
+
+    #[test]
+    fn dot_dot_is_collapsed_component_wise() {
+        assert_eq!(normalize_lexical("/usr/bin/../../opt/x/y.py"), "/opt/x/y.py");
+        assert_eq!(
+            normalize_lexical("/usr/lib/python3.14/../../../tmp/site-packages/a/b.py"),
+            "/tmp/site-packages/a/b.py"
+        );
+        assert_eq!(normalize_lexical("/a/./b//c"), "/a/b/c");
+        // Above the root there is nothing to remove.
+        assert_eq!(normalize_lexical("/../../etc/passwd"), "/etc/passwd");
+        // A name that merely CONTAINS dots is not traversal.
+        assert_eq!(normalize_lexical("/home/dan/..config/a..b"), "/home/dan/..config/a..b");
+        // A relative path keeps what it cannot resolve.
+        assert_eq!(normalize_lexical("../x"), "../x");
+    }
+
+    /// The bypass: a root-owned anchor satisfied by a string that resolves
+    /// somewhere else entirely.
+    #[test]
+    fn traversal_cannot_walk_past_an_anchored_root() {
+        let toml = "# t\n[[rule]]\nname = \"moat-cred-cloud-credentials-read\"\n\
+                    script = \"/usr/lib/python*/site-packages/azure/cli/__main__.py\"\n\
+                    file = \"*/.azure/*\"\n";
+        let a = Allowlist {
+            rules: Allowlist::parse(toml, Path::new("t.toml")).unwrap(),
+            failed: vec![],
+        };
+        let cand = |script: &'static str| Candidate {
+            rule: "moat-cred-cloud-credentials-read",
+            exe: "/usr/bin/python3.14",
+            file: Some("/home/dan/.azure/config"),
+            parents: vec![],
+            script: Some(script),
+        };
+        assert!(
+            a.find(&cand("/usr/lib/python3.14/site-packages/azure/cli/__main__.py")).is_some(),
+            "the real path still matches"
+        );
+        assert!(
+            a.find(&cand(
+                "/usr/lib/python3.14/../../../tmp/site-packages/azure/cli/__main__.py"
+            ))
+            .is_none(),
+            "a path that resolves under /tmp must not inherit a /usr/lib grant"
+        );
     }
 }

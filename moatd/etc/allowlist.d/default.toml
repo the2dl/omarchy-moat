@@ -413,31 +413,19 @@ name = "moat-cred-browser-secrets-read"
 exe = "/opt/spotify/spotify"
 file = "/home/*/.config/spotify/*"
 
-# The Azure CLI is a python package, and its __main__.py sits deep inside a
-# site-packages tree whose python version moves. The first anchored version of
-# these entries was `/opt/azure/cli/__main__.py`, which is not where any distro
-# puts it -- so they could never match, which is a safe failure and still a
-# wrong entry. `*` crosses `/` in this matcher, so one wildcard in the middle
-# spans the version directory while the ROOT stays root-owned.
-[[rule]]
-name   = "moat-cred-cloud-credentials-read"
-script = "/opt/azure-cli/*/azure/cli/__main__.py"
-file   = "*/.azure/*"
-
-# A distro or pip install under the system python.
-[[rule]]
-name   = "moat-cred-cloud-credentials-read"
-script = "/usr/lib/python*/site-packages/azure/cli/__main__.py"
-file   = "*/.azure/*"
-
-# The same under /usr/share, which some packagings use.
-[[rule]]
-name   = "moat-cred-cloud-credentials-read"
-script = "/usr/share/azure-cli/*/azure/cli/__main__.py"
-file   = "*/.azure/*"
-
-# Snap keeps a revision directory and a `current` symlink to it.
-[[rule]]
-name   = "moat-cred-cloud-credentials-read"
-script = "/snap/azure-cli/*/azure/cli/__main__.py"
-file   = "*/.azure/*"
+# NO azure-cli entry, and that is a decision rather than an omission.
+#
+# Two anchored attempts have now been wrong. The first named
+# /opt/azure/cli/__main__.py, which is not where any distro puts it. The second
+# named the real Arch layout -- and still cannot fire, because azure-cli's
+# launcher re-execs python with `-m azure.cli`, and `provenance::script_arg`
+# returns None for `-m` on purpose: `-m` names a MODULE, and resolving what
+# code that module is would mean trusting sys.path, which the caller controls.
+#
+# So no `script =` entry can ever match the real invocation, and an entry that
+# looks like it handles azure while never matching is worse than none: it reads
+# as done. `az` reading ~/.azure will alert until moat can identify a module
+# the way it identifies a script.
+#
+# The gcloud and aws entries above are NOT in this position: those launchers
+# hand python a real script path, which is why they work.
