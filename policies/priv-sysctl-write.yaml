@@ -22,8 +22,9 @@ metadata:
       change, it is somebody arranging to be root later.
     moat.omarchy/expected: >-
       systemd-sysctl applying /etc/sysctl.d at boot, and `sysctl -w` run by hand.
-      Both are excluded by name. A container runtime writing net.* is common and is
-      NOT matched: this watches /proc/sys/kernel only.
+      Both are excluded by name. Container runtimes writing net.* are not matched,
+      and neither is /proc/sys/kernel/ns_last_pid, which moat's own pidfd test
+      writes on every build.
     moat.omarchy/fp-hint: "exe"
 spec:
   options:
@@ -49,17 +50,45 @@ spec:
         - "/usr/bin/sysctl"
         - "/usr/bin/systemd-sysctl"
       matchArgs:
-      # Prefix over the whole subtree, verified against the live sensor rather
-      # than assumed: one Prefix matched both core_pattern and pid_max, and
-      # procfs paths resolve in full (NOTES section 3, "probed 2026-09-09").
+      # ENUMERATED, not a prefix over /proc/sys/kernel/.
       #
-      # /proc/sys/kernel ONLY, deliberately. /proc/sys/net is written by every
-      # container start, and /proc/sys/vm by tuning scripts; folding those in
-      # would drown the rule in exactly the traffic it cannot act on.
+      # The prefix was the first shape and it was wrong. On 2026-09-10 it fired
+      # on moat's OWN test suite: util::pidfd_tests writes
+      # /proc/sys/kernel/ns_last_pid to force a pid to be recycled, under
+      # makepkg -> cargo, so every package build of moat would have raised a
+      # high alert about moat. ns_last_pid is not an escalation path; it is a
+      # counter, used by that test and by CRIU.
+      #
+      # Two filters on one index is UNVERIFIED at runtime (notes section 2) and
+      # check.py flags it, so an exclusion alongside the prefix was not on
+      # offer. Equal with a named list is: string Equal values are map-backed
+      # with no four-value cap, and every one of these is a documented path to
+      # running code as root. The cost is that a tunable nobody has thought of
+      # is not covered, which is the honest trade for not crying wolf on a
+      # build.
       - index: 0
-        operator: "Prefix"
+        operator: "Equal"
         values:
-        - "/proc/sys/kernel/"
+        # Run as root on the next crash.
+        - "/proc/sys/kernel/core_pattern"
+        - "/proc/sys/kernel/core_pipe_limit"
+        # What the kernel executes to autoload a module.
+        - "/proc/sys/kernel/modprobe"
+        - "/proc/sys/kernel/modules_disabled"
+        # Re-opening the gates this machine's exploits would come through.
+        - "/proc/sys/kernel/unprivileged_userns_clone"
+        - "/proc/sys/kernel/unprivileged_bpf_disabled"
+        - "/proc/sys/kernel/kexec_load_disabled"
+        # Blinding the defences, which is what precedes the rest.
+        - "/proc/sys/kernel/kptr_restrict"
+        - "/proc/sys/kernel/dmesg_restrict"
+        - "/proc/sys/kernel/perf_event_paranoid"
+        - "/proc/sys/kernel/yama/ptrace_scope"
+        - "/proc/sys/kernel/sysrq"
+        - "/proc/sys/kernel/ftrace_enabled"
+        # Not under kernel/, and a real exploit primitive: userfaultfd is how a
+        # race is held open long enough to win.
+        - "/proc/sys/vm/unprivileged_userfaultfd"
       # MAY_WRITE. The mask is what makes this rule viable at all: /usr/bin/runc
       # reads /proc/sys/kernel/cap_last_cap twelve times in ten seconds on an
       # idle desktop, and every one of those is mask 4.

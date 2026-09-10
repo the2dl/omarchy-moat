@@ -2211,6 +2211,25 @@ function shouldNotify(alert, minSeverity, initialLoad, options) {
   // still toasts exactly once, never per repeat.
   if (String(alert.rule || "") === NOISY_RULE_ALERT) return true
 
+  // MOAT ACTED. The one thing that interrupts unconditionally.
+  //
+  // `alertState` returns "contained" for any alert whose action_taken is set --
+  // a kill, a quarantine, a kernel deny -- and the needs-you gate below then
+  // dropped it, because a contained alert is by definition not needsYou. So
+  // moat could SIGKILL a process tree or have the kernel refuse a credential
+  // read and say nothing at all, while a build script running curl toasted.
+  // That is exactly backwards: being told what was stopped is the whole reason
+  // to run enforcement, and finding out from a panel you happened to open is
+  // not being told.
+  //
+  // Severity is not consulted. If moat acted, the user needs to know, whatever
+  // the number attached to it -- a low-severity thing that was killed is a more
+  // surprising event than a high-severity thing that was not.
+  //
+  // "restored" is excluded upstream: that is the user undoing an action, and
+  // announcing someone's own click back at them is noise.
+  if (alertState(alert, options && options.demotedRules) === "contained") return true
+
   // 2h: three notification shapes, and ONLY needs-you may interrupt. An alert
   // an unattended agent pass has already read and called benign is `explained`
   // -- Moat decided, the user may look -- and interrupting for a decision that

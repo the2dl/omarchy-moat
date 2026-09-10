@@ -4129,4 +4129,71 @@ TestCase {
     verify(old.indexOf("Threat feeds have never updated") >= 0, old.join(" | "))
   }
 
+  // --- what may interrupt -------------------------------------------------
+  //
+  // Two things, and only two: moat acted, or the Now tab gained something
+  // worth looking at. Everything else belongs in the panel.
+
+  function test_a_kill_notifies_whatever_its_severity() {
+    // Before this, alertState returned "contained" for anything moat acted on
+    // and the needs-you gate then dropped it -- so a SIGKILL was silent while a
+    // build script running curl toasted.
+    var killed = {
+      id: "01A", rule: "moat-shell-reverse-shell-connect", severity: "low",
+      surface: "alerts", action_taken: "killed", ts: new Date().toISOString()
+    }
+    verify(Model.shouldNotify(killed, "high", false, {}),
+           "moat killed something: that interrupts, whatever the severity")
+  }
+
+  function test_a_kernel_deny_notifies() {
+    var denied = {
+      id: "01B", rule: "moat-cred-etc-shadow-read", severity: "medium",
+      surface: "alerts", action_taken: "denied", ts: new Date().toISOString()
+    }
+    verify(Model.shouldNotify(denied, "high", false, {}))
+  }
+
+  function test_the_user_undoing_a_quarantine_is_not_announced_back_at_them() {
+    var restored = {
+      id: "01C", rule: "moat-cred-etc-shadow-read", severity: "high",
+      surface: "alerts", action_taken: "restored", ts: new Date().toISOString()
+    }
+    verify(!Model.shouldNotify(restored, "high", false, {}),
+           "restoring is the user's own click, not moat acting")
+  }
+
+  function test_muting_still_beats_a_kill() {
+    // "never that has exceptions is not never" -- the mute check is ahead of
+    // this one on purpose and must stay there.
+    var killed = {
+      id: "01D", rule: "moat-shell-reverse-shell-connect", severity: "critical",
+      surface: "alerts", action_taken: "killed", ts: new Date().toISOString()
+    }
+    verify(!Model.shouldNotify(killed, "high", false, { notifyMuted: true }))
+  }
+
+  function test_an_acked_kill_does_not_re_announce() {
+    var killed = {
+      id: "01E", rule: "moat-shell-reverse-shell-connect", severity: "high",
+      surface: "alerts", action_taken: "killed", acked: true,
+      ts: new Date().toISOString()
+    }
+    verify(!Model.shouldNotify(killed, "high", false, {}))
+  }
+
+  function test_something_moat_did_not_act_on_still_needs_needsyou_and_severity() {
+    // The other half of the rule is unchanged: no action taken means the
+    // ordinary gate applies, so a timeline row stays quiet.
+    // surfaceStamped matters: without it alertSurface falls back to severity
+    // for records written before the daemon stamped `surface`, so a `high` with
+    // no stamp is legitimately treated as being on the badge.
+    var timelined = {
+      id: "01F", rule: "moat-exec-untrusted-home", severity: "high",
+      surface: "timeline", surfaceStamped: true, action_taken: "none",
+      ts: new Date().toISOString()
+    }
+    verify(!Model.shouldNotify(timelined, "high", false, {}))
+  }
+
 }
