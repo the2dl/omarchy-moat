@@ -2356,8 +2356,24 @@ function notifyDecision(store, alert, nowMs, options) {
   // two-member exfil chain would toast twice (once for the cred rule, once for
   // the net rule). Keyed on the chain id in the store's seen-set, so a chain
   // that grows and republishes still interrupts exactly once.
+  // ONE CHAIN IS ONE THING TO INVESTIGATE, so it is one toast.
+  //
+  // This used to collapse only when the chain was STRICTLY more severe than the
+  // member, which quietly excluded the case that matters most: a critical
+  // member of a critical chain fell through to the per-rule cooldown below, so
+  // a single sequence toasted once per distinct rule in it.
+  //
+  // Measured on 2026-09-10: one `makepkg` run produced a chain of 488 steps in
+  // 43 seconds crossing exec, pkg, priv and cred. The chain reaching critical
+  // re-surfaces its members onto the badge -- which is right, that is what makes
+  // the sequence visible -- but it also made every distinct rule in it eligible
+  // for its own toast. A build is one event. The panel already folds it into one
+  // incident; the notifier was the only surface still counting to 488.
+  //
+  // The chain id is the key, so a chain that grows and republishes still
+  // interrupts exactly once, and the members are all still in the panel.
   var chainId = alert.chain && alert.chain.id ? String(alert.chain.id) : ""
-  if (chainId && severityRank(alert.chain.severity) > severityRank(alert.severity)) {
+  if (chainId) {
     if (!store.notifiedChains) store.notifiedChains = {}
     if (store.notifiedChains[chainId])
       return { toast: false, collapsed: 0, reason: "chain-already-toasted" }

@@ -4196,4 +4196,45 @@ TestCase {
     verify(!Model.shouldNotify(timelined, "high", false, {}))
   }
 
+  // --- one chain is one toast ---------------------------------------------
+
+  function test_a_critical_member_of_a_critical_chain_toasts_once() {
+    // The case the old strict-greater-than comparison excluded, and the one
+    // that matters: measured 2026-09-10, one makepkg run made a 488-step
+    // critical chain and every distinct rule in it was eligible for its own
+    // toast.
+    var store = Model.newNotifyStore ? Model.newNotifyStore() : {}
+    var chain = { id: "01CHAIN", severity: "critical" }
+    var mk = function (id, rule) {
+      return {
+        id: id, rule: rule, severity: "critical", surface: "alerts",
+        surfaceStamped: true, action_taken: "none", chain: chain,
+        ts: new Date().toISOString()
+      }
+    }
+    var opts = { minNotifySeverity: "high" }
+    var a = Model.notifyDecision(store, mk("01A", "moat-cred-etc-shadow-read"), 1000, opts)
+    var b = Model.notifyDecision(store, mk("01B", "moat-cred-vcs-token-read"), 1100, opts)
+    var c = Model.notifyDecision(store, mk("01C", "moat-cred-registry-token-read"), 1200, opts)
+    compare(a.toast, true, "the first member of the chain interrupts")
+    compare(b.toast, false, "a different RULE in the same chain does not")
+    compare(c.toast, false)
+  }
+
+  function test_two_different_chains_still_toast_separately() {
+    var store = Model.newNotifyStore ? Model.newNotifyStore() : {}
+    var mk = function (id, chainId) {
+      return {
+        id: id, rule: "moat-cred-etc-shadow-read", severity: "critical",
+        surface: "alerts", surfaceStamped: true, action_taken: "none",
+        chain: { id: chainId, severity: "critical" },
+        ts: new Date().toISOString()
+      }
+    }
+    var opts = { minNotifySeverity: "high" }
+    compare(Model.notifyDecision(store, mk("01A", "01CHAIN-A"), 1000, opts).toast, true)
+    compare(Model.notifyDecision(store, mk("01B", "01CHAIN-B"), 1100, opts).toast, true,
+            "a separate sequence is a separate thing to investigate")
+  }
+
 }
