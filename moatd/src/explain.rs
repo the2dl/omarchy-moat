@@ -1205,7 +1205,6 @@ mod tests {
         assert_ne!(a.dedupe_key(), other_host.dedupe_key(), "different host must not fold");
     }
 
-    #[test]
     /// The same binary running again is one row with a count, not a new row.
     ///
     /// Measured 2026-09-10 on the live machine: `themebook/scripts/config` ran
@@ -1252,6 +1251,7 @@ mod tests {
         assert_ne!(a.dedupe_key(), b.dedupe_key());
     }
 
+    #[test]
     fn dedupe_key_folds_rule_exe_file() {
         // Outside the `cred` family the file still separates two alerts: two
         // different desktop entries written is two things that happened.
