@@ -420,8 +420,53 @@ function contentTypeFor(key) {
   return 'application/gzip';
 }
 
+/// Length-independent comparison. A `===` on a secret leaks its prefix through
+/// timing, which is a silly way to lose a key that guards a write endpoint.
+function timingSafeEqual(a, b) {
+  const ab = new TextEncoder().encode(a);
+  const bb = new TextEncoder().encode(b);
+  if (ab.length !== bb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < ab.length; i++) diff |= ab[i] ^ bb[i];
+  return diff === 0;
+}
+
 export async function serve(request, env, ctx) {
   const url = new URL(request.url);
+
+  // An authenticated way to run what the cron is supposed to run.
+  //
+  // Cloudflare accepted both cron triggers, the dashboard lists them with a
+  // next-run time, and on 2026-09-10 none of them ever fired: no tail event, no
+  // R2 heartbeat written before any work, and state.json frozen for 90 minutes
+  // across four boundaries with no deploy to blame. Whatever the cause, a feed
+  // that only updates when somebody runs a command by hand is not a feed, so
+  // the schedule can come from somewhere else.
+  //
+  // Guarded by a secret, because it does real work and writes to R2. Without
+  // TRIGGER_TOKEN set it is closed entirely rather than open -- a missing
+  // secret must not mean a public button.
+  if (url.pathname === '/admin/tick' || url.pathname === '/admin/rebuild') {
+    if (request.method !== 'POST') {
+      return new Response('method not allowed\n', { status: 405, headers: { allow: 'POST' } });
+    }
+    const want = env.TRIGGER_TOKEN;
+    const got = (request.headers.get('authorization') || '').replace(/^Bearer\s+/i, '');
+    if (!want || !got || !timingSafeEqual(got, want)) {
+      return new Response('unauthorized\n', { status: 401 });
+    }
+    const full = url.pathname.endsWith('rebuild');
+    const log = new RunLog(full ? 'full' : 'tick');
+    try {
+      await (full ? runFull : runTick)(env, log);
+      return json({ ok: true, run: log.kind, lines: log.lines }, 'no-store');
+    } catch (err) {
+      log.add('FAILED:', err && err.stack ? err.stack : err);
+      log.done({ error: String(err) });
+      return json({ ok: false, run: log.kind, error: String(err), lines: log.lines }, 'no-store', 500);
+    }
+  }
+
   if (request.method !== 'GET' && request.method !== 'HEAD') {
     return new Response('method not allowed\n', { status: 405, headers: { allow: 'GET, HEAD' } });
   }
@@ -471,8 +516,9 @@ export async function serve(request, env, ctx) {
   return res;
 }
 
-function json(body, cacheControl) {
+function json(body, cacheControl, status) {
   return new Response(JSON.stringify(body, null, 2) + '\n', {
+    status: status || 200,
     headers: { 'content-type': 'application/json', 'cache-control': cacheControl },
   });
 }
@@ -480,6 +526,25 @@ function json(body, cacheControl) {
 export default {
   fetch: serve,
   async scheduled(event, env, ctx) {
+    // FIRST, before anything that can fail or be cut short.
+    //
+    // On 2026-09-10 no scheduled run was observed for over an hour after both
+    // triggers were registered, and `wrangler tail` showed no invocation at
+    // all. That leaves two very different diagnoses -- Cloudflare is not
+    // dispatching the cron, or it dispatches and the run dies before it logs --
+    // and every log line in this file happens after work that could be killed.
+    // This one cannot be, so its presence or absence is the answer.
+    console.log(`[cron] fired ${event.cron} at ${new Date().toISOString()}`);
+    // And a heartbeat that does not depend on `wrangler tail` capturing
+    // scheduled invocations -- an assumption that has never been tested here,
+    // and which is currently the difference between "Cloudflare is not
+    // dispatching" and "we cannot see that it is".
+    try {
+      await env.FEED.put('state/last-cron.txt',
+        `${event.cron} ${new Date().toISOString()}\n`);
+    } catch (e) {
+      console.log('[cron] heartbeat write failed:', String(e));
+    }
     const fullCron = env.FULL_CRON || '17 4 * * *';
     const run = event.cron === fullCron ? runFull : runTick;
     const log = new RunLog(event.cron === fullCron ? 'full' : 'tick');

@@ -1,0 +1,54 @@
+# Runs the malicious-package feed's ingest on a schedule.
+#
+# This exists because Cloudflare's own Cron Triggers do not fire for this
+# Worker. Both triggers are registered, the dashboard lists them with a
+# next-run time, and on 2026-09-10 not one of them ever executed: no tail
+# event, no R2 heartbeat written before any work, and state.json frozen across
+# four boundaries with no deploy to blame. Rather than keep debugging somebody
+# else's scheduler, the schedule moved here.
+#
+# GitHub's cron is not punctual either -- it can drift five to fifteen minutes
+# under load, and skips runs on a repository that has been idle for 60 days.
+# Neither matters much: upstream (OSSF, DataDog) only moves every hour or two,
+# and a late tick costs freshness, never correctness. Clients keep the last
+# index they verified.
+name: feed tick
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      full:
+        description: 'Run a full rebuild instead of an incremental tick'
+        type: boolean
+        default: false
+
+concurrency:
+  # Two ingests writing R2 at once would race on the sequence number.
+  group: feed-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Run the ingest
+        env:
+          TOKEN: ${{ secrets.FEED_TRIGGER_TOKEN }}
+          FULL: ${{ inputs.full }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "FEED_TRIGGER_TOKEN is not set; nothing to authenticate with" >&2
+            exit 1
+          fi
+          path=/admin/tick
+          [ "$FULL" = "true" ] && path=/admin/rebuild
+          code=$(curl -sS --max-time 540 -o /tmp/out.json -w '%{http_code}' \
+            -X POST -H "Authorization: Bearer $TOKEN" \
+            "https://feed.runts.net$path")
+          echo "HTTP $code"
+          cat /tmp/out.json
+          # A tick that changed nothing is a success, so only the status decides.
+          [ "$code" = "200" ]
