@@ -1,0 +1,70 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-priv-sysctl-write
+  annotations:
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "Kernel tunable written by an unexpected program"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,ignore"
+    # There is one kernel. /proc/sys/kernel is not namespaced -- a container
+    # writing core_pattern sets what the HOST runs on the next crash -- so this
+    # is a fact about this machine wherever it happens, exactly like a module
+    # load or a BPF program load. scoring::GLOBAL_RULES must list it, and
+    # global_rules_match_the_annotated_policies fails if it does not.
+    moat.omarchy/namespace: "global"
+    moat.omarchy/why: >-
+      /proc/sys/kernel/core_pattern is the best-known write-to-root primitive there
+      is: a pipe there runs as root on the next crash, and it works from inside a
+      container as well as on the host. kernel/modprobe replaces the binary the
+      kernel calls to autoload a module. Nothing writes these after boot except
+      systemd-sysctl and sysctl, so a write by anything else is not a tuning
+      change, it is somebody arranging to be root later.
+    moat.omarchy/expected: >-
+      systemd-sysctl applying /etc/sysctl.d at boot, and `sysctl -w` run by hand.
+      Both are excluded by name. A container runtime writing net.* is common and is
+      NOT matched: this watches /proc/sys/kernel only.
+    moat.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  # file_post_open, which takes this hook from 8/19 to 9/19 -- ten short of the
+  # BPF trampoline cap (NOTES section 3). The LSM boundary rather than a kprobe
+  # on security_file_post_open, because this is a rule that may one day want to
+  # refuse: Override needs the LSM hook and a kprobe cannot do it.
+  - hook: "file_post_open"
+    message: "Kernel tunable written by an unexpected program"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/lib/systemd/systemd-sysctl"
+        - "/usr/bin/sysctl"
+        - "/usr/bin/systemd-sysctl"
+      matchArgs:
+      # Prefix over the whole subtree, verified against the live sensor rather
+      # than assumed: one Prefix matched both core_pattern and pid_max, and
+      # procfs paths resolve in full (NOTES section 3, "probed 2026-09-09").
+      #
+      # /proc/sys/kernel ONLY, deliberately. /proc/sys/net is written by every
+      # container start, and /proc/sys/vm by tuning scripts; folding those in
+      # would drown the rule in exactly the traffic it cannot act on.
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/proc/sys/kernel/"
+      # MAY_WRITE. The mask is what makes this rule viable at all: /usr/bin/runc
+      # reads /proc/sys/kernel/cap_last_cap twelve times in ten seconds on an
+      # idle desktop, and every one of those is mask 4.
+      - index: 1
+        operator: "Mask"
+        values: ["2"]
+      matchActions:
+      - action: Post

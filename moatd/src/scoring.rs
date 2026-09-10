@@ -191,6 +191,9 @@ pub fn row(key: &str) -> Option<&'static MatrixRow> {
 pub const GLOBAL_RULES: &[&str] = &[
     "moat-rootkit-kernel-module-load",
     "moat-rootkit-bpf-prog-load",
+    // /proc/sys/kernel is not namespaced: a container writing core_pattern sets
+    // what the HOST runs on the next crash. Same argument as the two above.
+    "moat-priv-sysctl-write",
 ];
 
 pub const NEVER_LOWERED: &[&str] = &[

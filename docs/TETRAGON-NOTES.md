@@ -316,6 +316,45 @@ Verified at: `SRC examples/tracingpolicy/{filename_monitoring,filename_monitorin
 kernel v7.1 `fs/namei.c:4701`, `fs/read_write.c` (rw_verify_area), `fs/open.c` (build_open_flags),
 `include/linux/fs.h`; local kallsyms + BTF.
 
+### procfs paths, write masks and matchBinaries (probed 2026-09-09)
+
+`docs/LPE.md` proposes watching writes under `/proc/sys`, which rests on things
+this document did not say. Probed with a throwaway Post-only policy added by
+`tetra tp add` and deleted after, on the live sensor:
+
+* **procfs paths resolve fully.** `file_arg.path` comes back as
+  `/proc/sys/kernel/core_pattern`, not truncated and not
+  `unresolvedPathComponents`. Nested paths resolve too (`/proc/sys/net/ipv4/ip_forward`).
+* **A write-open is `mask 2`, a read-open is `mask 4`** on `file_post_open`, as
+  section 3 predicts — confirmed rather than assumed, because the whole rule
+  design rests on `Mask ["2"]`.
+* **`Prefix` works on a `file` arg and covers the subtree.** One
+  `Prefix "/proc/sys/kernel/"` matched both `core_pattern` and `pid_max`.
+* **`matchBinaries In` works**, including for a symlinked interpreter named as
+  invoked (`/usr/bin/python3`, a symlink to `python3.14`). The event reports the
+  path as invoked and the filter matches it.
+* **They compose.** `matchBinaries NotIn` + `Prefix` + `Mask ["2"]` in one
+  selector fires on the write-open and stays silent on reads.
+
+Two things worth not repeating:
+
+* **`NPOST` in `tetra tp list` is not a match counter you can trust.** It read
+  `0` for a policy that was posting events at that moment, through several runs.
+  It is useless for "did my selector match"; read the event stream instead. This
+  cost a round of diagnosis.
+* **One open can produce several events.** Three to four per trigger were
+  observed consistently, across binaries and selectors. Cause not established.
+  It does not matter for moat — the 60-second fold on (rule, title) collapses
+  them — but it will mislead anyone counting events to measure a selector.
+
+And a live noise measurement that decided the rule's shape: **`/usr/bin/runc`
+reads `/proc/sys/kernel/cap_last_cap` constantly** — twelve times in ten seconds
+on an idle desktop with containers running. Every one is `mask 4`. A read-mask
+rule on that prefix is unusable; a write-mask rule sees none of it.
+
+Verified at: live `tetra tp add` / `getevents` against
+`unix:///run/tetragon/tetragon.sock`, kernel 7.1.9, Tetragon v1.7.1.
+
 ## 4. Process exec details
 
 `process_exec` = `{process, parent, ancestors[]}`. `ancestors` (beyond parent) needs
