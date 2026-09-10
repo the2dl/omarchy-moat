@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 /// Where the signed index is published. Overridable so a site can mirror it,
 /// and so the tests can point at a local fixture.
-pub const DEFAULT_BASE_URL: &str = "https://feed.omarchy-moat.org";
+pub const DEFAULT_BASE_URL: &str = "https://feed.runts.net";
 
 /// Shipped with the package; the private half never leaves the aggregator.
 pub const DEFAULT_PUBLIC_KEY_PATH: &str = "/usr/share/moat/feed-key.pub";

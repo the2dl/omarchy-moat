@@ -9,7 +9,7 @@
 enabled = true
 
 # Where the signed index is published. Override to point at a mirror.
-base_url = "https://feed.omarchy-moat.org"
+base_url = "https://feed.runts.net"
 
 # The index decides what moat warns about, so it is verified before it is
 # applied. Turning this off means trusting whoever can answer for base_url;

@@ -1,7 +1,11 @@
 name = "moat-feed-aggregator"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
-workers_dev = false
+# Enabled 2026-09-10 at deploy time: without a custom domain there is no
+# reachable hostname at all, and the feed has to be fetchable. Moving to a
+# custom domain later is a routes block plus a base_url change in feeds.toml --
+# the artifact paths are fixed and the signature does not depend on the host.
+workers_dev = true
 
 # Everything the Worker publishes and every piece of state it keeps lives here.
 # Create it once with:  npx wrangler r2 bucket create moat-feed
@@ -35,6 +39,11 @@ enabled = true
 
 # Serve the feed from your own hostname. Clients set base_url in feeds.toml to
 # match, so this is the one value the fleet is pinned to.
-# [[routes]]
-# pattern = "feed.example.org/v1/*"
-# zone_name = "example.org"
+[[routes]]
+# A custom domain rather than the workers.dev hostname: the feed URL is pinned
+# in every installed feeds.toml, so it wants to be a name this project controls
+# and can move. `custom_domain = true` makes Cloudflare create the DNS record
+# and the certificate; the artifact paths are fixed and the ed25519 signature
+# does not cover the host, so moving again later costs one base_url edit.
+pattern = "feed.runts.net"
+custom_domain = true
