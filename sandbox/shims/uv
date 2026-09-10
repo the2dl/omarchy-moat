@@ -42,4 +42,18 @@ elif [[ -n $subcmd ]] && uv_builds "$subcmd"; then
 	shim_scan_python_tree uv
 fi
 
+# `uv tool install` puts the tool under ~/.local/share/uv (already a writable
+# cache) but links its executable into ~/.local/bin, which was not -- so the
+# install did most of its work and then failed at the last step. `uv pip
+# install` has the pip shim's two cases for the same reasons.
+case $subcmd in
+tool | pip)
+	if [[ -n ${VIRTUAL_ENV:-} ]]; then
+		shim_allow_install_target "$VIRTUAL_ENV"
+	fi
+	_userbase=${PYTHONUSERBASE:-$HOME/.local}
+	shim_allow_install_target "$_userbase/bin" "$_userbase/lib"
+	;;
+esac
+
 shim_exec uv "$@"

@@ -746,8 +746,19 @@ fi
 say "profile.d / fish snippets"
 
 if [[ -f $SANDBOX_DIR/profile.d/moat-shims.sh ]]; then
+	# Which branch is correct depends on the machine: the snippet keys off
+	# /etc/moat/sandbox.enabled, and this asserted the no-op half without
+	# controlling the condition -- so it passed only where the sandbox was OFF
+	# and failed for every user who turned it on. Assert whichever branch the
+	# flag actually selects; both are the real behaviour.
 	out=$(env -i /bin/sh -c "PATH=/usr/bin:/bin; . '$SANDBOX_DIR/profile.d/moat-shims.sh'; echo \"\$PATH\"")
-	if [[ $out == "/usr/bin:/bin" ]]; then
+	if [[ -e /etc/moat/sandbox.enabled && -d /usr/lib/moat/shims ]]; then
+		if [[ $out == "/usr/lib/moat/shims:/usr/bin:/bin" ]]; then
+			ok "profile.d prepends the shims when the flag is set"
+		else
+			no "profile.d prepends the shims when the flag is set" "got: $out"
+		fi
+	elif [[ $out == "/usr/bin:/bin" ]]; then
 		ok "profile.d is a no-op without /etc/moat/sandbox.enabled"
 	else
 		no "profile.d is a no-op without /etc/moat/sandbox.enabled" "got: $out"
@@ -772,6 +783,102 @@ if command -v fish >/dev/null 2>&1; then
 	fi
 else
 	note "fish not installed, skipped the fish syntax check"
+fi
+
+# ------------------------------------------- global install targets ----------
+#
+# A global install writes OUTSIDE the project, and every one of those
+# destinations is read-only inside the box. The sandboxed-subcommand lists and
+# the writable-cache list were each correct alone and were never checked against
+# each other, so `npm i -g`, `npm uninstall -g`, `cargo install` and
+# `pip install --user` did not degrade -- they failed every time, with an EROFS
+# from a tool that has no idea it is sandboxed. npm blames "virtualized file
+# systems"; nothing named moat.
+#
+# These assert the --allow flags the shims hand to moat-sandbox. A stub stands
+# in for moat-sandbox so the argv is visible without running bubblewrap.
+
+say "global install targets"
+
+mkdir -p "$TMPROOT/stub"
+cat >"$TMPROOT/stub/moat-sandbox" <<'EOF'
+#!/usr/bin/env bash
+printf 'ARGS:%s\n' "$*"
+EOF
+chmod +x "$TMPROOT/stub/moat-sandbox"
+cat >"$TMPROOT/bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+echo "REAL cargo $*"
+EOF
+chmod +x "$TMPROOT/bin/cargo"
+
+# shim_argv SHIM ENV... -- args...: what the shim would hand moat-sandbox.
+shim_argv() {
+	local shim=$1
+	shift
+	(cd "$PROJ" && env PATH="$TMPROOT/stub:$SHIMS:$TMPROOT/bin:/usr/bin:/bin" \
+		HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" MOAT_QUIET=1 \
+		"$SHIMS/$shim" "$@" 2>&1 | grep '^ARGS:')
+}
+
+out=$(shim_argv npm install -g left-pad)
+if [[ $out == *"--allow"*"/lib/node_modules"* && $out == *"--allow"*"/bin"* ]]; then
+	ok "npm install -g makes the npm prefix writable"
+else
+	no "npm install -g makes the npm prefix writable" "got: $out"
+fi
+
+# The flag decides, not the verb: uninstall and update write the same prefix.
+out=$(shim_argv npm uninstall -g left-pad)
+if [[ $out == *"--allow"*"/lib/node_modules"* ]]; then
+	ok "npm uninstall -g makes the npm prefix writable too"
+else
+	no "npm uninstall -g makes the npm prefix writable too" "got: $out"
+fi
+
+# The control, and the one that matters: an ordinary project install must NOT
+# get a writable global prefix. That grant is what a malicious postinstall would
+# use to drop a binary on a PATH you run outside the box.
+out=$(shim_argv npm install left-pad)
+if [[ $out != *"--allow"* ]]; then
+	ok "a local npm install gets no writable global prefix"
+else
+	no "a local npm install gets no writable global prefix" "got: $out"
+fi
+
+# cargo writes <root>/bin plus .crates.toml and .crates2.json beside it. The
+# root itself is NOT granted: by default that is ~/.cargo, which holds
+# credentials.toml, and binding it writable would hand a build script the
+# registry token this sandbox exists to hide.
+out=$(shim_argv cargo install --root "$TMPROOT/croot" ripgrep)
+if [[ $out == *"--allow $TMPROOT/croot/bin"* &&
+	$out == *"--allow $TMPROOT/croot/.crates.toml"* &&
+	$out == *"--allow $TMPROOT/croot/.crates2.json"* ]]; then
+	ok "cargo install grants bin and the two crates files"
+else
+	no "cargo install grants bin and the two crates files" "got: $out"
+fi
+if [[ $out != *"--allow $TMPROOT/croot "* && $out != *"--allow $TMPROOT/croot"$'\n'* ]]; then
+	ok "cargo install does not grant the install root itself"
+else
+	no "cargo install does not grant the install root itself" "got: $out"
+fi
+
+# bubblewrap cannot invent a bind source's type. A missing .crates.toml made
+# with mkdir would be a DIRECTORY, and cargo would fail on it -- so the file
+# helper must touch, never mkdir.
+if [[ -f $TMPROOT/croot/.crates.toml && -d $TMPROOT/croot/bin ]]; then
+	ok "a missing metadata file is created as a file, and bin as a directory"
+else
+	no "a missing metadata file is created as a file, and bin as a directory" \
+		"$(find "$TMPROOT/croot" -maxdepth 1 -printf '%y %p\n' 2>&1 | head -4)"
+fi
+
+out=$(shim_argv cargo fmt)
+if [[ -z $out ]]; then
+	ok "cargo fmt is not sandboxed at all, so it grants nothing"
+else
+	no "cargo fmt is not sandboxed at all, so it grants nothing" "got: $out"
 fi
 
 # ------------------------------------------------------------ shellcheck -----

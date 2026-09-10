@@ -33,4 +33,18 @@ if [[ -n $subcmd ]] && pip_installs "$subcmd"; then
 	shim_scan_python_tree pip
 fi
 
+# pip writes outside the project in two ordinary cases, and both were
+# read-only in here: `--user` lands in PYTHONUSERBASE (~/.local), and a
+# virtualenv that lives anywhere but $PWD is not writable either. Only the two
+# leaves are granted -- ~/.local/bin and ~/.local/lib, never ~/.local itself,
+# because ~/.local/share holds the mise toolchains the cache list refuses on
+# purpose.
+if [[ -n $subcmd ]] && pip_installs "$subcmd"; then
+	if [[ -n ${VIRTUAL_ENV:-} ]]; then
+		shim_allow_install_target "$VIRTUAL_ENV"
+	fi
+	_userbase=${PYTHONUSERBASE:-$HOME/.local}
+	shim_allow_install_target "$_userbase/bin" "$_userbase/lib"
+fi
+
 shim_exec pip "$@"

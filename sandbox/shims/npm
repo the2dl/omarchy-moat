@@ -36,4 +36,19 @@ if [[ -n $subcmd ]] && npm_installs "$subcmd"; then
 	shim_scan_js_tree npm "$@"
 fi
 
+# A global install writes the npm prefix, which no default cache covers, so
+# without this it cannot finish -- and npm reports that as an EROFS blaming
+# "virtualized file systems", never moat. Sandboxing it is still right: `npm
+# i -g` runs a postinstall as you and puts a binary on your PATH, so it is the
+# last install shape to let out of the box. It needs one writable directory,
+# not fewer walls.
+# Deliberately not limited to install-shaped subcommands: `npm uninstall -g`
+# and `npm update -g` write the same prefix and failed the same way. The flag
+# is what decides, not the verb. A read-only `npm ls -g` gains a writable bind
+# it never uses, which is the harmless direction.
+if shim_js_has_global "$@"; then
+	# shellcheck disable=SC2046 # one directory per line, none with spaces
+	shim_allow_install_target $(shim_npm_global_dirs)
+fi
+
 shim_exec npm "$@"

@@ -18,6 +18,64 @@
 # sourcing this file and before calling shim_exec.
 SHIM_SANDBOX_ARGS=()
 
+# shim_allow_install_target PATH...
+#
+# Grant one or more directories write access inside the sandbox, for the one
+# command that is about to run.
+#
+# A global install -- `npm i -g`, `cargo install`, `go install`, `pip install
+# --user` -- writes its result OUTSIDE the project, and every one of those
+# destinations is read-only in here. The subcommand lists and the writable-cache
+# list were each right on their own and were never checked against each other,
+# so those four commands did not degrade: they failed, every time, with an
+# EROFS from a tool that has no idea it is in a box. npm blames "virtualized
+# file systems"; nothing names moat.
+#
+# Running them unsandboxed instead would be the wrong trade. A global install is
+# the MOST dangerous shape there is -- it runs a postinstall as you and puts a
+# binary on your PATH -- so it is the last thing to exempt from the box. What it
+# needs is not less sandbox but one more writable directory: the one the user
+# just asked to write. Credentials stay gone, / stays read-only, and the install
+# can finish.
+#
+# Only a directory the invocation itself implies is passed here. Never a parent
+# of ~/.local/share/mise: a writable bind there lets a sandboxed script drop a
+# shim that runs OUTSIDE the sandbox on the next command, which is the escape
+# the cache list is careful to avoid.
+shim_allow_install_target() {
+	local dir
+	for dir in "$@"; do
+		# Absolute only: a relative path would bind something under $PWD, which
+		# is already writable, and a bad --allow is worse than none.
+		[[ -n $dir && $dir == /* ]] || continue
+		# bubblewrap needs the bind source to exist, and on a first
+		# `cargo install` it does not yet. Creating it here is what the go shim
+		# already does for GOBIN; without it the --allow is silently dropped and
+		# the read-only failure comes back unchanged.
+		mkdir -p -- "$dir" 2>/dev/null || true
+		SHIM_SANDBOX_ARGS+=(--allow "$dir")
+	done
+}
+
+# shim_allow_install_file PATH...
+#
+# The same grant for a FILE rather than a directory. bubblewrap needs the bind
+# source to exist and cannot invent its type, so a missing one is created empty
+# -- with touch, never mkdir, which would leave a directory named
+# `.crates.toml` and break the tool it was meant to help.
+shim_allow_install_file() {
+	local f
+	for f in "$@"; do
+		[[ -n $f && $f == /* ]] || continue
+		[[ -e $f ]] || {
+			mkdir -p -- "${f%/*}" 2>/dev/null || true
+			: >"$f" 2>/dev/null || true
+		}
+		[[ -f $f ]] || continue
+		SHIM_SANDBOX_ARGS+=(--allow "$f")
+	done
+}
+
 shim_warn() {
 	[[ ${MOAT_QUIET:-0} == 1 ]] || printf '[moat] %s\n' "$*" >&2
 }
@@ -240,6 +298,34 @@ shim_js_has_global() {
 		esac
 	done
 	return 1
+}
+
+# shim_npm_global_dirs: the two directories `npm install -g` writes.
+#
+# npm is the only one of the five JS shims with this gap: pnpm writes
+# ~/.local/share/pnpm, bun ~/.bun and yarn ~/.yarn, and all three are already
+# writable caches. npm writes its prefix, which is wherever node was installed.
+#
+# Derived, not asked for: `npm prefix -g` is a node start-up (~100 ms) in front
+# of every install for a value already on disk. npm lives at <prefix>/bin/npm,
+# so the prefix is two directories up; npm_config_prefix and PREFIX override it
+# the same way npm itself honours them.
+#
+# This can put a mise toolchain directory on the writable list, which the cache
+# list deliberately refuses. The distinction is the command: that refusal exists
+# so an ordinary `npm install` cannot quietly drop a shim you later run outside
+# the box. `npm install -g` IS a request to put a binary on your PATH, typed on
+# purpose. Granting only what that command already means is not the same as
+# leaving it open to every install.
+shim_npm_global_dirs() {
+	local prefix=${npm_config_prefix:-${PREFIX:-}}
+	if [[ -z $prefix ]]; then
+		shim_resolve npm
+		local bindir=${SHIM_REAL%/*}
+		prefix=${bindir%/*}
+	fi
+	[[ -n $prefix && $prefix == /* ]] || return 0
+	printf '%s/lib/node_modules\n%s/bin\n' "$prefix" "$prefix"
 }
 
 # shim_scan_js_tree LABEL "$@": scan the JavaScript package tree in $PWD

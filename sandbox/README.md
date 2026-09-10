@@ -347,6 +347,21 @@ The sandbox is damage limitation, not containment. Specifically:
 - **Unix sockets under `/run` are read-only**, so a build cannot talk to the
   session D-Bus or the keyring. Mostly a feature; it does break the rare tool
   that expects them.
+- **Global installs get exactly one writable directory, on purpose.** `npm i -g`,
+  `cargo install`, `pip install --user` and `uv tool install` write outside the
+  project, and everything outside the project is read-only in here — so for a
+  while they did not degrade, they failed, with an `EROFS` from a tool that has
+  no idea it is sandboxed (npm blames "virtualized file systems"). Running them
+  unsandboxed would be the wrong repair: `npm i -g` runs a postinstall as you
+  *and* puts a binary on your `PATH`, which makes it the last shape to let out
+  of the box. Instead each shim grants the one destination its own invocation
+  implies — npm's prefix, `GOBIN`, `<cargo root>/bin` plus `.crates.toml` and
+  `.crates2.json`, `~/.local/{bin,lib}` — and nothing else. The cargo *root* is
+  deliberately not granted: by default that is `~/.cargo`, which holds
+  `credentials.toml`. An ordinary project-local install still gets none of this,
+  which is what stops a postinstall from dropping a binary you later run outside
+  the sandbox.
+
 - **The shims are `PATH`-based, so they are advisory.** `/usr/bin/npm`,
   `~/.local/share/mise/shims/npm`, an absolute path, a `Makefile` with a
   hardcoded path, or anything invoked from a non-login shell that never read

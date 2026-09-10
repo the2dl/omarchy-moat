@@ -59,6 +59,22 @@ for arg in "$@"; do
 	esac
 done
 
+# Where `cargo install` writes: <root>/bin/<exe> plus <root>/.crates.toml and
+# <root>/.crates2.json. --root wins, then CARGO_INSTALL_ROOT, then CARGO_HOME,
+# then the default.
+cargo_install_root() {
+	local prev="" arg root=""
+	for arg in "$@"; do
+		case $arg in
+		--root=*) root=${arg#--root=} ;;
+		*) [[ $prev == --root ]] && root=$arg ;;
+		esac
+		prev=$arg
+	done
+	[[ -n $root ]] || root=${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}
+	printf '%s\n' "$root"
+}
+
 if [[ -n $subcmd ]] && cargo_needs_sandbox "$subcmd"; then
 	# `cargo build` on an untrusted crate is arbitrary code execution via
 	# build.rs; that is the whole reason this subcommand list exists, so it is
@@ -66,6 +82,23 @@ if [[ -n $subcmd ]] && cargo_needs_sandbox "$subcmd"; then
 	# directory with no manifest reads nothing local, and stays silent.
 	if [[ -f ./Cargo.toml ]]; then
 		shim_run_scan cargo moat-scan-cargo --for cargo .
+	fi
+	# `cargo install` puts a binary in CARGO_INSTALL_ROOT/bin, CARGO_HOME/bin or
+	# ~/.cargo/bin -- none of which is writable in here, since only the registry
+	# and git caches are. Without this the command cannot do the one thing it
+	# was asked to do, and says so as an EROFS that never mentions moat.
+	# --root overrides all of it, so honour it or the allow is aimed at the
+	# wrong directory and the failure comes back unchanged.
+	if [[ $subcmd == install ]]; then
+		_root=$(cargo_install_root "$@")
+		# bin/ plus the two files cargo keeps beside it. Granting the ROOT
+		# instead would be one flag rather than three, and for the default root
+		# that root is ~/.cargo -- which holds credentials.toml. Binding it
+		# writable would hand a build script the registry token this sandbox
+		# exists to hide, so the grant stops at the three things cargo actually
+		# writes.
+		shim_allow_install_target "$_root/bin"
+		shim_allow_install_file "$_root/.crates.toml" "$_root/.crates2.json"
 	fi
 	shim_exec cargo "$@"
 fi

@@ -23,4 +23,13 @@ if [[ -n $subcmd ]] && pip_installs "$subcmd"; then
 	shim_scan_python_tree pip3
 fi
 
+# Same two cases as the pip shim; see it for the reasoning.
+if [[ -n $subcmd ]] && pip_installs "$subcmd"; then
+	if [[ -n ${VIRTUAL_ENV:-} ]]; then
+		shim_allow_install_target "$VIRTUAL_ENV"
+	fi
+	_userbase=${PYTHONUSERBASE:-$HOME/.local}
+	shim_allow_install_target "$_userbase/bin" "$_userbase/lib"
+fi
+
 shim_exec pip3 "$@"
