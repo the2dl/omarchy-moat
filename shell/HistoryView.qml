@@ -145,11 +145,21 @@ Item {
             bottomPadding: root.t ? root.t.bodyPadBottom : 0
             spacing: root.t ? root.t.v(30) : 12
 
-            Repeater {
-                model: root.days
+            // Day groups, then rows, each kept by KEY across polls. A Repeater
+            // over a JS array destroys and recreates every delegate when the
+            // array changes, and the array changes on every poll -- 58 rows
+            // rebuilt about once a second, measured at 206 ms of the desktop's
+            // thread each time, for one changed line. MoatKeyed keeps the item
+            // for a key and hands it the new value only when the value is a
+            // different object; an incident nothing happened to is the same
+            // object (Model.reuseIncidents), so its row does nothing at all.
+            MoatKeyed {
+                width: body.width
+                spacing: root.t ? root.t.v(30) : 12
+                items: root.days
 
                 delegate: Column {
-                    required property var modelData
+                    property var value: null
 
                     width: body.width
                     spacing: root.t ? root.t.s(4) : 2
@@ -168,7 +178,7 @@ Item {
                         Text {
                             height: root.t ? root.t.s(20) : 16
                             verticalAlignment: Text.AlignVCenter
-                            text: modelData.label
+                            text: value ? value.label : ""
                             color: root.t ? root.t.primary : "white"
                             font.family: root.t ? root.t.family : "monospace"
                             font.pixelSize: root.t ? root.t.fBody : 13
@@ -178,7 +188,7 @@ Item {
                         Text {
                             height: root.t ? root.t.s(20) : 16
                             verticalAlignment: Text.AlignVCenter
-                            text: modelData.summary
+                            text: value ? value.summary : ""
                             color: root.t ? root.t.fainter : "grey"
                             font.family: root.t ? root.t.family : "monospace"
                             font.pixelSize: root.t ? root.t.fMeta : 11
@@ -187,18 +197,19 @@ Item {
 
                     }
 
-                    Repeater {
-                        model: modelData.incidents
+                    MoatKeyed {
+                        width: body.width
+                        items: value ? value.incidents : []
 
                         delegate: HistoryRow {
-                            required property var modelData
+                            property var value: null
 
                             width: body.width
                             tokens: root.t
                             service: root.service
-                            incident: modelData
-                            selected: modelData.id === root.selectedId
-                            onActivated: root.openIncident(modelData.id)
+                            incident: value
+                            selected: !!value && value.id === root.selectedId
+                            onActivated: root.openIncident(value ? value.id : "")
                         }
 
                     }

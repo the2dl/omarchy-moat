@@ -199,7 +199,7 @@ Item {
     // the verdict line, and the only way bar and panel can be guaranteed never to
     // disagree is for both to read one derivation. Stage 4 of docs/design/PLAN.md
     // moves the grouping into the daemon behind this same API.
-    readonly property var incidents: Model.buildIncidents(root.alerts, root.renderOptions())
+    readonly property var incidents: Model.buildIncidents(root.alerts, root.renderOptions(), root._incidentMemo)
     // The same collapse with nothing hidden. History's third filter chip is
     // literally "Silenced by a rule" (1d), so that screen has to be able to reach
     // the rows the `showSuppressed` setting keeps off Now -- and 1d's answer to
@@ -208,7 +208,15 @@ Item {
         "demotedRules": root.demotedRules,
         "showSuppressed": true,
         "rawDetail": root.rawDetail
-    })
+    }, root._allIncidentMemo)
+    // What the two bindings above returned last time, so an incident nothing
+    // happened to is handed back as the SAME object (Model.reuseIncidents). A
+    // `property var` assigned the object it already holds does not signal, so
+    // the card, the row and every binding under them re-evaluate nothing for
+    // it. Still derived, never set: the memo is a cache the derivation reads,
+    // and the derivation is what decides.
+    readonly property var _incidentMemo: Model.createIncidentMemo()
+    readonly property var _allIncidentMemo: Model.createIncidentMemo()
     readonly property var needsYou: Model.needsYouIncidents(root.incidents)
     readonly property int needsYouCount: root.needsYou.length
     /// quiet | needsYou | chain | gap, derived and never set.
@@ -318,10 +326,11 @@ Item {
     property string copyMessage: ""
     property string _feedOutput: ""
     /// The last feed response, verbatim. Identical bytes mean nothing changed,
-    /// and skipping the parse keeps the delegate identity guards in `_apply`
-    /// meaningful -- `ingestFeed` builds fresh arrays every call, so without
-    /// this every poll would rebuild every row on the page.
-    property string _lastFeed: ""
+    /// so the parse is skipped. A `var`, not a `string`: reading a QML string
+    /// property from JS converts the whole QString, and this one is 7.7 MB --
+    /// the guard cost 9 ms a poll as a `string`; as the JS string it already
+    /// was, the comparison is a memcmp.
+    property var _lastFeed: ""
     /// An action landed during the post-action cooldown; answer it when it ends.
     property bool _refreshPending: false
 
@@ -396,7 +405,10 @@ Item {
         // more than once per append, and a re-read that folded nothing new hands
         // back the SAME arrays. Assigning them anyway would fire alertsChanged and
         // rebuild every incident, every day group and every delegate on the panel
-        // for a file that did not change.
+        // for a file that did not change. The feed path's array is new on every
+        // poll that changed anything; what it keeps is the ELEMENTS -- a row
+        // moatd did not touch is the same object, and everything downstream
+        // (incident memo, keyed rows, `property var` bindings) is built on that.
         if (result.alerts !== root.alerts)
             root.alerts = result.alerts;
 
@@ -894,12 +906,12 @@ Item {
 
     /// Refresh now, or once, soon -- never once per action in a burst.
     ///
-    /// `refresh()` re-fetches the whole feed, re-parses it and rebuilds every
-    /// row: `ingestFeed` returns fresh arrays, so the identity guards in
-    /// `_apply` cannot hold and the model is invalidated wholesale. One of those
-    /// per ack is what makes the panel stutter under the user's own hand while
+    /// `refresh()` re-fetches the whole feed and re-parses it -- 7.7 MB on the
+    /// UI thread -- and rebuilds every row the ack changed. One of those per
+    /// ack is what makes the panel stutter under the user's own hand while
     /// they close a stack of cards -- the act of clearing the backlog is what
-    /// stalls the thing clearing it.
+    /// stalls the thing clearing it. (Rows the ack did not touch now keep
+    /// their objects, see `Model.ingestFeed`; the parse is still the parse.)
     ///
     /// Leading edge on purpose: nothing updates a card locally, so it stays on
     /// screen until the model says otherwise, and a delayed first refresh would
@@ -1559,11 +1571,11 @@ Item {
             // missed, and re-poll status because mode/sandbox/feeds live there.
             //
             // COALESCED, because `refresh()` is not cheap: it re-fetches the whole
-            // feed, re-parses it and rebuilds every row (`ingestFeed` returns fresh
-            // arrays, so the identity guards in `_apply` cannot hold). Closing a
-            // stack of cards is a burst of acks, and one full cycle per ack is
-            // what makes the panel stutter under the user's own hand — the thing
-            // they are doing to make it quieter is what stalls it.
+            // feed and re-parses it on the UI thread, then rebuilds every row the
+            // ack changed. Closing a stack of cards is a burst of acks, and one
+            // full cycle per ack is what makes the panel stutter under the user's
+            // own hand — the thing they are doing to make it quieter is what
+            // stalls it.
             //
             // LEADING edge, then a cooldown. The first action refreshes at once,
             // because nothing here updates the card locally -- it disappears when

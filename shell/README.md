@@ -39,6 +39,7 @@ kill or quarantine something the sensor did not flag.
 | `RulesView.qml` | The Rules tab: 1e (Yours first, with what each rule has silenced since; shipped rules grouped into about five lines), 2e (programs Moat treats as yours, and what each is trusted for), 2c's holding list, and the baseline proposals. |
 | `SettingsView.qml` | 1f. Every row is a question and the control is its answer, with one line of consequence. Advanced is collapsed and its contents are listed in the header. |
 | `SettingsRow.qml` | One Settings row: question and consequence left, answer right. |
+| `MoatKeyed.qml` | A Column of one item per key, kept across changes of its list. History's day groups and rows sit in it: a Repeater over a JS array remakes every delegate when the array changes, and the array changes on every poll. Pure QtQuick, so `tests/tst_keyed.qml` can instantiate it. |
 | `MoatChip.qml` | The chip. Three states, and the third is the point: `dim` is for an option that is available but must never look like the easy one. |
 | `LearningCard.qml` | 1g. The learning window as a finite job with an end, and the one honest moment the enforce question can be asked. |
 | `FirstRunView.qml` | 3f. What Moat watches, what it never does, and what the first nine days will look like. |
@@ -48,6 +49,7 @@ kill or quarantine something the sensor did not flag.
 | `tests/fixtures/alerts.jsonl` | 21 realistic alerts across every family, plus 5 update lines including a dedupe `count` update, plus 2 install receipts. |
 | `tests/fixtures/status.json` | A `status` response with `baseline`, `proposals[]` and `demoted_rules[]`. |
 | `tests/tst_wire.qml` | 36 wire tests: `MoatModel.js` against output a REAL `moatd` produced, not hand-written examples of what it ought to produce. |
+| `tests/tst_keyed.qml` | `MoatKeyed` keeps the item for a key: a new array of the same objects touches nothing, a changed value reaches the kept item, a reorder moves items rather than remaking them. |
 | `tests/tst_tokens.qml` | The one suite that instantiates a view component. `Tokens.qml` imports nothing from Quickshell precisely so this can run; it checks that the derived palette still points the right way on a **light** theme, which is the failure nobody running a dark theme will ever see. |
 | `tests/fixtures/wire/*` | Those captures. 14 files: `alerts.jsonl` plus twelve `--json` responses and one `bundle.md`. |
 | `tests/capture-wire-fixtures.sh` | Regenerates `fixtures/wire/*` by running a real `moatd` unprivileged over a synthetic Tetragon export. Run it whenever the alert record or a socket response changes shape. |

@@ -76,4 +76,12 @@ echo "--- tst_scroll"
 QT_QPA_PLATFORM=offscreen \
   "$runner" -input "$here/tst_scroll.qml" || status=1
 
+# tst_keyed instantiates MoatKeyed, the keyed column History's rows sit in,
+# and checks the one thing it exists for: a row whose object did not change is
+# the same item afterwards, untouched. A Repeater over a JS array fails that
+# by design, and the panel's lists are rebuilt on every poll.
+echo "--- tst_keyed"
+QT_QPA_PLATFORM=offscreen \
+  "$runner" -input "$here/tst_keyed.qml" || status=1
+
 exit $status

@@ -899,7 +899,7 @@ function incidentUncertainty(alert) {
 /// incident is worded and whether it needs you are different questions, and
 /// letting a rendering flag near the second one is how a display setting turns
 /// into a security setting.
-function buildIncidents(alerts, options) {
+function buildIncidents(alerts, options, memo) {
   var o = options || {}
   var raw = o.rawDetail === true
   var set = demotedSet(o.demotedRules)
@@ -1016,7 +1016,68 @@ function buildIncidents(alerts, options) {
       g.coveredBy = "demoted:" + head.rule
   }
   order.sort(compareIncidentsNewestFirst)
+  if (memo && typeof memo === "object") reuseIncidents(order, o, memo)
   return order
+}
+
+/// A memo for `buildIncidents`: what it returned last time, by key, and the
+/// options it was built under. One per call site -- Service holds one for
+/// `incidents` and one for `allIncidents`, which differ in `showSuppressed`.
+function createIncidentMemo() {
+  return { byKey: {}, options: "" }
+}
+
+function incidentOptionsSignature(o) {
+  return JSON.stringify([o.rawDetail === true, o.showSuppressed === true,
+                         Object.keys(demotedSet(o.demotedRules)).sort()])
+}
+
+/// Swap an incident that did not change for the object it was last time.
+///
+/// `buildIncidents` runs on every poll and returns fresh objects, so a
+/// `property var incident` on a card changed every second even when nothing
+/// about the incident had -- and a changed var re-evaluates every binding
+/// under it. With `ingestFeed` keeping unchanged rows as the same objects, an
+/// incident is the same incident when its members are the same objects in the
+/// same order and every field derived from them under the same options is
+/// equal. The fields not compared (`story`, `uncertainty`) are pure functions
+/// of ones that are (`chain`, `alerts`, `head`, `rawDetail`), and a change of
+/// options empties the memo, so a title that happens to read the same under
+/// Advanced cannot smuggle a stale story through.
+///
+/// The fresh incident is built in full first and compared afterwards. That is
+/// the point: the old object is handed back only once it is known to say
+/// exactly what the new one says.
+function reuseIncidents(order, o, memo) {
+  var sig = incidentOptionsSignature(o)
+  var prev = memo.options === sig && memo.byKey ? memo.byKey : null
+  var next = {}
+  var reused = 0
+  for (var i = 0; i < order.length; i++) {
+    var fresh = order[i]
+    var old = prev ? prev[fresh.key] : null
+    if (old && sameIncident(old, fresh)) {
+      order[i] = old
+      reused++
+    }
+    next[order[i].key] = order[i]
+  }
+  memo.byKey = next
+  memo.options = sig
+  memo.reused = reused
+  return order
+}
+
+function sameIncident(a, b) {
+  if (a.alerts.length !== b.alerts.length) return false
+  for (var i = 0; i < a.alerts.length; i++) if (a.alerts[i] !== b.alerts[i]) return false
+  return a.key === b.key && a.id === b.id && a.rule === b.rule && a.family === b.family
+      && a.program === b.program && a.count === b.count
+      && a.firstSeen === b.firstSeen && a.lastSeen === b.lastSeen
+      && a.severity === b.severity && a.title === b.title && a.stake === b.stake
+      && a.state === b.state && a.coveredBy === b.coveredBy
+      && a.awaitingVerdict === b.awaitingVerdict
+      && a.head === b.head && a.chain === b.chain && a.verdict === b.verdict
 }
 
 function compareIncidentsNewestFirst(a, b) {
@@ -1593,6 +1654,11 @@ function createStore() {
     // The running fold: see createFold(). Rebuilt from scratch whenever the
     // file is not a strict append onto what we already folded.
     fold: null,
+    // The live path's memory of the last poll: id -> { alert, snap } and
+    // chain id -> chain, so a row moatd did not change keeps the object it
+    // had. See ingestFeed().
+    feedRows: {},
+    feedChains: {},
     // rule -> { rule, title, windowStart, windowMs, toasted, suppressedCount }
     notifyWindows: {},
     // Summaries owed for windows that were rolled over by a new alert before
@@ -1822,16 +1888,78 @@ function ingestText(store, text, options) {
 ///
 /// Deliberately returns the identical shape, so everything downstream --
 /// decoration, the badge counts, `newIds` and the notifier -- is unchanged and
-/// the two paths cannot drift.
+/// the two paths cannot drift. Plus `chains`, the response's shared chains,
+/// which `rehydrateChains` links onto the members: it reads them off the
+/// result it is handed, and this result used to have none, so on the live
+/// path no member was ever linked to its chain.
+///
+/// A row moatd did not change keeps the OBJECT it had last poll. Every poll
+/// is the whole window re-parsed -- 2,184 alerts and 7.7 MB on 2026-09-10,
+/// about once a second under a burst, for a payload in which one row is new
+/// -- and handing every one of them on as a fresh object meant `_apply`'s
+/// identity guards could never hold, every incident was rebuilt and every
+/// History row was destroyed and created again: 368 ms of the desktop's
+/// thread per poll, 206 ms of it History rows, for one changed line. Same
+/// object means a `property var` bound to it does not even signal (QML
+/// compares identity), so a card whose incident did not move re-evaluates
+/// nothing.
+///
+/// `sameFeedRow` decides. The daemon's own `fold()` (moatd/src/alert.rs) is
+/// the list of what an update can change on a stored alert: acked, acked_by,
+/// action_taken, count, severity, ts, surface, suppressed_by, incident, chain,
+/// chain_id, content (and through it explain.evidence) and triage. So a row is
+/// the same row when every scalar field is equal and every object field is
+/// deep-equal, except the subtrees captured once when the alert was raised and
+/// never rewritten -- `process`, `file`, `net`, `ioc`, `actor`, `context` --
+/// which are not walked; `process` alone is a quarter of the bytes. A field
+/// this file has never heard of still counts: any new or vanished key, or any
+/// scalar that moved, is a changed row.
+///
+/// The comparison is against a SNAPSHOT of the daemon's fields as they
+/// arrived, never the live object: `decorateAlerts` writes `surface`, `visible`
+/// and `demoted` onto the live object, `rehydrateExplains` hangs a fetched
+/// block off it, `rehydrateChains` links the chain -- none of which is the
+/// daemon changing its mind, and all of which a kept row must keep.
 function ingestFeed(store, payload, options) {
   var raw = (payload && payload.alerts) || []
   var receipts = (payload && payload.receipts) || []
+  var chains = reuseChains(store, payload ? payload.chains : null)
 
-  // moatd folds; this side only decorates. `byId` is rebuilt here because the
-  // notifier looks ids up in it and there is no fold to borrow one from.
-  var alerts = decorateAlerts(raw.slice().reverse(), options)
+  var rows = store.feedRows || {}
+  var kept = {}
+  var alerts = []
   var byId = {}
-  for (var b = 0; b < alerts.length; b++) byId[alerts[b].id] = alerts[b]
+  var reused = 0
+  // Newest first, which is the order everything downstream expects; moatd
+  // sends oldest first.
+  for (var r = raw.length - 1; r >= 0; r--) {
+    var next = raw[r]
+    if (!next) continue
+    var id = String(next.id || "")
+    var row = rows[id]
+    var alert
+    if (row && sameFeedRow(row.snap, next)) {
+      alert = row.alert
+      reused++
+      // The one thing a kept row holds that is not its own: the chain it was
+      // linked to, which moatd may have grown since. A stale link is dropped
+      // so `rehydrateChains` puts the current one back -- and a chain that
+      // did not grow is the same object, so the link is left alone.
+      if (chains && alert.chain_id && alert.chain !== chains[alert.chain_id])
+        alert.chain = null
+    } else {
+      alert = next
+      row = { alert: alert, snap: feedSnapshot(next) }
+    }
+    kept[id] = row
+    alerts.push(alert)
+    byId[id] = alert
+  }
+  store.feedRows = kept
+
+  // moatd folds; this side only decorates -- kept rows included, because the
+  // demotion list and the show-suppressed setting can have changed under them.
+  decorateAlerts(alerts, options)
 
   var initialLoad = !store.primed
   var newIds = []
@@ -1839,9 +1967,9 @@ function ingestFeed(store, payload, options) {
   // evicts from the front, so walking newest-first would remember the newest id
   // and then be the first to forget it.
   for (var i = alerts.length - 1; i >= 0; i--) {
-    var id = alerts[i].id
-    if (!store.seen[id] && !initialLoad) newIds.push(id)
-    rememberSeen(store, id, alerts.length)
+    var seenId = alerts[i].id
+    if (!store.seen[seenId] && !initialLoad) newIds.push(seenId)
+    rememberSeen(store, seenId, alerts.length)
   }
   store.primed = true
 
@@ -1849,12 +1977,99 @@ function ingestFeed(store, payload, options) {
     alerts: alerts,
     byId: byId,
     receipts: receipts,
+    chains: chains,
     newIds: newIds,
     initialLoad: initialLoad,
     // A socket read is never a partial file, so there is no rotation to detect.
     reloaded: false,
-    unacked: unackedCounts(alerts, options)
+    unacked: unackedCounts(alerts, options),
+    // How many rows kept their object. Diagnostics and tests; nothing renders it.
+    reused: reused
   }
+}
+
+// The subtrees `fold()` never touches. Captured when the alert was raised,
+// they are the bulk of every row and the reason a comparison can be cheaper
+// than the parse it follows.
+var FEED_IMMUTABLE = { process: true, file: true, net: true, ioc: true, actor: true, context: true }
+
+function deepEqual(a, b) {
+  if (a === b) return true
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false
+  var aa = Array.isArray(a), ba = Array.isArray(b)
+  if (aa !== ba) return false
+  if (aa) {
+    if (a.length !== b.length) return false
+    for (var i = 0; i < a.length; i++) if (!deepEqual(a[i], b[i])) return false
+    return true
+  }
+  var ka = Object.keys(a), kb = Object.keys(b)
+  if (ka.length !== kb.length) return false
+  for (var j = 0; j < ka.length; j++) {
+    var k = ka[j]
+    if (!(k in b)) return false
+    if (!deepEqual(a[k], b[k])) return false
+  }
+  return true
+}
+
+/// The daemon's fields of one feed row as they arrived, before anything in
+/// this file wrote on the object. Shallow: nested values are held by
+/// reference, and nothing here mutates a nested value it was sent
+/// (`mergeExplainResponse` REPLACES `alert.explain`, it does not write into
+/// the old one).
+function feedSnapshot(raw) {
+  var keys = Object.keys(raw)
+  var values = {}
+  for (var i = 0; i < keys.length; i++) values[keys[i]] = raw[keys[i]]
+  return { keys: keys, values: values }
+}
+
+/// Is `next`, fresh off the wire, the row the snapshot was taken of?
+///
+/// This runs for every row on every poll -- 2,622 rows, 28 keys each on
+/// 2026-09-10 -- and is the whole cost of keeping objects: about 25 ms a
+/// poll, of which 15 ms is simply reading 28 properties off 2,622 objects.
+/// It is spent on purpose. Comparing only the fields `fold()` names would be
+/// a third of it, and would also mean a field this file has never heard of
+/// could change on a row and the row would keep the old object -- which is a
+/// stale card, silently. Every key is compared; what is skipped is the
+/// walking of the subtrees `fold()` never rewrites.
+function sameFeedRow(snap, next) {
+  if (!snap || !next || typeof next !== "object") return false
+  var keys = Object.keys(next)
+  if (keys.length !== snap.keys.length) return false
+  var values = snap.values
+  for (var i = 0; i < keys.length; i++) {
+    var k = keys[i]
+    var v = next[k], s = values[k]
+    if (v === s) continue
+    if (s === undefined && !(k in values)) return false
+    if (typeof v !== "object" || v === null || typeof s !== "object" || s === null) return false
+    if (FEED_IMMUTABLE[k]) continue
+    if (!deepEqual(v, s)) return false
+  }
+  return true
+}
+
+/// The response's shared chains, with every chain that did not grow kept as
+/// the object its members already point at -- so an incident whose chain is
+/// unchanged sees the same `chain`, and stays the same incident.
+function reuseChains(store, chains) {
+  var incoming = chains && typeof chains === "object" && !Array.isArray(chains) ? chains : null
+  if (!incoming) {
+    store.feedChains = {}
+    return null
+  }
+  var prev = store.feedChains || {}
+  var kept = {}
+  var ids = Object.keys(incoming)
+  for (var i = 0; i < ids.length; i++) {
+    var id = ids[i]
+    kept[id] = prev[id] && deepEqual(prev[id], incoming[id]) ? prev[id] : incoming[id]
+  }
+  store.feedChains = kept
+  return kept
 }
 
 /// Hand the store the rotated half of the log, alerts.1.jsonl, once. From then

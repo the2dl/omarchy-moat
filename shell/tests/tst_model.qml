@@ -356,6 +356,184 @@ TestCase {
     compare(result.newIds[0], "01ZZZZZZZZZZZZZZZZZZZZZZZZ")
   }
 
+  // ------------------------------------------------- the feed keeps its objects
+  //
+  // Every poll is the whole window re-parsed, and one row in it is new. A row
+  // moatd did not change must come back as the SAME object, so that every
+  // incident, card and History row built on it can tell it did not change.
+  // Two payloads parsed separately, the way two polls are.
+
+  function feedPayload() {
+    var oldest = Model.ingestText(Model.createStore(), suite.fixtureText).alerts.slice().reverse()
+    return JSON.parse(JSON.stringify({ alerts: oldest, receipts: [] }))
+  }
+
+  function test_an_unchanged_feed_row_keeps_its_object() {
+    var store = Model.createStore()
+    var first = Model.ingestFeed(store, feedPayload())
+    var second = Model.ingestFeed(store, feedPayload())
+
+    verify(first.alerts.length > 3, "fixture has rows to keep")
+    compare(second.alerts.length, first.alerts.length)
+    for (var i = 0; i < first.alerts.length; i++)
+      verify(second.alerts[i] === first.alerts[i], "row " + i + " must keep its object")
+    compare(second.reused, first.alerts.length, "every row was kept")
+    compare(second.newIds.length, 0, "and nothing about that is news")
+    // byId points at the kept objects too: the notifier reads it.
+    verify(second.byId[first.alerts[0].id] === first.alerts[0])
+  }
+
+  function test_a_row_the_daemon_changed_is_replaced_and_only_that_row() {
+    var store = Model.createStore()
+    var first = Model.ingestFeed(store, feedPayload())
+    var n = first.alerts.length
+
+    // The five things `fold()` does to a stored alert that the panel draws:
+    // a fold bumps count, an answer acks, a response sets action_taken, a
+    // chain restamps surface, and an incident snapshot lands. Oldest first in
+    // the payload, so index k here is alerts[n-1-k] in the result. A fresh
+    // parse each time, as each poll is one.
+    function changedPayload() {
+      var payload = feedPayload()
+      payload.alerts[0].count = (payload.alerts[0].count || 1) + 1
+      payload.alerts[1].acked = !payload.alerts[1].acked
+      payload.alerts[2].action_taken = "killed"
+      payload.alerts[3].surface = payload.alerts[3].surface === "alerts" ? "timeline" : "alerts"
+      payload.alerts[4].incident = { dir: "/var/lib/moat/incidents/x", files: ["a.txt"] }
+      return payload
+    }
+    var second = Model.ingestFeed(store, changedPayload())
+
+    var changed = [n - 1, n - 2, n - 3, n - 4, n - 5]
+    for (var i = 0; i < n; i++) {
+      var isChanged = changed.indexOf(i) !== -1
+      compare(second.alerts[i] === first.alerts[i], !isChanged,
+              "row " + i + (isChanged ? " changed and must be replaced" : " did not change and must be kept"))
+    }
+    compare(second.reused, n - 5)
+    // And the replacements carry what changed.
+    compare(second.alerts[n - 1].count, first.alerts[n - 1].count + 1)
+    compare(second.alerts[n - 3].action_taken, "killed")
+    compare(second.alerts[n - 5].incident.dir, "/var/lib/moat/incidents/x")
+
+    // A third poll with the changed rows unchanged again keeps ALL of them.
+    var third = Model.ingestFeed(store, changedPayload())
+    compare(third.reused, n)
+    verify(third.alerts[n - 1] === second.alerts[n - 1])
+  }
+
+  function test_a_field_the_panel_has_never_heard_of_still_counts() {
+    var store = Model.createStore()
+    var first = Model.ingestFeed(store, feedPayload())
+    var payload = feedPayload()
+    payload.alerts[0].tier = "new-thing"      // a new key
+    delete payload.alerts[1].summary          // a vanished key
+    var second = Model.ingestFeed(store, payload)
+    var n = first.alerts.length
+    verify(second.alerts[n - 1] !== first.alerts[n - 1], "a new key is a changed row")
+    verify(second.alerts[n - 2] !== first.alerts[n - 2], "a vanished key is a changed row")
+    compare(second.reused, n - 2)
+  }
+
+  function test_a_kept_row_keeps_what_the_panel_hung_on_it_and_is_redecorated() {
+    var store = Model.createStore()
+    var first = Model.ingestFeed(store, feedPayload())
+    var row = first.alerts[0]
+    // The card fetched the explain block and the model put it on the row.
+    Model.mergeExplainResponse(row, { explain: { what: "fetched", why: "because" } })
+    compare(row.explain.what, "fetched")
+
+    // Next poll: same row on the wire, but the demotion list now names its rule.
+    var second = Model.ingestFeed(store, feedPayload(), { demotedRules: [row.rule] })
+    verify(second.alerts[0] === row, "kept")
+    compare(row.explain.what, "fetched", "the fetched block survives the poll")
+    compare(row.explain_elided, false)
+    compare(row.demoted, true, "and the kept row is decorated under the NEW options")
+  }
+
+  function test_the_feed_result_carries_the_chains_so_the_live_path_links_them() {
+    // Service does `rehydrateChains(ingestFeed(...))`. The result must carry
+    // the response's chains, or no member is ever linked on the live path.
+    var payload = {
+      alerts: [{ id: "01A", ts: "2026-09-10T10:00:00Z", chain_id: "01CHAIN" },
+               { id: "01B", ts: "2026-09-10T10:00:01Z", chain_id: "01CHAIN" }],
+      chains: { "01CHAIN": { id: "01CHAIN", steps: [{ alert: "01A" }, { alert: "01B" }], steps_total: 2 } },
+      receipts: []
+    }
+    var result = Model.rehydrateChains(Model.ingestFeed(Model.createStore(), payload))
+    verify(result.alerts[0].chain, "the member is linked to its chain")
+    compare(result.alerts[0].chain.id, "01CHAIN")
+    verify(result.alerts[0].chain === result.alerts[1].chain, "one object, shared")
+  }
+
+  function test_a_chain_that_grew_reaches_a_kept_member_and_one_that_did_not_is_the_same_object() {
+    var store = Model.createStore()
+    function payload(total) {
+      return {
+        alerts: [{ id: "01A", ts: "2026-09-10T10:00:00Z", chain_id: "01CHAIN" },
+                 { id: "01Z", ts: "2026-09-10T10:00:00Z", chain_id: "01OTHER" }],
+        chains: {
+          "01CHAIN": { id: "01CHAIN", steps: [{ alert: "01A" }], steps_total: total },
+          "01OTHER": { id: "01OTHER", steps: [{ alert: "01Z" }], steps_total: 1 }
+        },
+        receipts: []
+      }
+    }
+    var first = Model.rehydrateChains(Model.ingestFeed(store, payload(1)))
+    var a = first.byId["01A"], z = first.byId["01Z"]
+    var otherChain = z.chain
+    compare(a.chain.steps_total, 1)
+
+    var second = Model.rehydrateChains(Model.ingestFeed(store, payload(2)))
+    verify(second.byId["01A"] === a, "the member row did not change, so it is kept")
+    compare(a.chain.steps_total, 2, "but its chain is the grown one")
+    verify(second.byId["01Z"] === z)
+    verify(z.chain === otherChain, "a chain that did not grow is the same object")
+  }
+
+  function test_an_unchanged_incident_keeps_its_object() {
+    var store = Model.createStore()
+    var memo = Model.createIncidentMemo()
+    var options = { demotedRules: [suite.demotedRule] }
+    var first = Model.buildIncidents(Model.ingestFeed(store, feedPayload(), options).alerts, options, memo)
+    var second = Model.buildIncidents(Model.ingestFeed(store, feedPayload(), options).alerts, options, memo)
+
+    verify(first.length > 1, "fixture folds to several incidents")
+    compare(second.length, first.length)
+    for (var i = 0; i < first.length; i++)
+      verify(second[i] === first[i], "incident " + first[i].key + " did not change and must be the same object")
+    compare(memo.reused, first.length)
+
+    // One fold onto one member: that incident is new, every other one is kept.
+    var payload = feedPayload()
+    var bumped = payload.alerts[0]
+    bumped.count = (bumped.count || 1) + 10
+    var third = Model.buildIncidents(Model.ingestFeed(store, payload, options).alerts, options, memo)
+    var moved = 0
+    for (var j = 0; j < third.length; j++) {
+      var was = null
+      for (var k = 0; k < second.length; k++) if (second[k].key === third[j].key) was = second[k]
+      verify(was !== null, "same incidents")
+      if (third[j] === was) continue
+      moved++
+      compare(third[j].key, Model.incidentKey(bumped), "the only new incident is the one that folded")
+      compare(third[j].count, was.count + 10, "and it carries the new count")
+    }
+    compare(moved, 1)
+
+    // A change of options is a change of every incident: nothing is reused.
+    var fourth = Model.buildIncidents(Model.ingestFeed(store, feedPayload(), options).alerts,
+                                      { demotedRules: [suite.demotedRule], rawDetail: true }, memo)
+    compare(memo.reused, 0)
+    for (var m = 0; m < fourth.length; m++)
+      for (var n = 0; n < third.length; n++)
+        verify(fourth[m] !== third[n], "a different rawDetail is a different incident")
+
+    // Without a memo, as every existing caller calls it, nothing changes.
+    var plain = Model.buildIncidents(Model.ingestFeed(store, feedPayload(), options).alerts, options)
+    compare(plain.length, first.length)
+  }
+
   function test_new_alert_after_priming_notifies() {
     var store = Model.createStore()
     Model.ingestText(store, suite.fixtureText)
