@@ -3460,6 +3460,28 @@ impl Daemon {
             self.quarantine_chain_artifacts(&c);
         }
 
+        // NOTE (2026-09-10): this loop is quadratic and it is the largest
+        // known defect in the store. Every growth of a chain appends an update
+        // line carrying the WHOLE chain to EVERY member, so a 488-step chain --
+        // one `makepkg` run, measured -- writes about 48 MB on its final step
+        // alone. The store rotates at 20 MB, so it rotated ten times in eleven
+        // minutes, each rotation tripping moat's own rootkit-evidence-tamper
+        // rule and discarding the history that would have explained it.
+        //
+        // The obvious fix -- stamp only the members that are new, restamp all
+        // of them only when severity moves -- was tried and REVERTED, because
+        // the invariant it breaks is load-bearing: `acking_a_chain_resolves_its
+        // _siblings` finds an alert's siblings through that alert's own copy of
+        // the chain, so a member holding an earlier snapshot silently loses the
+        // members that joined after it. Two tests caught it.
+        //
+        // The real fix is to write the chain ONCE per version against its
+        // anchor (a chain's `id` IS its first step's alert id, so the anchor
+        // always exists), give the other members a `chain_id`, and rehydrate in
+        // `Store::fold_from_disk` so every reader still sees a whole chain. That
+        // keeps the invariant at read time and makes the write O(1). It is a
+        // store-format change and is not something to do at the end of a long
+        // session.
         for member in c.member_ids() {
             let mut u = UpdateLine::new(&member).set("chain", value.clone());
             if raise && triggers.contains(member.as_str()) {

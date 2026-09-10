@@ -421,7 +421,24 @@ fn cmd_feed(d: &Daemon, req: &Value) -> Value {
                 // rather than being dropped.
                 match chain.get("id").and_then(|i| i.as_str()).map(str::to_string) {
                     Some(id) => {
-                        chains.entry(id.clone()).or_insert(chain);
+                        // Keep the MOST GROWN copy, not the first seen. Members
+                        // are stamped as they join and restamped only when the
+                        // chain's severity moves, so an early member can carry
+                        // an earlier snapshot -- taking whichever arrived first
+                        // would hand the panel a truncated story.
+                        let steps = chain
+                            .get("steps_total")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let better = chains
+                            .get(&id)
+                            .and_then(|c: &Value| c.get("steps_total"))
+                            .and_then(|v| v.as_u64())
+                            .map(|prev| steps > prev)
+                            .unwrap_or(true);
+                        if better {
+                            chains.insert(id.clone(), chain);
+                        }
                         obj.insert("chain_id".into(), Value::String(id));
                     }
                     None => {
