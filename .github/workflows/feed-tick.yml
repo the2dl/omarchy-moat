@@ -20,14 +20,30 @@
 # pulled back from the API, not just the local source), and propagation delay
 # (the last two boundaries had no deploy within 40 minutes).
 #
-# Then a control ruled out this Worker entirely. A throwaway Worker `cron-probe`
+# The cause turned out to be published all along. Cloudflare status incident
+# sjs8s0q2x4hw, "Workers Cron Triggers degraded", opened 2026-09-09T19:17Z and
+# still `identified` with no resolution a day later: "Workers Cron Triggers may
+# not execute or may be delayed in executing." It predates this Worker's
+# creation (12:56Z on 2026-09-10) by about eighteen hours, so the schedule has
+# never once existed outside the outage. The lesson is cheap and was skipped:
+# check the provider's status page BEFORE spending hours bisecting your own
+# configuration.
+#
+# A control ruled out this Worker independently. A throwaway Worker `cron-probe`
 # -- no bindings, no routes, no R2, a `scheduled()` that only console.logs, cron
 # `* * * * *` -- was deployed at 15:41:27Z and had run zero times by 15:51Z, ten
 # boundaries later. Analytics was reporting fine over the same window (it showed
 # every one of moat's own pointer fetches). So automatic dispatch is broken for
 # the account, not misconfigured for moat-feed-aggregator, and nothing in this
-# repository can fix it. That makes it a Cloudflare support ticket, and this
-# workflow the answer in the meantime rather than a stopgap.
+# repository can fix it.
+#
+# Use the right dataset when re-checking. `workersInvocationsAdaptive` mixes
+# HTTP in with cron, which is what made moat's own pointer polls look like
+# ticks; `workersInvocationsScheduled` is cron-only and was empty for the whole
+# account over 24h. The crons stay registered -- when Cloudflare resolves the
+# incident they should resume with no action here, and the `state/last-cron.txt`
+# heartbeat is how we will notice. This workflow is the schedule regardless: it
+# does not depend on anyone else's scheduler being healthy.
 #
 # GitHub's cron is not punctual either -- it can drift five to fifteen minutes
 # under load, and skips runs on a repository that has been idle for 60 days.
