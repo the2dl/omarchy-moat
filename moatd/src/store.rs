@@ -58,11 +58,21 @@ impl Cache {
     fn fold_line(&mut self, line: &str) {
         match parse_record(line) {
             Some(Record::Full(a)) => {
-                self.map.insert(a.id.clone(), *a);
+                let id = a.id.clone();
+                self.map.insert(id.clone(), *a);
+                self.hydrate(&id);
+                self.propagate(&id);
             }
             Some(Record::Update(u)) => {
-                if let Some(a) = self.map.get_mut(&u.id) {
-                    fold(a, &u.update);
+                let Some(a) = self.map.get_mut(&u.id) else {
+                    return;
+                };
+                fold(a, &u.update);
+                if u.update.contains_key("chain_id") {
+                    self.hydrate(&u.id);
+                }
+                if u.update.contains_key("chain") {
+                    self.propagate(&u.id);
                 }
             }
             None => {
@@ -71,6 +81,67 @@ impl Cache {
                     if let Ok(r) = serde_json::from_str::<ReceiptLine>(line) {
                         self.receipts.push(r.receipt);
                     }
+                }
+            }
+        }
+    }
+
+    /// Give `id` the chain its `chain_id` names, copied from the anchor.
+    ///
+    /// The chain is on disk ONCE, on the anchor (`Alert::chain_id`); every
+    /// other member holds a reference. The fold is what readers see, so the
+    /// reference is resolved here and nowhere else -- `load`, `find`,
+    /// `unacked`, `ledger`, the carry set and `cmd_feed` all read `chain` off
+    /// the folded alert exactly as they did when it was inlined.
+    ///
+    /// An inline copy the member already carries (a record from before
+    /// `chain_id` existed, or a carried row whose anchor was not carried) is
+    /// replaced only by one at least as grown: a chain only ever grows, and
+    /// the anchor's copy is the newest write, so this is the same "keep the
+    /// most grown" rule `cmd_feed` applies.
+    fn hydrate(&mut self, id: &str) {
+        let Some(a) = self.map.get(id) else {
+            return;
+        };
+        let Some(cid) = a.chain_id.clone() else {
+            return;
+        };
+        if cid == id {
+            return;
+        }
+        let own = a.chain.as_ref().map(|c| c.steps_total);
+        let Some(chain) = self.map.get(&cid).and_then(|anchor| anchor.chain.as_ref()) else {
+            return;
+        };
+        if chain.id != cid || own.is_some_and(|t| t > chain.steps_total) {
+            return;
+        }
+        let chain = chain.clone();
+        if let Some(a) = self.map.get_mut(id) {
+            a.chain = Some(chain);
+        }
+    }
+
+    /// `id`'s chain changed and `id` is the anchor: every member that names
+    /// it gets the new copy, so a member never holds an earlier snapshot than
+    /// the anchor. This is the invariant `moatctl ack --chain` and the panel
+    /// rely on, and it is what the write side used to pay for by appending the
+    /// chain to every member. Memory work only: nothing is written.
+    fn propagate(&mut self, id: &str) {
+        let Some(chain) = self.map.get(id).and_then(|a| a.chain.as_ref()) else {
+            return;
+        };
+        if chain.id != id {
+            return;
+        }
+        let chain = chain.clone();
+        for m in chain.member_ids() {
+            if m == id {
+                continue;
+            }
+            if let Some(member) = self.map.get_mut(&m) {
+                if member.chain_id.as_deref() == Some(id) {
+                    member.chain = Some(chain.clone());
                 }
             }
         }
@@ -254,6 +325,24 @@ impl AlertStore {
     /// The protected rows to carry across a rotation, id-ordered, stamped
     /// `carried`, and capped. Returns the rows plus how many still-wanted-a-
     /// human rows the caps had to evict.
+    ///
+    /// A chain travels the way it is stored: once, on its anchor. The fold
+    /// holds every member hydrated, so writing the rows as they are would put
+    /// the whole chain into every carried member -- 488 members times ~100 KB
+    /// for the 2026-09-10 `makepkg` chain, which is more than the byte cap and
+    /// would evict most of the story to make room for copies of itself. So a
+    /// member whose anchor is ALSO in the set is written with `chain_id` only,
+    /// and the caps are measured on what is actually written.
+    ///
+    /// The anchor is not pulled in on a member's behalf. When the chain is
+    /// `high`+, every member is P3-protected and the anchor comes along on the
+    /// same predicate; when it is not, a member protected for its own reasons
+    /// keeps its chain inline -- today's format -- so nothing depends on a row
+    /// that was never going to be carried. What the caps must not do is evict
+    /// the anchor from under a member that was stripped against it, and the
+    /// plain order would: eviction is oldest-first within a tier, and the
+    /// anchor is the oldest member by construction. `apply_carry_caps` orders
+    /// an anchor after every member that depends on it.
     fn protected_carry_set(&self) -> (Vec<Alert>, usize) {
         let now = crate::util::now_rfc3339();
         let mut rows: Vec<Alert> = self.with_fold(|c| {
@@ -279,24 +368,38 @@ impl AlertStore {
     /// Evict least-important-then-oldest until `rows` is within both caps.
     /// Returns how many evicted rows still wanted a human (P1: surfaced,
     /// unacked, unsuppressed) — the honest cost of the eviction.
+    ///
+    /// Strips the shared chains first (see `protected_carry_set`), so the byte
+    /// cap is measured on the lines that will be written, and sorts an anchor
+    /// after the members that were stripped against it, at the strongest of
+    /// their priorities: a chain's record outlives its last surviving member,
+    /// never the other way round.
     fn apply_carry_caps(&self, rows: &mut Vec<Alert>) -> usize {
-        let bytes = |r: &[Alert]| -> u64 { r.iter().map(line_len).sum() };
-        if rows.len() <= self.carry_max && bytes(rows) <= self.carry_max_bytes {
+        let anchor_of = strip_shared_chains(rows);
+        let sizes: Vec<u64> = rows.iter().map(line_len).collect();
+        let bytes: u64 = sizes.iter().sum();
+        if rows.len() <= self.carry_max && bytes <= self.carry_max_bytes {
             return 0;
         }
         // Eviction order mirrors incident.rs prune: least important first, and
         // oldest first within a tier. `rows` is already id-ascending (oldest
         // first), so a stable sort by ascending priority puts the first victim
-        // at the front.
+        // at the front. An anchor's key is lifted to its youngest, most
+        // important dependant's, and it sorts after that one on the tie.
+        let mut key: Vec<(u8, usize, u8)> = (0..rows.len())
+            .map(|i| (carry_priority(&rows[i]), i, 0))
+            .collect();
+        for (i, anchor) in anchor_of.iter().enumerate() {
+            let Some(j) = *anchor else { continue };
+            let (p, idx, _) = key[i];
+            let k = &mut key[j];
+            *k = (k.0.max(p), k.1.max(idx), 1);
+        }
         let mut order: Vec<usize> = (0..rows.len()).collect();
-        order.sort_by(|&x, &y| {
-            carry_priority(&rows[x])
-                .cmp(&carry_priority(&rows[y]))
-                .then(x.cmp(&y))
-        });
+        order.sort_by_key(|&x| key[x]);
 
         let mut kept_count = rows.len();
-        let mut kept_bytes = bytes(rows);
+        let mut kept_bytes = bytes;
         let mut evict = std::collections::HashSet::new();
         let mut evicted_wanted = 0usize;
         for &victim in &order {
@@ -305,7 +408,7 @@ impl AlertStore {
             }
             evict.insert(victim);
             kept_count -= 1;
-            kept_bytes = kept_bytes.saturating_sub(line_len(&rows[victim]));
+            kept_bytes = kept_bytes.saturating_sub(sizes[victim]);
             if still_wanted_a_human(&rows[victim]) {
                 evicted_wanted += 1;
             }
@@ -500,6 +603,36 @@ impl AlertStore {
         l.needs_you = queued.len() as u64;
         l
     }
+}
+
+/// Drop the inline chain from every row whose anchor is also in `rows` and
+/// carries that chain; the reference in `chain_id` is enough, and `Cache::
+/// hydrate` puts the chain back when the row is read. Returns, per row, the
+/// index of the anchor it was stripped against. Rows whose anchor is absent
+/// keep their inline copy, so they do not depend on a row that is not there.
+fn strip_shared_chains(rows: &mut [Alert]) -> Vec<Option<usize>> {
+    let anchors: std::collections::HashMap<&str, usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.is_chain_anchor())
+        .map(|(i, a)| (a.id.as_str(), i))
+        .collect();
+    let anchor_of: Vec<Option<usize>> = rows
+        .iter()
+        .map(|a| {
+            let cid = a.chain_id.as_deref()?;
+            if cid == a.id || a.chain.as_ref().is_none_or(|c| c.id != cid) {
+                return None;
+            }
+            anchors.get(cid).copied()
+        })
+        .collect();
+    for (a, anchor) in rows.iter_mut().zip(&anchor_of) {
+        if anchor.is_some() {
+            a.chain = None;
+        }
+    }
+    anchor_of
 }
 
 /// Serialized on-disk size of one carried row, including its newline.
@@ -965,6 +1098,284 @@ mod tests {
         }
         s.append_alert(&demo_alert("01BBBBBBBBBBBBBBBBBBBBBBBB")).unwrap();
         assert_eq!(s.load().len(), 2);
+    }
+
+    // ---- chains: written once, read everywhere ---------------------------
+
+    /// A chain over `members`, anchored on the first of them, as the engine
+    /// would serialise it.
+    fn chain_over(members: &[&str], severity: &str) -> crate::chain::Chain {
+        let steps: Vec<crate::chain::Step> = members
+            .iter()
+            .take(crate::chain::MAX_STEPS)
+            .map(|m| crate::chain::Step {
+                alert: m.to_string(),
+                ts: "2026-09-10T10:00:00Z".into(),
+                family: "cred".into(),
+                rule: "moat-cred-registry-token-read".into(),
+                severity: "medium".into(),
+                title: "t".into(),
+                pid: 1,
+                exe: "/usr/bin/node".into(),
+                role: "trigger".into(),
+            })
+            .collect();
+        crate::chain::Chain {
+            v: 1,
+            id: members[0].to_string(),
+            ancestor: crate::alert::Ancestor { pid: 9000, exe: "/usr/bin/npm".into() },
+            families: vec!["cred".into(), "net".into()],
+            severity: severity.into(),
+            severity_base: "medium".into(),
+            severity_reason: "r".into(),
+            first_ts: "2026-09-10T10:00:00Z".into(),
+            last_ts: "2026-09-10T10:00:01Z".into(),
+            span_secs: 1,
+            steps,
+            steps_total: members.len(),
+            truncated: members.len() > crate::chain::MAX_STEPS,
+            members: members.iter().map(|m| m.to_string()).collect(),
+            triggers_total: members.len(),
+            summary: "s".into(),
+        }
+    }
+
+    /// Write a grown chain the way `engine::write_chain` does: the chain on
+    /// the anchor, a `chain_id` on each member.
+    fn grow(s: &mut AlertStore, members: &[&str], severity: &str) {
+        let c = chain_over(members, severity);
+        s.append_update(
+            &UpdateLine::new(members[0])
+                .set("chain", serde_json::to_value(&c).unwrap())
+                .set("chain_id", Value::from(members[0])),
+        )
+        .unwrap();
+        for m in &members[1..] {
+            s.append_update(&UpdateLine::new(m).set("chain_id", Value::from(members[0]))).unwrap();
+        }
+    }
+
+    const A: &str = "01CHAIN0000000000000000A00";
+    const B: &str = "01CHAIN0000000000000000B00";
+    const C: &str = "01CHAIN0000000000000000C00";
+
+    /// THE invariant: every member carries the whole chain. It used to be paid
+    /// for at write time by appending the chain to every member on every
+    /// growth; now it is kept at read time. The trap is a member that joined
+    /// early holding an early snapshot -- `moatctl ack --chain` on it would
+    /// silently miss whoever joined later -- and it has to hold both on the
+    /// fold the writer keeps and on a fold rebuilt from disk.
+    #[test]
+    fn a_member_sees_the_siblings_that_joined_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store(dir.path(), 1 << 20);
+        for id in [A, B, C] {
+            s.append_alert(&demo_alert(id)).unwrap();
+        }
+        grow(&mut s, &[A, B], "medium");
+        let b = s.find(B).unwrap();
+        assert_eq!(b.chain_id.as_deref(), Some(A));
+        assert_eq!(b.chain.as_ref().unwrap().member_ids(), vec![A, B]);
+
+        // C joins. Only the anchor gets the new chain; B gets nothing at all.
+        grow(&mut s, &[A, B, C], "medium");
+        for id in [A, B, C] {
+            let a = s.find(id).unwrap();
+            assert_eq!(
+                a.chain.as_ref().map(|c| c.member_ids()),
+                Some(vec![A.to_string(), B.to_string(), C.to_string()]),
+                "{} holds an earlier snapshot",
+                id
+            );
+        }
+
+        // The chain is on disk exactly once per growth: two growths, two copies.
+        let text = std::fs::read_to_string(s.path()).unwrap();
+        assert_eq!(text.matches("\"steps\"").count(), 2, "the chain was inlined on a member");
+
+        // And a reader that folds the file from the top sees the same thing.
+        drop(s);
+        let s = store(dir.path(), 1 << 20);
+        for id in [A, B, C] {
+            let a = s.find(id).unwrap();
+            assert_eq!(a.chain.as_ref().unwrap().member_ids().len(), 3, "{} lost siblings on refold", id);
+        }
+        // A plain update on a member, which is what an ack is, does not
+        // disturb the chain it was given.
+        drop(s);
+        let mut s = store(dir.path(), 1 << 20);
+        s.append_update(&UpdateLine::new(B).set("acked", Value::Bool(true))).unwrap();
+        let b = s.find(B).unwrap();
+        assert!(b.acked);
+        assert_eq!(b.chain.as_ref().unwrap().member_ids().len(), 3);
+    }
+
+    /// Records written before `chain_id` existed carry the chain inline on
+    /// every member and name no anchor. They fold exactly as they did, and a
+    /// mixed file -- an old chain grown by a new daemon -- converges on the
+    /// anchor's copy, which is the newest.
+    #[test]
+    fn an_inline_chain_from_an_older_daemon_still_folds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store(dir.path(), 1 << 20);
+        for id in [A, B, C] {
+            s.append_alert(&demo_alert(id)).unwrap();
+        }
+        let two = serde_json::to_value(chain_over(&[A, B], "medium")).unwrap();
+        for id in [A, B] {
+            s.append_update(&UpdateLine::new(id).set("chain", two.clone())).unwrap();
+        }
+        for id in [A, B] {
+            let a = s.find(id).unwrap();
+            assert!(a.chain_id.is_none(), "an old record names no anchor");
+            assert_eq!(a.chain.as_ref().unwrap().member_ids(), vec![A, B]);
+        }
+        assert!(s.find(C).unwrap().chain.is_none());
+
+        // A new daemon grows the same chain: B is given a reference, and the
+        // anchor's copy replaces B's older inline one.
+        grow(&mut s, &[A, B, C], "medium");
+        for id in [A, B, C] {
+            let a = s.find(id).unwrap();
+            assert_eq!(a.chain.as_ref().unwrap().member_ids().len(), 3, "{}", id);
+        }
+        drop(s);
+        let s = store(dir.path(), 1 << 20);
+        for id in [A, B, C] {
+            assert_eq!(s.find(id).unwrap().chain.as_ref().unwrap().member_ids().len(), 3);
+        }
+    }
+
+    /// A reference whose anchor is missing is just a reference: the member
+    /// shows no chain rather than a made-up one, and an inline copy it already
+    /// had is kept.
+    #[test]
+    fn a_member_without_its_anchor_keeps_what_it_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store(dir.path(), 1 << 20);
+        s.append_alert(&demo_alert(B)).unwrap();
+        s.append_update(&UpdateLine::new(B).set("chain_id", Value::from(A))).unwrap();
+        let b = s.find(B).unwrap();
+        assert_eq!(b.chain_id.as_deref(), Some(A));
+        assert!(b.chain.is_none());
+
+        let two = serde_json::to_value(chain_over(&[A, B], "medium")).unwrap();
+        s.append_update(&UpdateLine::new(B).set("chain", two)).unwrap();
+        assert_eq!(s.find(B).unwrap().chain.as_ref().unwrap().member_ids(), vec![A, B]);
+    }
+
+    /// Rotation carries a `high` chain the way the file stores it: once, on
+    /// the anchor. Every member is P3-protected, so the anchor comes along on
+    /// the same predicate, and the carried members are references.
+    #[test]
+    fn rotation_carries_a_high_chain_once_and_every_member_still_has_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = serde_json::to_string(&timeline_row("01T00000000000000000000000")).unwrap();
+        let mut s = store(dir.path(), (line.len() as u64 + 1) * 40);
+        // All acked and on the timeline, so nothing but P3 protects them.
+        let mut ids = Vec::new();
+        for i in 0..30 {
+            let id = format!("01CHAIN{:019}", i);
+            let mut a = timeline_row(&id);
+            a.rule = "moat-cred-registry-token-read".into();
+            s.append_alert(&a).unwrap();
+            ids.push(id);
+        }
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        grow(&mut s, &refs, "high");
+        for i in 0..60 {
+            s.append_alert(&timeline_row(&format!("01T{:023}", i))).unwrap();
+        }
+        assert!(dir.path().join("alerts.1.jsonl").exists(), "should have rotated");
+
+        let live = std::fs::read_to_string(dir.path().join("alerts.jsonl")).unwrap();
+        assert_eq!(live.matches("\"steps\"").count(), 1, "the chain was carried more than once");
+        assert_eq!(live.matches("\"chain_id\"").count(), 30, "every member was carried");
+
+        for id in &ids {
+            let a = s.find(id).unwrap();
+            assert_eq!(a.chain.as_ref().map(|c| c.member_ids().len()), Some(30), "{} lost its chain", id);
+        }
+        // The carried anchor has no `chain_id` of its own to resolve; the
+        // carried members do, and the rotated file is gone from the fold's
+        // point of view once alerts.1.jsonl rotates again.
+        drop(s);
+        let s = store(dir.path(), 1 << 20);
+        for id in &ids {
+            assert_eq!(s.find(id).unwrap().chain.as_ref().unwrap().member_ids().len(), 30);
+        }
+    }
+
+    /// The anchor is not carried on a member's behalf: a member protected for
+    /// its own reasons, whose anchor is not, keeps its chain inline -- the
+    /// format every record used to have -- so it depends on nothing that was
+    /// not written.
+    #[test]
+    fn a_carried_member_whose_anchor_stays_behind_keeps_the_chain_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = serde_json::to_string(&timeline_row("01T00000000000000000000000")).unwrap();
+        let mut s = store(dir.path(), (line.len() as u64 + 1) * 12);
+        // Anchor: unprotected. Member: on the badge (P1).
+        s.append_alert(&timeline_row(A)).unwrap();
+        s.append_alert(&demo_alert(B)).unwrap();
+        grow(&mut s, &[A, B], "medium");
+        assert!(!s.find(A).unwrap().is_protected());
+        assert!(s.find(B).unwrap().is_protected());
+        for i in 0..20 {
+            s.append_alert(&timeline_row(&format!("01T{:023}", i))).unwrap();
+        }
+        assert!(dir.path().join("alerts.1.jsonl").exists());
+        let live = std::fs::read_to_string(dir.path().join("alerts.jsonl")).unwrap();
+        // A Full line opens `{"v":1,"id":<id>,"ts":...}`; the chain's own `id`
+        // inside the member's inline copy is followed by `ancestor`.
+        assert!(!live.contains(&format!("\"id\":\"{}\",\"ts\"", A)), "the anchor was not protected");
+        assert!(live.contains("\"steps\""), "the member carries its chain inline");
+        drop(s);
+        // Rotate the rotated file away too, so only the carried copy is left.
+        let mut s = store(dir.path(), (line.len() as u64 + 1) * 12);
+        for i in 20..60 {
+            s.append_alert(&timeline_row(&format!("01T{:023}", i))).unwrap();
+        }
+        let b = s.find(B).unwrap();
+        assert!(s.find(A).is_none());
+        assert_eq!(b.chain.as_ref().map(|c| c.member_ids()), Some(vec![A.to_string(), B.to_string()]));
+    }
+
+    /// The caps evict oldest-first within a tier, and the anchor is the oldest
+    /// member by construction, so the plain order would evict the record a
+    /// surviving member was stripped against. An anchor goes after its
+    /// dependants.
+    #[test]
+    fn carry_caps_never_evict_an_anchor_from_under_a_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = serde_json::to_string(&timeline_row("01T00000000000000000000000")).unwrap();
+        // Room for two rows: one of the three P3 members has to go.
+        let mut s = store_caps(dir.path(), (line.len() as u64 + 1) * 12, u64::MAX, 2);
+        for id in [A, B, C] {
+            let mut a = timeline_row(id);
+            a.rule = "moat-cred-registry-token-read".into();
+            s.append_alert(&a).unwrap();
+        }
+        grow(&mut s, &[A, B, C], "high");
+        for i in 0..20 {
+            s.append_alert(&timeline_row(&format!("01T{:023}", i))).unwrap();
+        }
+        assert!(dir.path().join("alerts.1.jsonl").exists());
+        let live = std::fs::read_to_string(dir.path().join("alerts.jsonl")).unwrap();
+        assert!(live.contains(&format!("\"id\":\"{}\",\"ts\"", A)), "anchor evicted first");
+        assert!(!live.contains(&format!("\"id\":\"{}\",\"ts\"", B)), "the oldest dependant goes first");
+        assert!(live.contains(&format!("\"id\":\"{}\",\"ts\"", C)));
+        assert_eq!(live.matches("\"steps\"").count(), 1);
+        // Rotate again so nothing but the carried rows remains, then C must
+        // still have its chain -- from the carried anchor.
+        drop(s);
+        let mut s = store_caps(dir.path(), (line.len() as u64 + 1) * 12, u64::MAX, 2);
+        for i in 20..60 {
+            s.append_alert(&timeline_row(&format!("01T{:023}", i))).unwrap();
+        }
+        assert!(s.find(B).is_none());
+        let c = s.find(C).unwrap();
+        assert_eq!(c.chain.as_ref().map(|c| c.member_ids().len()), Some(3));
     }
 
     /// Timing probe, not a test: `MOAT_BENCH_DIR=<dir with alerts.jsonl and

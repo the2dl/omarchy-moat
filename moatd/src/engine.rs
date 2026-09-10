@@ -181,6 +181,16 @@ fn mins(secs: u64) -> String {
     }
 }
 
+/// How much of one chain is already on disk (`Daemon::write_chain`).
+#[derive(Debug, Default, Clone, Copy)]
+struct ChainStamp {
+    /// `Chain::member_ids()[..stamped]` carry a `chain_id` line.
+    stamped: usize,
+    /// The trigger members have been restamped onto the badge because the
+    /// chain reached `high`.
+    raised: bool,
+}
+
 pub struct Daemon {
     pub cfg: Config,
     pub cfg_path: PathBuf,
@@ -323,6 +333,11 @@ pub struct Daemon {
     /// Design 2b/3a: alerts sharing a process tree and crossing families are
     /// one sequence. Bounded and self-pruning; see `chain.rs`.
     pub chains: ChainStore,
+    /// What `write_chain` has already written for each live chain, by chain
+    /// id, so a growth writes only what changed. Pruned to the chains that are
+    /// still open; empty after a restart, which only means the first growth
+    /// after one re-stamps every member once.
+    chain_stamps: HashMap<String, ChainStamp>,
     /// Policies armed for in-kernel enforcement individually, while the daemon
     /// as a whole stays in monitor mode.
     ///
@@ -533,6 +548,7 @@ impl Daemon {
             rarity,
             baseline,
             exec_rarity: HashMap::new(),
+            chain_stamps: HashMap::new(),
             in_meta_alert: false,
             receipts: receipt::Tracker::default(),
             digest_enabled,
@@ -3460,38 +3476,88 @@ impl Daemon {
             self.quarantine_chain_artifacts(&c);
         }
 
-        // NOTE (2026-09-10): this loop is quadratic and it is the largest
-        // known defect in the store. Every growth of a chain appends an update
-        // line carrying the WHOLE chain to EVERY member, so a 488-step chain --
-        // one `makepkg` run, measured -- writes about 48 MB on its final step
-        // alone. The store rotates at 20 MB, so it rotated ten times in eleven
-        // minutes, each rotation tripping moat's own rootkit-evidence-tamper
-        // rule and discarding the history that would have explained it.
-        //
-        // The obvious fix -- stamp only the members that are new, restamp all
-        // of them only when severity moves -- was tried and REVERTED, because
-        // the invariant it breaks is load-bearing: `acking_a_chain_resolves_its
-        // _siblings` finds an alert's siblings through that alert's own copy of
-        // the chain, so a member holding an earlier snapshot silently loses the
-        // members that joined after it. Two tests caught it.
-        //
-        // The real fix is to write the chain ONCE per version against its
-        // anchor (a chain's `id` IS its first step's alert id, so the anchor
-        // always exists), give the other members a `chain_id`, and rehydrate in
-        // `Store::fold_from_disk` so every reader still sees a whole chain. That
-        // keeps the invariant at read time and makes the write O(1). It is a
-        // store-format change and is not something to do at the end of a long
-        // session.
-        for member in c.member_ids() {
-            let mut u = UpdateLine::new(&member).set("chain", value.clone());
-            if raise && triggers.contains(member.as_str()) {
+        self.write_chain(&c, value, raise, &triggers);
+    }
+
+    /// Put a grown chain on disk: the chain ONCE, on its anchor, and a
+    /// `chain_id` on each member that has not been stamped yet.
+    ///
+    /// Until 2026-09-10 every growth appended the whole chain to every member,
+    /// which is quadratic: a 488-step chain -- one `makepkg` run, measured --
+    /// wrote about 48 MB on its final step alone, and the store rotated ten
+    /// times in eleven minutes, each rotation tripping moat's own
+    /// rootkit-evidence-tamper rule and discarding the history that would
+    /// have explained it. Now a growth writes the chain record plus one small
+    /// line per NEW member (plus one `surface` line per trigger the first time
+    /// the chain reaches `high`).
+    ///
+    /// The invariant that every member carries the whole chain is load-bearing
+    /// -- `moatctl ack --chain` finds an alert's siblings through that alert's
+    /// own copy -- and a version that stamped only the new members and left
+    /// the old ones holding an earlier snapshot was tried and reverted the
+    /// same day. It is kept at read time instead: a chain's `id` IS its first
+    /// step's alert id, so the anchor always exists, and `store::Cache`
+    /// rehydrates every member from it (`Alert::chain_id`).
+    fn write_chain(
+        &mut self,
+        c: &chain::Chain,
+        value: Value,
+        raise: bool,
+        triggers: &std::collections::HashSet<&str>,
+    ) {
+        let open: std::collections::HashSet<&str> =
+            self.chains.open().map(|c| c.id.as_str()).collect();
+        self.chain_stamps
+            .retain(|id, _| *id == c.id || open.contains(id.as_str()));
+        let st = self.chain_stamps.get(&c.id).copied().unwrap_or_default();
+        let members = c.member_ids();
+        let surface_for = |m: &str, need_id: bool| -> bool {
+            raise && triggers.contains(m) && (need_id || !st.raised)
+        };
+
+        // The anchor first, so a member's reference never lands before the
+        // record it refers to.
+        let anchor_new = !members.iter().take(st.stamped).any(|m| *m == c.id);
+        let mut u = UpdateLine::new(&c.id).set("chain", value);
+        if anchor_new {
+            u = u.set("chain_id", Value::from(c.id.as_str()));
+        }
+        if surface_for(&c.id, anchor_new) {
+            u = u.set("surface", Value::from("alerts"));
+        }
+        if let Err(e) = self.store.append_update(&u) {
+            log::error!("alerts.jsonl: {}", e);
+            return;
+        }
+        for (i, member) in members.iter().enumerate() {
+            if *member == c.id {
+                continue;
+            }
+            let need_id = i >= st.stamped;
+            let need_surface = surface_for(member, need_id);
+            if !need_id && !need_surface {
+                continue;
+            }
+            let mut u = UpdateLine::new(member);
+            if need_id {
+                u = u.set("chain_id", Value::from(c.id.as_str()));
+            }
+            if need_surface {
                 u = u.set("surface", Value::from("alerts"));
             }
             if let Err(e) = self.store.append_update(&u) {
+                // Left unstamped, so the next growth writes it again.
                 log::error!("alerts.jsonl: {}", e);
                 return;
             }
         }
+        self.chain_stamps.insert(
+            c.id.clone(),
+            ChainStamp {
+                stamped: members.len(),
+                raised: st.raised || raise,
+            },
+        );
     }
 
     /// Which of the four rarity tuples this finding is about. An alert with no
@@ -6653,6 +6719,176 @@ mod tests {
         let st = d.status();
         assert_eq!(st["chains_formed"], 1);
         assert_eq!(st["chains_open"], 1);
+    }
+
+    /// A chain over `ids`, anchored on the first, as the correlator would
+    /// hand it to `publish_chain` after `ids.len()` observations.
+    fn chain_of_members(ids: &[String], severity: &str) -> chain::Chain {
+        let steps: Vec<chain::Step> = ids
+            .iter()
+            .take(chain::MAX_STEPS)
+            .map(|m| chain::Step {
+                alert: m.clone(),
+                ts: "2026-09-10T10:00:00Z".into(),
+                family: "cred".into(),
+                rule: "moat-cred-registry-token-read".into(),
+                severity: "medium".into(),
+                title: "Registry token read by an unexpected program".into(),
+                pid: 41233,
+                exe: "/usr/bin/node".into(),
+                role: "trigger".into(),
+            })
+            .collect();
+        chain::Chain {
+            v: 1,
+            id: ids[0].clone(),
+            ancestor: crate::alert::Ancestor { pid: 41201, exe: "/usr/bin/makepkg".into() },
+            families: vec!["cred".into(), "net".into()],
+            severity: severity.into(),
+            severity_base: "medium".into(),
+            severity_reason: "medium -> high: a credential was read and the same process tree then connected out".into(),
+            first_ts: "2026-09-10T10:00:00Z".into(),
+            last_ts: "2026-09-10T10:00:01Z".into(),
+            span_secs: 1,
+            steps,
+            steps_total: ids.len(),
+            truncated: ids.len() > chain::MAX_STEPS,
+            members: ids.to_vec(),
+            triggers_total: ids.len(),
+            summary: "4 things happened in 1 second under makepkg".into(),
+        }
+    }
+
+    /// The store's largest known defect, measured. Every growth of a chain
+    /// used to append the WHOLE chain to EVERY member, so a chain of N steps
+    /// wrote O(N^2) chain copies: the 488-step `makepkg` chain of 2026-09-10
+    /// wrote ~48 MB on its final growth alone and rotated the store ten times
+    /// in eleven minutes.
+    ///
+    /// The budget asserted here is the design: one chain record per growth,
+    /// on the anchor, plus one small line per member, once. And the reason the
+    /// naive fix was reverted is asserted too: after the last growth every
+    /// member -- the one that joined first most of all -- sees all N siblings,
+    /// on the fold the daemon holds and on one rebuilt from disk.
+    #[test]
+    fn a_chain_growth_writes_the_chain_once_not_once_per_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, cfg) = dev_daemon(dir.path());
+        // Unbounded, so rotation cannot hide what was written: under the old
+        // loop this chain wrote past 20 MB many times over.
+        d.store = AlertStore::open(
+            &cfg.paths.alerts(),
+            &cfg.paths.alerts_rotated(),
+            u64::MAX,
+            u64::MAX,
+            usize::MAX,
+            &cfg.group,
+        )
+        .unwrap();
+        const N: usize = 488;
+        let ids: Vec<String> = (0..N).map(|i| format!("01MAKEPKG{:017}", i)).collect();
+        for id in &ids {
+            let mut a = crate::alert::tests_support::demo_alert(id);
+            a.severity = "medium".into();
+            a.surface = "timeline".into();
+            d.store.append_alert(&a).unwrap();
+        }
+        let path = d.store.path().to_path_buf();
+        let size = || std::fs::metadata(&path).unwrap().len();
+        let before = size();
+
+        let mut chain_bytes = 0u64;
+        let mut unique = 0u64;
+        for k in 1..=N {
+            let c = chain_of_members(&ids[..k], "high");
+            let value = serde_json::to_value(&c).unwrap();
+            unique = serde_json::to_string(&c).unwrap().len() as u64;
+            chain_bytes += serde_json::to_string(&UpdateLine::new(&c.id).set("chain", value.clone())).unwrap().len() as u64 + 1;
+            let triggers: std::collections::HashSet<&str> = c.steps.iter().map(|s| s.alert.as_str()).collect();
+            d.write_chain(&c, value, true, &triggers);
+        }
+        let appended = size() - before;
+        eprintln!(
+            "CHAIN WRITE: {} growths to {} members appended {} bytes; the final chain is {} bytes; \
+             one copy per growth would be {} bytes",
+            N, N, appended, unique, chain_bytes
+        );
+        // One chain record per growth plus one short line per member: the
+        // members' lines are `{"v":1,"id":<26>,"update":{"chain_id":<26>,"surface":"alerts"}}`.
+        assert!(
+            appended <= chain_bytes + (N as u64) * 128,
+            "appended {} bytes against a budget of {} + {}: the chain is being written per member",
+            appended,
+            chain_bytes,
+            N * 128
+        );
+
+        // The invariant every reader relies on, on the daemon's own fold.
+        for id in &ids {
+            let a = d.store.find(id).unwrap();
+            let c = a.chain.as_ref().unwrap_or_else(|| panic!("{} has no chain", id));
+            assert_eq!(c.member_ids().len(), N, "{} holds an earlier snapshot", id);
+            assert_eq!(c.id, ids[0]);
+        }
+        // ... and on a fold rebuilt from disk by another reader.
+        let fresh = AlertStore::open(
+            &cfg.paths.alerts(),
+            &cfg.paths.alerts_rotated(),
+            u64::MAX,
+            u64::MAX,
+            usize::MAX,
+            "moat",
+        )
+        .unwrap();
+        for id in &ids {
+            let c = fresh.find(id).unwrap().chain.expect("chain on refold");
+            assert_eq!(c.member_ids().len(), N, "{} lost siblings on refold", id);
+        }
+        // A growth that adds nobody and moves nothing writes one line.
+        let c = chain_of_members(&ids, "high");
+        let triggers: std::collections::HashSet<&str> = c.steps.iter().map(|s| s.alert.as_str()).collect();
+        let lines = std::fs::read_to_string(&path).unwrap().lines().count();
+        d.write_chain(&c, serde_json::to_value(&c).unwrap(), true, &triggers);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), lines + 1);
+    }
+
+    /// The trigger members are restamped onto the badge the moment the chain
+    /// reaches `high`, once, not on every growth after -- and a member that
+    /// joins after that is stamped when it joins.
+    #[test]
+    fn a_chain_reaching_high_restamps_its_triggers_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        let ids: Vec<String> = (0..4).map(|i| format!("01SURFACE{:017}", i)).collect();
+        for id in &ids {
+            let mut a = crate::alert::tests_support::demo_alert(id);
+            a.severity = "medium".into();
+            a.surface = "timeline".into();
+            d.store.append_alert(&a).unwrap();
+        }
+        let path = d.store.path().to_path_buf();
+        let lines = || std::fs::read_to_string(&path).unwrap().lines().count();
+        let publish = |d: &mut Daemon, k: usize, sev: &str| {
+            let c = chain_of_members(&ids[..k], sev);
+            let raise = crate::alert::severity_rank(sev) >= crate::alert::severity_rank("high");
+            let triggers: std::collections::HashSet<&str> = c.steps.iter().map(|s| s.alert.as_str()).collect();
+            d.write_chain(&c, serde_json::to_value(&c).unwrap(), raise, &triggers);
+        };
+        publish(&mut d, 2, "medium");
+        assert_eq!(d.store.find(&ids[1]).unwrap().surface, "timeline");
+        let n = lines();
+        publish(&mut d, 3, "high");
+        // Anchor (chain + surface), member 1 (surface), member 2 (chain_id + surface).
+        assert_eq!(lines(), n + 3);
+        for id in &ids[..3] {
+            assert_eq!(d.store.find(id).unwrap().surface, "alerts", "{}", id);
+        }
+        let n = lines();
+        publish(&mut d, 4, "high");
+        // Anchor, and the newcomer. Nobody else is touched.
+        assert_eq!(lines(), n + 2);
+        assert_eq!(d.store.find(&ids[3]).unwrap().surface, "alerts");
+        assert_eq!(d.store.find(&ids[3]).unwrap().chain.unwrap().member_ids().len(), 4);
     }
 
     /// Regression for the 2026-09-04 20:41 miss, driven through `emit` because

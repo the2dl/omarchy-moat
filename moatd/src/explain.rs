@@ -344,6 +344,7 @@ pub fn build_alert(f: &Finding, id: &str, ts: &str, allowlist_file: &str, allowl
         // yet; the chain arrives as an update line on this id when it does
         // (CONTRACT §4, design 2b).
         chain: None,
+        chain_id: None,
         // Content analysis only ever runs on a file a chain implicated, which
         // needs a chain, which needs a second event (`content.rs`).
         content: Vec::new(),

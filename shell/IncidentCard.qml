@@ -112,6 +112,16 @@ Rectangle {
         return String(root.head.process ? root.head.process.exe || "" : "");
     }
 
+    // The feed sends `explain` as `{why}` alone; the rest of the block is
+    // fetched when a card shows the alert. Every poll rebuilds the incident,
+    // so this also re-asks after a fold moved the count -- and it is a no-op
+    // once the block is held (Service caches it by id and count).
+    onHeadChanged: {
+        if (root.service && root.head && typeof root.service.loadExplain === "function")
+            root.service.loadExplain(root.head.id);
+
+    }
+
     onIncidentChanged: {
         var key = root.incident ? String(root.incident.key) : "";
         if (key === root._openFor)

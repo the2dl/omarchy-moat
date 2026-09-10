@@ -226,6 +226,21 @@ pub struct Alert {
     /// event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<crate::chain::Chain>,
+    /// The chain this alert is a step of, by id -- and a chain's `id` IS its
+    /// first step's alert id, so this names the ANCHOR: the one member whose
+    /// record carries the chain in full on disk.
+    ///
+    /// The whole chain used to be appended to every member on every growth,
+    /// which is quadratic: a 488-step chain from one `makepkg` run (2026-09-10)
+    /// wrote about 48 MB on its final step alone and rotated the store ten
+    /// times in eleven minutes. Now the chain is written once, against the
+    /// anchor, and every other member gets this. `Store` rehydrates at fold
+    /// time, so a reader still finds the whole chain on every member; the
+    /// "every member carries the whole chain" promise above is kept at read
+    /// time rather than write time. Records written before this field existed
+    /// still carry the chain inline and fold exactly as they did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<String>,
     /// What is actually *in* the files this alert implicated (`content.rs`).
     ///
     /// Empty on almost every alert: content analysis only runs when a chain
@@ -257,6 +272,12 @@ fn default_tier() -> String {
 impl Alert {
     pub fn severity_rank(&self) -> u8 {
         severity_rank(&self.severity)
+    }
+
+    /// Is this the alert whose record carries its chain on disk? The anchor is
+    /// the chain's first step, so the chain's id is this alert's id.
+    pub fn is_chain_anchor(&self) -> bool {
+        self.chain.as_ref().is_some_and(|c| c.id == self.id)
     }
 
     /// Suppressed alerts are recorded but never notified and never counted
@@ -435,6 +456,10 @@ pub fn fold(alert: &mut Alert, update: &Map<String, Value>) {
                     alert.chain = Some(c);
                 }
             }
+            // Membership by reference; the store fills `chain` in from the
+            // anchor (`store::Cache::hydrate`).
+            ("chain_id", Value::String(s)) => alert.chain_id = Some(s.clone()),
+            ("chain_id", Value::Null) => alert.chain_id = None,
             // Content analysis arrives after the fact, like `incident`. Folding
             // it also folds its one-line summaries into `explain.evidence`,
             // which is what every reader — the panel, `moatctl show`, the
@@ -558,6 +583,7 @@ pub mod tests_support {
             triage: None,
             incident: None,
             chain: None,
+            chain_id: None,
             content: Vec::new(),
             carried: None,
             exec_id: "abc".into(),
@@ -716,6 +742,48 @@ mod tests {
         // Garbage must not blank a story already recorded.
         fold(&mut a, &UpdateLine::new(&id).set("chain", Value::from(7)).update);
         assert!(a.chain.is_some(), "a malformed chain must be ignored, not applied");
+    }
+
+    /// The member's half of the chain record: a reference to the anchor,
+    /// absent by default, folded from an update line, kept on the full record.
+    #[test]
+    fn a_chain_id_folds_in_and_round_trips() {
+        let mut a = demo();
+        assert!(a.chain_id.is_none());
+        assert!(!serde_json::to_string(&a).unwrap().contains("chain_id"));
+        assert!(!a.is_chain_anchor());
+        let id = a.id.clone();
+        fold(&mut a, &UpdateLine::new(&id).set("chain_id", Value::from("01A")).update);
+        assert_eq!(a.chain_id.as_deref(), Some("01A"));
+        assert!(a.chain.is_none(), "a reference is not the chain itself");
+        let line = serde_json::to_string(&a).unwrap();
+        match parse_record(&line).unwrap() {
+            Record::Full(b) => assert_eq!(b.chain_id.as_deref(), Some("01A")),
+            _ => panic!("should parse as a full alert"),
+        }
+        // Garbage is ignored; null is the explicit undo.
+        fold(&mut a, &UpdateLine::new(&id).set("chain_id", Value::from(7)).update);
+        assert_eq!(a.chain_id.as_deref(), Some("01A"));
+        fold(&mut a, &UpdateLine::new(&id).set("chain_id", Value::Null).update);
+        assert!(a.chain_id.is_none());
+    }
+
+    #[test]
+    fn the_anchor_is_the_member_whose_id_is_the_chains() {
+        let mut a = demo();
+        let mut c: crate::chain::Chain = serde_json::from_value(serde_json::json!({
+            "v": 1, "id": a.id,
+            "ancestor": {"pid": 1, "exe": "/usr/bin/npm"},
+            "families": ["cred"], "severity": "high", "severity_base": "high",
+            "severity_reason": "r", "first_ts": "t", "last_ts": "t", "span_secs": 1,
+            "steps": [], "steps_total": 0, "truncated": false, "summary": "s",
+        }))
+        .unwrap();
+        a.chain = Some(c.clone());
+        assert!(a.is_chain_anchor());
+        c.id = "01SOMEONEELSE".into();
+        a.chain = Some(c);
+        assert!(!a.is_chain_anchor());
     }
 
     #[test]

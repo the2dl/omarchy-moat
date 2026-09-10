@@ -446,6 +446,27 @@ fn cmd_feed(d: &Daemon, req: &Value) -> Value {
                     }
                 }
             }
+            // `explain` is the CARD's text: what happened, the evidence lines,
+            // the ignore options with their TOML, what to do next. No list row
+            // draws any of it, and on 2026-09-10 it was 4.44 MB of a 9.43 MB
+            // feed across 1273 alerts (~3.5 KB each), re-parsed on the panel's
+            // UI thread every poll. Only `why` stays inline: the blocked card at
+            // the top of Now prints it before anyone clicks, and it is 3% of
+            // the block. The rest is marked elided and the panel fetches the
+            // whole block with `explain <id>` when a card opens. The STORED
+            // record is untouched; this is what the feed sends, nothing else.
+            let elided = match obj.get_mut("explain").and_then(Value::as_object_mut) {
+                Some(explain) => {
+                    let why = explain.remove("why").unwrap_or_else(|| Value::String(String::new()));
+                    explain.clear();
+                    explain.insert("why".into(), why);
+                    true
+                }
+                None => false,
+            };
+            if elided {
+                obj.insert("explain_elided".into(), Value::Bool(true));
+            }
         }
         wire.push(v);
     }
@@ -4851,6 +4872,46 @@ mod tests {
                 id
             );
         }
+    }
+
+    /// The feed carries `explain.why` and nothing else of the block, and says
+    /// so. On 2026-09-10 the full block was 4.44 MB of a 9.43 MB feed and no
+    /// list row rendered a byte of it; the card fetches it by id instead. The
+    /// stored record keeps everything -- only the wire shape changes.
+    #[test]
+    fn feed_elides_the_explain_body_and_keeps_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+
+        let r = cmd_feed(&d, &json!({"limit": 500}));
+        let alerts = r["alerts"].as_array().unwrap();
+        assert!(!alerts.is_empty(), "the sample log produces alerts");
+
+        let mut with_body = 0usize;
+        for a in alerts {
+            let id = a["id"].as_str().unwrap();
+            assert_eq!(a["explain_elided"], true, "{} is not marked elided", id);
+            let explain = a["explain"].as_object().expect("explain stays an object");
+            let keys: Vec<&String> = explain.keys().collect();
+            assert_eq!(keys, vec!["why"], "{} carries more than `why`: {:?}", id, keys);
+
+            // The record on disk is intact, and `explain <id>` still serves all
+            // of it: the panel's fetch has something to fetch.
+            let stored = d.find_alert(id).unwrap();
+            assert_eq!(a["explain"]["why"], stored.explain.why, "{} `why` must match the store", id);
+            let full = dispatch(&mut d, &json!({"cmd":"explain","id":id}));
+            assert_eq!(full["ok"], true);
+            assert_eq!(full["alert"].get("explain_elided"), None, "explain <id> is never elided");
+            if !stored.explain.evidence.is_empty() {
+                with_body += 1;
+                assert!(
+                    !full["alert"]["explain"]["evidence"].as_array().unwrap().is_empty(),
+                    "{}: the fetch must return the evidence the feed left out",
+                    id
+                );
+            }
+        }
+        assert!(with_body > 0, "the fixture must have an explain body to elide, or this proves nothing");
     }
 
     /// R0: the feed window is `protected ∪ tail(limit)`, so a burst of trivial

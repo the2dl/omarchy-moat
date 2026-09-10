@@ -292,6 +292,15 @@ Item {
     // touching anything else the sensor recorded.
     property string _explainId: ""
     property string _explainOutput: ""
+    // The feed sends `explain` as `{why}` alone (`explain_elided`), and the
+    // whole block is fetched here when a card opens. Fetched blocks are kept by
+    // alert id with the alert's count, and `_apply` puts them back on each
+    // poll's fresh alert objects -- so opening the same card twice is one round
+    // trip, and a fold onto the alert (count moves) asks again. One `explain`
+    // process runs at a time; the ids behind it wait their turn.
+    property var _explainCache: ({
+    })
+    property var _explainQueue: []
     // The agent name from `omarchy default agent`, read once at service start.
     // "" means no default is set, and the panel shows the hint instead of a
     // button rather than launching something the user never chose.
@@ -378,6 +387,10 @@ Item {
     /// Shared by both paths, so they cannot drift in how a result is applied.
     function _apply(result) {
         result = Model.rehydrateChains(result);
+        // Same shape as the chains: the feed left the explain blocks out, and
+        // the ones already fetched go back on. A hash lookup per alert, no
+        // parsing -- this is the hot path.
+        result = Model.rehydrateExplains(result, root._explainCache);
 
         // Identity guards, not micro-optimisation. FileView fires onFileChanged
         // more than once per append, and a re-read that folded nothing new hands
@@ -956,16 +969,46 @@ Item {
     }
 
     function loadExplain(id) {
-        if (!root.available || explainProc.running)
+        if (!root.available)
             return ;
 
-        var alert = root.alertById(id);
-        if (!alert || Model.hasExplain(alert))
+        var key = String(id || "");
+        var alert = root.alertById(key);
+        if (!alert || !Model.needsExplain(alert))
             return ;
 
+        // Asked once per count. Cards re-ask on every poll, so a fetch that
+        // failed for THIS count (the row rotated out from under the feed) would
+        // otherwise spawn a process a second until the alert changed.
+        var kept = root._explainCache[key];
+        if (kept && kept.explain === null && kept.count === Model.alertCount(alert))
+            return ;
+
+        if (explainProc.running) {
+            if (key !== root._explainId && root._explainQueue.indexOf(key) === -1)
+                root._explainQueue.push(key);
+
+            return ;
+        }
+        root._startExplain(key);
+    }
+
+    function _startExplain(id) {
         root._explainId = String(id);
         explainProc.command = [root.ctlPath, "explain", root._explainId, "--json"];
         explainProc.running = true;
+    }
+
+    /// The next id that still needs its block, once the running fetch is done.
+    function _nextExplain() {
+        while (root._explainQueue.length > 0) {
+            var key = root._explainQueue.shift();
+            var alert = root.alertById(key);
+            if (alert && Model.needsExplain(alert)) {
+                root._startExplain(key);
+                return ;
+            }
+        }
     }
 
     function _setAnalyze(state, message) {
@@ -1644,18 +1687,20 @@ Item {
         onExited: function(exitCode) {
             var stdout = String(explainStdout.text || root._explainOutput || "").trim();
             root._explainOutput = "";
-            if (exitCode !== 0 || !stdout)
-                return ;
-
             var alert = root.alertById(root._explainId);
-            if (!alert)
-                return ;
-
-            Model.mergeExplainResponse(alert, stdout);
-            // alerts is a plain array; reassigning it is what re-evaluates the
-            // panel's bindings on the alert we just filled in.
-            root.alerts = root.alerts.slice();
-            root.alertsUpdated();
+            if (alert && exitCode === 0 && stdout) {
+                Model.mergeExplainResponse(alert, stdout, root._explainCache);
+                // alerts is a plain array; reassigning it is what re-evaluates the
+                // panel's bindings on the alert we just filled in.
+                root.alerts = root.alerts.slice();
+                root.alertsUpdated();
+            } else if (alert) {
+                root._explainCache[root._explainId] = {
+                    "count": Model.alertCount(alert),
+                    "explain": null
+                };
+            }
+            root._nextExplain();
         }
 
         stdout: StdioCollector {

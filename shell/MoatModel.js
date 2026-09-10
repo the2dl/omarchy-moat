@@ -644,8 +644,62 @@ function normalizeExplain(value) {
 function hasExplain(alert) {
   var e = alert && alert.explain ? alert.explain : null
   if (!e) return false
-  return !!(e.what || e.why || e.evidence.length || e.expected ||
-            e.if_expected.options.length || e.next.length)
+  // Guarded reads: a feed alert is the daemon's JSON as sent, not a
+  // normalizeAlert() result, and the feed now sends `explain` as `{why}` alone.
+  var options = e.if_expected && Array.isArray(e.if_expected.options) ? e.if_expected.options : []
+  return !!(e.what || e.why || (Array.isArray(e.evidence) && e.evidence.length) || e.expected ||
+            options.length || (Array.isArray(e.next) && e.next.length))
+}
+
+// ----------------------------------------------------- explain on demand
+//
+// `explain` is the card's text and the list never draws it, so `cmd_feed`
+// sends `explain: {why}` with `explain_elided: true` and the panel fetches the
+// whole block (`explain <id>`) when a card opens. On 2026-09-10 the inline
+// block was 4.44 MB of a 9.43 MB feed, ~3.5 KB on each of 1273 alerts,
+// re-parsed on the UI thread every poll for text nobody was looking at.
+//
+// A fetched block is remembered per alert id WITH the alert's `count`, and put
+// back on the fresh alert object every poll (`rehydrateExplains`), the way
+// `rehydrateChains` puts shared chains back. A fold onto the alert bumps
+// `count` and can change the evidence lines, so a cached block for another
+// count is not reused: the card asks again.
+//
+// An older daemon that still inlines the whole block never sets the flag, and
+// nothing here touches its alerts -- `needsExplain` is false for them unless
+// the record predates the explain block entirely, which is the repair path
+// `loadExplain` has always had.
+
+/// Does this alert's card need the daemon's `explain <id>` before it can show
+/// the whole block?
+function needsExplain(alert) {
+  if (!alert) return false
+  if (alert.explain_elided === true) return true
+  return !hasExplain(alert)
+}
+
+/// Put remembered explain blocks back on the alerts that were sent without
+/// one. Same count only: a block fetched for an alert that has since folded
+/// another event is left for the card to re-request.
+function rehydrateExplains(result, cache) {
+  if (!result || !cache || !Array.isArray(result.alerts))
+    return result
+
+  for (var i = 0; i < result.alerts.length; i++) {
+    var a = result.alerts[i]
+    if (!a || a.explain_elided !== true) continue
+    var kept = cache[String(a.id || "")]
+    // `explain: null` is a fetch that failed for this count: nothing to put back.
+    if (!kept || !kept.explain || kept.count !== alertCount(a)) continue
+    a.explain = kept.explain
+    a.explain_elided = false
+  }
+  return result
+}
+
+function alertCount(alert) {
+  var n = Number(alert && alert.count)
+  return isNaN(n) || n < 1 ? 1 : n
 }
 
 // The IF THIS IS EXPECTED buttons, recommended scope first (CONTRACT 7), each
@@ -3183,7 +3237,12 @@ function allowlistSections(rules) {
 // for the case where the log line was written by an older moatd (or
 // truncated). Merge only the explain block: the rest of the alert on disk is
 // what the sensor saw and stays authoritative.
-function mergeExplainResponse(alert, raw) {
+//
+// With `cache` given, the block is also remembered under the alert's id and
+// count for `rehydrateExplains`. The response's own `count` wins when it has
+// one: the daemon may have folded another event between the feed poll and
+// this fetch, and the next poll's alert carries that count.
+function mergeExplainResponse(alert, raw, cache) {
   if (!alert) return null
   var value = raw
   if (typeof raw === "string") {
@@ -3193,6 +3252,11 @@ function mergeExplainResponse(alert, raw) {
   var source = v.explain ? v.explain : (v.alert && v.alert.explain ? v.alert.explain : null)
   if (!source) return alert
   alert.explain = normalizeExplain(source)
+  alert.explain_elided = false
+  if (cache && alert.id) {
+    var count = v.alert && v.alert.count !== undefined ? alertCount(v.alert) : alertCount(alert)
+    cache[String(alert.id)] = { count: count, explain: alert.explain }
+  }
   return alert
 }
 

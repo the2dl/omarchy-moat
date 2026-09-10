@@ -25,6 +25,16 @@ Rectangle {
     readonly property var verdict: root.head && root.head.triage ? root.head.triage : null
     readonly property bool pendingVerdict: !root.verdict && !!root.head && !!root.service && root.service.autoTriageOn === true
 
+    // The feed sends `explain` as `{why}` alone; the rest of the block is
+    // fetched when a card shows the alert. Every poll rebuilds the incident,
+    // so this also re-asks after a fold moved the count -- and it is a no-op
+    // once the block is held (Service caches it by id and count).
+    onHeadChanged: {
+        if (root.service && root.head && typeof root.service.loadExplain === "function")
+            root.service.loadExplain(root.head.id);
+
+    }
+
     /// Allow exactly what was stopped, at the narrow scope this card promises.
     signal allowRequested(string id, string scope)
     /// Stop enforcing THE RULE THAT DID THIS -- not everything.

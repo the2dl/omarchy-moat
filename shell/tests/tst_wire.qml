@@ -960,4 +960,114 @@ TestCase {
     compare(Model.rehydrateChains({}).alerts, undefined)
   }
 
+  // --- explain on demand ---------------------------------------------------
+  //
+  // The list never draws `explain`, and it was 4.44 MB of a 9.43 MB feed
+  // (~3.5 KB on each of 1273 alerts). The daemon now sends `{why}` with
+  // `explain_elided`; the card fetches the block by id; the panel keeps it by
+  // id and count so the next poll's fresh alert object gets it back.
+
+  function elidedFeed(count) {
+    return { ok: true, alerts: [
+      { id: "01M1ME4KXMXWCDBX4X95MYS51V", rule: "moat-x", severity: "high", count: count,
+        summary: "s", process: { exe: "/usr/bin/x" }, actions: [],
+        explain: { why: "the why line" }, explain_elided: true }
+    ], receipts: [] }
+  }
+
+  function test_an_elided_explain_keeps_why_and_asks_for_the_rest() {
+    var result = Model.ingestFeed(Model.createStore(), elidedFeed(1), {})
+    var a = result.alerts[0]
+    compare(a.explain.why, "the why line", "the blocked card prints `why` before any fetch")
+    // `{why}` alone must not trip the readers that used to assume the full shape.
+    compare(Model.hasExplain(a), true)
+    compare(Model.ignoreOptions(a).length, 0)
+    compare(Model.otherOptions(a).length, 0)
+    verify(Model.alertAsText(a).indexOf("the why line") > 0)
+    verify(Model.needsExplain(a), "an elided block is fetched, not trusted")
+  }
+
+  function test_a_fetched_explain_comes_back_on_the_next_poll_for_the_same_count() {
+    var cache = {}
+    var first = Model.ingestFeed(Model.createStore(), elidedFeed(2), {}).alerts[0]
+    Model.mergeExplainResponse(first, suite.explainRaw, cache)
+    verify(!Model.needsExplain(first), "the fetched block satisfies the card")
+    verify(first.explain.evidence.length >= 3)
+
+    // The next poll hands over a NEW object for the same alert, still elided.
+    var next = Model.ingestFeed(Model.createStore(), elidedFeed(2), {})
+    verify(Model.needsExplain(next.alerts[0]), "fresh from the wire it is elided")
+    Model.rehydrateExplains(next, cache)
+    var a = next.alerts[0]
+    verify(!Model.needsExplain(a), "same id, same count: one round trip, not two")
+    compare(a.explain_elided, false)
+    verify(a.explain === first.explain, "the SAME block, not a copy")
+    verify(a.explain.evidence.length >= 3)
+  }
+
+  function test_a_fold_that_moved_the_count_asks_again() {
+    var cache = {}
+    var first = Model.ingestFeed(Model.createStore(), elidedFeed(2), {}).alerts[0]
+    Model.mergeExplainResponse(first, suite.explainRaw, cache)
+
+    var next = Model.ingestFeed(Model.createStore(), elidedFeed(3), {})
+    Model.rehydrateExplains(next, cache)
+    var a = next.alerts[0]
+    verify(Model.needsExplain(a), "count 2 -> 3: the evidence may have changed, fetch it")
+    compare(a.explain_elided, true)
+    compare(a.explain.why, "the why line", "`why` is still there meanwhile")
+  }
+
+  function test_the_response_count_is_what_the_cache_keys_on() {
+    // The daemon folded one more event between the poll (count 1) and the
+    // fetch: the response says 2, so the poll that carries 2 must hit.
+    var cache = {}
+    var stale = Model.ingestFeed(Model.createStore(), elidedFeed(1), {}).alerts[0]
+    var response = JSON.parse(suite.explainRaw)
+    response.alert.count = 2
+    Model.mergeExplainResponse(stale, JSON.stringify(response), cache)
+    verify(!Model.needsExplain(stale), "the alert on screen is filled in either way")
+
+    var next = Model.ingestFeed(Model.createStore(), elidedFeed(2), {})
+    Model.rehydrateExplains(next, cache)
+    var a = next.alerts[0]
+    compare(a.explain_elided, false, "keyed on the response's count")
+    verify(a.explain === stale.explain, "the block the fetch brought, on the count-2 alert")
+    verify(a.explain.evidence.length >= 3)
+  }
+
+  function test_an_older_daemon_that_inlines_explain_is_left_alone() {
+    var full = JSON.parse(suite.explainRaw).alert
+    full.count = 1
+    var result = Model.ingestFeed(Model.createStore(), { ok: true, alerts: [full], receipts: [] }, {})
+    var a = result.alerts[0]
+    verify(!Model.needsExplain(a), "no flag and a full block: nothing to fetch")
+    // A cache entry for another count must not clobber what the daemon sent.
+    var cache = {}
+    cache[a.id] = { count: 7, explain: { why: "wrong" } }
+    Model.rehydrateExplains(result, cache)
+    verify(a.explain.evidence.length >= 3, "the inline block survives rehydration")
+    compare(Model.rehydrateExplains(null, cache), null)
+    compare(Model.rehydrateExplains({}, cache).alerts, undefined)
+    compare(Model.rehydrateExplains(result, null), result)
+  }
+
+  function test_a_failed_fetch_is_remembered_but_puts_nothing_back() {
+    var cache = {}
+    cache["01M1ME4KXMXWCDBX4X95MYS51V"] = { count: 2, explain: null }
+    var next = Model.ingestFeed(Model.createStore(), elidedFeed(2), {})
+    Model.rehydrateExplains(next, cache)
+    compare(next.alerts[0].explain_elided, true, "a failure memo is not a block")
+    compare(next.alerts[0].explain.why, "the why line")
+  }
+
+  // The repair path that predates elision: a record with no explain at all.
+  function test_a_record_with_no_explain_block_is_still_fetched() {
+    var result = Model.ingestFeed(Model.createStore(), { ok: true, alerts: [
+      { id: "01OLD", rule: "moat-x", count: 1, process: {}, actions: [] }
+    ], receipts: [] }, {})
+    verify(Model.needsExplain(result.alerts[0]))
+    verify(!Model.needsExplain(null))
+  }
+
 }
