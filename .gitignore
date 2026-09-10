@@ -6,5 +6,10 @@ pkg/*.tar.gz
 __pycache__/
 .dev.vars
 .dev.vars.*
+# The PRIVATE half only. feed-key.pub is the pinned verification key: it has to
+# be committed and shipped at /usr/share/moat/feed-key.pub, or moat-feeds
+# refuses every artifact and the feed is inert. Ignoring it was a mistake on
+# 2026-09-09 -- a public key is public.
 feed-key
-feed-key.pub
+secrets/
+.dev.vars

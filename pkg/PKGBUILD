@@ -286,10 +286,24 @@ package() {
 	install -Dm644 "${tree}/moatd/etc/moat.toml" "${pkgdir}/etc/moat/moat.toml"
 	# feeds.toml carries no credential any more -- the package index is keyless
 	# and signed -- but it does carry the base_url and the pinned key path, so
-	# it stays root-only. When the aggregator is deployed, its public key is
-	# installed here too, at /usr/share/moat/feed-key.pub, and until it exists
-	# moat-feeds refuses to apply anything (see docs/PACKAGE-FEED.md).
+	# it stays root-only.
 	install -Dm600 "${tree}/moatd/etc/feeds.toml"    "${pkgdir}/etc/moat/feeds.toml"
+
+	# The pinned feed verification key, world-readable because it is public and
+	# moat-feeds may run as any user that can read the config.
+	#
+	# Conditional on purpose: until the aggregator is deployed there is no
+	# keypair, and a hard failure here would mean moat could not be built at all
+	# before its feed exists. The consequence of it being absent is already the
+	# right one -- `require_signature = true` makes moat-feeds refuse every
+	# artifact and say so -- so an inert feed is the failure mode, not a broken
+	# package. Once secrets/ holds a key, copy the .pub to moatd/etc/ and commit
+	# it; the private half never leaves the aggregator.
+	if [[ -f ${tree}/moatd/etc/feed-key.pub ]]; then
+		install -Dm644 "${tree}/moatd/etc/feed-key.pub" "${pkgdir}/usr/share/moat/feed-key.pub"
+	else
+		echo "==> NOTE: no moatd/etc/feed-key.pub; the package feed will be inert" >&2
+	fi
 	install -Dm644 "${tree}/moatd/etc/allowlist.d/default.toml" \
 		"${pkgdir}/etc/moat/allowlist.d/default.toml"
 	# The shipped baseline (LEARNING section 8): reviewed once by a human,
