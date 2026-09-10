@@ -20,6 +20,15 @@
 # pulled back from the API, not just the local source), and propagation delay
 # (the last two boundaries had no deploy within 40 minutes).
 #
+# Then a control ruled out this Worker entirely. A throwaway Worker `cron-probe`
+# -- no bindings, no routes, no R2, a `scheduled()` that only console.logs, cron
+# `* * * * *` -- was deployed at 15:41:27Z and had run zero times by 15:51Z, ten
+# boundaries later. Analytics was reporting fine over the same window (it showed
+# every one of moat's own pointer fetches). So automatic dispatch is broken for
+# the account, not misconfigured for moat-feed-aggregator, and nothing in this
+# repository can fix it. That makes it a Cloudflare support ticket, and this
+# workflow the answer in the meantime rather than a stopgap.
+#
 # GitHub's cron is not punctual either -- it can drift five to fifteen minutes
 # under load, and skips runs on a repository that has been idle for 60 days.
 # Neither matters much: upstream (OSSF, DataDog) only moves every hour or two,
