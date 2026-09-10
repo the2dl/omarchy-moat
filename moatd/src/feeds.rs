@@ -33,6 +33,18 @@ use serde::{Deserialize, Serialize};
 /// and so the tests can point at a local fixture.
 pub const DEFAULT_BASE_URL: &str = "https://feed.runts.net";
 
+/// The placeholder that shipped before the aggregator existed. It never
+/// resolved and never will.
+///
+/// It matters because `/etc/moat/feeds.toml` is in pacman's `backup` array: an
+/// upgrade keeps the file the machine already has and writes a `.pacnew`
+/// beside it. So every machine installed before the feed went live would carry
+/// this dead name forever, `moat-feeds` would fail to resolve it on every tick,
+/// and the feed would be silently inert -- on exactly the machines that already
+/// trusted moat enough to install it. Nobody edits a config file they were
+/// never told about.
+const DEAD_PLACEHOLDER_URL: &str = "https://feed.omarchy-moat.org";
+
 /// Shipped with the package; the private half never leaves the aggregator.
 pub const DEFAULT_PUBLIC_KEY_PATH: &str = "/usr/share/moat/feed-key.pub";
 
@@ -121,11 +133,26 @@ impl Default for FeedsConfig {
 
 impl FeedsConfig {
     pub fn load(path: &Path) -> Result<FeedsConfig, String> {
-        match std::fs::read_to_string(path) {
-            Ok(t) => toml::from_str(&t).map_err(|e| format!("{}: {}", path.display(), e)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FeedsConfig::default()),
-            Err(e) => Err(format!("{}: {}", path.display(), e)),
+        let mut cfg = match std::fs::read_to_string(path) {
+            Ok(t) => toml::from_str::<FeedsConfig>(&t)
+                .map_err(|e| format!("{}: {}", path.display(), e))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => FeedsConfig::default(),
+            Err(e) => return Err(format!("{}: {}", path.display(), e)),
+        };
+        // Migrate the dead placeholder in place rather than asking anyone to
+        // edit a file. A config that names a host which has never existed is
+        // not a preference to respect -- it is the absence of one.
+        if cfg.base_url.trim().trim_end_matches('/') == DEAD_PLACEHOLDER_URL {
+            log::info!(
+                "{}: base_url was the pre-deployment placeholder ({}); using {} instead. \
+                 Merge the .pacnew to silence this.",
+                path.display(),
+                DEAD_PLACEHOLDER_URL,
+                DEFAULT_BASE_URL
+            );
+            cfg.base_url = DEFAULT_BASE_URL.to_string();
         }
+        Ok(cfg)
     }
 
     /// Names any abuse.ch-era settings still in the file. They do nothing now;
@@ -1093,6 +1120,48 @@ mod tests {
         assert!(400u64 < s.seq, "an older sequence must be refused");
         assert!(!(412u64 < s.seq), "the same sequence is not a rollback");
         assert!(!(500u64 < s.seq), "and moving forward is fine");
+    }
+
+    /// A machine that installed moat before the feed existed keeps its own
+    /// /etc/moat/feeds.toml on upgrade -- pacman writes a .pacnew and leaves the
+    /// old file in place -- so it would carry a hostname that has never resolved
+    /// and get an inert feed for ever, without being told. The bundle has to
+    /// carry the feed, not ask for it.
+    #[test]
+    fn the_pre_deployment_placeholder_migrates_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("feeds.toml");
+        std::fs::write(&p, "base_url = \"https://feed.omarchy-moat.org\"\n").unwrap();
+        let c = FeedsConfig::load(&p).unwrap();
+        assert_eq!(c.base_url, DEFAULT_BASE_URL, "the dead placeholder is replaced");
+
+        // A trailing slash is the same dead name.
+        std::fs::write(&p, "base_url = \"https://feed.omarchy-moat.org/\"\n").unwrap();
+        assert_eq!(FeedsConfig::load(&p).unwrap().base_url, DEFAULT_BASE_URL);
+    }
+
+    /// A DELIBERATE base_url is a preference and is left alone. Someone running
+    /// their own mirror must not have it overwritten by an upgrade.
+    #[test]
+    fn a_real_base_url_is_never_second_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("feeds.toml");
+        std::fs::write(&p, "base_url = \"https://mirror.example.internal\"\n").unwrap();
+        assert_eq!(
+            FeedsConfig::load(&p).unwrap().base_url,
+            "https://mirror.example.internal"
+        );
+    }
+
+    /// The shipped config names the live feed, so a fresh install needs no
+    /// edit at all -- which is the actual requirement.
+    #[test]
+    fn the_shipped_config_points_at_the_deployed_feed() {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("etc/feeds.toml");
+        let c = FeedsConfig::load(&p).expect("etc/feeds.toml must parse");
+        assert_eq!(c.base_url, DEFAULT_BASE_URL);
+        assert_eq!(c.public_key_path, DEFAULT_PUBLIC_KEY_PATH);
+        assert!(c.require_signature);
     }
 
     #[test]
