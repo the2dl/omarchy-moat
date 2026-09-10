@@ -206,6 +206,65 @@ fn is_unix_socket(root: &Path, inode: u64) -> bool {
 }
 
 /// `192.168.1.14:4444` / `[::1]:4444` -> (`192.168.1.14`, 4444).
+/// `pipe:[12345]` -> 12345. Anything else is not a pipe.
+fn pipe_inode(link: &str) -> Option<u64> {
+    link.strip_prefix("pipe:[")?.strip_suffix(']')?.parse().ok()
+}
+
+/// Every fd a process holds, not just 0/1/2.
+///
+/// Rung 3 needs this on the PARENT to find a socket that is not on its stdio
+/// and to prove it holds both ends of the shell's pipes. It is never used to
+/// decide anything on its own -- see the shape rung 3 requires.
+fn all_fd_targets(root: &Path, pid: u32) -> Option<Vec<(u32, Target)>> {
+    let dir = root.join(pid.to_string()).join("fd");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).ok()? {
+        let Ok(entry) = entry else { continue };
+        let Some(fd) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(t) = std::fs::read_link(entry.path()) else { continue };
+        let t = t.to_string_lossy().to_string();
+        let target = if let Some(inode) = t
+            .strip_prefix("socket:[")
+            .and_then(|r| r.strip_suffix(']'))
+            .and_then(|n| n.parse::<u64>().ok())
+        {
+            Target::Socket(inode)
+        } else if t.starts_with("/dev/pts/") || t == "/dev/tty" || t == "/dev/ptmx" {
+            Target::Pty(t)
+        } else {
+            Target::Other(t)
+        };
+        out.push((fd, target));
+    }
+    Some(out)
+}
+
+/// Was this shell given something to run, or is it waiting to be told?
+///
+/// `-c` and a script operand both mean "here is the work". Everything else --
+/// bare `bash`, `bash -i`, `bash -s`, `bash --noprofile --norc -s` -- means the
+/// commands arrive from stdin, which is the half of a relay that matters.
+fn waits_for_commands(args: &str) -> bool {
+    for tok in args.split_whitespace() {
+        if tok == "-c" || tok == "--command" {
+            return false;
+        }
+        // A script operand: the first non-flag word. `-s` is explicitly "read
+        // from stdin" and is a flag, not a script.
+        if !tok.starts_with('-') {
+            return false;
+        }
+        // Bundled short flags: `-ic` carries a -c.
+        if !tok.starts_with("--") && tok.contains('c') {
+            return false;
+        }
+    }
+    true
+}
+
 fn split_peer(s: &str) -> Option<(String, u16)> {
     let (host, port) = s.rsplit_once(':')?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
@@ -497,6 +556,111 @@ impl ShellStdioSocket {
         Some(f)
     }
 
+    /// Rung 3: the shell talks through PIPES to a parent that holds the socket.
+    ///
+    /// This is the shape rungs 1 and 2 cannot see, and the one that got through
+    /// on 2026-09-10: `node` with `spawn(bash, {stdio: ['pipe','pipe','pipe']})`
+    /// and `openssl s_client` relaying through a fifo. The shell's own fds are
+    /// pipes, so rung 1 finds no socket; it has no pty, so rung 2 does not
+    /// apply. The socket is on the PARENT, on some fd that is not 0/1/2.
+    ///
+    /// Rung 2 refuses to look at a parent's non-stdio fds on purpose -- "every
+    /// editor, language server and dev server holds sockets and spawns shells"
+    /// -- and that reasoning is still right. What makes this rung safe is not
+    /// looking harder, it is requiring a shape those processes do not have:
+    ///
+    /// * **Both directions.** fd 0 AND fd 1 are pipes, and the PARENT holds
+    ///   both of those same pipe inodes. That is a two-way channel between the
+    ///   shell and the thing holding the socket. `curl … | bash` -- the pattern
+    ///   this would otherwise drown in -- fails here: curl feeds the shell's
+    ///   stdin, but the shell's stdout is the terminal, so the loop is open.
+    /// * **No command.** The shell was given nothing to run: no `-c`, no script
+    ///   operand. It is waiting for instructions from that pipe. An editor or a
+    ///   build tool runs `bash -c '…'` or `bash script.sh`; a relay runs
+    ///   `bash -i` or `bash -s` or bare `bash`, because the commands are coming
+    ///   over the wire.
+    /// * **A real peer.** The parent's socket resolves to a non-loopback
+    ///   address. A language server talking to 127.0.0.1 is not this.
+    ///
+    /// All three, or nothing. Any one of them alone is ordinary.
+    fn pipe_relay(&self, exec_id: &str, ctx: &RuleCtx, targets: &[(u32, Target)]) -> Option<Finding> {
+        let pipe_of = |want: u32| -> Option<u64> {
+            targets.iter().find_map(|(fd, t)| match t {
+                Target::Other(p) if *fd == want => pipe_inode(p),
+                _ => None,
+            })
+        };
+        // Both directions, or this is a pipeline and not a channel.
+        let (in_pipe, out_pipe) = (pipe_of(0)?, pipe_of(1)?);
+
+        // A shell that was handed a command is doing a job, not waiting for one.
+        let me = ctx.table.get(exec_id)?;
+        if !waits_for_commands(&me.args) {
+            return None;
+        }
+
+        let parent = ctx.table.ancestry(exec_id).first().copied()?.clone();
+        let pfds = all_fd_targets(&self.proc_root, parent.pid)?;
+
+        // The parent must hold BOTH ends. Holding one is a pipeline stage.
+        let holds = |inode: u64| {
+            pfds.iter().any(|(_, t)| match t {
+                Target::Other(p) => pipe_inode(p) == Some(inode),
+                _ => false,
+            })
+        };
+        if !holds(in_pipe) || !holds(out_pipe) {
+            return None;
+        }
+
+        // And a socket to somewhere real. `find` prefers an fd that resolves in
+        // the process's own namespace, which is what makes this work inside a
+        // container as well as outside.
+        let sock = StdioSocket::find(&self.proc_root, parent.pid, &pfds)?;
+        let (ip, port) = sock.row.as_ref().and_then(|r| split_peer(&r.remote))?;
+        if is_loopback(&ip) {
+            return None;
+        }
+
+        let mut f = ctx.finding(ID, self.meta(), exec_id)?;
+        f.meta.severity = "critical".into();
+        f.hook = "userland: shell on pipes to a parent holding a remote socket".into();
+        f.what_override = Some(format!(
+            "{} was started with no command, reading and writing through pipes held by {} \
+             (pid {}), which has a socket open to {}:{}.",
+            basename(&f.proc.exe),
+            basename(&parent.exe),
+            parent.pid,
+            ip,
+            port
+        ));
+        f.extra_evidence = vec![
+            format!(
+                "this shell's stdin and stdout are both pipes ({}, {}), and {} (pid {}) holds \
+                 both ends -- a two-way channel, not a pipeline",
+                in_pipe, out_pipe, parent.exe, parent.pid
+            ),
+            format!(
+                "it was given no command to run ({}), so it is waiting for instructions from \
+                 that pipe",
+                if me.args.trim().is_empty() { "no arguments".to_string() } else { me.args.clone() }
+            ),
+            sock.peer_line(),
+            "all three had to hold at once: both pipe directions shared with the parent, no \
+             command, and a non-loopback peer. `curl … | bash` fails the first (its stdout is \
+             the terminal) and an editor running `bash -c` fails the second"
+                .to_string(),
+            format!("started by: {}", ctx.table.ancestry_line(exec_id)),
+        ];
+        f.net = Some(crate::alert::NetRef {
+            dst_ip: ip,
+            dst_port: port,
+            domain: None,
+        });
+        self.arm(&mut f, ctx);
+        Some(f)
+    }
+
     /// Enforcement, the way `moat-pkg-subtree-netcat-exec` does it: the rule
     /// asks, the engine verifies the pid's start time and signals.
     ///
@@ -580,7 +744,10 @@ impl UserRule for ShellStdioSocket {
         if let Some(f) = self.direct(exec_id, ctx, &targets) {
             return vec![f];
         }
-        self.pty_upgrade(exec_id, ctx, &targets).into_iter().collect()
+        if let Some(f) = self.pty_upgrade(exec_id, ctx, &targets) {
+            return vec![f];
+        }
+        self.pipe_relay(exec_id, ctx, &targets).into_iter().collect()
     }
 }
 
@@ -646,7 +813,119 @@ mod tests {
         t.observe(&proc("e-py", 5200, "/usr/bin/python3", "-c import pty", Some("e-term")));
         t.observe(&proc("e-bash2", 5201, "/usr/bin/bash", "", Some("e-py")));
         t.observe(&proc("e-curl", 5300, "/usr/bin/curl", "https://x", Some("e-term")));
+        // Rung 3: node holding a socket, with a bash on pipes under it.
+        t.observe(&proc("e-node", 5400, "/usr/bin/node", "worker.mjs", Some("e-term")));
+        t.observe(&proc("e-bash3", 5401, "/usr/bin/bash", "--noprofile --norc -s", Some("e-node")));
+        // The control it must not catch: the same node, but the shell was
+        // handed a command, which is what every build tool does.
+        t.observe(&proc("e-bash4", 5402, "/usr/bin/bash", "-c npm run build", Some("e-node")));
         t
+    }
+
+    /// Give `pid` an arbitrary set of fds under the fake root.
+    fn fds_many(dir: &Path, pid: u32, links: &[(u32, &str)]) {
+        let fd = dir.join(pid.to_string()).join("fd");
+        std::fs::create_dir_all(&fd).unwrap();
+        for (n, target) in links {
+            symlink(target, fd.join(n.to_string())).unwrap();
+        }
+    }
+
+    /// The shape that got through on 2026-09-10: node relaying between a socket
+    /// and a shell it talks to over pipes. Rung 1 sees no socket on the shell,
+    /// rung 2 sees no pty, and the connection is real.
+    #[test]
+    fn a_shell_on_pipes_to_a_parent_holding_the_socket_is_caught() {
+        let dir = tempfile::tempdir().unwrap();
+        proc_root(dir.path());
+        fds(dir.path(), 5401, "pipe:[7001]", "pipe:[7002]", "pipe:[7002]");
+        // node: both pipe ends, plus the LAN socket on a high fd.
+        fds_many(dir.path(), 5400, &[
+            (0, "/dev/pts/3"), (1, "/dev/pts/3"), (2, "/dev/pts/3"),
+            (3, "pipe:[7001]"), (4, "pipe:[7002]"), (9, "socket:[90001]"),
+        ]);
+        let t = table();
+        let out = run(dir.path(), &t, "e-bash3", "monitor");
+        assert_eq!(out.len(), 1, "the relay must be caught: {:?}", out);
+        assert_eq!(out[0].meta.severity, "critical");
+        assert!(out[0].hook.contains("pipes"), "{}", out[0].hook);
+    }
+
+    /// The reason rung 2 refuses to look at a parent's non-stdio fds: every
+    /// editor and build tool holds sockets and spawns shells. What saves rung 3
+    /// is the shell having been given a command -- so this must stay silent
+    /// even though node holds both pipes AND the same socket.
+    #[test]
+    fn a_build_tool_running_bash_dash_c_is_not_a_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        proc_root(dir.path());
+        fds(dir.path(), 5402, "pipe:[7001]", "pipe:[7002]", "pipe:[7002]");
+        fds_many(dir.path(), 5400, &[
+            (0, "/dev/pts/3"), (1, "/dev/pts/3"), (2, "/dev/pts/3"),
+            (3, "pipe:[7001]"), (4, "pipe:[7002]"), (9, "socket:[90001]"),
+        ]);
+        let t = table();
+        let out = run(dir.path(), &t, "e-bash4", "monitor");
+        assert!(out.is_empty(), "`bash -c` was handed its work: {:?}", out);
+    }
+
+    /// `curl … | bash` is the pattern this rung would otherwise drown in: curl
+    /// holds a real socket and feeds the shell's stdin. It is not a relay,
+    /// because the loop is open -- the shell's stdout is the terminal.
+    #[test]
+    fn curl_piped_into_bash_is_not_a_relay_because_the_loop_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        proc_root(dir.path());
+        // stdin is the pipe from curl; stdout is the terminal.
+        fds(dir.path(), 5401, "pipe:[7001]", "/dev/pts/3", "/dev/pts/3");
+        fds_many(dir.path(), 5400, &[
+            (0, "/dev/pts/3"), (1, "pipe:[7001]"), (2, "/dev/pts/3"),
+            (9, "socket:[90001]"),
+        ]);
+        let t = table();
+        let out = run(dir.path(), &t, "e-bash3", "monitor");
+        assert!(out.is_empty(), "one-way pipeline is not a channel: {:?}", out);
+    }
+
+    /// A language server talking to itself is the everyday case.
+    #[test]
+    fn a_loopback_peer_is_not_a_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        proc_root(dir.path());
+        fds(dir.path(), 5401, "pipe:[7001]", "pipe:[7002]", "pipe:[7002]");
+        fds_many(dir.path(), 5400, &[
+            (3, "pipe:[7001]"), (4, "pipe:[7002]"), (9, "socket:[90002]"),
+        ]);
+        let t = table();
+        let out = run(dir.path(), &t, "e-bash3", "monitor");
+        assert!(out.is_empty(), "127.0.0.1 is not a reverse shell: {:?}", out);
+    }
+
+    /// Holding one end is a pipeline stage; holding both is a channel.
+    #[test]
+    fn a_parent_holding_only_one_pipe_end_is_not_a_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        proc_root(dir.path());
+        fds(dir.path(), 5401, "pipe:[7001]", "pipe:[7002]", "pipe:[7002]");
+        fds_many(dir.path(), 5400, &[
+            (3, "pipe:[7001]"), (9, "socket:[90001]"),
+        ]);
+        let t = table();
+        let out = run(dir.path(), &t, "e-bash3", "monitor");
+        assert!(out.is_empty(), "only the inbound end is held: {:?}", out);
+    }
+
+    #[test]
+    fn a_shell_given_work_is_told_apart_from_one_waiting_for_it() {
+        assert!(waits_for_commands(""));
+        assert!(waits_for_commands("-i"));
+        assert!(waits_for_commands("-s"));
+        assert!(waits_for_commands("--noprofile --norc -s"));
+        assert!(!waits_for_commands("-c npm run build"));
+        assert!(!waits_for_commands("script.sh"));
+        assert!(!waits_for_commands("--noprofile /tmp/x.sh"));
+        // Bundled short flags still carry the -c.
+        assert!(!waits_for_commands("-ic 'id'"));
     }
 
     fn run(root: &Path, t: &ProcTable, exec_id: &str, mode: &str) -> Vec<Finding> {
