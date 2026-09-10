@@ -239,6 +239,27 @@ const ROOT_ONLY_ACTIONS: &[(&str, &str, &str)] = &[
     // has to be able to run freely: putting the blast radius behind sudo is how
     // the blast radius stops being looked at, exactly as with `baseline list`.
     ("allow", "add", "writing an allowlist rule"),
+    // Undoing a response is weakening protection, and both of these were
+    // reachable as an ordinary user: `moatctl quarantine <id> --restore` from
+    // uid 1000 answered "nothing quarantined under ..." rather than refusing,
+    // which is the gate saying yes.
+    //
+    // Restoring takes a file root put away for being malicious and writes it
+    // back where it came from -- the one place it is certain to be reachable
+    // again. tmpfiles.d holds the quarantine at 0700 root:root and says why:
+    // "nothing in the moat group should be able to read a sample back out, let
+    // alone re-execute it." This route handed the group exactly that, and
+    // unlike `contain release` it did not even record a protection change, so
+    // the sample came back with nothing on the badge to say so.
+    //
+    // It is not an arbitrary-write primitive: `original_path` comes from a
+    // meta.json inside that 0700 directory, and the sha256 is re-checked, so
+    // the caller chooses which quarantined file returns, never where it lands.
+    // That bounds the damage; it does not make it the user's decision to make.
+    ("quarantine", "restore", "putting a quarantined file back"),
+    // Releasing drops an active containment on a chain moat decided to hold.
+    // Listing stays open, like every other read here.
+    ("contain", "release", "dropping a containment"),
 ];
 
 /// `set threshold.<name> <value>` is root, in BOTH directions.
@@ -3296,6 +3317,13 @@ mod tests {
             // cannot see, and only one of the two possible mistakes is safe.
             json!({"cmd":"set","key":"threshold.ransom_churn_files","value":"200"}),
             json!({"cmd":"set","key":"threshold.ransom_churn_files","value":"3"}),
+            // Undoing a response is weakening protection too. Restoring writes
+            // a file root put away for being malicious back to the one place it
+            // is certain to be reachable again -- the exact thing the 0700
+            // quarantine exists to prevent -- and releasing drops a hold moat
+            // decided to place. Both answered an ordinary user before this.
+            json!({"cmd":"quarantine","action":"restore","id":"01X"}),
+            json!({"cmd":"contain","action":"release","id":"01X"}),
         ] {
             let r = dispatch(&mut d, &user(cmd.clone()));
             assert_eq!(r["ok"], false, "{:?} must be refused for a non-root caller", cmd);
@@ -3327,6 +3355,10 @@ mod tests {
             // person is supposed to look at BEFORE deciding -- evidence behind
             // sudo does not get read, exactly as with `baseline list`.
             json!({"cmd":"allow","action":"preview","name":"moat-cred-ssh-private-key-read"}),
+            // Seeing what is held and what is contained stays open: the gate is
+            // on undoing a response, never on reading that one happened.
+            json!({"cmd":"quarantine","action":"list"}),
+            json!({"cmd":"contain","action":"list"}),
         ] {
             assert_eq!(dispatch(&mut d, &user(cmd.clone()))["ok"], true, "{:?}", cmd);
         }
