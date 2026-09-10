@@ -106,6 +106,31 @@ expect ticks to fail with 403s at unpredictable times; the run logs say
 Raw file fetches (`raw.githubusercontent.com`) and the codeload tarball do not
 count against the API limit.
 
+## `.dev.vars` will silently sign with the wrong key
+
+`wrangler dev` reads `.dev.vars` **instead of** the deployed Worker secrets --
+including `--remote`, where everything else about the run is real. On
+2026-09-10 a leftover `.dev.vars` from local workerd testing held a throwaway
+signing key, and a tick fired that way published a live artifact signed with it.
+
+Nothing warned. The publish succeeded, the pointer advanced, R2 held a perfectly
+well-formed artifact, and every client refused it with `SIGNATURE DID NOT VERIFY`
+-- which is the system working, but the feed was broken until the next correctly
+signed publish.
+
+So: **delete `.dev.vars` before any `wrangler dev --remote` that can publish**,
+and if a publish is ever refused by clients, check which key signed it before
+looking anywhere else:
+
+```sh
+curl -s https://feed.runts.net/v1/pointer.json | jq -r .artifact | \
+  xargs -I{} sh -c 'curl -s https://feed.runts.net{} -o /tmp/a.gz; curl -s https://feed.runts.net{}.sig -o /tmp/a.sig'
+# then verify /tmp/a.gz against secrets/feed-key.pub
+```
+
+It is gitignored, so it will not follow a clone -- which is exactly why it
+survives locally and surprises you.
+
 ## Seeding sequence 1
 
 `seed/packages.txt.gz` is a pre-built `moat-packages v1` artifact (241,813
