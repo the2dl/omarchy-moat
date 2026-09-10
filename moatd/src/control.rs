@@ -3339,6 +3339,40 @@ mod tests {
         assert_eq!(r["ok"], true, "{:?}", r["error"]);
     }
 
+    /// The panel's `pkexec` list has to carry every root-gated set key.
+    ///
+    /// These are two lists in two languages that must agree, and nothing kept
+    /// them in step. When one drifts the switch still draws, still moves, and
+    /// comes back with "needs root. Run the same command with sudo." -- advice
+    /// nobody can follow from a GUI toggle. It reads as a permissions message
+    /// rather than a bug, which is how `containers` stayed broken from the day
+    /// it was added until 2026-09-10, when `canary` arrived the same way and
+    /// the two of them together made the pattern visible.
+    ///
+    /// Reading the QML rather than mirroring it in a Rust const on purpose: a
+    /// mirror is a third copy to drift.
+    #[test]
+    fn every_root_gated_switch_is_elevated_by_the_panel() {
+        let qml = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../shell/Service.qml"),
+        )
+        .expect("shell/Service.qml");
+        let line = qml
+            .lines()
+            .find(|l| l.contains("property var privilegedCommands"))
+            .expect("privilegedCommands is declared on one line");
+        for key in ROOT_ONLY_SET_KEYS {
+            assert!(
+                line.contains(&format!("\"{}\"", key)),
+                "`set {}` needs root, so the panel must run it under pkexec -- add it to \
+                 privilegedCommands in shell/Service.qml, or its switch is one a user cannot \
+                 actually operate.\n  {}",
+                key,
+                line.trim()
+            );
+        }
+    }
+
     /// Turning protection off is a root action.
     ///
     /// The socket is group-owned so a person can read their own alerts without

@@ -260,7 +260,13 @@ Item {
     // different route, so it must meet the same prompt -- and without this the
     // button would simply fail against a daemon that now refuses it.
     // `baseline-dismiss` is NOT privileged: refusing an offer weakens nothing.
-    readonly property var privilegedCommands: ["mode", "rule-mode", "contain", "kill", "sandbox", "ignore", "unignore", "baseline-accept", "baseline-relearn"]
+    // Every entry in the daemon's ROOT_ONLY_SET_KEYS has to appear here, or its
+    // switch runs unprivileged and comes back as the refusal text with no way
+    // to answer it -- a toggle that cannot be toggled. `containers` was missing
+    // from the day it was added and nobody noticed, because the failure looks
+    // like a permissions message rather than a bug. A test in control.rs reads
+    // this line and fails when the two lists drift.
+    readonly property var privilegedCommands: ["mode", "rule-mode", "contain", "kill", "sandbox", "containers", "canary", "ignore", "unignore", "baseline-accept", "baseline-relearn"]
     property var _queue: []
     property var _lastArg: undefined
     property var _lastArg2: undefined
