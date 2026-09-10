@@ -216,6 +216,28 @@ impl Finding {
         // which pid preserves; two distinct executions were never one event.
         // The test `a_second_unrelated_install_is_a_second_chain` documented
         // this collapse by disabling dedupe to work around it.
+        // An EXEC-shaped finding -- no file, no destination -- is "this binary
+        // ran", and the pid is new by construction every single time. Keeping it
+        // in the key meant the fold could never fire for the rules that need it
+        // most: measured 2026-09-10, one `themebook/scripts/config` produced 74
+        // separate rows in ten minutes, and 141 exec rows came from 9 distinct
+        // binaries. The kernel's own rateLimit fails the same way for the same
+        // reason (`rateLimitScope: process` on an exec rule keys on a process
+        // that did not exist a moment ago), so nothing upstream collapsed them
+        // either.
+        //
+        // The pid was only ever here to protect chain correlation, and the
+        // comment at the fold site says that protection is no longer needed:
+        // "the fold now correlates too, and the key no longer needs to carry a
+        // pid to protect it". Every repeat still reaches the correlator; what
+        // changes is that it is one row with a count instead of 74 rows.
+        //
+        // A finding WITH a file keeps the pid. That is the ~/.bashrc case the
+        // comment above describes -- two different trees writing one well-known
+        // path are two things that happened, and merging them was the trap.
+        if self.file.is_none() {
+            return format!("{}|{}", self.rule, self.proc.exe);
+        }
         format!(
             "{}|{}|{}|pid:{}",
             self.rule,
@@ -1184,6 +1206,52 @@ mod tests {
     }
 
     #[test]
+    /// The same binary running again is one row with a count, not a new row.
+    ///
+    /// Measured 2026-09-10 on the live machine: `themebook/scripts/config` ran
+    /// 74 times in ten minutes and produced 74 rows, because the key carried a
+    /// pid that is new by construction for an exec. 141 exec rows came from 9
+    /// distinct binaries.
+    #[test]
+    fn the_same_binary_executed_again_folds_into_one_row() {
+        let mut a = finding();
+        a.meta.family = "exec".into();
+        a.rule = "moat-exec-untrusted-home".into();
+        a.file = None;
+        a.net = None;
+        a.proc.exe = "/home/dan/.config/omarchy/plugins/themebook/scripts/config".into();
+
+        let mut again = a.clone();
+        again.proc.pid = a.proc.pid + 4000; // a new process, as every exec is
+        assert_eq!(
+            a.dedupe_key(),
+            again.dedupe_key(),
+            "a new pid must not make a repeat of the same binary a new row"
+        );
+
+        let mut other = a.clone();
+        other.proc.exe = "/home/dan/.config/omarchy/plugins/other/bin/thing".into();
+        assert_ne!(
+            a.dedupe_key(),
+            other.dedupe_key(),
+            "a DIFFERENT binary is still a different row -- that is the distinction \
+             a global kernel rateLimit would have destroyed, because 40 bytes of \
+             these paths are identical"
+        );
+    }
+
+    /// The trap the pid was protecting against, still protected: a finding with
+    /// a FILE keeps it, so two trees writing ~/.bashrc stay two rows.
+    #[test]
+    fn two_trees_writing_one_file_are_still_two_rows() {
+        let mut a = finding();
+        a.meta.family = "persist".into();
+        assert!(a.file.is_some(), "this test is about the file branch");
+        let mut b = a.clone();
+        b.proc.pid = a.proc.pid + 1;
+        assert_ne!(a.dedupe_key(), b.dedupe_key());
+    }
+
     fn dedupe_key_folds_rule_exe_file() {
         // Outside the `cred` family the file still separates two alerts: two
         // different desktop entries written is two things that happened.
