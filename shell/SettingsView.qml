@@ -297,8 +297,8 @@ Item {
             SettingsRow {
                 width: parent.width
                 tokens: root.t
-                question: "Hide your keys from package installs"
-                help: "Runs npm, pip, cargo and makepkg in a box where ~/.ssh and your tokens do not exist. Takes effect in new shells."
+                question: "Check and sandbox package installs"
+                help: "Two things, one switch. Installs are checked against the malicious-package feed first — 240k known-bad names, refreshed every 15 minutes, checked offline — and a match stops the install: it asks at a terminal, refuses in a script. Then npm, pip, cargo, go and makepkg run in a box where ~/.ssh and your tokens do not exist.\n\nLeft off, the feed still refreshes but nothing reads it. Nothing is checked automatically.\n\nTakes effect in new shells. Creates empty ~/.bun, ~/.yarn, ~/.rustup and ~/.cargo folders even for tools you never use — bubblewrap needs them to exist. MOAT_SANDBOX=0 bypasses it for one command."
 
                 Row {
                     anchors.right: parent.right
