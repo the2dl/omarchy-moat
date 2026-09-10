@@ -44,9 +44,9 @@ TestCase {
         compare(t.summary, "systemd  →  sh  →  pg_isready");
     }
 
-    /// Closed is the default and has to build nothing: every incident card
-    /// carries one of these and History builds many cards at once.
-    function test_a_closed_tree_builds_no_rows() {
+    /// A short chain opens itself: three or four processes is the whole answer,
+    /// and hiding it behind a click meant nobody found it.
+    function test_a_short_chain_opens_itself() {
         var t = make([{
             "pid": 1,
             "exe": "/a"
@@ -54,7 +54,43 @@ TestCase {
             "pid": 2,
             "exe": "/b"
         });
-        compare(t.open, false, "closed by default");
+        compare(t.nodes.length, 2);
+        compare(t.open, true, "two processes is worth reading straight away");
+    }
+
+    /// A long one does not. Container and package-manager chains are where
+    /// these get deep, and History builds many cards at once.
+    function test_a_long_chain_stays_folded() {
+        var deep = [];
+        for (var i = 0; i < 8; i++) {
+            deep.push({
+                "pid": i,
+                "exe": "/p" + i
+            });
+        }
+        var t = make(deep, {
+            "pid": 99,
+            "exe": "/leaf"
+        });
+        compare(t.nodes.length, 9);
+        compare(t.open, false, "past autoOpenMax it waits to be asked");
+    }
+
+    /// Closed builds nothing: that is the whole reason the rows sit behind a
+    /// Loader rather than being built and hidden.
+    function test_a_closed_tree_builds_no_rows() {
+        var deep = [];
+        for (var i = 0; i < 8; i++) {
+            deep.push({
+                "pid": i,
+                "exe": "/p" + i
+            });
+        }
+        var t = make(deep, {
+            "pid": 99,
+            "exe": "/b"
+        });
+        compare(t.open, false, "long enough to start folded");
         var loader = null;
         for (var i = 0; i < t.children.length; i++) {
             if (t.children[i].hasOwnProperty("sourceComponent"))

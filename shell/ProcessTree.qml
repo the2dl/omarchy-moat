@@ -20,13 +20,26 @@ import QtQuick
 Column {
     id: root
 
+    /// Chains up to this deep open themselves. Five covers the ordinary shapes
+    /// -- `systemd → sh → pg_isready`, `herdr → bash → node → bash` -- while a
+    /// container or package-manager chain, which is where these get long, stays
+    /// folded until someone wants it.
+    readonly property int autoOpenMax: 5
+
     property var tokens: null
     /// `[{pid, exe}, ...]`, nearest parent first, straight off the record.
     property var ancestry: []
     /// The process the alert is about -- the deepest node, which the record
     /// keeps beside the ancestry rather than inside it.
     property var process: null
-    property bool open: false
+    /// Open when the chain is short enough to be worth reading straight away.
+    ///
+    /// Closed-by-default was chosen for cost, and cost is real -- History
+    /// builds many cards at once -- but it made the common case worse: three or
+    /// four processes is the whole answer, and hiding it behind a click meant
+    /// nobody found it. A short chain is a handful of Text items, and the rows
+    /// stay behind a Loader so a deep one still costs nothing until asked for.
+    property bool open: root.nodes.length > 0 && root.nodes.length <= autoOpenMax
 
     readonly property var t: root.tokens
     /// Oldest first, with the alerting process last: the order a person reads a
@@ -66,6 +79,16 @@ Column {
 
     spacing: root.t ? root.t.s(4) : 3
     visible: root.nodes.length > 0
+
+    // Labelled like every other section on the card. Without it the chain was
+    // an unexplained line of arrows -- correct, and unidentifiable.
+    Text {
+        text: "WHAT STARTED IT"
+        color: root.t ? root.t.fainter : "grey"
+        font.family: root.t ? root.t.family : "monospace"
+        font.pixelSize: root.t ? root.t.fMeta : 11
+        font.letterSpacing: root.t ? root.t.lsLabel : 0
+    }
 
     Text {
         width: parent.width
