@@ -43,6 +43,13 @@ spec:
         - "/nc.openbsd"
         - "/nc.traditional"
         - "/socat"
+        # `/usr/bin/socat` is a SYMLINK to `socat1`, and matchBinaries matches
+        # the resolved binary, so "/socat" alone never matched socat on Arch --
+        # verified on 2026-09-10 by running the real socat and a copy of nc
+        # renamed to `socat` at the same address seconds apart: the copy fired,
+        # socat did not. moatd's own alert says exe=/usr/bin/socat because it
+        # resolves the path differently, which is what hid this.
+        - "/socat1"
         - "/telnet"
       matchArgs:
       - index: 0

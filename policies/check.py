@@ -10,6 +10,7 @@ Exit:   0 = all templates valid, 1 = at least one problem, 2 = cannot run.
 """
 
 import os
+import shutil
 import re
 import sys
 
@@ -335,6 +336,56 @@ def check_hook(p, where, kind, hook):
         check_matchargs(p, w, sel.get("matchArgs", []), argtypes)
 
 
+def check_symlinked_binaries(p, path, doc):
+    """A `Postfix` binary value that names a symlink matches nothing.
+
+    `matchBinaries` compares the RESOLVED executable, so `Postfix "/socat"`
+    never matches `/usr/bin/socat` on Arch, where it is a symlink to `socat1`.
+    The rule loads, reports armed, and silently covers one program fewer than it
+    claims -- and moatd's own alerts still say `exe=/usr/bin/socat`, because it
+    resolves the invoked path rather than the real one, so the timeline actively
+    hides the gap. Found live on 2026-09-10: a reverse shell over socat was
+    missed while a copy of nc renamed `socat` was caught.
+
+    Only flagged when nothing else in the same list covers the resolved name --
+    `/netcat` and `/nc.openbsd` both resolve to `nc`, and `/nc` is already
+    there, so those are fine. Best effort: this can only see what is installed
+    on the machine doing the build.
+    """
+    for op, values, where in iter_match_binaries(doc):
+        if op not in ("Postfix", "In"):
+            continue
+        covered = {v.rsplit("/", 1)[-1] for v in values}
+        for val in values:
+            name = val.rsplit("/", 1)[-1]
+            if not name or "{{" in val:
+                continue
+            found = shutil.which(name)
+            if not found:
+                continue
+            real = os.path.realpath(found)
+            real_name = os.path.basename(real)
+            if real_name == name or real_name in covered:
+                continue
+            p.add(path, "%s: %r matches nothing -- %s is a symlink to %s, and "
+                        "matchBinaries compares the resolved binary. Add %r."
+                  % (where, val, found, real, "/" + real_name))
+
+
+def iter_match_binaries(node, where="spec"):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "matchBinaries" and isinstance(v, list):
+                for e in v:
+                    if isinstance(e, dict):
+                        yield e.get("operator", ""), list(e.get("values") or []), where
+            else:
+                yield from iter_match_binaries(v, where + "." + str(k))
+    elif isinstance(node, list):
+        for i, item in enumerate(node):
+            yield from iter_match_binaries(item, "%s[%d]" % (where, i))
+
+
 def check_policy(path, text):
     p = Problems()
     rendered = text.replace("{{HOME}}", HOME)
@@ -357,6 +408,8 @@ def check_policy(path, text):
     except Exception as exc:  # noqa: BLE001
         p.add(path, "YAML does not parse after rendering: %s" % exc)
         return None, p
+
+    check_symlinked_binaries(p, path, doc)
 
     if doc.get("apiVersion") != API_VERSION:
         p.add(path, "apiVersion is %r, expected %r" % (doc.get("apiVersion"), API_VERSION))
