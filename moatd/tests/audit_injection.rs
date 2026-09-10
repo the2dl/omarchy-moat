@@ -23,6 +23,7 @@ fn proc(exe: &str) -> ProcInfo {
         in_container: None,
         sid: None,
         tty: None,
+        ..Default::default()
     }
 }
 

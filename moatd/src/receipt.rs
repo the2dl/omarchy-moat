@@ -425,6 +425,7 @@ mod tests {
             in_container: None,
             sid: None,
             tty: None,
+            ..Default::default()
         }
     }
 

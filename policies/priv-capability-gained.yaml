@@ -1,0 +1,62 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-priv-capability-gained
+  annotations:
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "A running process gained a root-equivalent capability"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,ignore"
+    # There is one kernel and capabilities are not namespaced in a way that
+    # makes a gain somebody else's business. Same argument as module load.
+    moat.omarchy/namespace: "global"
+    moat.omarchy/why: >-
+      moat-x-exec-privileges-raised catches privilege gained AT EXEC -- a setuid
+      binary, a file capability. This catches a process that was already running and
+      gained one, which is what a successful kernel exploit looks like from the
+      outside: no new binary, no new process, the same pid holding CAP_SYS_ADMIN it
+      did not have a moment ago. It was the largest gap in docs/LPE.md.
+    moat.omarchy/expected: >-
+      Very little. Dropping capabilities is constant on a desktop and does not match
+      -- only a GAIN does. Container runtimes and systemd set up capabilities for
+      children at exec, which is the other rule, not this one.
+    moat.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  # A hook nothing else uses, so 1/19 and no pressure on the trampoline cap.
+  # Detection only, and that is not timidity: by the time capset reports, the
+  # capability is granted. An Override here would be theatre.
+  - hook: "capset"
+    message: "A running process gained a root-equivalent capability"
+    selectors:
+    # Shape from cilium/tetragon types.go, CapabilitiesSelector: `type` is
+    # Effective|Inheritable|Permitted and `operator` is In|NotIn ONLY.
+    # `CapabilitiesGained` is in the CRD operator enum but belongs to matchArgs,
+    # not here -- it does not validate in this field.
+    - matchCapabilityChanges:
+      - type: "Effective"
+        operator: "In"
+        isNamespaceCapability: false
+        values:
+        # The set that converts directly into root with no further exploit.
+        # Kept identical to event::Capabilities::is_dangerous in moatd, so the
+        # kernel rule and the userspace evidence agree about what "grave" means.
+        - "CAP_SYS_ADMIN"
+        # NOT "CAP_DAC_OVERRIDE". It is the ONE value in Tetragon's
+        # CapabilitiesType enum without the CAP_ prefix -- 1 of 41 -- and the
+        # policy is rejected outright with "value CAP_DAC_OVERRIDE unknown".
+        # Verified by a load test against the live sensor.
+        - "DAC_OVERRIDE"
+        - "CAP_DAC_READ_SEARCH"
+        - "CAP_SETUID"
+        - "CAP_SETGID"
+        - "CAP_SYS_MODULE"
+        - "CAP_SYS_PTRACE"
+        - "CAP_SYS_RAWIO"
+        - "CAP_BPF"
+        - "CAP_SYS_BOOT"
+      matchActions:
+      - action: Post

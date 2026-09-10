@@ -867,6 +867,7 @@ mod tests {
             in_container: None,
             sid: None,
             tty: None,
+            ..Default::default()
         }
     }
 
@@ -902,6 +903,7 @@ mod tests {
             in_container: None,
             sid: None,
             tty: None,
+            ..Default::default()
         }, ProcInfo {
             exec_id: "e-1".into(),
             pid: 41201,
@@ -917,6 +919,7 @@ mod tests {
             in_container: None,
             sid: None,
             tty: None,
+            ..Default::default()
         }];
         f.ancestry_line = "npm -> sh -> node".into();
         f

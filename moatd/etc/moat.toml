@@ -116,6 +116,22 @@ exec_memfd = true
 # every sudo and pkexec, so it is a chain step rather than a finding.
 exec_privileges_raised = true
 
+# moat-x-exec-capability-held: a NON-ROOT process running with a capability that
+# is root by another name -- CAP_SYS_ADMIN, DAC_OVERRIDE, DAC_READ_SEARCH,
+# SETUID, SYS_MODULE, SYS_PTRACE, SYS_RAWIO, BPF, SYS_BOOT.
+#
+# priv-setcap-xattr sees a file capability being WRITTEN and
+# exec_privileges_raised sees privilege being gained at exec, but neither says
+# WHICH capability, and that is what decides whether it matters:
+# cap_net_bind_service on rlogin is nothing, cap_sys_admin on gsr-kms-server is
+# unrestricted root on a screen-recording helper.
+#
+# Read from the kernel's own set for each exec, never a list of binaries, so a
+# package adding a capability changes what this reports with nothing here
+# edited. Root is skipped: root already holds everything, so including it would
+# match every daemon and distinguish none of them. A chain step, not a finding.
+exec_capability_held = true
+
 # The four rules below replaced the `pkg` kernel policies of the same names.
 # Tetragon's `matchParentBinaries … followChildren` matched processes with no
 # package manager in their ancestry at all (quickshell -> bash, Xwayland -> bash,

@@ -316,6 +316,42 @@ Verified at: `SRC examples/tracingpolicy/{filename_monitoring,filename_monitorin
 kernel v7.1 `fs/namei.c:4701`, `fs/read_write.c` (rw_verify_area), `fs/open.c` (build_open_flags),
 `include/linux/fs.h`; local kallsyms + BTF.
 
+### Capabilities in selectors: `matchCapabilityChanges` and the DAC_OVERRIDE wart
+
+`matchCapabilities` and `matchCapabilityChanges` both take a
+`CapabilitiesSelector` (`SRC pkg/k8s/apis/cilium.io/v1alpha1/types.go`):
+
+```yaml
+matchCapabilityChanges:
+- type: "Effective"        # Effective | Inheritable | Permitted (default Effective)
+  operator: "In"           # In | NotIn -- ONLY these two
+  isNamespaceCapability: false
+  values: ["CAP_SYS_ADMIN", "DAC_OVERRIDE"]
+```
+
+**`CapabilitiesGained` is in the CRD operator enum but is NOT valid here.** It
+belongs to `matchArgs`. The operator on a capabilities selector is `In`/`NotIn`
+and nothing else.
+
+**One capability name in 41 has no `CAP_` prefix.** From
+`SRC api/v1/tetragon/capabilities.proto`, `DAC_OVERRIDE` is value 1 and is
+spelled without it; every other value, `CAP_DAC_READ_SEARCH` included, carries
+the prefix. A policy naming `CAP_DAC_OVERRIDE` is rejected at load:
+
+```
+parseMatchCapabilityChanges error: value CAP_DAC_OVERRIDE unknown
+```
+
+That failure is loud and self-correcting. The dangerous half is in **userspace**:
+protojson renders enums by name, so an event reports `DAC_OVERRIDE` too, and
+moatd code matching only the prefixed spelling silently never fires. That is
+exactly what happened to `moat-x-exec-capability-held`, which would have been
+permanently blind to `dumpcap` -- the binary docs/LPE.md holds up as the example
+-- while looking perfectly healthy. Match both spellings anywhere this is
+compared.
+
+Verified 2026-09-09 by `tetra tp add` against the live sensor.
+
 ### procfs paths, write masks and matchBinaries (probed 2026-09-09)
 
 `docs/LPE.md` proposes watching writes under `/proc/sys`, which rests on things

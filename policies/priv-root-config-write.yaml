@@ -1,0 +1,55 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-priv-root-config-write
+  annotations:
+    moat.omarchy/severity: "high"
+    moat.omarchy/title: "Config that runs as root was written"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "kill,quarantine,ignore"
+    moat.omarchy/why: >-
+      Each of these paths is a way to have code run as root without ever being root
+      now. A polkit rule is JavaScript evaluated by a root daemon; a line in
+      /etc/pam.d runs inside every authentication; a udev RUN+= executes as root on
+      the next device event; /etc/ld.so.conf.d adds a library search path to every
+      program on the machine. persist-system-unit-write already covers units,
+      sudoers and cron -- this is the rest of the same idea.
+    moat.omarchy/expected: >-
+      pacman installing or upgrading a package that ships any of these, which is
+      common and is what the pkg-install context is for. Outside a package
+      transaction almost nothing writes them.
+    moat.omarchy/fp-hint: "exe+file"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  # file_post_open, 9/19 -> 10/19 with priv-sysctl-write. Nine short of the cap.
+  - hook: "file_post_open"
+    message: "Config that runs as root was written"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int"
+    selectors:
+    - matchArgs:
+      # String Prefix values are map-backed with no four-value cap (notes
+      # section 2), so one filter covers the whole list. Prefix on a `file` arg
+      # is verified against the live sensor (notes section 3).
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/etc/polkit-1/rules.d/"
+        - "/usr/share/polkit-1/actions/"
+        - "/etc/pam.d/"
+        - "/etc/udev/rules.d/"
+        - "/usr/lib/udev/rules.d/"
+        - "/etc/ld.so.conf.d/"
+        - "/sys/kernel/uevent_helper"
+      # MAY_WRITE only. Reading /etc/pam.d is every login; writing it is not.
+      - index: 1
+        operator: "Mask"
+        values: ["2"]
+      matchActions:
+      - action: Post

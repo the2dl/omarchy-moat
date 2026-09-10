@@ -6040,8 +6040,13 @@ fn self_proc(about: &str) -> ProcInfo {
     let (sid, tty) = crate::proctable::read_session(std::process::id());
     ProcInfo {
         // moatd runs on the host. An alert moat raises about ITSELF must never
-        // be quietened by the container switch.
+        // be quietened by the container switch, nor by the namespace step in
+        // `scoring`.
         in_container: Some(false),
+        user_ns_host: Some(true),
+        // moatd holds capabilities, but an alert ABOUT moat is not a finding
+        // about moat's own privilege.
+        caps: Vec::new(),
         exec_id: String::new(),
         pid: std::process::id(),
         uid: unsafe { libc::geteuid() },
@@ -6664,6 +6669,7 @@ mod tests {
             in_container: None,
             sid: None,
             tty: None,
+            ..Default::default()
         };
         let node = proc("e-node", 1_876_167, "/home/dan/.no-such-mise/node/26.5.0/bin/node");
         let bash = proc("e-bash", 581_833, "/usr/bin/bash");
@@ -6778,6 +6784,7 @@ mod tests {
             in_container: None,
             sid: None,
             tty: None,
+            ..Default::default()
         };
         let actor = proc("e-drop", 4242, &dropper.display().to_string());
         let parent = proc("e-bash", 4241, "/usr/bin/bash");
@@ -6989,6 +6996,7 @@ mod tests {
             in_container: None,
             sid: None,
             tty: None,
+            ..Default::default()
         };
         let actor = proc("e-imp", 7100, "/tmp/no-such-lab/implant");
         let root = proc("e-mk", 7000, "/usr/bin/no-such-makepkg");
@@ -7056,6 +7064,7 @@ mod tests {
             in_container: None,
             sid: None,
             tty: None,
+            ..Default::default()
         };
         let root = mkproc("e-root", 7000);
         let mut mk = |exec_id: &str, pid: u32| {
@@ -7124,6 +7133,7 @@ mod tests {
             in_container: None,
             sid: None,
             tty: None,
+            ..Default::default()
         };
         let mut mk = |exec_id: &str, pid: u32| {
             let mut f = Finding::new(
@@ -7249,6 +7259,7 @@ mod tests {
             in_container: None,
             sid: None,
             tty: None,
+            ..Default::default()
         };
         let actor = mkproc("e-ssh", 7200, "/usr/bin/ssh");
         let root = mkproc("e-pull", 7000, "/home/dan/pull/no-such-pull.sh");
@@ -7404,6 +7415,7 @@ mod tests {
             in_container: None,
             sid: None,
             tty: None,
+            ..Default::default()
         };
         let mut f = Finding::new(
             "moat-net-first-contact",
@@ -8653,6 +8665,7 @@ esac
             in_container: None,
             sid: None,
             tty: None,
+            ..Default::default()
         };
         let mut f = Finding::new(
             "moat-persist-git-config-write",
@@ -8763,6 +8776,7 @@ esac
             in_container: None,
             sid: None,
             tty: None,
+            ..Default::default()
         };
         let actor = proc("e-py", 2_257_600, "/usr/bin/no-such-python");
         let makepkg = proc("e-mk", 2_257_581, "/usr/bin/no-such-makepkg");
@@ -8876,6 +8890,7 @@ esac
             in_container: None,
             sid: None,
             tty: None,
+            ..Default::default()
         }
     }
 
@@ -9758,6 +9773,7 @@ esac
             in_container: None,
             sid: None,
             tty: None,
+            ..Default::default()
         };
         let finding = |rule: &str, family: &str, severity: &str, path: &str| {
             let mut f = Finding::new(rule, crate::policy::PolicyMeta::fallback(rule), node.clone());
@@ -10834,6 +10850,7 @@ esac
             in_container: None,
                     sid: None,
                     tty: None,
+                    ..Default::default()
                 },
             );
             f.meta.family = "cred".into();

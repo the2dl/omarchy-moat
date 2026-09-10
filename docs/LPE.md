@@ -185,6 +185,16 @@ from the rendered policy names, and severity/title come from the
 Ordered by value per unit of noise. Each item names what it costs against the
 budget above.
 
+**All six are built as of 2026-09-09** (0.1.0-149). Every policy was proved to
+ATTACH with `tetra tp add` against the live sensor before being committed,
+because a policy that fails to load crash-loops Tetragon and takes moatd with it
+-- and two of these hooks had never been attached on this machine. That gate
+caught a real rejection (see the DAC_OVERRIDE note in TETRAGON-NOTES) that would
+otherwise have shipped.
+
+Final hook budget: `file_post_open` 10/19, `capset` 1/19, `task_fix_setuid`
+1/19.
+
 ### 1. Parse `process.cap` — moatd only, no policy
 
 `event.rs::Process` parses `uid`, `auid`, `ns.mnt` and `binary_properties` and

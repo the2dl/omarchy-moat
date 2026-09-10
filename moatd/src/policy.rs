@@ -356,7 +356,7 @@ spec:
         assert!(m.actions.contains(&"ignore".to_string()));
     }
 
-    /// The `signal` set is a claim the docs make (BASELINE §4a,
+    /// The `signal` set is a claim the docs make (BASELINE §4a, docs/LPE.md,
     /// policies/README.md), so it is pinned rather than left to drift.
     ///
     /// It is also not an arbitrary list: it is exactly what the noise guard's
@@ -365,7 +365,7 @@ spec:
     /// takes it off the badge for good; that should be a decision somebody
     /// makes on purpose and a test they had to update.
     #[test]
-    fn the_shipped_signal_rules_are_the_eight_the_docs_name() {
+    fn the_shipped_signal_rules_are_the_nine_the_docs_name() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().map(|p| p.join("policies"));
         // Building from a source tarball that ships only moatd/.
         let Some(dir) = dir.filter(|d| d.is_dir()) else { return };
@@ -387,13 +387,22 @@ spec:
                 "moat-persist-desktop-entry-write",
                 "moat-persist-omarchy-menu-extension-write",
                 "moat-persist-omarchy-plugin-write",
+                // 2026-09-09: becoming another user is the outcome half of
+                // most escalations and the ordinary business of a desktop at
+                // the same time -- su, sudo, login, systemd starting a user
+                // service, every container start. docs/LPE.md item 5 put it
+                // here on purpose rather than discovering it the way
+                // exec-untrusted-tmpfs was discovered: 300 alerts in an
+                // afternoon, then a demotion. It is a chain step beside a
+                // capability gain or a sysctl write, never a finding alone.
+                "moat-priv-uid-transition",
                 // 2026-09-06: the feed for the ransom counter. Owned by the
                 // userland rule of the same name, so its events are input to
                 // a count rather than records; `signal` is what they would be
                 // if the rule were switched off.
                 "moat-ransom-file-churn",
             ],
-            "the eighth, moat-pkg-subtree-interpreter-spawn, is a userland rule"
+            "the tenth, moat-pkg-subtree-interpreter-spawn, is a userland rule"
         );
         // A building block must not be able to end a process on evidence it has
         // declared too weak for the badge. `check.py` says the same at build

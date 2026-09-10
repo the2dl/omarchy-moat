@@ -1,0 +1,70 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-priv-uid-transition
+  annotations:
+    moat.omarchy/severity: "low"
+    moat.omarchy/title: "A process changed which user it runs as"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "ignore"
+    # A BUILDING BLOCK, not a finding. docs/LPE.md put this last and said why:
+    # su, sudo, login, systemd starting user services, dbus-daemon-launch-helper,
+    # polkit agents and every container runtime do this legitimately and often.
+    # A rule that fires on all of them is exec-untrusted-tmpfs again -- 300
+    # alerts in an afternoon, ignored by the next day, then demoted by the noise
+    # guard and effectively off. It earns its place beside a capability gain or a
+    # sysctl write, never alone.
+    moat.omarchy/tier: "signal"
+    moat.omarchy/why: >-
+      Becoming another user is the outcome half of most escalations. On its own it
+      is the ordinary business of a desktop, which is why this is recorded as a
+      chain step and not raised as a finding: what makes it interesting is what it
+      sits next to.
+    moat.omarchy/expected: >-
+      Constantly. Every sudo and su, systemd starting a user service, polkit and
+      dbus helpers, and every container start. Excluded by name where the binary is
+      a known helper; the remainder is timeline.
+    moat.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  lsmhooks:
+  # Another unused hook: 1/19.
+  #
+  # security_task_fix_setuid is the one that exists -- NOTES section 6 records
+  # that security_task_setuid does NOT, which is the sort of thing worth having
+  # written down before designing around it.
+  #
+  # No matchArgs: the hook takes `struct cred *` pointers, which Tetragon has no
+  # argument type for, so the transition cannot be filtered down to "became uid
+  # 0" in the kernel. That filtering is moatd's job, which is exactly the split
+  # NOTES "Gaps" describes -- and it is the other reason this ships as signal.
+  - hook: "task_fix_setuid"
+    message: "A process changed which user it runs as"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/sudo"
+        - "/usr/bin/su"
+        - "/usr/bin/login"
+        - "/usr/bin/newgrp"
+        - "/usr/bin/passwd"
+        - "/usr/bin/pkexec"
+        - "/usr/lib/systemd/systemd"
+        - "/usr/lib/systemd/systemd-executor"
+        - "/usr/lib/dbus-daemon-launch-helper"
+        - "/usr/lib/polkit-1/polkitd"
+        - "/usr/bin/dbus-daemon"
+        - "/usr/bin/runc"
+        - "/usr/bin/containerd-shim-runc-v2"
+        - "/usr/bin/crun"
+        - "/usr/bin/docker"
+        - "/usr/bin/dockerd"
+        - "/usr/bin/podman"
+        - "/usr/bin/sshd"
+        - "/usr/lib/sddm/sddm-helper"
+        - "/usr/bin/unix_chkpwd"
+      matchActions:
+      - action: Post

@@ -291,6 +291,7 @@ pub fn all() -> Vec<Box<dyn UserRule>> {
         Box::new(mass_read::MassRead::default()),
         Box::new(exec_properties::ExecMemfd),
         Box::new(exec_properties::ExecPrivilegesRaised),
+        Box::new(exec_properties::ExecCapabilityHeld),
         Box::new(pkg_subtree::InterpreterSpawn::default()),
         Box::new(pkg_subtree::Downloader),
         Box::new(pkg_subtree::NetcatExec),
@@ -747,10 +748,11 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), n, "rule ids must be unique");
         assert_eq!(
-            n, 14,
+            n, 15,
             "four gap rules, the four that replaced pkg policies, net-first-contact, \
-             the two that read binary_properties (memfd, privileges raised), \
-             shell-stdio-socket, and the two ransom rules (file-churn, snapshot-command)"
+             the three that read what the sensor already sends about privilege (memfd, \
+             privileges raised, capability held), shell-stdio-socket, and the two ransom \
+             rules (file-churn, snapshot-command)"
         );
 
         // Every rule must be switchable off, or `[rules]` is a lie.
@@ -763,6 +765,7 @@ mod tests {
             mass_read: false,
             exec_memfd: false,
             exec_privileges_raised: false,
+            exec_capability_held: false,
             pkg_subtree_interpreter_spawn: false,
             pkg_subtree_downloader: false,
             pkg_subtree_netcat_exec: false,

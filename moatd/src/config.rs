@@ -149,6 +149,7 @@ pub struct RuleToggles {
     pub mass_read: bool,
     pub exec_memfd: bool,
     pub exec_privileges_raised: bool,
+    pub exec_capability_held: bool,
     /// The four rules that replaced the deleted `pkg` kernel policies.
     pub pkg_subtree_interpreter_spawn: bool,
     pub pkg_subtree_downloader: bool,
@@ -182,6 +183,7 @@ impl Default for RuleToggles {
             mass_read: true,
             exec_memfd: true,
             exec_privileges_raised: true,
+            exec_capability_held: true,
             pkg_subtree_interpreter_spawn: true,
             pkg_subtree_downloader: true,
             pkg_subtree_netcat_exec: true,

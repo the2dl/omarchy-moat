@@ -35,6 +35,7 @@ use crate::rules::{meta, RuleCtx, UserRule};
 
 pub const MEMFD_ID: &str = "moat-x-exec-memfd";
 pub const PRIV_ID: &str = "moat-x-exec-privileges-raised";
+pub const CAP_ID: &str = "moat-x-exec-capability-held";
 
 /// A binary with no path on disk.
 #[derive(Default)]
@@ -340,5 +341,205 @@ mod tests {
         // chain step. Raising it would make the badge useless within an hour.
         assert_eq!(out[0].meta.severity, "medium");
         assert_eq!(out[0].meta.family, "priv");
+    }
+}
+
+
+/// A process running with a capability that is root by another name.
+///
+/// `moat-priv-setcap-xattr` watches a file capability being WRITTEN.
+/// `moat-x-exec-privileges-raised` fires when the kernel raises privilege at
+/// exec, which includes any file capability at all. Neither says which
+/// capability, and that is the part that decides whether this matters:
+/// `cap_net_bind_service` on `rlogin` is nothing, and `cap_sys_admin` on
+/// `gsr-kms-server` is unrestricted root sitting on a screen-recording helper
+/// most people do not know they have installed (docs/LPE.md).
+///
+/// Keyed off the capability set on the EVENT, never a list of binaries. An
+/// audit of this machine goes stale the moment a package adds a capability;
+/// `process.cap` is what the kernel handed the process this time.
+///
+/// A chain step, deliberately. On its own "a privileged helper ran" is the
+/// ordinary business of a desktop -- `dumpcap`, `btop`, `newuidmap` -- and it
+/// is next to a credential read or an outbound connection that it means
+/// something. Loud on its own it would be `exec-untrusted-tmpfs` again.
+#[derive(Default)]
+pub struct ExecCapabilityHeld;
+
+impl UserRule for ExecCapabilityHeld {
+    fn id(&self) -> &'static str {
+        CAP_ID
+    }
+
+    fn enabled(&self, cfg: &crate::config::Config) -> bool {
+        cfg.rules.exec_capability_held
+    }
+
+    fn on_exec(&mut self, ev: &ExecEvent, exec_id: &str, ctx: &RuleCtx) -> Vec<Finding> {
+        let Some(proc) = ev.process.as_ref() else {
+            return Vec::new();
+        };
+        let grave = proc.dangerous_caps();
+        if grave.is_empty() {
+            return Vec::new();
+        }
+        // A process that is ALREADY root gains nothing from a capability: root
+        // holds the full set by definition, so every daemon on the machine
+        // would match and the rule would say nothing about any of them. The
+        // interesting case is an unprivileged process holding one.
+        let euid = proc
+            .process_credentials
+            .as_ref()
+            .and_then(|c| c.euid)
+            .or(proc.uid);
+        if euid == Some(0) {
+            return Vec::new();
+        }
+        let m = self.meta();
+        let Some(mut f) = ctx.finding(CAP_ID, m, exec_id) else {
+            return Vec::new();
+        };
+        f.extra_evidence = vec![
+            format!(
+                "held as a non-root process (uid {}): {}",
+                euid.map(|u| u.to_string()).unwrap_or_else(|| "unknown".into()),
+                grave.join(", ")
+            ),
+            "read from the kernel's own capability set for this exec, not from a list of \
+             binaries: a package adding a capability changes what this reports without \
+             anything here being updated"
+                .to_string(),
+        ];
+        vec![f]
+    }
+
+    fn meta(&self) -> PolicyMeta {
+        meta(
+            CAP_ID,
+            "priv",
+            "low",
+            "A privileged capability was held by a program that is not root",
+            "This process ran without being root and still held a capability that grants \
+             what root has -- reading any file, writing any file, loading a module, or \
+             becoming another user. A file capability is how a binary carries that \
+             without a setuid bit.",
+            "Ordinary desktop tooling: dumpcap holds CAP_DAC_OVERRIDE, btop holds \
+             CAP_DAC_READ_SEARCH, newuidmap and newgidmap hold CAP_SETUID and CAP_SETGID. \
+             It is a chain step beside something else, never a finding on its own.",
+            &[],
+            &["ignore"],
+            "exe",
+        )
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use crate::event::{Capabilities, Credentials};
+
+    fn caps(effective: &[&str], permitted: &[&str]) -> Capabilities {
+        Capabilities {
+            effective: effective.iter().map(|s| s.to_string()).collect(),
+            permitted: permitted.iter().map(|s| s.to_string()).collect(),
+            inheritable: Vec::new(),
+        }
+    }
+
+    /// The measured example: gpu-screen-recorder's helper carries
+    /// cap_sys_admin=ep, which is root by another name, on a machine where
+    /// nobody knows it is installed.
+    #[test]
+    fn cap_sys_admin_is_grave_and_cap_net_bind_service_is_not() {
+        assert_eq!(
+            caps(&["CAP_SYS_ADMIN"], &["CAP_SYS_ADMIN"]).is_dangerous(),
+            vec!["CAP_SYS_ADMIN"]
+        );
+        assert!(caps(&["CAP_NET_BIND_SERVICE"], &[]).is_dangerous().is_empty());
+        assert!(caps(&[], &[]).is_dangerous().is_empty());
+    }
+
+    /// The one-of-41 wart. Tetragon's CapabilitiesType enum spells DAC_OVERRIDE
+    /// without the CAP_ prefix, protojson renders enums by name, and so that is
+    /// what an event carries. Matching only the prefixed spelling meant silently
+    /// never reporting dumpcap -- the exact binary docs/LPE.md holds up as the
+    /// example of a read-anything primitive. A load test against the live sensor
+    /// found it, in the policy; the same mistake was sitting here.
+    #[test]
+    fn dac_override_is_matched_in_the_spelling_tetragon_actually_sends() {
+        assert_eq!(caps(&["DAC_OVERRIDE"], &[]).is_dangerous(), vec!["DAC_OVERRIDE"]);
+        // And the kernel's own spelling still works, for anything reading getcap.
+        assert_eq!(
+            caps(&["CAP_DAC_OVERRIDE"], &[]).is_dangerous(),
+            vec!["CAP_DAC_OVERRIDE"]
+        );
+        // CAP_DAC_READ_SEARCH does carry the prefix -- only DAC_OVERRIDE does not.
+        assert_eq!(
+            caps(&["CAP_DAC_READ_SEARCH"], &[]).is_dangerous(),
+            vec!["CAP_DAC_READ_SEARCH"]
+        );
+    }
+
+    /// Permitted counts, not just effective: a process can raise a permitted
+    /// capability into effective at any moment without executing anything.
+    #[test]
+    fn permitted_counts_even_when_not_effective() {
+        assert_eq!(
+            caps(&[], &["CAP_DAC_OVERRIDE"]).is_dangerous(),
+            vec!["CAP_DAC_OVERRIDE"]
+        );
+    }
+
+    /// dumpcap holds cap_dac_override,cap_net_admin,cap_net_raw=eip. Only the
+    /// first is a read-anything primitive, and the report must name that one
+    /// rather than the whole set.
+    #[test]
+    fn only_the_grave_ones_are_named_and_they_are_deduped() {
+        let c = caps(
+            &["CAP_DAC_OVERRIDE", "CAP_NET_ADMIN", "CAP_NET_RAW"],
+            &["CAP_DAC_OVERRIDE", "CAP_NET_ADMIN", "CAP_NET_RAW"],
+        );
+        assert_eq!(c.is_dangerous(), vec!["CAP_DAC_OVERRIDE"], "named once, not twice");
+    }
+
+    /// Root holds everything by definition. Including it would match every
+    /// daemon on the machine and distinguish none of them.
+    #[test]
+    fn root_is_not_reported_because_root_explains_nothing() {
+        let creds = Credentials {
+            uid: Some(0),
+            euid: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(creds.euid, Some(0));
+        // The rule's own gate, stated as the test's subject.
+        let is_root = creds.euid.or(creds.uid) == Some(0);
+        assert!(is_root, "a root process is skipped by ExecCapabilityHeld");
+    }
+
+    /// A setuid execution is uid 1000 with euid 0, and the difference is the
+    /// whole point: `process.uid` alone cannot see it.
+    #[test]
+    fn euid_raised_sees_what_uid_alone_cannot() {
+        let setuid = Credentials {
+            uid: Some(1000),
+            euid: Some(0),
+            ..Default::default()
+        };
+        assert!(setuid.euid_raised());
+
+        let ordinary = Credentials {
+            uid: Some(1000),
+            euid: Some(1000),
+            ..Default::default()
+        };
+        assert!(!ordinary.euid_raised());
+
+        // Already root is not a RAISE, whatever else it is.
+        let root = Credentials {
+            uid: Some(0),
+            euid: Some(0),
+            ..Default::default()
+        };
+        assert!(!root.euid_raised());
     }
 }

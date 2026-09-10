@@ -36,6 +36,12 @@ pub struct ProcInfo {
     /// `None` means the sensor did not say (`--enable-process-ns` off, or an
     /// older daemon). Never guessed.
     pub in_container: Option<bool>,
+    /// Grave capabilities held at exec, from `process.cap` (docs/LPE.md item 6).
+    /// Empty means "held none", not "unknown": Tetragon omits an empty set.
+    pub caps: Vec<String>,
+    /// `false` when the process was outside the host user namespace at exec.
+    /// `None` when the sensor did not say.
+    pub user_ns_host: Option<bool>,
     /// Set when `exe` is not what the kernel reported: a `/proc/self/fd/<n>`
     /// binary we resolved (or failed to). Shown as evidence on every alert.
     pub exe_note: Option<String>,
@@ -164,6 +170,8 @@ impl ProcTable {
             exit_signal: None,
             exe_note: None,
             in_container: p.in_container(),
+            caps: p.dangerous_caps().iter().map(|c| c.to_string()).collect(),
+            user_ns_host: p.user_ns_is_host(),
             sid,
             tty,
         };

@@ -194,6 +194,9 @@ pub const GLOBAL_RULES: &[&str] = &[
     // /proc/sys/kernel is not namespaced: a container writing core_pattern sets
     // what the HOST runs on the next crash. Same argument as the two above.
     "moat-priv-sysctl-write",
+    // Capabilities gained inside a container are still capabilities on this
+    // kernel, and the exploit that granted them ran here.
+    "moat-priv-capability-gained",
 ];
 
 pub const NEVER_LOWERED: &[&str] = &[

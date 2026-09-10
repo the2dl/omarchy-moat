@@ -99,6 +99,14 @@ pub struct Process {
     /// time moatd reads the event, a `psql` or a `pg_isready` in a container has
     /// long exited and `/proc/<pid>/ns/mnt` is gone.
     pub ns: Option<Namespaces>,
+    /// Only present with `--enable-process-cred`, which moat sets. The
+    /// capability sets the process held AT EVENT TIME. Tetragon omits a set
+    /// that is empty, so a `None` field means "held none", not "unknown".
+    pub cap: Option<Capabilities>,
+    /// Also `--enable-process-cred`. The full uid/gid quartet, where `uid` on
+    /// the Process itself is only the real uid: a setuid binary is uid 1000
+    /// with euid 0, and the difference is the whole point.
+    pub process_credentials: Option<Credentials>,
     pub binary_properties: Option<BinaryProperties>,
     /// Only present with `--enable-process-environment-variables`. protojson
     /// capitalises the keys of this message (NOTES §4).
@@ -106,12 +114,97 @@ pub struct Process {
     pub environment_variables: Vec<EnvVar>,
 }
 
-/// `process.ns`. Only `mnt` is read: it is the one that answers "is this this
-/// machine's filesystem", which is the question every path-matching policy is
-/// really asking.
+/// `process.ns`. `mnt` answers "is this this machine's filesystem", which is
+/// what every path-matching policy is really asking. `user` answers something
+/// different and just as useful: a process outside the host user namespace
+/// holds a full capability set inside its own, which is the precondition for a
+/// large family of kernel privilege escalations (docs/LPE.md §3).
+///
+/// The other eight namespaces are exported and deliberately not read. Adding a
+/// field here is free; giving it a meaning is not.
 #[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 pub struct Namespaces {
     pub mnt: Option<Namespace>,
+    pub user: Option<Namespace>,
+}
+
+/// `process.cap`. Tetragon omits an empty set, so an absent field means the
+/// process held nothing in it — never "we could not tell".
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+pub struct Capabilities {
+    #[serde(default)]
+    pub permitted: Vec<String>,
+    #[serde(default)]
+    pub effective: Vec<String>,
+    #[serde(default)]
+    pub inheritable: Vec<String>,
+}
+
+impl Capabilities {
+    /// Does this process hold anything that is root by another name?
+    ///
+    /// The list is short on purpose. Every capability is a privilege, but these
+    /// are the ones that convert directly into "read or write anything, or run
+    /// as anyone" with no further exploit: CAP_SYS_ADMIN is famously
+    /// root-equivalent, DAC_OVERRIDE and DAC_READ_SEARCH defeat file
+    /// permissions outright, and SETUID/SETGID/SYS_MODULE/SYS_PTRACE/BPF each
+    /// end in the same place.
+    pub fn is_dangerous(&self) -> Vec<&str> {
+        const GRAVE: &[&str] = &[
+            "CAP_SYS_ADMIN",
+            // Tetragon's CapabilitiesType enum spells this WITHOUT the CAP_
+            // prefix -- the only one of 41 that does -- and protojson renders
+            // enums by name, so that is what arrives in an event. The prefixed
+            // spelling is kept too: it is what the kernel and `getcap` call it,
+            // and being wrong here means silently never matching dumpcap, which
+            // is the exact binary docs/LPE.md holds up as the example.
+            "DAC_OVERRIDE",
+            "CAP_DAC_OVERRIDE",
+            "CAP_DAC_READ_SEARCH",
+            "CAP_SETUID",
+            "CAP_SETGID",
+            "CAP_SYS_MODULE",
+            "CAP_SYS_PTRACE",
+            "CAP_SYS_RAWIO",
+            "CAP_BPF",
+            "CAP_SYS_BOOT",
+        ];
+        let mut out: Vec<&str> = self
+            .effective
+            .iter()
+            .chain(self.permitted.iter())
+            .filter(|c| GRAVE.contains(&c.as_str()))
+            .map(|c| c.as_str())
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.permitted.is_empty() && self.effective.is_empty() && self.inheritable.is_empty()
+    }
+}
+
+/// `process.process_credentials`.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+pub struct Credentials {
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub euid: Option<u32>,
+    pub egid: Option<u32>,
+    pub suid: Option<u32>,
+    pub sgid: Option<u32>,
+    pub fsuid: Option<u32>,
+    pub fsgid: Option<u32>,
+}
+
+impl Credentials {
+    /// Running with an effective uid it was not started with: the shape of a
+    /// setuid execution, and of a successful escalation.
+    pub fn euid_raised(&self) -> bool {
+        matches!((self.uid, self.euid), (Some(r), Some(e)) if e != r && e == 0)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq)]
@@ -146,6 +239,22 @@ impl Process {
     /// this does not guess, because the two callers want opposite defaults.
     pub fn in_container(&self) -> Option<bool> {
         self.ns.as_ref()?.mnt.as_ref()?.is_host.map(|host| !host)
+    }
+
+    /// Was this in the HOST user namespace?
+    ///
+    /// `None` when the sensor did not say. A process outside it holds a full
+    /// capability set inside its own, which is the precondition for a large
+    /// family of kernel escalations -- and also what every Chrome tab and every
+    /// `bwrap` does all day, which is why this is evidence and never a verdict
+    /// (docs/LPE.md §3).
+    pub fn user_ns_is_host(&self) -> Option<bool> {
+        self.ns.as_ref()?.user.as_ref()?.is_host
+    }
+
+    /// Grave capabilities this process held at event time, sorted, or empty.
+    pub fn dangerous_caps(&self) -> Vec<&str> {
+        self.cap.as_ref().map(|c| c.is_dangerous()).unwrap_or_default()
     }
 
     pub fn exe(&self) -> &str {
