@@ -368,6 +368,32 @@ impl Default for NetConfig {
                 // PyPI / Cloudflare fronted.
                 "104.16.0.0/12".into(),
                 "172.64.0.0/13".into(),
+                // Arch's own infrastructure. Missing until 2026-09-10, on a
+                // list shipped only to Arch machines: `omarchy-update` runs
+                // `yay`, `yay` clones from aur.archlinux.org, and that was a
+                // medium alert every single time anyone updated.
+                "209.126.35.0/24".into(),
+                // --- IPv6 -------------------------------------------------
+                //
+                // There were none of these at all, and `parse_cidr` goes
+                // through `IpAddr`, so v6 always parsed and never matched:
+                // every package-manager connection over v6 was "outside the
+                // registry allowlist" whatever it talked to. On a dual-stack
+                // machine this rule was reporting that you have IPv6, not that
+                // something reached somewhere it should not.
+                //
+                // Verified by resolving the names on 2026-09-10 rather than
+                // copied from a vendor page -- aur.archlinux.org is
+                // 2604:cac0:a104:d::2 and the tarball fetch that fired went to
+                // 2607:f8b0:4006:81f::200e, whose PTR is 1e100.net. These are
+                // the /32s those sit in; they are ranges, so they will drift
+                // like the v4 ones already do, which is why this rule is medium
+                // and not a block.
+                "2604:cac0::/32".into(),  // archlinux.org, aur.archlinux.org
+                "2607:f8b0::/32".into(),  // Google
+                "2a00:1450::/32".into(),  // Google, EU
+                "2606:4700::/32".into(),  // Cloudflare (PyPI, crates.io front)
+                "2a04:4e42::/32".into(),  // Fastly (npm registry)
             ],
             allow_private: true,
             egress_severity: "medium".into(),

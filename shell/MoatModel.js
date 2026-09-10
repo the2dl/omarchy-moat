@@ -2977,7 +2977,10 @@ function rawFacts(alert) {
   add("args", p.args)
   add("cwd", p.cwd)
   add("start_ts", p.start_ts)
-  add("ancestry", ancestryLines(a).join("\n"))
+  // NOT here any more: ProcessTree draws this properly, and printing the same
+  // chain twice on one card -- once as a tree and once as a blob of "pid path"
+  // lines -- is worse than either alone. `ancestryLines` stays because the
+  // bundle and the tests read it.
   if (a.file) {
     add("file", a.file.path)
     add("sha256", a.file.sha256)
@@ -3261,6 +3264,11 @@ function normalizeStatus(raw) {
     sensorsLoaded: (s.sensors_loaded === null || s.sensors_loaded === undefined)
       ? null : Number(s.sensors_loaded),
     sensorUnhealthy: s.sensor_unhealthy === true,
+    // Unhealthy because it has not finished attaching, rather than broken. The
+    // footer says opposite things for the two, and both spellings are carried
+    // because this function has dropped a field five times now.
+    sensorLoading: s.sensor_loading === true,
+    sensor_loading: s.sensor_loading === true,
     policies_failed: Array.isArray(s.policies_failed) ? s.policies_failed.slice() : [],
     feeds: {
       updated: String(feeds.updated || ""),

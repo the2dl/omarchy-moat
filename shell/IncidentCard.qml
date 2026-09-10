@@ -447,6 +447,18 @@ Rectangle {
             }
         }
 
+        // Who started what. The record's own shape is a tree and it used to be
+        // printed as a block of "pid  path" lines inside the Advanced grid --
+        // the whole story of an alert rendered as the least readable thing on
+        // the card. Collapsed by default: the one-line summary answers it most
+        // of the time, and a closed tree costs one Text.
+        ProcessTree {
+            width: parent.width
+            tokens: root.t
+            ancestry: root.head && root.head.process ? root.head.process.ancestry : []
+            process: root.head ? root.head.process : null
+        }
+
         // Only the two that answer "what, and by what". Everything else is evidence.
         // Advanced: the record itself, in the card, without opening anything. The
         // two facts below are a strict subset of these, so they step aside rather

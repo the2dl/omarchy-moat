@@ -84,4 +84,12 @@ echo "--- tst_keyed"
 QT_QPA_PLATFORM=offscreen \
   "$runner" -input "$here/tst_keyed.qml" || status=1
 
+# tst_tree instantiates ProcessTree, the collapsible ancestry on every incident
+# card. It pins the order (the record stores nearest-parent-first, a reader
+# wants oldest-first with the alerting process last) and that a closed tree
+# builds nothing -- the whole reason it is closed by default.
+echo "--- tst_tree"
+QT_QPA_PLATFORM=offscreen \
+  "$runner" -input "$here/tst_tree.qml" || status=1
+
 exit $status

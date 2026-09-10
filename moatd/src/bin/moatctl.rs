@@ -1025,6 +1025,13 @@ fn print_human(cmd: &Cmd, r: &Value) {
                               so the updated moatd.service is in place, then \
                               `sudo systemctl daemon-reload && sudo systemctl restart moatd`.");
                 }
+                if r["sensor_loading"] == Value::Bool(true) {
+                    println!(
+                        "\n  NOTE: the sensor is still attaching. These are planted but not yet \
+                         watched -- give it a few seconds before testing a read, or the read \
+                         will look like the detection failing."
+                    );
+                }
                 if *on {
                     println!("\n  see them with: moatctl canary");
                     println!("  a read is an alert; `moatctl canary --enforce on` refuses the read too");
@@ -1068,6 +1075,11 @@ fn print_human(cmd: &Cmd, r: &Value) {
                 let gone = if row["present"].as_bool() == Some(true) { "" } else { "   (MISSING)" };
                 println!("  {}{}", row["path"].as_str().unwrap_or("?"), gone);
                 println!("    a read here means {}", row["means"].as_str().unwrap_or(""));
+            }
+            if r["sensor_loading"] == Value::Bool(true) {
+                println!(
+                    "\n  the sensor is still attaching -- these are not being watched yet."
+                );
             }
             let missing = r["missing"].as_array().map(|a| a.len()).unwrap_or(0);
             if missing > 0 {
@@ -1581,7 +1593,12 @@ fn print_status(r: &Value) {
         state,
         // Loud, because a sensor that is not loaded makes every other line on
         // this screen meaningless — including a reassuring 0 unacked.
-        if r["sensor_unhealthy"] == Value::Bool(true) {
+        if r["sensor_loading"] == Value::Bool(true) {
+            // Not a fault, and the old text sent people to `systemctl status`
+            // to find a healthy unit. Detections really are not live yet, so
+            // this still has to say so -- it just has to say the true thing.
+            "   *** STILL ATTACHING — detections are not live yet, give it a few seconds ***"
+        } else if r["sensor_unhealthy"] == Value::Bool(true) {
             "   *** NOT PROTECTED — check: systemctl status tetragon ***"
         } else {
             ""

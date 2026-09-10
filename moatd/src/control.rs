@@ -2717,6 +2717,12 @@ fn set_canary(d: &mut Daemon, value: &str, who: &str, per_kind: usize) -> Value 
                 "canary": on,
                 "summary": summary,
                 "canaries": d.canary_paths().len(),
+                // A decoy planted while the sensor is still attaching is a
+                // decoy nothing is watching yet, and the person who just
+                // planted it is about to test exactly that. Two reads went
+                // unobserved inside a 19-second window on 2026-09-10 and read
+                // as the feature being broken.
+                "sensor_loading": d.sensor_loading(),
                 // Never silent. A plant that covered two of seven places while
                 // reporting success is a security feature lying about its own
                 // coverage, which is the failure this whole product exists
@@ -2751,6 +2757,7 @@ fn cmd_canary(d: &Daemon) -> Value {
         .collect();
     ok(json!({
         "canaries": rows,
+        "sensor_loading": d.sensor_loading(),
         // A decoy that was deleted leaves a rule that still loads, still counts
         // as a policy and can never fire again. Silence from this rule is
         // supposed to mean nothing went looking; if the file is gone it means

@@ -211,6 +211,45 @@ mod tests {
         assert!(net.domain.is_none());
     }
 
+    /// Every default CIDR was IPv4, and `parse_cidr` goes through `IpAddr`, so
+    /// v6 parsed fine and matched nothing. On a dual-stack machine this rule
+    /// reported that you have IPv6, not that a package install reached
+    /// somewhere it should not: `omarchy-update` -> `yay` -> AUR over v6 was a
+    /// medium alert every time anyone updated.
+    ///
+    /// The addresses are the ones a real `omarchy-update` actually used on
+    /// 2026-09-10, resolved back to aur.archlinux.org and 1e100.net.
+    #[test]
+    fn the_default_allowlist_covers_both_address_families() {
+        let cfg = crate::config::Config::default();
+        let nets: Vec<_> = cfg
+            .net
+            .registry_cidrs
+            .iter()
+            .filter_map(|c| crate::rules::netmatch::parse_cidr(c))
+            .collect();
+        assert_eq!(
+            nets.len(),
+            cfg.net.registry_cidrs.len(),
+            "every shipped CIDR has to parse, or it silently allows nothing"
+        );
+
+        let covered = |ip: &str| {
+            let addr: std::net::IpAddr = ip.parse().unwrap();
+            crate::rules::netmatch::contains_any(&nets, &addr)
+        };
+
+        // What the update actually hit.
+        assert!(covered("2604:cac0:a104:d::2"), "aur.archlinux.org over v6");
+        assert!(covered("2607:f8b0:4006:81f::200e"), "the source tarball over v6");
+        assert!(covered("209.126.35.78"), "aur.archlinux.org over v4");
+
+        // And the rule still has to mean something: somewhere unrelated is not
+        // in the list, or this would be an allowlist of the whole internet.
+        assert!(!covered("203.0.113.7"), "an unrelated v4 host is still reported");
+        assert!(!covered("2001:db8::1"), "an unrelated v6 host is still reported");
+    }
+
     #[test]
     fn the_registry_allowlist_silences_it() {
         let t = table_with_install();

@@ -46,6 +46,16 @@ pub const HISTORY_TAMPER: &str = "moat-rootkit-history-tamper";
 
 /// The rules whose SUBJECT is moat's own directories. Everything else is cut
 /// off from them entirely (`is_own_store`).
+/// How long after the last policy was pinned a short count still counts as
+/// "loading" rather than "degraded".
+///
+/// Measured, not guessed: 51 policies took 19 s to pin on 2026-09-10, and
+/// tetragon writes the directory as it goes, so the gap between two pins is a
+/// fraction of that. 60 s is generous enough to cover a slower or busier
+/// machine and short enough that a sensor which really stopped short is called
+/// degraded within a minute rather than excused indefinitely.
+const SENSOR_SETTLE_SECS: u64 = 60;
+
 const SELF_WATCH_RULES: &[&str] = &[
     "moat-rootkit-evidence-tamper",
     "moat-rootkit-sensor-tamper",
@@ -192,6 +202,13 @@ struct ChainStamp {
 }
 
 pub struct Daemon {
+    /// How long after the last pin a short count still reads as "loading".
+    ///
+    /// A field rather than a constant so a test can set it to 0 and assert the
+    /// degraded path deterministically: removing a pin touches the directory
+    /// mtime exactly like adding one, so at that instant the two are genuinely
+    /// indistinguishable and only time tells them apart.
+    pub sensor_settle_secs: u64,
     pub cfg: Config,
     pub cfg_path: PathBuf,
     pub policies: PolicySet,
@@ -486,6 +503,7 @@ impl Daemon {
 
         let mut d = Daemon {
             cfg,
+            sensor_settle_secs: SENSOR_SETTLE_SECS,
             cfg_path: cfg_path.to_path_buf(),
             policies,
             allowlist,
@@ -5366,10 +5384,52 @@ impl Daemon {
             .collect()
     }
 
+    /// Is the sensor still attaching, as opposed to broken?
+    ///
+    /// Both look identical from the pin count alone -- fewer policies than
+    /// there should be -- and the advice for each is the opposite. On
+    /// 2026-09-10 tetragon took 19 seconds to pin 51 policies, and during that
+    /// window `moatctl status` said "degraded 50/51 *** NOT PROTECTED --
+    /// check: systemctl status tetragon ***": a fault report, pointing at a
+    /// healthy unit, for a sensor that was simply not finished. Two decoy
+    /// reads in that window went unobserved and read as the detection being
+    /// broken, which cost an evening.
+    ///
+    /// The distinction is whether policies are still ARRIVING. The bpffs
+    /// directory's mtime moves every time tetragon pins one, so a count below
+    /// expected with a directory touched seconds ago is a sensor mid-load; the
+    /// same count with a directory untouched for a minute is a sensor that
+    /// stopped short and needs looking at.
+    /// NOT for a count of zero. `sensor_health_is_counted_from_the_kernel_not_
+    /// guessed` exists because an earlier version trusted a file's existence
+    /// and a log's mtime, and "a crash loop keeps both fresh" -- this is the
+    /// same mtime, so it gets the same suspicion. Nothing pinned stays `down`
+    /// however recently the directory was touched, which is the case a crash
+    /// loop actually produces.
+    ///
+    /// What is left is the honest residual: a sensor that pins some policies,
+    /// dies, and repeats would read `loading` rather than `degraded`. Both are
+    /// `sensor_unhealthy`, so nothing is excused by this -- only the advice
+    /// changes, and after SENSOR_SETTLE_SECS without a new pin it says
+    /// `degraded` anyway.
+    fn sensor_is_settling(&self) -> bool {
+        let Ok(m) = std::fs::metadata(&self.cfg.paths.tetragon_bpf_dir) else {
+            return false;
+        };
+        use std::os::unix::fs::MetadataExt;
+        let age = util::unix_secs().saturating_sub(m.mtime().max(0) as u64);
+        age < self.sensor_settle_secs
+    }
+
     pub fn tetragon_state(&self) -> String {
         let expected = self.policies.len();
         match self.sensors_loaded() {
+            // Zero is always down, never "just starting" -- see
+            // `sensor_is_settling`. That is the shape a crash loop makes.
             Some(0) if expected > 0 => "down".into(),
+            Some(n) if n < expected && self.sensor_is_settling() => {
+                format!("loading {}/{}", n, expected)
+            }
             Some(n) if n < expected => format!("degraded {}/{}", n, expected),
             Some(_) => "running".into(),
             // Cannot see bpffs. Fall back to the old, weaker heuristics, but
@@ -5396,6 +5456,15 @@ impl Daemon {
     /// sensor is the most dangerous shape of "quiet" there is.
     pub fn sensor_unhealthy(&self) -> bool {
         !matches!(self.tetragon_state().as_str(), "running" | "unverified")
+    }
+
+    /// Unhealthy because it has not FINISHED, rather than because it is broken.
+    ///
+    /// Still unhealthy -- coverage really is incomplete and saying nothing
+    /// would be the worse lie -- but the advice is the opposite of the
+    /// degraded case: wait a few seconds, do not go looking for a fault.
+    pub fn sensor_loading(&self) -> bool {
+        self.tetragon_state().starts_with("loading")
     }
 
     pub fn sandbox_on(&self) -> bool {
@@ -5448,6 +5517,10 @@ impl Daemon {
             },
             "unacked": unacked,
             "sandbox": self.sandbox_on(),
+            // Separate from `sensor_unhealthy`, which stays true for both: a
+            // sensor mid-load and a sensor that stopped short look identical in
+            // the pin count and need opposite advice.
+            "sensor_loading": self.sensor_loading(),
             // Two numbers, because "canaries are on" and "canaries can still
             // fire" are different questions: a decoy deleted by a /tmp sweep
             // leaves the rule loaded and armed with nothing to match.
@@ -10249,6 +10322,19 @@ esac
         assert_eq!(d.tetragon_state(), "down");
         assert!(d.sensor_unhealthy());
 
+        // Partway, with policies still arriving: attaching, not broken. This
+        // is the 19-second window that made two decoy reads on 2026-09-10 look
+        // like a detection that did not work.
+        let names: Vec<String> = d.policies.names().into_iter().collect();
+        std::fs::create_dir_all(pins.join(&names[0])).unwrap();
+        assert_eq!(d.tetragon_state(), format!("loading 1/{}", expected));
+        assert!(d.sensor_loading());
+        assert!(
+            d.sensor_unhealthy(),
+            "still unhealthy -- coverage really is incomplete, only the advice differs"
+        );
+        std::fs::remove_dir_all(pins.join(&names[0])).unwrap();
+
         // Every policy pinned: running.
         for name in d.policies.names() {
             std::fs::create_dir_all(pins.join(&name)).unwrap();
@@ -10261,6 +10347,12 @@ esac
 
         // One policy fails to attach — the exact E2BIG shape — and the count
         // names how many of how many, rather than rounding up to "running".
+        //
+        // The settle window goes to zero first: unpinning touches the directory
+        // mtime exactly like pinning, so at this instant a failed attach and a
+        // load in progress are the same observation and only time separates
+        // them. Zero here asks the question this test is actually about.
+        d.sensor_settle_secs = 0;
         std::fs::remove_dir_all(pins.join(d.policies.names()[0].clone())).unwrap();
         assert_eq!(
             d.tetragon_state(),

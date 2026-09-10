@@ -180,7 +180,16 @@ Item {
                 ? root.status.sensorsLoaded : root.status.sensors_loaded;
         var loaded = Number(raw);
         var total = Number(root.status.policies);
-        var sensors = isFinite(loaded) && isFinite(total) && loaded !== total ? loaded + " of " + total + " detections" : total + " detections";
+        // A sensor mid-attach and a sensor that stopped short read the same
+        // here -- fewer loaded than rendered -- and the difference is the whole
+        // meaning: one is about to be fine, the other needs someone. Two decoy
+        // reads inside a 19-second attach window on 2026-09-10 looked like the
+        // detection not working.
+        var sensors = isFinite(loaded) && isFinite(total) && loaded !== total
+                    ? (root.status.sensorLoading === true || root.status.sensor_loading === true
+                       ? "still attaching, " + loaded + " of " + total
+                       : loaded + " of " + total + " detections")
+                    : total + " detections";
         return sensors + "  ·  tetragon " + String(root.status.tetragon || "?");
     }
 

@@ -4355,6 +4355,23 @@ TestCase {
     compare(none.canary_enforcing, false)
   }
 
+  /// A sensor mid-attach and a sensor that stopped short are both unhealthy
+  /// and need opposite advice, so the flag has to survive the normalizer
+  /// separately from `sensorUnhealthy` -- which stays true for both.
+  function test_a_settling_sensor_is_told_apart_from_a_broken_one() {
+    var loading = Model.normalizeStatus({ sensor_loading: true, sensor_unhealthy: true })
+    compare(loading.sensorLoading, true)
+    compare(loading.sensor_loading, true, "both spellings, like sensors_loaded")
+    compare(loading.sensorUnhealthy, true, "still unhealthy: coverage really is incomplete")
+
+    var broken = Model.normalizeStatus({ sensor_unhealthy: true })
+    compare(broken.sensorLoading, false)
+    compare(broken.sensorUnhealthy, true)
+
+    // Neither flag set is the ordinary case, and must not be undefined.
+    compare(Model.normalizeStatus({}).sensorLoading, false)
+  }
+
   /// "Never updated" is a fault. "No key configured" is a setup step nobody
   /// took. The footer said the first when it meant the second, and the reason
   /// existed only in the journal of a service that exits successfully.
