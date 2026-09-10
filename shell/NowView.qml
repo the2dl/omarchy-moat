@@ -173,7 +173,12 @@ Item {
         if (!root.status)
             return "";
 
-        var loaded = Number(root.status.sensors_loaded);
+        // Either spelling: normalizeStatus emits snake_case for this reader
+        // and camelCase for the model's own, and this line asking for only one
+        // of them is why the "of" form never appeared.
+        var raw = root.status.sensors_loaded === undefined || root.status.sensors_loaded === null
+                ? root.status.sensorsLoaded : root.status.sensors_loaded;
+        var loaded = Number(raw);
         var total = Number(root.status.policies);
         var sensors = isFinite(loaded) && isFinite(total) && loaded !== total ? loaded + " of " + total + " detections" : total + " detections";
         return sensors + "  ·  tetragon " + String(root.status.tetragon || "?");

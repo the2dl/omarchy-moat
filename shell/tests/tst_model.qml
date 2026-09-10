@@ -4275,6 +4275,67 @@ TestCase {
     verify(all.indexOf("Blocking, not just watching") >= 0, all.join(" | "))
   }
 
+  /// Every test above hands `footerFacts` a raw daemon object, and that is
+  /// exactly how the bug it was written for survived being fixed. On the real
+  /// path the status crosses `normalizeStatus` first, which builds a NEW object
+  /// from a whitelist and drops silently whatever the whitelist forgot -- and
+  /// it forgot `enforcing_rules`. So the footer went on saying "Watching, not
+  /// blocking" with eight rules armed, while the test proving otherwise passed.
+  ///
+  /// These go through the round trip a running panel actually performs. That is
+  /// the only shape that can catch a dropped field, which this function has now
+  /// done to four of them (`chain`, `triage`, `surface`, and these).
+  function test_the_footer_counts_armed_rules_through_the_normalizer() {
+    var status = Model.normalizeStatus({
+      mode: "monitor",
+      enforcing_rules: ["moat-cred-etc-shadow-read", "moat-rootkit-kernel-module-load",
+                        "moat-shell-reverse-shell-connect"]
+    })
+    compare(status.enforcing_rules.length, 3, "the normalizer must carry the armed rules")
+
+    var bits = Model.footerFacts(status)
+    verify(bits.indexOf("Watching, and blocking 3 rules") >= 0, bits.join(" | "))
+    verify(bits.indexOf("Watching, not blocking") < 0,
+           "it must not claim nothing is blocked: " + bits.join(" | "))
+  }
+
+  /// `onToggled` sends `!status.inspect_containers`. With the field dropped
+  /// that is `!undefined`, which is `true` every time -- so the control could
+  /// turn container inspection on and never off, and the switch it drew was
+  /// `undefined` rather than either position.
+  function test_container_inspection_survives_the_normalizer_in_both_positions() {
+    var on = Model.normalizeStatus({ inspect_containers: true })
+    compare(on.inspect_containers, true)
+    compare(on.inspect_containers !== true, false,
+            "with it on, the toggle must send off")
+
+    var off = Model.normalizeStatus({ inspect_containers: false })
+    compare(off.inspect_containers, false)
+    compare(off.inspect_containers !== true, true,
+            "with it off, the toggle must send on")
+
+    // Absent is off, never undefined: an undefined here is what QML refused to
+    // assign to `checked`, ten seconds apart, forever.
+    var absent = Model.normalizeStatus({})
+    compare(absent.inspect_containers, false)
+  }
+
+  /// The footer says "31 of 50 detections" only when the kernel loaded fewer
+  /// than were rendered -- the one line that reveals a sensor that failed to
+  /// attach. NowView asks for snake_case; the normalizer emitted only
+  /// camelCase, so the comparison was against NaN and the "of" form was
+  /// unreachable.
+  function test_both_spellings_of_the_sensor_count_survive_the_normalizer() {
+    var partial = Model.normalizeStatus({ sensors_loaded: 31, policies: 50 })
+    compare(Number(partial.sensors_loaded), 31, "the footer's spelling")
+    compare(Number(partial.sensorsLoaded), 31, "the model's spelling")
+
+    // "cannot tell" has to stay distinguishable from "none loaded".
+    var unknown = Model.normalizeStatus({ policies: 50 })
+    compare(unknown.sensors_loaded, null)
+    compare(unknown.sensorsLoaded, null)
+  }
+
   /// "Never updated" is a fault. "No key configured" is a setup step nobody
   /// took. The footer said the first when it meant the second, and the reason
   /// existed only in the journal of a service that exits successfully.

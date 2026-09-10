@@ -314,7 +314,7 @@ Item {
 
                     ToggleSwitch {
                         anchors.verticalCenter: parent.verticalCenter
-                        checked: !!root.status && root.status.sandbox
+                        checked: !!root.status && root.status.sandbox === true
                         busy: !!root.service && root.service.busy
                         foreground: root.t ? root.t.secondary : "white"
                         accent: root.t ? root.t.accent : "orange"
@@ -351,14 +351,14 @@ Item {
 
                     ToggleSwitch {
                         anchors.verticalCenter: parent.verticalCenter
-                        checked: !!root.status && root.status.inspect_containers
+                        checked: !!root.status && root.status.inspect_containers === true
                         busy: !!root.service && root.service.busy
                         foreground: root.t ? root.t.secondary : "white"
                         accent: root.t ? root.t.accent : "orange"
                         trackHeight: root.t ? root.t.s(23) : 18
                         onToggled: {
                             if (root.service)
-                                root.service.setContainers(!root.service.status.inspect_containers);
+                                root.service.setContainers(root.service.status.inspect_containers !== true);
 
                         }
                     }

@@ -3270,6 +3270,24 @@ function normalizeStatus(raw) {
     },
     unacked: s.unacked && typeof s.unacked === "object" ? s.unacked : null,
     sandbox: s.sandbox === true,
+    // Whitelisted, for the fourth time in this function's history. The rules
+    // armed to act regardless of the daemon-wide mode -- `footerFacts` counts
+    // them to answer "will this stop anything". It was taught to read this
+    // field and the field was never added here, so `armed` has been 0 on every
+    // real status since: the footer kept saying "Watching, not blocking" with
+    // eight rules armed, which is the exact bug that change set out to fix.
+    enforcing_rules: Array.isArray(s.enforcing_rules) ? stringList(s.enforcing_rules) : [],
+    // Whitelisted. Settings reads this to draw the containers toggle, and its
+    // absence did more than blank the switch: `onToggled` sends
+    // `!status.inspect_containers`, and `!undefined` is always true, so the
+    // control could only ever turn inspection ON. Off was unreachable.
+    inspect_containers: s.inspect_containers === true,
+    // Both spellings, because two readers disagree: MoatModel takes either,
+    // NowView's footer asks for snake_case only and got undefined, so the
+    // "31 of 50 detections" form -- the one that says the kernel is missing
+    // some -- could never appear. It always read a flat "50 detections".
+    sensors_loaded: (s.sensors_loaded === null || s.sensors_loaded === undefined)
+      ? null : Number(s.sensors_loaded),
     // When moatd first ran here. It is what turns "learning ends on Thursday"
     // into "day 2 of 9" -- the design's learning card is a progress bar, and a
     // progress bar needs both ends of the window (1g).
