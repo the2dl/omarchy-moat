@@ -330,6 +330,101 @@ Item {
 
             }
 
+            // ------------------------------------------------- decoy files (row 4)
+            SettingsRow {
+                width: parent.width
+                tokens: root.t
+                question: "Plant decoy files"
+                help: {
+                    var n = root.status ? Number(root.status.canaries) || 0 : 0;
+                    var gone = root.status ? Number(root.status.canaries_missing) || 0 : 0;
+                    var base = "Writes a handful of files that look like leftover credentials — into /etc, /root, your home and the temp directories — and watches them. Nothing on this machine has any reason to open one, so unlike every other rule here this one has no legitimate reader and needs no tuning: a read is the alert.\n\nThe names are different on every machine, so knowing one does not reveal the rest. Moat never overwrites an existing file, and never deletes anything that is not still its own decoy.";
+                    if (n > 0)
+                        base += "\n\n" + n + " planted. See them with `moatctl canary`.";
+                    if (gone > 0)
+                        base += " " + gone + " have been deleted from disk — the rule still counts as armed but cannot fire for those, so re-plant them.";
+                    return base;
+                }
+
+                Row {
+                    anchors.right: parent.right
+                    spacing: root.t ? root.t.s(10) : 6
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        // The count, not just on/off: "on" with every decoy
+                        // deleted is a rule that cannot fire, and that has to be
+                        // visible without opening the CLI.
+                        text: {
+                            if (!root.status || !(Number(root.status.canaries) > 0))
+                                return "off";
+                            var gone = Number(root.status.canaries_missing) || 0;
+                            return gone > 0 ? (Number(root.status.canaries) - gone) + " of " + Number(root.status.canaries) : String(Number(root.status.canaries));
+                        }
+                        color: {
+                            if (root.status && (Number(root.status.canaries_missing) || 0) > 0)
+                                return root.t ? root.t.alarm : "red";
+                            return root.t ? root.t.faint : "grey";
+                        }
+                        font.family: root.t ? root.t.family : "monospace"
+                        font.pixelSize: root.t ? root.t.fSecondary : 12
+                    }
+
+                    ToggleSwitch {
+                        anchors.verticalCenter: parent.verticalCenter
+                        checked: !!root.status && Number(root.status.canaries) > 0
+                        busy: !!root.service && root.service.busy
+                        foreground: root.t ? root.t.secondary : "white"
+                        accent: root.t ? root.t.accent : "orange"
+                        trackHeight: root.t ? root.t.s(23) : 18
+                        onToggled: {
+                            if (root.service)
+                                root.service.setCanary(!(Number(root.service.status.canaries) > 0));
+
+                        }
+                    }
+                }
+            }
+
+            // --------------------------------------- refuse the decoy read (row 5)
+            SettingsRow {
+                width: parent.width
+                tokens: root.t
+                question: "Refuse the read as well"
+                help: "Off: a decoy can be read, and Moat says so. On: the read itself fails with a permission error and Moat still says so — the bytes never reach whatever asked for them.\n\nThis refuses the open rather than killing the reader, deliberately. The one false positive this rule has is a backup or a full-disk search, and a backup that skips one file and reports it is a better outcome than a backup killed halfway through. Needs decoys planted above."
+
+                Row {
+                    anchors.right: parent.right
+                    spacing: root.t ? root.t.s(10) : 6
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: !!root.status && root.status.canary_enforcing === true ? "on" : "off"
+                        color: root.t ? root.t.faint : "grey"
+                        font.family: root.t ? root.t.family : "monospace"
+                        font.pixelSize: root.t ? root.t.fSecondary : 12
+                    }
+
+                    ToggleSwitch {
+                        anchors.verticalCenter: parent.verticalCenter
+                        checked: !!root.status && root.status.canary_enforcing === true
+                        // Arming a rule that matches nothing would report success
+                        // and change nothing, so the switch is only live once
+                        // there is something to arm.
+                        enabled: !!root.status && Number(root.status.canaries) > 0
+                        busy: !!root.service && root.service.busy
+                        foreground: root.t ? root.t.secondary : "white"
+                        accent: root.t ? root.t.accent : "orange"
+                        trackHeight: root.t ? root.t.s(23) : 18
+                        onToggled: {
+                            if (root.service)
+                                root.service.setRuleMode("moat-canary-file-read", root.status.canary_enforcing === true ? "monitor" : "enforce");
+
+                        }
+                    }
+                }
+            }
+
             // ------------------------------------------- inspect containers (row 4)
             SettingsRow {
                 width: parent.width

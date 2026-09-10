@@ -33,6 +33,10 @@ HOME = "/home/test"
 LIST_PLACEHOLDERS = {
     "{{FILE_SCOPE}}": ["/usr/bin/", HOME + "/.local/bin/"],
     "{{FILE_SUFFIXES}}": [".sh", ".js", ".mjs"],
+    # Stand-ins only. The real list is per-machine and lives in
+    # /var/lib/moat/canaries.json, which does not exist at build time -- these
+    # two are here so the policy can be shape-checked like any other.
+    "{{CANARIES}}": ["/etc/rsync.secrets", HOME + "/.env.production"],
 }
 
 # ---------------------------------------------------------------------------
@@ -43,6 +47,9 @@ API_VERSION = "cilium.io/v1alpha1"
 KIND = "TracingPolicy"
 NAME_PREFIX = "moat-"
 FAMILIES = {"cred", "pkg", "persist", "shell", "rootkit", "priv", "ai", "net", "exec",
+            # `canary`: decoy files moat planted itself. The only family with no
+            # legitimate reader, which is why it needs no allowlist.
+            "canary",
             # `ransom`: files or recovery points destroyed. Two policies, one a
             # plain detection (snapshot-destroy) and one a `signal` feed for the
             # counting rule of the same name (file-churn).

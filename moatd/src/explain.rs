@@ -396,6 +396,18 @@ fn what_sentence(f: &Finding) -> String {
             Some(p) => format!("{} read {}.", comm, describe_secret(p)),
             None => format!("{} touched a credential store.", comm),
         },
+        // Name the file, and say what it is in the same breath. Every other
+        // family can assume the reader knows what the path means; this one
+        // cannot, because the path was invented by moat and looks exactly like
+        // the real secret it imitates. "node read /etc/rsync.secrets" reads as
+        // a catastrophe until you know that file was never real.
+        "canary" => match file {
+            Some(p) => format!(
+                "{} read {}, a decoy file Moat planted. Nothing else knows it exists.",
+                comm, p
+            ),
+            None => format!("{} read a decoy file Moat planted.", comm),
+        },
         // Every shipped `pkg-*` policy hooks bprm_check_security, so the file
         // in the event is the binary being EXECUTED inside the package-manager
         // process tree, not a secret being read. Saying "curl read /usr/bin/curl"

@@ -1,3 +1,8 @@
+// `status()` is one json! literal with ~60 fields, and serde_json's macro
+// recurses once per field. The default 128 was reached by adding three; the
+// alternative is splitting that object up, which would scatter the one place a
+// reader can see everything moatd reports about itself.
+#![recursion_limit = "512"]
 //! moatd — the userspace half of omarchy-moat.
 //!
 //! Tetragon (upstream, unmodified) does the kernel work and writes a JSON-lines
@@ -44,6 +49,7 @@ pub mod allowlist;
 pub mod analysis;
 pub mod baseline;
 pub mod bundle;
+pub mod canary;
 pub mod chain;
 pub mod config;
 pub mod contain;

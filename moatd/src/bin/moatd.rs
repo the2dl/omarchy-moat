@@ -195,6 +195,7 @@ fn init_logging(verbose: u8) {
 fn cmd_render(cfg: Config, a: RenderArgs) -> std::process::ExitCode {
     // Read before anything moves out of `cfg.paths`.
     let exclusions = moatd::engine::read_exclusions(&cfg.paths.state_file());
+    let canary_manifest = cfg.paths.canaries();
     let templates = a.templates_dir.unwrap_or(cfg.paths.templates_dir);
     let out = a.out_dir.unwrap_or(cfg.paths.policies_dir);
     let allowlist = match a.export_allowlist {
@@ -210,6 +211,7 @@ fn cmd_render(cfg: Config, a: RenderArgs) -> std::process::ExitCode {
         passwd: &passwd,
         homes: (!a.homes.is_empty()).then_some(a.homes.clone()),
         telemetry: cfg.telemetry.clone(),
+        canaries: moatd::canary::Manifest::load(&canary_manifest).paths(),
         // Read from state.json, because `render-policies` runs as ExecStartPre
         // in its own process: an exclusion the user granted has to survive a
         // restart, or the program they allowed starts dying again after the
@@ -458,6 +460,7 @@ fn cmd_telemetry(cfg: Config, cfg_path: PathBuf, a: TelemetryArgs) -> std::proce
         passwd: &cfg.paths.passwd,
         homes: None,
         telemetry: cfg.telemetry.clone(),
+        canaries: moatd::canary::Manifest::load(&cfg.paths.canaries()).paths(),
         exclusions: moatd::engine::read_exclusions(&cfg.paths.state_file()),
         contain_slots: cfg.contain.max,
     };

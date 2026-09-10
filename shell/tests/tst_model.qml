@@ -4336,6 +4336,25 @@ TestCase {
     compare(unknown.sensorsLoaded, null)
   }
 
+  /// The decoy counts have to survive the normalizer, and for a reason beyond
+  /// drawing a switch: "canaries are on" and "canaries can still fire" are
+  /// different questions. A decoy deleted by a /tmp sweep leaves the rule
+  /// loaded, counted and reporting armed with nothing to match, so a panel that
+  /// only carries the on/off flag would show a working detection that is not.
+  function test_the_decoy_counts_survive_the_normalizer() {
+    var s = Model.normalizeStatus({ canaries: 7, canaries_missing: 2, canary_enforcing: true })
+    compare(s.canaries, 7)
+    compare(s.canaries_missing, 2)
+    compare(s.canary_enforcing, true)
+
+    // Absent is zero and false, never undefined -- an undefined here is what
+    // QML refuses to assign to `checked`.
+    var none = Model.normalizeStatus({})
+    compare(none.canaries, 0)
+    compare(none.canaries_missing, 0)
+    compare(none.canary_enforcing, false)
+  }
+
   /// "Never updated" is a fault. "No key configured" is a setup step nobody
   /// took. The footer said the first when it meant the second, and the reason
   /// existed only in the journal of a service that exits successfully.

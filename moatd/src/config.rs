@@ -106,6 +106,12 @@ impl Paths {
         self.state_dir.join("feeds")
     }
 
+    /// The decoy manifest. 0600 root:root: it is the only list of which files
+    /// are decoys, so anything that can read it can step around all of them.
+    pub fn canaries(&self) -> PathBuf {
+        self.state_dir.join("canaries.json")
+    }
+
     pub fn user_allowlist(&self) -> PathBuf {
         self.allowlist_dir.join("user.toml")
     }

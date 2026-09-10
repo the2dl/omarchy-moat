@@ -111,6 +111,22 @@ enum Cmd {
         #[arg(long)]
         restore: bool,
     },
+    /// Decoy files: plant them, remove them, see what is planted.
+    ///
+    /// With no flags this lists what exists, which is the question a person has
+    /// when a critical alert names a file they have never heard of.
+    Canary {
+        /// Plant a fresh set. Needs root.
+        #[arg(long, conflicts_with_all = ["off", "enforce"])]
+        on: bool,
+        /// Remove every decoy this machine planted. Needs root.
+        #[arg(long, conflicts_with_all = ["on", "enforce"])]
+        off: bool,
+        /// `on` denies the read outright; `off` alerts and lets it through.
+        /// Needs root.
+        #[arg(long, value_name = "on|off")]
+        enforce: Option<String>,
+    },
     /// Stop alerting on this pattern; writes a [[rule]] block and acks.
     Ignore {
         id: String,
@@ -328,6 +344,13 @@ fn agent_may_not_run(cmd: &Cmd) -> bool {
             // preview is for. The gate is on the commit, not on the thinking.
             | Cmd::Allow { yes: true, .. }
             | Cmd::Ignore { .. }
+            // Planting is a state change; removing hands over the location of
+            // every decoy on the machine. Listing them stays allowed -- an
+            // agent explaining a critical alert has to be able to say "that
+            // file was a decoy" without asking a human to go and look.
+            | Cmd::Canary { on: true, .. }
+            | Cmd::Canary { off: true, .. }
+            | Cmd::Canary { enforce: Some(_), .. }
             | Cmd::Unignore { .. }
             | Cmd::Set { .. }
             | Cmd::Kill { .. }
@@ -432,6 +455,18 @@ fn main() -> ExitCode {
                 json!({"cmd": "exclusions", "action": "remove", "rule": rule, "exe": exe})
             }
             None => json!({"cmd": "exclusions", "action": "list"}),
+        },
+        Cmd::Canary { on, off, enforce } => match (on, off, enforce) {
+            (true, _, _) => json!({"cmd": "set", "key": "canary", "value": "on"}),
+            (_, true, _) => json!({"cmd": "set", "key": "canary", "value": "off"}),
+            // Enforcement is the generic per-rule switch, not a second concept:
+            // `set mode --rule` is what arms every other policy, and giving
+            // canaries their own would be a second thing to keep in step.
+            (_, _, Some(v)) => {
+                let mode = if matches!(v.as_str(), "on" | "true" | "1") { "enforce" } else { "monitor" };
+                json!({"cmd": "set", "key": "mode", "value": mode, "rule": "moat-canary-file-read"})
+            }
+            _ => json!({"cmd": "canary"}),
         },
         Cmd::Contain { release } => match release {
             Some(chain) => json!({"cmd": "contain", "action": "release", "id": chain}),
@@ -974,6 +1009,53 @@ fn print_human(cmd: &Cmd, r: &Value) {
     match cmd {
         Cmd::Status => print_status(r),
         Cmd::List { .. } => print_list(r),
+        Cmd::Canary { on, off, enforce } => {
+            if *on || *off {
+                println!("  {}", r["summary"].as_str().unwrap_or("done"));
+                if *on {
+                    println!("  see them with: moatctl canary");
+                    println!("  a read is an alert; `moatctl canary --enforce on` refuses the read too");
+                }
+                return;
+            }
+            if enforce.is_some() {
+                println!("  {}", r["applied"].as_array().map(|a| a.len()).unwrap_or(0));
+                return;
+            }
+            let rows = r["canaries"].as_array().cloned().unwrap_or_default();
+            if rows.is_empty() {
+                println!("no decoy files planted. `sudo moatctl canary --on` plants a set.");
+                return;
+            }
+            println!(
+                "{} decoy file(s). Nothing reads these; a read is the alert.\n",
+                rows.len()
+            );
+            for row in &rows {
+                let gone = if row["present"].as_bool() == Some(true) { "" } else { "   (MISSING)" };
+                println!("  {}{}", row["path"].as_str().unwrap_or("?"), gone);
+                println!("    a read here means {}", row["means"].as_str().unwrap_or(""));
+            }
+            let missing = r["missing"].as_array().map(|a| a.len()).unwrap_or(0);
+            if missing > 0 {
+                // The rule still loads and still reports armed, so its silence
+                // stops meaning anything. Say so where it will be read.
+                println!(
+                    "\n{} of them are gone from disk. The rule still loads and still counts as \
+                     armed, so it cannot fire for those paths -- re-plant with \
+                     `sudo moatctl canary --on`.",
+                    missing
+                );
+            }
+            println!(
+                "\nreading  {}",
+                if r["enforcing"].as_bool() == Some(true) {
+                    "is refused outright (-EACCES) and alerts"
+                } else {
+                    "is allowed, and alerts. `sudo moatctl canary --enforce on` refuses it."
+                }
+            );
+        }
         Cmd::Exclusions { remove: Some(_) } => println!(
             "{} is watched again by {}",
             r["exe"].as_str().unwrap_or("?"),

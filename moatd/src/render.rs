@@ -39,6 +39,17 @@ pub const PLACEHOLDER: &str = "{{HOME}}";
 pub const FILE_SCOPE: &str = "{{FILE_SCOPE}}";
 pub const FILE_SUFFIXES: &str = "{{FILE_SUFFIXES}}";
 
+/// The decoy paths this machine planted, from `canary::Manifest`.
+///
+/// Unlike the telemetry lists this one is empty in the ordinary case -- most
+/// machines have canaries off -- and empty here is not a narrower policy but a
+/// broken one: `matchArgs` with no values matches NOTHING, while the policy
+/// still loads, still counts toward `policies`, and still reports armed. A rule
+/// that can never fire while looking exactly like one that can is the worst
+/// thing to ship, so the template is skipped entirely instead and `render`
+/// removes the stale file, the way it does for a telemetry class turned off.
+pub const CANARIES: &str = "{{CANARIES}}";
+
 /// The three export-allowlist lines, matching `policies/export-allowlist.example`.
 ///
 /// Line 1 keeps exec/exit — they carry no `policy_name`, so there is no other
@@ -116,6 +127,8 @@ pub struct RenderOptions<'a> {
     /// that actually stops the killing while the rule stays armed for
     /// everything else.
     pub exclusions: std::collections::BTreeMap<String, Vec<String>>,
+    /// Decoy paths for `canary-file-read.yaml`. Empty skips that template.
+    pub canaries: Vec<String>,
     /// `[contain] max`: how many containment policy names to reserve in the
     /// export allowlist. See the note at the write site -- a runtime policy
     /// whose name is not in this file is invisible to moatd.
@@ -131,6 +144,7 @@ impl Default for RenderOptions<'_> {
             passwd: Path::new("/etc/passwd"),
             homes: None,
             telemetry: crate::config::TelemetryConfig::default(),
+            canaries: Vec::new(),
             exclusions: std::collections::BTreeMap::new(),
             contain_slots: crate::config::ContainConfig::default().max,
         }
@@ -145,6 +159,7 @@ pub fn render(opts: &RenderOptions) -> Result<RenderReport, String> {
     let mut lists: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
     lists.insert(FILE_SCOPE, opts.telemetry.file_scope.clone());
     lists.insert(FILE_SUFFIXES, opts.telemetry.file_suffixes.clone());
+    lists.insert(CANARIES, opts.canaries.clone());
 
     let mut report = RenderReport {
         telemetry_classes: opts
@@ -190,6 +205,15 @@ pub fn render(opts: &RenderOptions) -> Result<RenderReport, String> {
                     .push((stem.clone(), format!("telemetry.{} is off", class)));
                 continue;
             }
+        }
+        // The canary policy with no canaries is not a quieter policy, it is a
+        // rule that matches nothing while reporting itself armed. Skip it, and
+        // the sweep below deletes whatever was rendered last time.
+        if stem.starts_with("canary-") && opts.canaries.is_empty() {
+            report
+                .skipped
+                .push((stem.clone(), "no canaries are planted".to_string()));
+            continue;
         }
         match render_one_with(tpl, &homes, &lists, &opts.exclusions) {
             Ok((name, body)) => {
@@ -572,6 +596,70 @@ fn expand(v: &mut Value, homes: &[String]) {
 
 #[cfg(test)]
 mod tests {
+
+    /// The canary policy is rendered from the manifest, and an empty manifest
+    /// must produce no policy at all.
+    ///
+    /// An empty `matchArgs` list is not a narrower rule, it is a rule that
+    /// matches nothing -- while still loading, still counting toward
+    /// `policies`, and still reporting armed. That combination is the worst
+    /// thing this feature could ship: a detection whose silence means nothing,
+    /// wearing the face of one whose silence means everything.
+    #[test]
+    fn the_canary_policy_is_skipped_when_nothing_is_planted() {
+        let tpl = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../policies/canary-file-read.yaml"),
+            tpl.path().join("canary-file-read.yaml"),
+        )
+        .unwrap();
+
+        let opts = RenderOptions {
+            templates_dir: tpl.path(),
+            out_dir: out.path(),
+            export_allowlist: None,
+            passwd: Path::new("/etc/passwd"),
+            homes: Some(vec!["/home/x".into()]),
+            telemetry: crate::config::TelemetryConfig::default(),
+            canaries: Vec::new(),
+            exclusions: Default::default(),
+            contain_slots: 4,
+        };
+        let report = render(&opts).unwrap();
+        assert!(
+            !out.path().join("canary-file-read.yaml").exists(),
+            "an empty list must render no policy at all"
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|(s, why)| s.starts_with("canary-") && why.contains("no canaries")),
+            "and it must say why: {:?}",
+            report.skipped
+        );
+
+        // With paths, the same template renders and carries them exactly.
+        let opts = RenderOptions {
+            canaries: vec!["/etc/rsync.secrets".into(), "/root/.pgpass".into()],
+            ..opts
+        };
+        render(&opts).unwrap();
+        let body = std::fs::read_to_string(out.path().join("canary-file-read.yaml")).unwrap();
+        assert!(body.contains("/etc/rsync.secrets"), "{}", body);
+        assert!(body.contains("/root/.pgpass"), "{}", body);
+        assert!(!body.contains("{{CANARIES}}"), "the placeholder must be gone: {}", body);
+
+        // And a stale render is swept when the last decoy goes away.
+        let opts = RenderOptions { canaries: Vec::new(), ..opts };
+        render(&opts).unwrap();
+        assert!(
+            !out.path().join("canary-file-read.yaml").exists(),
+            "turning canaries off must delete the policy, not leave it matching nothing"
+        );
+    }
+
     use super::*;
 
     const TPL: &str = r#"apiVersion: cilium.io/v1alpha1
@@ -709,6 +797,7 @@ spec:
             passwd: Path::new("/etc/passwd"),
             homes: Some(vec!["/home/dan".into()]),
             telemetry: crate::config::TelemetryConfig::default(),
+            canaries: Vec::new(),
             exclusions: Default::default(),
             contain_slots: 0,
         };
@@ -742,6 +831,7 @@ spec:
             passwd: Path::new("/etc/passwd"),
             homes: Some(vec!["/home/dan".into()]),
             telemetry: crate::config::TelemetryConfig::default(),
+            canaries: Vec::new(),
             exclusions: Default::default(),
             contain_slots: 0,
         };
@@ -852,6 +942,7 @@ spec:
             passwd: Path::new("/etc/passwd"),
             homes: Some(vec!["/home/dan".into()]),
             telemetry: telemetry.clone(),
+            canaries: Vec::new(),
             exclusions: Default::default(),
             contain_slots: 0,
         };

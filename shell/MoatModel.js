@@ -3270,6 +3270,14 @@ function normalizeStatus(raw) {
     },
     unacked: s.unacked && typeof s.unacked === "object" ? s.unacked : null,
     sandbox: s.sandbox === true,
+    // Whitelisted, and the count matters as much as the flag: `canaries` is how
+    // many decoys are planted, `canaries_missing` how many of those are gone
+    // from disk. A rule matching paths that no longer exist still loads and
+    // still reports armed, so without the second number the panel cannot tell
+    // "nothing went looking" from "nothing could have been seen".
+    canaries: Number(s.canaries) || 0,
+    canaries_missing: Number(s.canaries_missing) || 0,
+    canary_enforcing: s.canary_enforcing === true,
     // Whitelisted, for the fourth time in this function's history. The rules
     // armed to act regardless of the daemon-wide mode -- `footerFacts` counts
     // them to answer "will this stop anything". It was taught to read this

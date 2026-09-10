@@ -197,7 +197,8 @@ const ROOT_ONLY: &[(&str, &str)] = &[
 /// it decides whether a weekly summary is sent, which is a preference and not a
 /// protection, and making a person sudo for it would teach them that the sudo
 /// prompt is meaningless -- which is how the meaningful one gets waved through.
-const ROOT_ONLY_SET_KEYS: &[&str] = &["mode", "sandbox", "contain", "kill", "containers"];
+const ROOT_ONLY_SET_KEYS: &[&str] =
+    &["mode", "sandbox", "contain", "kill", "containers", "canary"];
 
 /// `(command, action)` pairs that need root, where the COMMAND itself does not.
 ///
@@ -368,6 +369,7 @@ pub fn dispatch(d: &mut Daemon, req: &Value) -> Value {
         "digest" => cmd_digest(d, req),
         "contain" => cmd_contain(d, req, &id()),
         "exclusions" => cmd_exclusions(d, req),
+        "canary" => cmd_canary(d),
         "" => err("missing `cmd`"),
         other => err(format!("unknown command {:?}", other)),
     }
@@ -2293,6 +2295,7 @@ fn cmd_set(d: &mut Daemon, req: &Value) -> Value {
     match key {
         "mode" => set_mode(d, value, req["rule"].as_str().unwrap_or(""), &who),
         "sandbox" => set_sandbox(d, value, &who),
+        "canary" => set_canary(d, value, &who, 2),
         "containers" => set_containers(d, value, &who),
         "digest" => set_digest(d, value),
         "contain" => set_contain(d, value, &who),
@@ -2687,6 +2690,65 @@ fn d_kill_word(rank: u8) -> &'static str {
         2 => "kill",
         _ => "log",
     }
+}
+
+/// Plant or remove the decoys.
+///
+/// Root-gated with the other protection switches, and for a sharper reason than
+/// most: the manifest is the only record of which paths are decoys, so a caller
+/// who can turn this off can also learn where every one of them is on the way
+/// past. That is the whole detection, handed over in one command.
+fn set_canary(d: &mut Daemon, value: &str, who: &str, per_kind: usize) -> Value {
+    let on = match value {
+        "on" | "true" | "1" => true,
+        "off" | "false" | "0" => false,
+        other => return err(format!("canary must be on or off, got {:?}", other)),
+    };
+    match d.set_canaries(on, per_kind) {
+        Ok(summary) => {
+            if !on {
+                d.raise_protection_change(
+                    "remove the decoy files (canary off)",
+                    who,
+                    vec![summary.clone()],
+                );
+            }
+            ok(json!({ "canary": on, "summary": summary, "canaries": d.canary_paths().len() }))
+        }
+        Err(e) => err(e),
+    }
+}
+
+/// What is planted, and whether any of it has gone missing.
+///
+/// Reading is not gated. A person cannot decide whether a critical alert was
+/// their own decoy without being able to see the list, and evidence behind sudo
+/// does not get read -- the same argument that keeps `baseline list` open.
+fn cmd_canary(d: &Daemon) -> Value {
+    let m = crate::canary::Manifest::load(&d.cfg.paths.canaries());
+    let missing = crate::canary::missing(&m);
+    let rows: Vec<Value> = m
+        .canaries
+        .iter()
+        .map(|c| {
+            json!({
+                "path": c.path,
+                "kind": c.kind.as_str(),
+                "means": c.kind.meaning(),
+                "planted": c.planted,
+                "present": std::path::Path::new(&c.path).exists(),
+            })
+        })
+        .collect();
+    ok(json!({
+        "canaries": rows,
+        // A decoy that was deleted leaves a rule that still loads, still counts
+        // as a policy and can never fire again. Silence from this rule is
+        // supposed to mean nothing went looking; if the file is gone it means
+        // nothing at all, and only this field can tell the two apart.
+        "missing": missing,
+        "enforcing": d.mode_for("moat-canary-file-read") == "enforce",
+    }))
 }
 
 fn set_sandbox(d: &mut Daemon, value: &str, who: &str) -> Value {
@@ -3323,6 +3385,11 @@ mod tests {
             // quarantine exists to prevent -- and releasing drops a hold moat
             // decided to place. Both answered an ordinary user before this.
             json!({"cmd":"quarantine","action":"restore","id":"01X"}),
+            // Turning the decoys off does two things at once: it stops the
+            // detection, and on the way past it tells the caller where every
+            // decoy on this machine is. Either alone would earn the gate.
+            json!({"cmd":"set","key":"canary","value":"off"}),
+            json!({"cmd":"set","key":"canary","value":"on"}),
             json!({"cmd":"contain","action":"release","id":"01X"}),
         ] {
             let r = dispatch(&mut d, &user(cmd.clone()));
@@ -3358,6 +3425,9 @@ mod tests {
             // Seeing what is held and what is contained stays open: the gate is
             // on undoing a response, never on reading that one happened.
             json!({"cmd":"quarantine","action":"list"}),
+            // Listing the decoys is evidence, not a switch: a person cannot
+            // decide whether a critical alert was their own decoy without it.
+            json!({"cmd":"canary"}),
             json!({"cmd":"contain","action":"list"}),
         ] {
             assert_eq!(dispatch(&mut d, &user(cmd.clone()))["ok"], true, "{:?}", cmd);

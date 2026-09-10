@@ -2409,6 +2409,7 @@ impl Daemon {
             passwd: &self.cfg.paths.passwd,
             homes: None,
             telemetry: self.cfg.telemetry.clone(),
+            canaries: self.canary_paths(),
             exclusions: self.kernel_exclusions.clone(),
         contain_slots: self.cfg.contain.max,
         };
@@ -2478,6 +2479,7 @@ impl Daemon {
             passwd: &self.cfg.paths.passwd,
             homes: None,
             telemetry: self.cfg.telemetry.clone(),
+            canaries: self.canary_paths(),
             exclusions: self.kernel_exclusions.clone(),
         contain_slots: self.cfg.contain.max,
         };
@@ -5181,6 +5183,107 @@ impl Daemon {
         }
     }
 
+    /// Plant or remove the decoys, then make the kernel agree with the manifest.
+    ///
+    /// The order matters in both directions and is not symmetric. Planting
+    /// writes the files FIRST and loads the policy second, because a policy
+    /// naming paths that do not exist yet is a rule that cannot fire. Removing
+    /// unloads the policy FIRST, because a live rule whose files have just been
+    /// deleted is the same broken state arrived at from the other side -- and
+    /// worse, it would be moat's own `remove` that trips it.
+    pub fn set_canaries(&mut self, on: bool, per_kind: usize) -> Result<String, String> {
+        let manifest_path = self.cfg.paths.canaries();
+        let mut manifest = crate::canary::Manifest::load(&manifest_path);
+
+        let summary = if on {
+            let homes = crate::util::human_homes(&self.cfg.paths.passwd);
+            let existing: Vec<String> = manifest.paths();
+            let mut planted = 0usize;
+            let now = crate::util::unix_secs();
+            for (kind, path) in crate::canary::plan(&homes, per_kind) {
+                if existing.iter().any(|p| p == &path.display().to_string()) {
+                    continue;
+                }
+                match crate::canary::plant(kind, &path, now) {
+                    Ok(c) => {
+                        manifest.canaries.push(c);
+                        planted += 1;
+                    }
+                    // One unwritable directory is not a reason to abandon the
+                    // rest: /root may not exist, /var/tmp may be a read-only
+                    // mount, and decoys in the other four places are still
+                    // worth having.
+                    Err(e) => log::warn!("canary: {}", e),
+                }
+            }
+            if manifest.canaries.is_empty() {
+                return Err("could not plant a single decoy; nothing was changed".into());
+            }
+            manifest.save(&manifest_path)?;
+            format!("{} decoy file(s) planted", planted)
+        } else {
+            // Unload before deleting -- see above.
+            self.tetra_policy(&["tp", "delete", "moat-canary-file-read"]);
+            let mut removed = 0usize;
+            let mut kept: Vec<crate::canary::Canary> = Vec::new();
+            for c in manifest.canaries.drain(..) {
+                match crate::canary::remove(std::path::Path::new(&c.path)) {
+                    Ok(_) => removed += 1,
+                    // Someone put a real file at that path after we planted
+                    // ours. It stays, and so does the record of it, so the next
+                    // `canary on` does not try to plant over it.
+                    Err(e) => {
+                        log::warn!("canary: {}", e);
+                        kept.push(c);
+                    }
+                }
+            }
+            manifest.canaries = kept;
+            manifest.save(&manifest_path)?;
+            format!("{} decoy file(s) removed", removed)
+        };
+
+        let opts = crate::render::RenderOptions {
+            templates_dir: &self.cfg.paths.templates_dir,
+            out_dir: &self.cfg.paths.policies_dir,
+            export_allowlist: Some(&self.cfg.paths.export_allowlist),
+            passwd: &self.cfg.paths.passwd,
+            homes: None,
+            telemetry: self.cfg.telemetry.clone(),
+            canaries: manifest.paths(),
+            exclusions: self.kernel_exclusions.clone(),
+            contain_slots: self.cfg.contain.max,
+        };
+        crate::render::render(&opts).map_err(|e| format!("render: {}", e))?;
+
+        if on {
+            let path = self.rendered_path("moat-canary-file-read")?;
+            self.tetra_policy(&["tp", "delete", "moat-canary-file-read"]);
+            if !self.tetra_policy(&["tp", "add", &path]) {
+                return Err(format!(
+                    "{} -- but the policy could not be loaded; run \
+                     `sudo systemctl restart tetragon` to arm it",
+                    summary
+                ));
+            }
+            if self.mode_for("moat-canary-file-read") == "enforce" {
+                self.tetra_arm("moat-canary-file-read");
+            }
+        }
+        Ok(summary)
+    }
+
+    /// The decoy paths this machine has planted, for the renderer.
+    ///
+    /// Read from disk rather than held in memory: `canary off` removes files
+    /// and rewrites the manifest, and a stale in-memory copy would re-render a
+    /// policy naming paths that are no longer there -- a rule that reports
+    /// armed and can never fire, which is the failure this whole feature is
+    /// least able to afford.
+    pub fn canary_paths(&self) -> Vec<String> {
+        crate::canary::Manifest::load(&self.cfg.paths.canaries()).paths()
+    }
+
     /// TracingPolicies the kernel is actually running, counted from the
     /// directories Tetragon pins under its bpffs dir (one per loaded policy).
     ///
@@ -5333,6 +5436,14 @@ impl Daemon {
             },
             "unacked": unacked,
             "sandbox": self.sandbox_on(),
+            // Two numbers, because "canaries are on" and "canaries can still
+            // fire" are different questions: a decoy deleted by a /tmp sweep
+            // leaves the rule loaded and armed with nothing to match.
+            "canaries": self.canary_paths().len(),
+            "canaries_missing": crate::canary::missing(
+                &crate::canary::Manifest::load(&self.cfg.paths.canaries())
+            ).len(),
+            "canary_enforcing": self.mode_for("moat-canary-file-read") == "enforce",
             // Whether the *caller* is in the group is a client-side question:
             // if it were not, it could not have reached this socket.
             "socket_group": self.cfg.group,

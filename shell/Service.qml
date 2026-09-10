@@ -622,6 +622,10 @@ Item {
             return [root.ctlPath, "set", "mode", Model.normalizeMode(arg2), "--rule", String(arg), "--json"];
         case "sandbox":
             return [root.ctlPath, "set", "sandbox", arg === true || arg === "on" ? "on" : "off", "--json"];
+        case "canary":
+            // Plant or remove the decoys. Root-gated, so an unprivileged toggle
+            // comes back as the daemon's refusal text like the rest.
+            return [root.ctlPath, "set", "canary", arg === true || arg === "on" ? "on" : "off", "--json"];
         case "containers":
             // Whether container activity reaches the badge. Root-gated, so an
             // unprivileged toggle comes back as the daemon's refusal text.
@@ -818,6 +822,12 @@ Item {
 
     function setSandbox(on) {
         return root._enqueue("sandbox", on === true || on === "on");
+    }
+
+    /// Plant or remove the decoy files. Root-gated like the other protection
+    /// switches; `_enqueue` carries that refusal back as-is.
+    function setCanary(on) {
+        return root._enqueue("canary", on === true || on === "on");
     }
 
     /// Whether container activity reaches the badge. Root-gated like the other

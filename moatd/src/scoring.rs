@@ -197,6 +197,11 @@ pub const GLOBAL_RULES: &[&str] = &[
     // Capabilities gained inside a container are still capabilities on this
     // kernel, and the exploit that granted them ran here.
     "moat-priv-capability-gained",
+    // The decoys sit on the host filesystem. A container that opened one is
+    // reading outside itself, which is a mount escape before it is anything
+    // else -- the containment being broken is the finding, so this is the last
+    // rule that should be softened for having happened in a container.
+    "moat-canary-file-read",
 ];
 
 pub const NEVER_LOWERED: &[&str] = &[
