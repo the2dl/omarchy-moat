@@ -47,7 +47,12 @@ ProtectSystem=strict
 # written to deserve it: control.rs copies from a descriptor opened O_NOFOLLOW
 # and removes with unlinkat() relative to the parent directory, which cannot be
 # redirected out of that directory by swapping a symlink in.
-ReadWritePaths=/var/lib/moat /var/log/moat /run/moat /etc/moat /tmp /var/tmp /dev/shm /home
+# /etc and /root are here for the decoys (canary.rs). They are the two most
+# valuable places to put one -- an unprivileged process reading /etc is looking
+# for a way up, and anything reading /root has already found one -- and both
+# were EROFS until now, so `canary --on` planted two files in /tmp and called
+# it success.
+ReadWritePaths=/var/lib/moat /var/log/moat /run/moat /etc/moat /tmp /var/tmp /dev/shm /home /etc /root
 
 # Capabilities, and why each one is here:
 #   CAP_KILL             `moatctl kill` signals a process of any uid
@@ -64,7 +69,23 @@ NoNewPrivileges=yes
 
 # ReadWritePaths=/home above takes precedence over this for /home itself;
 # this still keeps /root and /run/user read-only.
-ProtectHome=read-only
+# NOT read-only, and this is the second time that has been decided.
+#
+# ReadWritePaths above lists /home for one reason, spelled out there: without
+# it `moatctl quarantine` copied the payload and then failed with EROFS trying
+# to remove the original, reporting a quarantine while leaving the implant
+# running. `ProtectHome=read-only` silently put that back -- it is applied over
+# ReadWritePaths, not under it -- so the fix described above has never once
+# worked on a real machine.
+#
+# Found on 2026-09-10 from the other end: planting a decoy in /home/dan failed
+# with EROFS, which is the same mount and the same syscall class as the unlink
+# quarantine needs. The unit said $HOME mattered most and then made $HOME the
+# one place moat could not act.
+#
+# What is left is not nothing: ProtectSystem=strict still makes everything
+# outside ReadWritePaths read-only, /usr included.
+ProtectHome=no
 PrivateTmp=no
 PrivateDevices=yes
 ProtectKernelTunables=yes

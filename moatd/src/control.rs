@@ -2705,7 +2705,7 @@ fn set_canary(d: &mut Daemon, value: &str, who: &str, per_kind: usize) -> Value 
         other => return err(format!("canary must be on or off, got {:?}", other)),
     };
     match d.set_canaries(on, per_kind) {
-        Ok(summary) => {
+        Ok((summary, failures)) => {
             if !on {
                 d.raise_protection_change(
                     "remove the decoy files (canary off)",
@@ -2713,7 +2713,16 @@ fn set_canary(d: &mut Daemon, value: &str, who: &str, per_kind: usize) -> Value 
                     vec![summary.clone()],
                 );
             }
-            ok(json!({ "canary": on, "summary": summary, "canaries": d.canary_paths().len() }))
+            ok(json!({
+                "canary": on,
+                "summary": summary,
+                "canaries": d.canary_paths().len(),
+                // Never silent. A plant that covered two of seven places while
+                // reporting success is a security feature lying about its own
+                // coverage, which is the failure this whole product exists
+                // against.
+                "failed": failures,
+            }))
         }
         Err(e) => err(e),
     }

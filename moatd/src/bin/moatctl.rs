@@ -1012,8 +1012,21 @@ fn print_human(cmd: &Cmd, r: &Value) {
         Cmd::Canary { on, off, enforce } => {
             if *on || *off {
                 println!("  {}", r["summary"].as_str().unwrap_or("done"));
+                // Loudly. A plant that covered two of seven places and printed
+                // only the two is a security feature overstating its own reach.
+                let failed = r["failed"].as_array().cloned().unwrap_or_default();
+                if !failed.is_empty() {
+                    println!("\n  {} place(s) could NOT be covered:", failed.len());
+                    for f in &failed {
+                        println!("    {}", f.as_str().unwrap_or("?"));
+                    }
+                    println!("  Those paths are NOT watched. `Read-only file system` here means \
+                              moatd's own sandbox is refusing the write -- reinstall the package \
+                              so the updated moatd.service is in place, then \
+                              `sudo systemctl daemon-reload && sudo systemctl restart moatd`.");
+                }
                 if *on {
-                    println!("  see them with: moatctl canary");
+                    println!("\n  see them with: moatctl canary");
                     println!("  a read is an alert; `moatctl canary --enforce on` refuses the read too");
                 }
                 return;
@@ -1023,14 +1036,34 @@ fn print_human(cmd: &Cmd, r: &Value) {
                 return;
             }
             let rows = r["canaries"].as_array().cloned().unwrap_or_default();
+            // Which PLACES are covered, not just how many files exist. Two
+            // decoys in /tmp and none in /etc or /root is a very different
+            // posture from seven spread across all of them, and the count alone
+            // cannot tell them apart.
+            let mut places: Vec<&str> = rows
+                .iter()
+                .filter_map(|x| x["kind"].as_str())
+                .collect();
+            places.sort_unstable();
+            places.dedup();
             if rows.is_empty() {
                 println!("no decoy files planted. `sudo moatctl canary --on` plants a set.");
                 return;
             }
             println!(
-                "{} decoy file(s). Nothing reads these; a read is the alert.\n",
-                rows.len()
+                "{} decoy file(s) across {}. Nothing reads these; a read is the alert.\n",
+                rows.len(),
+                places.join(", ")
             );
+            for want in ["etc", "root", "home", "tmp"] {
+                if !places.contains(&want) {
+                    println!(
+                        "  NOT COVERED: {} -- nothing is watching there. \
+                         Re-run `sudo moatctl canary --on`; it will say why.",
+                        want
+                    );
+                }
+            }
             for row in &rows {
                 let gone = if row["present"].as_bool() == Some(true) { "" } else { "   (MISSING)" };
                 println!("  {}{}", row["path"].as_str().unwrap_or("?"), gone);

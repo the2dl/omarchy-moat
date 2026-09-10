@@ -229,14 +229,25 @@ fn body(kind: Kind, name: &str, secret: &str) -> String {
     }
 }
 
-/// 0644 in `/etc` is not an oversight -- see the module docs. Everywhere else
-/// the decoy is only meant to be reachable by whoever already owns the
-/// directory it sits in.
+/// A decoy nobody can read catches nothing, so the mode follows who has to be
+/// able to open it -- which is the attacker, not the owner.
+///
+/// `/etc` and the temp directories are 0644 on purpose. In `/etc` a
+/// world-readable secrets file is itself the classic escalation finding, which
+/// is what makes it convincing bait AND what makes it reachable before the
+/// escalation rather than after. In `/tmp` the first attempt made them 0600
+/// owned by the directory's owner -- root -- so `cat /tmp/db-dump.sql` was
+/// Permission denied for the person who planted it, and would have been for
+/// every attacker running as a user too. A decoy the threat model cannot open
+/// is furniture.
+///
+/// `/root` stays 0600: unreadable until something is already root, which is the
+/// whole signal. A home decoy stays 0600 too, but is chowned to the owner of
+/// that home below -- the threat model there is a package running AS that user.
 fn mode(kind: Kind) -> u32 {
     match kind {
-        Kind::Etc => 0o644,
-        Kind::Root => 0o600,
-        Kind::Home | Kind::Tmp => 0o600,
+        Kind::Etc | Kind::Tmp => 0o644,
+        Kind::Root | Kind::Home => 0o600,
     }
 }
 
@@ -302,7 +313,11 @@ pub fn plant(kind: Kind, path: &Path, now: u64) -> Result<Canary, String> {
     // A decoy in a user's home owned by root is not a decoy, it is a puzzle --
     // and the attacker we care about runs as that user, so it has to be
     // readable by them or it catches nothing.
-    if matches!(kind, Kind::Home | Kind::Tmp) {
+    //
+    // Only Home. Doing this for Tmp took the owner of /tmp, which is root, and
+    // produced a root-owned 0600 file that nobody could read; the temp decoys
+    // are world-readable instead, see `mode`.
+    if matches!(kind, Kind::Home) {
         if let Some(dir) = path.parent() {
             if let Ok(md) = std::fs::metadata(dir) {
                 use std::os::unix::fs::MetadataExt;
@@ -382,6 +397,19 @@ mod tests {
         assert_eq!(c.kind, Kind::Etc);
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644, "an /etc decoy only root can read cannot catch a process looking for a way up");
+    }
+
+    /// The first cut made these 0600 and chowned them to the owner of /tmp,
+    /// which is root -- so `cat /tmp/db-dump.sql` was Permission denied for the
+    /// person who planted it, and for every attacker running as a user. A decoy
+    /// the threat model cannot open is furniture.
+    #[test]
+    fn a_temp_decoy_is_readable_or_it_is_furniture() {
+        let d = tmpdir();
+        let p = d.path().join("db-dump.sql");
+        plant(Kind::Tmp, &p, 100).unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "an unprivileged process must be able to open it");
     }
 
     #[test]

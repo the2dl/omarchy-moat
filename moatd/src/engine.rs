@@ -5191,9 +5191,10 @@ impl Daemon {
     /// unloads the policy FIRST, because a live rule whose files have just been
     /// deleted is the same broken state arrived at from the other side -- and
     /// worse, it would be moat's own `remove` that trips it.
-    pub fn set_canaries(&mut self, on: bool, per_kind: usize) -> Result<String, String> {
+    pub fn set_canaries(&mut self, on: bool, per_kind: usize) -> Result<(String, Vec<String>), String> {
         let manifest_path = self.cfg.paths.canaries();
         let mut manifest = crate::canary::Manifest::load(&manifest_path);
+        let mut failures: Vec<String> = Vec::new();
 
         let summary = if on {
             let homes = crate::util::human_homes(&self.cfg.paths.passwd);
@@ -5213,7 +5214,18 @@ impl Daemon {
                     // rest: /root may not exist, /var/tmp may be a read-only
                     // mount, and decoys in the other four places are still
                     // worth having.
-                    Err(e) => log::warn!("canary: {}", e),
+                    //
+                    // But it IS a reason to say so. The first cut only logged
+                    // this, and on 2026-09-10 `canary --on` planted two files
+                    // in /tmp, failed five times on EROFS, and reported "2
+                    // decoy file(s) planted" as a success -- a security feature
+                    // reporting that it was watching /etc and /root when it was
+                    // watching neither. A partial plant that looks like a whole
+                    // one is worse than a plant that fails outright.
+                    Err(e) => {
+                        log::warn!("canary: {}", e);
+                        failures.push(e);
+                    }
                 }
             }
             if manifest.canaries.is_empty() {
@@ -5270,7 +5282,7 @@ impl Daemon {
                 self.tetra_arm("moat-canary-file-read");
             }
         }
-        Ok(summary)
+        Ok((summary, failures))
     }
 
     /// The decoy paths this machine has planted, for the renderer.
