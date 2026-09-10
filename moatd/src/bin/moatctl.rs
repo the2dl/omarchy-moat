@@ -453,7 +453,7 @@ fn main() -> ExitCode {
     };
 
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_default());
+        println!("{}", render_json(&cli.cmd, &resp));
     } else {
         print_human(&cli.cmd, &resp);
     }
@@ -2093,8 +2093,49 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Render a `--json` response.
+///
+/// `feed` is the panel's data pump, not something anyone reads: the panel polls
+/// it several times a minute and the answer is megabytes. Indenting it cost
+/// 2.2 MB of pure whitespace out of 7.6 -- 29% -- built into a string by this
+/// process, pushed through a pipe, and allocated again as a JS string on every
+/// poll before being thrown away. That is a real part of the panel's heap
+/// high-water mark, and none of it was ever looked at.
+///
+/// Every other command stays indented. Those answers are read by people, and
+/// `moatctl status --json` piped into a pager is a thing we do constantly.
+fn render_json(cmd: &Cmd, resp: &Value) -> String {
+    if matches!(cmd, Cmd::Feed { .. }) {
+        serde_json::to_string(resp).unwrap_or_default()
+    } else {
+        serde_json::to_string_pretty(resp).unwrap_or_default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// The panel polls `feed --json` several times a minute and never shows the
+    /// bytes to anyone, so it must not pay to indent them; `status --json` is
+    /// read by people and must stay indented. Both halves are asserted, because
+    /// "make it compact" applied to everything would be the obvious wrong fix.
+    #[test]
+    fn only_the_feed_is_rendered_compact() {
+        let resp = serde_json::json!({"alerts": [{"id": "01X", "rule": "r"}], "ok": true});
+
+        let feed = render_json(&Cmd::Feed { limit: 500 }, &resp);
+        assert!(!feed.contains('\n'), "the feed must not be indented: {feed}");
+        assert!(feed.contains(r#""alerts":["#), "and must still be the same JSON: {feed}");
+
+        let status = render_json(&Cmd::Status, &resp);
+        assert!(status.contains('\n'), "status is read by people: {status}");
+
+        // Same content either way -- this is presentation, never a filter.
+        let a: Value = serde_json::from_str(&feed).unwrap();
+        let b: Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(a, b);
+        assert!(feed.len() < status.len());
+    }
 
     /// An agent may read, never act. The marker is what the launchers set.
     #[test]
