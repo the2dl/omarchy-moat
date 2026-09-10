@@ -114,6 +114,14 @@ prepare() {
 		return 1
 	fi
 
+	# `shell` is NOT installed by package() -- the panel is a separate Omarchy
+	# plugin, added with `omarchy plugin add` -- but it is copied here because
+	# check() reads Service.qml. `privilegedCommands` in that file has to carry
+	# every root-gated key the daemon defines, and when it does not the switch
+	# still draws and still moves and comes back "needs root", which reads as a
+	# permissions message rather than a bug. That went unnoticed for
+	# `containers` until a second switch arrived the same way, so the check runs
+	# in the build and not only in the repo.
 	rm -rf "${srcdir:?}/${_tree}"
 	install -d "${srcdir}/${_tree}"
 	cp -a \
@@ -125,6 +133,7 @@ prepare() {
 		"${repo}/skills" \
 		"${repo}/assets" \
 		"${repo}/README.md" \
+		"${repo}/shell" \
 		"${srcdir}/${_tree}/"
 
 	# A developer's ./target would otherwise be reused (and its stale

@@ -3362,10 +3362,19 @@ mod tests {
     /// mirror is a third copy to drift.
     #[test]
     fn every_root_gated_switch_is_elevated_by_the_panel() {
-        let qml = std::fs::read_to_string(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../shell/Service.qml"),
-        )
-        .expect("shell/Service.qml");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../shell/Service.qml");
+        let Ok(qml) = std::fs::read_to_string(path) else {
+            // Loudly, never silently. A guard that quietly stops guarding when
+            // a file moves is worse than no guard, because the green run is
+            // read as proof. The PKGBUILD copies `shell` into the build tree
+            // for exactly this reason.
+            panic!(
+                "{} is missing, so the panel's pkexec list cannot be checked \
+                 against ROOT_ONLY_SET_KEYS. Copy `shell` into the build tree \
+                 or run this from the repository.",
+                path
+            );
+        };
         let line = qml
             .lines()
             .find(|l| l.contains("property var privilegedCommands"))
