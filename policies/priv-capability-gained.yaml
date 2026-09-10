@@ -36,7 +36,30 @@ spec:
     # Effective|Inheritable|Permitted and `operator` is In|NotIn ONLY.
     # `CapabilitiesGained` is in the CRD operator enum but belongs to matchArgs,
     # not here -- it does not validate in this field.
-    - matchCapabilityChanges:
+    # ONLY in the host user namespace.
+    #
+    # Without this the rule fired 37 times in minutes on 2026-09-10, all of it
+    # `bwrap`: a sandbox creates a user namespace and is handed a full
+    # capability set INSIDE it, which is what a sandbox is. Chrome, Flatpak and
+    # moat's own moat-sandbox all do it on every launch, and the noise guard had
+    # demoted the rule to the timeline within minutes of it shipping -- so the
+    # detection was off before anyone read one of its alerts.
+    #
+    # `isNamespaceCapability: false` does NOT express this; it describes how the
+    # values are read, not which namespace to watch. The namespace filter does.
+    #
+    # What is kept is the case the rule is for: a process in THIS machine's user
+    # namespace gaining a root-equivalent capability it did not exec with. A
+    # process that first unshares into its own namespace has escalated inside a
+    # box it built, which is not the same claim -- and the escalation that
+    # matters, breaking OUT of that box, lands back in the host namespace where
+    # this still sees it.
+    - matchNamespaces:
+      - namespace: User
+        operator: "In"
+        values:
+        - "host_ns"
+      matchCapabilityChanges:
       - type: "Effective"
         operator: "In"
         isNamespaceCapability: false
