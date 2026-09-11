@@ -5,8 +5,13 @@
 # the pacman package ships no QML, so without this the running UI silently
 # stays behind whatever was just committed.
 #
-# Never fails the commit: a hook that can break `git commit` is a hook someone
-# disables.
-exec >/dev/null 2>&1 || true
+# Output is NOT suppressed. The script says nothing when there is nothing to
+# say, and the things it does say are the ones worth seeing: that it moved the
+# panel, or that it refused to because somebody has been editing it. An earlier
+# version of this hook redirected both streams to /dev/null, which would have
+# hidden exactly the refusal this whole mechanism exists to surface.
+#
+# Never fails the commit, though: a hook that can break `git commit` is a hook
+# somebody disables.
 "$(git rev-parse --show-toplevel)/scripts/sync-plugin.sh" || true
 exit 0
