@@ -750,14 +750,14 @@ mod tests {
         let mut a = demo_alert("01AAAAAAAAAAAAAAAAAAAAAAAA");
         a.ts = "2026-09-03T16:21:07.000Z".into();
         a.process.pid = 41233;
-        a.process.ancestry = vec![Ancestor { pid: 41201, exe: "/usr/bin/npm".into() }];
+        a.process.ancestry = vec![Ancestor::new(41201, "/usr/bin/npm".into())];
         a.process.cwd = "/home/dan/proj".into();
 
         // Same tree (its parent is our parent), inside the window.
         let mut sibling = demo_alert("01SSSSSSSSSSSSSSSSSSSSSSSS");
         sibling.ts = "2026-09-03T16:22:00.000Z".into();
         sibling.process.pid = 41240;
-        sibling.process.ancestry = vec![Ancestor { pid: 41201, exe: "/usr/bin/npm".into() }];
+        sibling.process.ancestry = vec![Ancestor::new(41201, "/usr/bin/npm".into())];
         // Same tree, but hours later.
         let mut late = sibling.clone();
         late.id = "01LLLLLLLLLLLLLLLLLLLLLLLL".into();
@@ -766,7 +766,7 @@ mod tests {
         let mut other = demo_alert("01OOOOOOOOOOOOOOOOOOOOOOOO");
         other.ts = "2026-09-03T16:21:30.000Z".into();
         other.process.pid = 9000;
-        other.process.ancestry = vec![Ancestor { pid: 8000, exe: "/usr/bin/systemd".into() }];
+        other.process.ancestry = vec![Ancestor::new(8000, "/usr/bin/systemd".into())];
 
         let all = vec![a.clone(), sibling.clone(), late, other];
         let got = related_alerts(&a, &all, RELATED_WINDOW_SECS);

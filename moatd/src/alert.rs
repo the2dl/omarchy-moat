@@ -28,10 +28,57 @@ pub struct ProcessRef {
     pub ancestry: Vec<Ancestor>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Ancestor {
     pub pid: u32,
     pub exe: String,
+    /// Everything below is what the detail panel reads, and every field is
+    /// `default` so a record written by an older daemon still parses -- the
+    /// store is append-only and years of alerts predate this.
+    ///
+    /// It is deliberately NOT in the feed: `cmd_feed` strips it, because the
+    /// panel polls that several times a minute and only needs the names for the
+    /// collapsed chain. The full row arrives with `explain`, which the card
+    /// already fetches when it is opened.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub args: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub start_time: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    /// What else this process started, besides the one that led to the alert.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub others: Vec<Sibling>,
+}
+
+impl Ancestor {
+    /// The two fields every caller has. Chain identity is built from these and
+    /// nothing else, so it is unaffected by the detail above.
+    pub fn new(pid: u32, exe: String) -> Ancestor {
+        Ancestor {
+            pid,
+            exe,
+            ..Default::default()
+        }
+    }
+}
+
+/// A process an ancestor started that is not on the path to the alert.
+///
+/// "What else was that shell doing" is how a person tells a build from an
+/// intrusion, and it is the one thing the flat chain could never show.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Sibling {
+    pub pid: u32,
+    pub exe: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub args: String,
+    /// `exited` / `running`, and the signal if one killed it. Stated rather
+    /// than inferred from a missing field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -531,10 +578,7 @@ pub mod tests_support {
                 cwd: "/home/dan/proj".into(),
                 start_ts: "2026-09-03T16:21:06.900Z".into(),
                 in_container: None,
-                ancestry: vec![Ancestor {
-                    pid: 41230,
-                    exe: "/usr/bin/sh".into(),
-                }],
+                ancestry: vec![Ancestor::new(41230, "/usr/bin/sh".into())],
             },
             file: Some(FileRef {
                 path: "/home/dan/.ssh/id_rsa".into(),

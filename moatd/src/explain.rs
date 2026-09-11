@@ -250,12 +250,24 @@ impl Finding {
 
 /// Turn a finding into the record readers see.
 pub fn build_alert(f: &Finding, id: &str, ts: &str, allowlist_file: &str, allowlist_note: &str) -> Alert {
+    // Carry the detail the panel's process tree reads. It costs nothing in the
+    // feed -- `cmd_feed` strips it -- and the record is the only durable copy:
+    // the process table is an LRU, so by the time anyone opens a week-old alert
+    // every one of these processes is long gone from it.
+    //
+    // `others` is filled by the caller that still has the table (`build_tree`
+    // in engine.rs); this function is handed a Finding and does not have one.
     let ancestry: Vec<Ancestor> = f
         .ancestry
         .iter()
         .map(|p| Ancestor {
             pid: p.pid,
             exe: p.exe.clone(),
+            args: p.args.clone(),
+            cwd: p.cwd.clone(),
+            start_time: p.start_time.clone(),
+            uid: Some(p.uid),
+            others: Vec::new(),
         })
         .collect();
 

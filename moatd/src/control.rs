@@ -491,6 +491,7 @@ fn cmd_feed(d: &Daemon, req: &Value) -> Value {
                 obj.insert("explain_elided".into(), Value::Bool(true));
             }
         }
+        strip_ancestry_detail(&mut v);
         wire.push(v);
     }
 
@@ -2033,6 +2034,30 @@ fn cmd_unignore(d: &mut Daemon, req: &Value) -> Value {
     }
 }
 
+/// Drop everything from `process.ancestry` except the names, for the feed.
+///
+/// The panel polls this several times a minute and the answer is already
+/// megabytes -- `process` is about a fifth of it. All the feed needs is the
+/// collapsed chain, which is pids and paths; the args, cwd, start time and
+/// sibling lists are read only when a card is opened, and that path already
+/// fetches the full record through `explain`.
+///
+/// Same reasoning as eliding `explain` itself, and the same shape: nothing is
+/// lost, it just arrives when it is looked at rather than on every poll.
+fn strip_ancestry_detail(v: &mut Value) {
+    let Some(rows) = v
+        .get_mut("process")
+        .and_then(|p| p.get_mut("ancestry"))
+        .and_then(|a| a.as_array_mut())
+    else {
+        return;
+    };
+    for row in rows {
+        let Some(o) = row.as_object_mut() else { continue };
+        o.retain(|k, _| k == "pid" || k == "exe");
+    }
+}
+
 fn cmd_allowlist(d: &Daemon) -> Value {
     let user = d.cfg.paths.user_allowlist();
     let rules: Vec<Value> = d
@@ -3478,6 +3503,45 @@ mod tests {
         let blob = serde_json::to_string(&r).unwrap();
         assert!(blob.contains("/etc/backup.secrets"), "{blob}");
         assert!(blob.contains("/root/.rclone.conf"), "{blob}");
+    }
+
+    /// The feed carries names; the detail arrives with `explain`.
+    ///
+    /// `process` is about a fifth of a feed that is already megabytes, and the
+    /// panel polls it several times a minute. The ancestry detail is read only
+    /// when a card is opened, so it must not ride along on every poll -- same
+    /// trade as eliding `explain`, and the same requirement: nothing lost, just
+    /// deferred.
+    #[test]
+    fn the_feed_carries_ancestry_names_and_the_detail_arrives_with_explain() {
+        let mut v = json!({
+            "id": "01X",
+            "process": {
+                "exe": "/usr/bin/cat",
+                "ancestry": [{
+                    "pid": 10, "exe": "/bin/sh",
+                    "args": "-c cargo build", "cwd": "/home/dan", "start_time": "t",
+                    "uid": 1000,
+                    "others": [{"pid": 11, "exe": "/usr/bin/rustc", "state": "exited"}]
+                }]
+            }
+        });
+        strip_ancestry_detail(&mut v);
+        let row = &v["process"]["ancestry"][0];
+        assert_eq!(row["pid"], 10, "the chain still needs the pid");
+        assert_eq!(row["exe"], "/bin/sh", "and the name");
+        for gone in ["args", "cwd", "start_time", "uid", "others"] {
+            assert!(row.get(gone).is_none(), "{gone} rode along on a poll: {row}");
+        }
+        // The sibling's command line is the biggest thing here and the easiest
+        // to leak by adding a field later, so assert on the whole blob too.
+        let blob = serde_json::to_string(&v).unwrap();
+        assert!(!blob.contains("cargo build"), "{blob}");
+        assert!(!blob.contains("rustc"), "{blob}");
+
+        // Everything outside process.ancestry is untouched.
+        assert_eq!(v["process"]["exe"], "/usr/bin/cat");
+        assert_eq!(v["id"], "01X");
     }
 
     /// Turning protection off is a root action.

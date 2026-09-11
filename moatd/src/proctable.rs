@@ -260,6 +260,31 @@ impl ProcTable {
         Some(id)
     }
 
+    /// The other processes this one started, excluding the one on the path to
+    /// the alert.
+    ///
+    /// The lineage answers "what led here"; this answers "what else was that
+    /// shell doing", which is how a person tells a build from an intrusion. The
+    /// table is an LRU and siblings that exited before it was warm are simply
+    /// not here -- an empty list means "none recorded", never "none existed".
+    pub fn other_children(&self, parent_exec_id: &str, on_path: &str) -> Vec<&ProcInfo> {
+        if parent_exec_id.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<&ProcInfo> = self
+            .map
+            .values()
+            .filter(|p| {
+                p.parent_exec_id.as_deref() == Some(parent_exec_id) && p.exec_id != on_path
+            })
+            .collect();
+        // Oldest first, so the order a person reads them in matches the order
+        // they happened. HashMap iteration is arbitrary and would reshuffle the
+        // panel on every poll.
+        out.sort_by(|a, b| a.start_time.cmp(&b.start_time).then(a.pid.cmp(&b.pid)));
+        out
+    }
+
     pub fn get(&self, exec_id: &str) -> Option<&ProcInfo> {
         self.map.get(exec_id)
     }
@@ -364,6 +389,44 @@ impl ProcTable {
 mod tests {
     use super::*;
     use crate::event::RawEvent;
+
+    /// "What else was that shell doing" is the question the flat chain could
+    /// never answer, and it is how a person tells a build from an intrusion.
+    #[test]
+    fn other_children_are_the_siblings_not_on_the_path() {
+        let mut t = ProcTable::new(8, 60);
+        let mk = |exec: &str, pid: u32, exe: &str, parent: Option<&str>, start: &str| Process {
+            exec_id: Some(exec.into()),
+            pid: Some(pid),
+            uid: Some(1000),
+            binary: Some(exe.into()),
+            start_time: Some(start.into()),
+            parent_exec_id: parent.map(|p| p.to_string()),
+            ..Default::default()
+        };
+        t.observe(&mk("sh", 100, "/bin/sh", None, "00:00:01"));
+        // Three children of that shell. `cargo` is the one that led to the
+        // alert; the other two are what it was also doing.
+        t.observe(&mk("cargo", 101, "/usr/bin/cargo", Some("sh"), "00:00:03"));
+        t.observe(&mk("rustc", 102, "/usr/bin/rustc", Some("sh"), "00:00:02"));
+        t.observe(&mk("nvim", 103, "/usr/bin/nvim", Some("sh"), "00:00:04"));
+        // Someone else's child entirely.
+        t.observe(&mk("other", 200, "/usr/bin/git", Some("elsewhere"), "00:00:05"));
+
+        let others = t.other_children("sh", "cargo");
+        let names: Vec<&str> = others.iter().map(|p| p.exe.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["/usr/bin/rustc", "/usr/bin/nvim"],
+            "the path itself is excluded, another parent's child is not included, \
+             and they are oldest first so the panel does not reshuffle each poll"
+        );
+
+        // A parent nothing was recorded under is empty, not an error.
+        assert!(t.other_children("nobody", "cargo").is_empty());
+        // And an empty parent id must not match every rootless process.
+        assert!(t.other_children("", "cargo").is_empty());
+    }
 
     fn feed() -> ProcTable {
         let mut t = ProcTable::new(8, 60);

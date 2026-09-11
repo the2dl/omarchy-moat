@@ -965,7 +965,7 @@ mod tests {
             a.chain = Some(crate::chain::Chain {
                 v: 1,
                 id: "01CHAIN".into(),
-                ancestor: crate::alert::Ancestor { pid: 9000, exe: "/usr/bin/bash".into() },
+                ancestor: crate::alert::Ancestor::new(9000, "/usr/bin/bash".into()),
                 families: vec!["net".into()],
                 severity: "high".into(),
                 severity_base: "medium".into(),
@@ -1123,7 +1123,7 @@ mod tests {
         crate::chain::Chain {
             v: 1,
             id: members[0].to_string(),
-            ancestor: crate::alert::Ancestor { pid: 9000, exe: "/usr/bin/npm".into() },
+            ancestor: crate::alert::Ancestor::new(9000, "/usr/bin/npm".into()),
             families: vec!["cred".into(), "net".into()],
             severity: severity.into(),
             severity_base: "medium".into(),

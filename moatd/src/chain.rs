@@ -394,10 +394,9 @@ pub fn tree_key(lineage: &[LineageNode]) -> Option<(String, Ancestor)> {
     }
     Some((
         root.exec_id.clone(),
-        Ancestor {
-            pid: root.pid,
-            exe: root.exe.clone(),
-        },
+        // Identity only. Chain grouping is keyed on exec_id and this pair, and
+        // must not start depending on the detail the panel reads.
+        Ancestor::new(root.pid, root.exe.clone()),
     ))
 }
 

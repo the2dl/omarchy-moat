@@ -3166,6 +3166,7 @@ impl Daemon {
         if killed {
             alert.action_taken = "killed".into();
         }
+        self.fill_siblings(&f, &mut alert);
         // A container is watched, not asked about -- unless you asked to be.
         //
         // The kernel already refuses to ENFORCE inside a container
@@ -3857,6 +3858,48 @@ impl Daemon {
 
     /// The process tree as the daemon's own table saw it — `tree.txt`, and the
     /// ancestry rows `bundle.md` uses.
+    /// Record what each ancestor started BESIDES the path to this alert.
+    ///
+    /// "What led here" is the lineage; this is "what else was that shell
+    /// doing", and it is how a person tells a build from an intrusion without
+    /// leaving the card. It has to happen here, at alert time, because the
+    /// process table is an LRU pruned on a timer -- open a week-old alert and
+    /// every one of these processes is long gone. The record is the only
+    /// durable copy.
+    ///
+    /// An empty list therefore means "none recorded", never "none existed": a
+    /// sibling that exited before the table was warm was never seen, and the
+    /// panel says so rather than implying the shell did nothing else.
+    fn fill_siblings(&self, f: &Finding, alert: &mut Alert) {
+        // `f.ancestry` is nearest-parent-first, and the child on the path to
+        // the alert is whatever precedes each entry -- the finding's own
+        // process for the first, the previous ancestor for the rest.
+        let mut on_path = f.proc.exec_id.clone();
+        for (i, ancestor) in f.ancestry.iter().enumerate() {
+            let others: Vec<crate::alert::Sibling> = self
+                .table
+                .other_children(&ancestor.exec_id, &on_path)
+                .into_iter()
+                .map(|p| crate::alert::Sibling {
+                    pid: p.pid,
+                    exe: p.exe.clone(),
+                    args: p.args.clone(),
+                    state: match (&p.exit_signal, p.exited_at) {
+                        // The signal is the only proof a kill happened (NOTES
+                        // §7), so it is named rather than folded into "exited".
+                        (Some(sig), _) => format!("killed by {}", sig),
+                        (None, Some(_)) => "exited".to_string(),
+                        (None, None) => "running".to_string(),
+                    },
+                })
+                .collect();
+            if let Some(row) = alert.process.ancestry.get_mut(i) {
+                row.others = others;
+            }
+            on_path = ancestor.exec_id.clone();
+        }
+    }
+
     fn tree_rows(&self, f: &Finding) -> Vec<AncestryRow> {
         let mut rows: Vec<AncestryRow> = f
             .ancestry
@@ -6938,7 +6981,7 @@ mod tests {
         chain::Chain {
             v: 1,
             id: ids[0].clone(),
-            ancestor: crate::alert::Ancestor { pid: 41201, exe: "/usr/bin/makepkg".into() },
+            ancestor: crate::alert::Ancestor::new(41201, "/usr/bin/makepkg".into()),
             families: vec!["cred".into(), "net".into()],
             severity: severity.into(),
             severity_base: "medium".into(),
@@ -7394,7 +7437,7 @@ mod tests {
         let c = crate::chain::Chain {
             v: 1,
             id: "01CHAIN".into(),
-            ancestor: crate::alert::Ancestor { pid: 5000, exe: "/usr/bin/makepkg".into() },
+            ancestor: crate::alert::Ancestor::new(5000, "/usr/bin/makepkg".into()),
             families: vec!["exec".into(), "net".into()],
             severity: "high".into(),
             severity_base: "high".into(),
@@ -7651,7 +7694,7 @@ mod tests {
         let c = crate::chain::Chain {
             v: 1,
             id: "01CHAINDEMOTED".into(),
-            ancestor: crate::alert::Ancestor { pid: 5000, exe: "/usr/bin/dockerd".into() },
+            ancestor: crate::alert::Ancestor::new(5000, "/usr/bin/dockerd".into()),
             families: vec!["net".into(), "persist".into()],
             severity: "medium".into(),
             severity_base: "medium".into(),
@@ -8450,10 +8493,7 @@ esac
         let chain_of = |families: &[&str]| crate::chain::Chain {
             v: 1,
             id: "01CH".into(),
-            ancestor: crate::alert::Ancestor {
-                pid: 5000,
-                exe: "/usr/bin/makepkg".into(),
-            },
+            ancestor: crate::alert::Ancestor::new(5000, "/usr/bin/makepkg".into()),
             families: families.iter().map(|s| s.to_string()).collect(),
             severity: "high".into(),
             severity_base: "high".into(),
@@ -9729,10 +9769,7 @@ esac
         crate::chain::Chain {
             v: 1,
             id: "01CHAINQUARANTINE".into(),
-            ancestor: crate::alert::Ancestor {
-                pid: 4_299_999,
-                exe: "/usr/bin/no-such-makepkg".into(),
-            },
+            ancestor: crate::alert::Ancestor::new(4_299_999, "/usr/bin/no-such-makepkg".into()),
             families,
             severity: severity.into(),
             severity_base: "high".into(),
