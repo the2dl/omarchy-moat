@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Fast-forward the installed panel to the commit just made.
+#
+# The panel is a separate clone of this repo (see scripts/sync-plugin.sh) and
+# the pacman package ships no QML, so without this the running UI silently
+# stays behind whatever was just committed.
+#
+# Never fails the commit: a hook that can break `git commit` is a hook someone
+# disables.
+exec >/dev/null 2>&1 || true
+"$(git rev-parse --show-toplevel)/scripts/sync-plugin.sh" || true
+exit 0

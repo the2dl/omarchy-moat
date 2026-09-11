@@ -91,6 +91,20 @@ docs/           CONTRACT.md is the spec every component builds against
 
 `docs/CONTRACT.md` before touching anything. `docs/BASELINE.md` for the learning
 and noise model, `docs/TETRAGON-NOTES.md` for what the sensor actually reports.
+**If you are working on the panel, run this once:**
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The panel is an Omarchy shell plugin, which means it is a *second clone of this
+repository* under `~/.config/omarchy/plugins/`. The pacman package ships the
+daemon, the policies and the scanners and no QML at all, so `makepkg -si`
+updates everything except the thing you are looking at. The hook fast-forwards
+that clone on every commit; `scripts/sync-plugin.sh --check` reports drift
+without writing. Without it, UI work is "shipped" and not running, which has
+happened twice.
+
 `docs/LPE.md` and `docs/CANARIES.md` cover the two newest detection surfaces,
 `docs/DNS.md` the name-resolution artifact on network alerts,
 `docs/PACKAGE-FEED.md` the malicious-package index the scanners read, and
