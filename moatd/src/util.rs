@@ -292,6 +292,18 @@ fn tmp_sibling(path: &Path) -> PathBuf {
     dir.join(format!(".{}.{}.tmp", name, std::process::id()))
 }
 
+/// Cut a string to `max` CHARACTERS, marking that it was cut.
+///
+/// Characters, not bytes: slicing a UTF-8 string at a byte offset inside a
+/// multi-byte sequence panics, and command lines carry arbitrary bytes.
+pub fn clamp_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max).collect();
+    format!("{}… (+{} more)", kept, s.chars().count() - max)
+}
+
 pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut f = fs::File::open(path)?;
     let mut hasher = Sha256::new();

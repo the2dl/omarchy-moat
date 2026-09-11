@@ -53,6 +53,38 @@ TestCase {
     /// The other children an ancestor started are context, and they are
     /// per-node: opening one must not open the rest, or a deep tree becomes a
     /// wall the moment you ask one question.
+    /// The daemon caps `others` at twenty; `others_total` is the real number.
+    /// A chip reading "20 other children" under a build that started 554 is a
+    /// quieter lie than showing nothing, on the row whose entire job is
+    /// answering "what else was that shell doing".
+    function test_a_capped_sibling_list_still_reports_the_real_count() {
+        var t = makeFull({
+            "ancestry": [{
+                "pid": 2,
+                "exe": "/bin/sh",
+                "others_total": 554,
+                "others": [
+                    { "pid": 20, "exe": "/usr/bin/rustc", "state": "exited" },
+                    { "pid": 21, "exe": "/usr/bin/rustc", "state": "exited" }
+                ]
+            }],
+            "process": { "pid": 3, "exe": "/usr/bin/curl" }
+        })
+        compare(t.otherTotalOf(t.nodes[0]), 554)
+        compare(t.othersOf(t.nodes[0]).length, 2)
+
+        // An uncapped list (no others_total, or one that is not larger) still
+        // reports what is there -- an older daemon sends no such field.
+        var plain = makeFull({
+            "ancestry": [{
+                "pid": 2, "exe": "/bin/sh",
+                "others": [{ "pid": 20, "exe": "/usr/bin/rustc", "state": "exited" }]
+            }],
+            "process": { "pid": 3, "exe": "/usr/bin/curl" }
+        })
+        compare(plain.otherTotalOf(plain.nodes[0]), 1)
+    }
+
     function test_other_children_reveal_one_node_at_a_time() {
         var t = makeFull({
             "ancestry": [{

@@ -267,7 +267,10 @@ pub fn build_alert(f: &Finding, id: &str, ts: &str, allowlist_file: &str, allowl
             cwd: p.cwd.clone(),
             start_time: p.start_time.clone(),
             uid: Some(p.uid),
+            // Filled by `Daemon::fill_siblings` on the live path; this
+            // builder has no process table to ask.
             others: Vec::new(),
+            others_total: 0,
         })
         .collect();
 

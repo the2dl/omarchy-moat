@@ -21,6 +21,9 @@ Item {
     property string note: ""
     /// How many other children this ancestor has; 0 hides the toggle.
     property int otherCount: 0
+    /// How many of `otherCount` the daemon actually recorded. Lower when the
+    /// cap bit; the chip says so rather than quietly showing a short list.
+    property int otherShown: 0
     property bool othersOpen: false
 
     signal picked
@@ -159,6 +162,8 @@ Item {
             anchors.centerIn: parent
             text: (row.othersOpen ? "▾  " : "▸  ") + row.otherCount
                 + (row.otherCount === 1 ? " other child" : " other children")
+                + (row.otherShown > 0 && row.otherShown < row.otherCount
+                   ? " (" + row.otherShown + " shown)" : "")
             color: chipHover.hovered ? (row.t ? row.t.dimmer : "grey") : (row.t ? row.t.faint : "grey")
             font.family: row.t ? row.t.family : "monospace"
             font.pixelSize: row.t ? row.t.fMeta : 11

@@ -4089,28 +4089,58 @@ impl Daemon {
         // process for the first, the previous ancestor for the rest.
         let mut on_path = f.proc.exec_id.clone();
         for (i, ancestor) in f.ancestry.iter().enumerate() {
-            let others: Vec<crate::alert::Sibling> = self
-                .table
-                .other_children(&ancestor.exec_id, &on_path)
-                .into_iter()
-                .map(|p| crate::alert::Sibling {
-                    pid: p.pid,
-                    exe: p.exe.clone(),
-                    args: p.args.clone(),
-                    state: match (&p.exit_signal, p.exited_at) {
-                        // The signal is the only proof a kill happened (NOTES
-                        // §7), so it is named rather than folded into "exited".
-                        (Some(sig), _) => format!("killed by {}", sig),
-                        (None, Some(_)) => "exited".to_string(),
-                        (None, None) => "running".to_string(),
-                    },
-                })
-                .collect();
+            let (others, total) = self.siblings_of(&ancestor.exec_id, &on_path);
             if let Some(row) = alert.process.ancestry.get_mut(i) {
                 row.others = others;
+                row.others_total = total;
             }
             on_path = ancestor.exec_id.clone();
         }
+    }
+
+    /// The capped sibling list and the real count.
+    ///
+    /// Capped, and the cap is not cosmetic. 2026-09-11: `others` shipped
+    /// unbounded. One `cargo build` gives an ancestor 554 concurrent rustc
+    /// children, each with a ~1.3 KB command line, and every one of them was
+    /// serialised into every alert raised under that build -- 730 KB in a
+    /// single `others`, a 277 KB alert record, a 47 KB MEAN across the store.
+    /// alerts.jsonl rotated every nine minutes, so `moatctl list --limit 100`
+    /// covered under two minutes of wall clock and a high-severity IOC alert
+    /// aged out of it while it was still the thing being looked at. The symptom
+    /// was "list did not show my alert"; the cause was here.
+    ///
+    /// Twenty is what a person reads, and `others_total` keeps the count
+    /// honest. A rustc command line is longer than most alerts, and for a
+    /// SIBLING the question is "what else was running" -- which the binary and
+    /// the head of its arguments answer. The full line is kept whole only for
+    /// the process the alert is actually about.
+    ///
+    /// Split from `fill_siblings` so the cap is testable without a `Daemon`
+    /// and an `Alert` around it.
+    fn siblings_of(&self, parent: &str, on_path: &str) -> (Vec<crate::alert::Sibling>, usize) {
+        const MAX_SIBLINGS: usize = 20;
+        const MAX_SIBLING_ARGS: usize = 200;
+
+        let all = self.table.other_children(parent, on_path);
+        let total = all.len();
+        let others = all
+            .into_iter()
+            .take(MAX_SIBLINGS)
+            .map(|p| crate::alert::Sibling {
+                pid: p.pid,
+                exe: p.exe.clone(),
+                args: crate::util::clamp_chars(&p.args, MAX_SIBLING_ARGS),
+                state: match (&p.exit_signal, p.exited_at) {
+                    // The signal is the only proof a kill happened (NOTES §7),
+                    // so it is named rather than folded into "exited".
+                    (Some(sig), _) => format!("killed by {}", sig),
+                    (None, Some(_)) => "exited".to_string(),
+                    (None, None) => "running".to_string(),
+                },
+            })
+            .collect();
+        (others, total)
     }
 
     fn tree_rows(&self, f: &Finding) -> Vec<AncestryRow> {
@@ -6853,6 +6883,73 @@ mod tests {
         d.homes = vec!["/home/dan".into()];
         d.provenance.set_homes(&d.homes);
         (d, cfg)
+    }
+
+    /// The sibling list is capped, and the count stays honest.
+    ///
+    /// 2026-09-11: `others` shipped unbounded. A `cargo build` gives one
+    /// ancestor hundreds of concurrent rustc children with ~1.3 KB command
+    /// lines each, all of which were written into every alert under that
+    /// build: 730 KB in one `others`, a 277 KB record, a 47 KB mean across the
+    /// store, alerts.jsonl rotating every nine minutes, and a high-severity
+    /// IOC alert ageing out of `moatctl list --limit 100` in under two
+    /// minutes while it was the thing being looked at.
+    #[test]
+    fn a_noisy_ancestor_does_not_put_its_whole_build_in_every_alert() {
+        use crate::rules::testkit::proc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+
+        // A shell, the process that goes on to alert, and 300 siblings with
+        // the kind of command line rustc actually has.
+        let long_args = format!("--crate-name x {}", "--cfg feature=y ".repeat(80));
+        d.table.observe(&proc("sh", 10, "/bin/sh", "", None));
+        d.table.observe(&proc("victim", 11, "/usr/bin/curl", "https://x/", Some("sh")));
+        for i in 0..300u32 {
+            d.table.observe(&proc(
+                &format!("s{}", i),
+                1000 + i,
+                "/usr/bin/rustc",
+                &long_args,
+                Some("sh"),
+            ));
+        }
+
+        let (others, total) = d.siblings_of("sh", "victim");
+        assert_eq!(total, 300, "the real count is still reported");
+        assert_eq!(others.len(), 20, "the list is capped");
+
+        // The cap has to bound the BYTES, which is the whole point: twenty
+        // rows of an unclamped rustc line is still 26 KB.
+        for s in &others {
+            assert!(
+                s.args.chars().count() <= 220,
+                "sibling args not clamped: {} chars",
+                s.args.chars().count()
+            );
+        }
+        let bytes = serde_json::to_string(&others).unwrap().len();
+        assert!(
+            bytes < 8_192,
+            "one ancestor's siblings under a 300-process build serialise to {} bytes",
+            bytes
+        );
+
+        // The process on the path to the alert is never one of its own
+        // siblings, cap or no cap.
+        assert!(others.iter().all(|s| s.pid != 11));
+    }
+
+    #[test]
+    fn clamping_a_command_line_says_how_much_it_dropped() {
+        // Characters, not bytes: slicing UTF-8 at a byte offset inside a
+        // multi-byte sequence panics, and command lines carry arbitrary text.
+        assert_eq!(crate::util::clamp_chars("short", 10), "short");
+        assert_eq!(crate::util::clamp_chars("abcdef", 3), "abc… (+3 more)");
+        let multi = "héllo wörld ünïcode";
+        let out = crate::util::clamp_chars(multi, 5);
+        assert!(out.starts_with("héllo"), "{}", out);
     }
 
     /// docs/DNS.md. The one place every net finding is enriched, tested end

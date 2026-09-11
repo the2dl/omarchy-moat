@@ -49,8 +49,22 @@ pub struct Ancestor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<u32>,
     /// What else this process started, besides the one that led to the alert.
+    ///
+    /// CAPPED. See `engine::MAX_SIBLINGS`: unbounded, this one field reached
+    /// 730 KB on a single alert and made the mean record 47 KB.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub others: Vec<Sibling>,
+    /// How many there actually were, which is not `others.len()` once the cap
+    /// bites. The panel's "N other children" label is built from this: saying
+    /// "20" when a cargo build started 554 of them would be a quieter lie than
+    /// saying nothing, and this row exists to answer "what else was that shell
+    /// doing".
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub others_total: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl Ancestor {

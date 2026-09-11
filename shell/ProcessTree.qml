@@ -88,6 +88,19 @@ Column {
         return o && typeof o.length === "number" ? o : [];
     }
 
+    /// How many there actually were.
+    ///
+    /// `others` is capped by the daemon at twenty -- unbounded it reached 554
+    /// rustc siblings and 730 KB on one alert. `others_total` is the real
+    /// count, and the chip has to show it: "20 other children" under a cargo
+    /// build is a quieter lie than showing nothing, on the row whose whole job
+    /// is answering "what else was that shell doing".
+    function otherTotalOf(node) {
+        var shown = root.othersOf(node).length;
+        var total = node && typeof node.others_total === "number" ? node.others_total : 0;
+        return total > shown ? total : shown;
+    }
+
     function eventsFor(pid) {
         var e = root.events ? root.events[String(pid)] : null;
         return e && typeof e.length === "number" ? e : [];
@@ -227,7 +240,8 @@ Column {
                             node: modelData
                             isFlagged: index === root.nodes.length - 1
                             isSelected: index === root.selected
-                            otherCount: root.othersOf(modelData).length
+                            otherCount: root.otherTotalOf(modelData)
+                            otherShown: root.othersOf(modelData).length
                             othersOpen: root.revealed[index] === true
                             onPicked: root.selected = index
                             onToggled: {
