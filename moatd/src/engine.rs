@@ -11567,21 +11567,41 @@ esac
         // which x86 here happened never to be.
         let want = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
+        let matches = |e: &str| {
+            let got = Path::new(e);
+            got == path || got == want || got.canonicalize().map(|c| c == want).unwrap_or(false)
+        };
+
         let mut why: Vec<String> = Vec::new();
         for _ in 0..20 {
             let child = spawn_retrying_etxtbsy(path);
             let pid = child.id();
-            let exe = util::proc_exe(pid);
+
+            // WAIT for the exec, do not re-spawn through it.
+            //
+            // `Command::spawn` goes through posix_spawn: the pid is live the
+            // moment the fork lands, and until the exec completes
+            // `/proc/<pid>/exe` still names the PARENT -- this test binary.
+            // The first aarch64 run caught exactly that, three times in a row
+            // with one start time between them, which is three forks inside a
+            // single 10 ms clock tick.
+            //
+            // The old loop killed the child and spawned another on a mismatch,
+            // so it re-ran the race twenty times instead of giving any one
+            // child time to win it. Polling the same pid is what actually
+            // closes it; a mismatch that survives this long is a real one.
+            let mut exe = util::proc_exe(pid);
+            for _ in 0..100 {
+                match exe.as_deref() {
+                    Some(e) if matches(e) => break,
+                    _ => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        exe = util::proc_exe(pid);
+                    }
+                }
+            }
             let start = util::proc_start_nanos(pid);
-            let same = exe
-                .as_deref()
-                .map(|e| {
-                    let got = Path::new(e);
-                    got == path
-                        || got == want
-                        || got.canonicalize().map(|c| c == want).unwrap_or(false)
-                })
-                .unwrap_or(false);
+            let same = exe.as_deref().map(&matches).unwrap_or(false);
             match (exe, start) {
                 (Some(exe), Some(start)) if same => {
                     let ts = chrono::DateTime::from_timestamp(
