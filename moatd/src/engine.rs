@@ -11556,13 +11556,34 @@ esac
     /// the daemon under some other program's name — which is a broken test, not
     /// a broken rule.
     fn spawn_victim(path: &Path) -> (std::process::Child, u32, String, String) {
+        // `/proc/<pid>/exe` is FULLY RESOLVED: it follows every symlink and
+        // bind mount. `path` is whatever `tempfile` handed us, which is
+        // TMPDIR-relative and need not be canonical -- on a host where /tmp
+        // resolves somewhere else the two never compare equal, so this retried
+        // twenty times and then blamed the child for dying.
+        //
+        // That is what the first aarch64 build hit, and it is not
+        // arch-specific: it is a host whose /tmp is a symlink or a bind mount,
+        // which x86 here happened never to be.
+        let want = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+        let mut why: Vec<String> = Vec::new();
         for _ in 0..20 {
             let child = spawn_retrying_etxtbsy(path);
             let pid = child.id();
             let exe = util::proc_exe(pid);
             let start = util::proc_start_nanos(pid);
+            let same = exe
+                .as_deref()
+                .map(|e| {
+                    let got = Path::new(e);
+                    got == path
+                        || got == want
+                        || got.canonicalize().map(|c| c == want).unwrap_or(false)
+                })
+                .unwrap_or(false);
             match (exe, start) {
-                (Some(exe), Some(start)) if Path::new(&exe) == path => {
+                (Some(exe), Some(start)) if same => {
                     let ts = chrono::DateTime::from_timestamp(
                         (start / 1_000_000_000) as i64,
                         (start % 1_000_000_000) as u32,
@@ -11572,14 +11593,32 @@ esac
                     .to_string();
                     return (child, pid, ts, exe);
                 }
-                _ => {
+                (exe, start) => {
+                    // Record WHY. The old message asserted the child was too
+                    // short-lived, which was the one explanation that happened
+                    // not to be true -- and it sent a build failure looking
+                    // like a timing problem when it was a path comparison.
+                    if why.len() < 3 {
+                        why.push(format!(
+                            "pid {}: exe={:?} start={:?}",
+                            pid,
+                            exe.as_deref().unwrap_or("<gone>"),
+                            start
+                        ));
+                    }
                     let mut child = child;
                     let _ = child.kill();
                     let _ = child.wait();
                 }
             }
         }
-        panic!("{} never stayed alive long enough to be observed", path.display())
+        panic!(
+            "{} could not be observed in /proc after 20 attempts (wanted exe {}); \
+             last attempts: {}",
+            path.display(),
+            want.display(),
+            why.join("; ")
+        )
     }
 
     /// Enforce mode kills the netcat itself — verified against a real process,
