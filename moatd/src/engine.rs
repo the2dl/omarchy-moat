@@ -6742,6 +6742,140 @@ mod tests {
         (d, cfg)
     }
 
+    /// docs/DNS.md. The one place every net finding is enriched, tested end
+    /// to end: reader message -> cache -> record, with the feed match on top,
+    /// and the honest line when there is nothing to say.
+    #[test]
+    fn net_findings_carry_the_resolved_name_or_say_it_is_not_recorded() {
+        use crate::names::{Msg, Resolved};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.thresholds.dedupe_secs = 0;
+        let feeds_dir = d.cfg.paths.feeds();
+        std::fs::create_dir_all(&feeds_dir).unwrap();
+        std::fs::write(feeds_dir.join("domains.txt"), "evil.example\n").unwrap();
+        d.feeds = crate::feeds::Feeds::load(&feeds_dir);
+
+        // Off: the record says so, in words.
+        let proc = ProcInfo {
+            exec_id: "e-curl".into(),
+            pid: 7100,
+            uid: 1000,
+            exe: "/usr/bin/curl".into(),
+            args: String::new(),
+            cwd: "/home/dan".into(),
+            start_time: util::now_rfc3339(),
+            ..Default::default()
+        };
+        let mk = |ip: &str| {
+            let mut f = Finding::new(
+                "moat-net-first-contact",
+                crate::policy::PolicyMeta::fallback("moat-net-first-contact"),
+                proc.clone(),
+            );
+            f.meta.family = "net".into();
+            f.meta.severity = "low".into();
+            f.net = Some(crate::alert::NetRef::new(ip, 443));
+            f
+        };
+        d.names_state = "off".into();
+        let id = d.emit(mk("142.250.80.14")).expect("recorded");
+        let a = d.store.find(&id).unwrap();
+        assert_eq!(a.net.as_ref().unwrap().domain, None);
+        assert!(
+            a.explain.evidence.iter().any(|l| l.starts_with("name: not recorded -- name resolution artifacts are off")),
+            "{:?}",
+            a.explain.evidence
+        );
+
+        // Connected, with what the reader saw: the name lands on the record,
+        // with its age, and a fed name becomes the IOC.
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        d.names_rx = Some(rx);
+        tx.send(Msg::State("connected".into())).unwrap();
+        tx.send(Msg::Resolved(vec![
+            Resolved {
+                question: "api.evil.example".into(),
+                answer_name: Some("edge.evil-cdn.example".into()),
+                ip: "45.9.148.99".parse().unwrap(),
+                ttl: Some(300),
+            },
+            Resolved {
+                question: "www.google.com".into(),
+                answer_name: None,
+                ip: "142.251.154.119".parse().unwrap(),
+                ttl: None,
+            },
+        ]))
+        .unwrap();
+        let now = util::unix_secs();
+        d.drain_names(now - 30);
+        assert_eq!(d.names_state, "connected");
+        let st = d.status();
+        assert_eq!(st["names"]["state"], "connected");
+        assert_eq!(st["names"]["addresses"], 2);
+        assert_eq!(st["names"]["source"], "systemd-resolved");
+
+        let id = d.emit(mk("142.251.154.119")).expect("recorded");
+        let a = d.store.find(&id).unwrap();
+        let net = a.net.as_ref().unwrap();
+        assert_eq!(net.domain.as_deref(), Some("www.google.com"));
+        assert!(net.domain_age_secs.unwrap() >= 30, "{:?}", net);
+        assert!(a.ioc.is_none(), "google is not on the feed");
+        assert!(a.summary.contains("(www.google.com)"), "{}", a.summary);
+        assert!(
+            a.explain.evidence.iter().any(|l| l.starts_with("name: www.google.com was resolved to 142.251.154.119")),
+            "{:?}",
+            a.explain.evidence
+        );
+
+        let id = d.emit(mk("45.9.148.99")).expect("recorded");
+        let a = d.store.find(&id).unwrap();
+        let net = a.net.as_ref().unwrap();
+        assert_eq!(net.domain.as_deref(), Some("api.evil.example"));
+        assert_eq!(net.domain_cname.as_deref(), Some("edge.evil-cdn.example"));
+        let ioc = a.ioc.as_ref().expect("a fed name is the finding's IOC");
+        assert_eq!(ioc.source, "domain-feed");
+        assert_eq!(ioc.matched, "domain:evil.example");
+        assert!(
+            a.explain.evidence.iter().any(|l| l.contains("the answer came via edge.evil-cdn.example")),
+            "{:?}",
+            a.explain.evidence
+        );
+
+        // Connected and nothing known about the address: the line says what
+        // that can mean, and names the window.
+        let id = d.emit(mk("203.0.113.9")).expect("recorded");
+        let a = d.store.find(&id).unwrap();
+        assert_eq!(a.net.as_ref().unwrap().domain, None);
+        let line = a
+            .explain
+            .evidence
+            .iter()
+            .find(|l| l.starts_with("name: not recorded -- no resolution of 203.0.113.9"))
+            .unwrap_or_else(|| panic!("{:?}", a.explain.evidence));
+        assert!(line.contains("6 h"), "{}", line);
+        assert!(line.contains("DNS-over-HTTPS"), "{}", line);
+
+        // The reader going away is a state, not a silent null.
+        drop(tx);
+        d.drain_names(now);
+        assert_eq!(d.names_state, "reader exited");
+        assert!(d.names_rx.is_none());
+        let id = d.emit(mk("203.0.113.9")).expect("recorded");
+        let a = d.store.find(&id).unwrap();
+        assert!(
+            a.explain.evidence.iter().any(|l| l.contains("query stream is not available: reader exited")),
+            "{:?}",
+            a.explain.evidence
+        );
+
+        // Retention: `tick` prunes, and a pruned address reads as unknown.
+        d.tick(now + d.cfg.names.retain_secs + 1, false);
+        assert!(d.names.is_empty());
+    }
+
     // ------------------------------------------------------------- telemetry
 
     fn telemetry_daemon(dir: &Path, f: impl FnOnce(&mut crate::config::TelemetryConfig)) -> Daemon {
@@ -12544,139 +12678,5 @@ mod downtime_tests {
                 d
             );
         }
-    }
-
-    /// docs/DNS.md. The one place every net finding is enriched, tested end
-    /// to end: reader message -> cache -> record, with the feed match on top,
-    /// and the honest line when there is nothing to say.
-    #[test]
-    fn net_findings_carry_the_resolved_name_or_say_it_is_not_recorded() {
-        use crate::names::{Msg, Resolved};
-
-        let dir = tempfile::tempdir().unwrap();
-        let (mut d, _) = dev_daemon(dir.path());
-        d.cfg.thresholds.dedupe_secs = 0;
-        let feeds_dir = d.cfg.paths.feeds();
-        std::fs::create_dir_all(&feeds_dir).unwrap();
-        std::fs::write(feeds_dir.join("domains.txt"), "evil.example\n").unwrap();
-        d.feeds = crate::feeds::Feeds::load(&feeds_dir);
-
-        // Off: the record says so, in words.
-        let proc = ProcInfo {
-            exec_id: "e-curl".into(),
-            pid: 7100,
-            uid: 1000,
-            exe: "/usr/bin/curl".into(),
-            args: String::new(),
-            cwd: "/home/dan".into(),
-            start_time: util::now_rfc3339(),
-            ..Default::default()
-        };
-        let mk = |ip: &str| {
-            let mut f = Finding::new(
-                "moat-net-first-contact",
-                crate::policy::PolicyMeta::fallback("moat-net-first-contact"),
-                proc.clone(),
-            );
-            f.meta.family = "net".into();
-            f.meta.severity = "low".into();
-            f.net = Some(crate::alert::NetRef::new(ip, 443));
-            f
-        };
-        d.names_state = "off".into();
-        let id = d.emit(mk("142.250.80.14")).expect("recorded");
-        let a = d.store.find(&id).unwrap();
-        assert_eq!(a.net.as_ref().unwrap().domain, None);
-        assert!(
-            a.explain.evidence.iter().any(|l| l.starts_with("name: not recorded -- name resolution artifacts are off")),
-            "{:?}",
-            a.explain.evidence
-        );
-
-        // Connected, with what the reader saw: the name lands on the record,
-        // with its age, and a fed name becomes the IOC.
-        let (tx, rx) = std::sync::mpsc::sync_channel(8);
-        d.names_rx = Some(rx);
-        tx.send(Msg::State("connected".into())).unwrap();
-        tx.send(Msg::Resolved(vec![
-            Resolved {
-                question: "api.evil.example".into(),
-                answer_name: Some("edge.evil-cdn.example".into()),
-                ip: "45.9.148.99".parse().unwrap(),
-                ttl: Some(300),
-            },
-            Resolved {
-                question: "www.google.com".into(),
-                answer_name: None,
-                ip: "142.251.154.119".parse().unwrap(),
-                ttl: None,
-            },
-        ]))
-        .unwrap();
-        let now = util::unix_secs();
-        d.drain_names(now - 30);
-        assert_eq!(d.names_state, "connected");
-        let st = d.status();
-        assert_eq!(st["names"]["state"], "connected");
-        assert_eq!(st["names"]["addresses"], 2);
-        assert_eq!(st["names"]["source"], "systemd-resolved");
-
-        let id = d.emit(mk("142.251.154.119")).expect("recorded");
-        let a = d.store.find(&id).unwrap();
-        let net = a.net.as_ref().unwrap();
-        assert_eq!(net.domain.as_deref(), Some("www.google.com"));
-        assert!(net.domain_age_secs.unwrap() >= 30, "{:?}", net);
-        assert!(a.ioc.is_none(), "google is not on the feed");
-        assert!(a.summary.contains("(www.google.com)"), "{}", a.summary);
-        assert!(
-            a.explain.evidence.iter().any(|l| l.starts_with("name: www.google.com was resolved to 142.251.154.119")),
-            "{:?}",
-            a.explain.evidence
-        );
-
-        let id = d.emit(mk("45.9.148.99")).expect("recorded");
-        let a = d.store.find(&id).unwrap();
-        let net = a.net.as_ref().unwrap();
-        assert_eq!(net.domain.as_deref(), Some("api.evil.example"));
-        assert_eq!(net.domain_cname.as_deref(), Some("edge.evil-cdn.example"));
-        let ioc = a.ioc.as_ref().expect("a fed name is the finding's IOC");
-        assert_eq!(ioc.source, "domain-feed");
-        assert_eq!(ioc.matched, "domain:evil.example");
-        assert!(
-            a.explain.evidence.iter().any(|l| l.contains("the answer came via edge.evil-cdn.example")),
-            "{:?}",
-            a.explain.evidence
-        );
-
-        // Connected and nothing known about the address: the line says what
-        // that can mean, and names the window.
-        let id = d.emit(mk("203.0.113.9")).expect("recorded");
-        let a = d.store.find(&id).unwrap();
-        assert_eq!(a.net.as_ref().unwrap().domain, None);
-        let line = a
-            .explain
-            .evidence
-            .iter()
-            .find(|l| l.starts_with("name: not recorded -- no resolution of 203.0.113.9"))
-            .unwrap_or_else(|| panic!("{:?}", a.explain.evidence));
-        assert!(line.contains("6 h"), "{}", line);
-        assert!(line.contains("DNS-over-HTTPS"), "{}", line);
-
-        // The reader going away is a state, not a silent null.
-        drop(tx);
-        d.drain_names(now);
-        assert_eq!(d.names_state, "reader exited");
-        assert!(d.names_rx.is_none());
-        let id = d.emit(mk("203.0.113.9")).expect("recorded");
-        let a = d.store.find(&id).unwrap();
-        assert!(
-            a.explain.evidence.iter().any(|l| l.contains("query stream is not available: reader exited")),
-            "{:?}",
-            a.explain.evidence
-        );
-
-        // Retention: `tick` prunes, and a pruned address reads as unknown.
-        d.tick(now + d.cfg.names.retain_secs + 1, false);
-        assert!(d.names.is_empty());
     }
 }

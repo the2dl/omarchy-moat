@@ -2603,6 +2603,52 @@ TestCase {
     compare(real.group_ok, true)
   }
 
+  function test_names_status_survives_normalisation() {
+    // Where the names on network alerts come from, and whether that source is
+    // connected. `normalizeStatus` is a whitelist, so this is the sixth field
+    // that had to be added here on purpose -- and without it a `domain` that
+    // is always null cannot be told apart from a subscription resolved refused.
+    var st = Model.normalizeStatus(JSON.stringify({ ok: true,
+      names: { source: "systemd-resolved", enabled: true, state: "connected",
+               addresses: 812, recorded: 40210 } }))
+    compare(st.names.source, "systemd-resolved")
+    compare(st.names.enabled, true)
+    compare(st.names.state, "connected")
+    compare(st.names.addresses, 812)
+    compare(st.names.recorded, 40210)
+    // A daemon too old to report it: unknown, not undefined.
+    var bare = Model.normalizeStatus(JSON.stringify({ ok: true }))
+    compare(bare.names.state, "unknown")
+    compare(bare.names.enabled, false)
+    compare(bare.names.addresses, 0)
+  }
+
+  function test_a_connection_without_a_name_says_not_recorded() {
+    // `domain: null` means moat did not see a resolution -- a literal address,
+    // DoH inside the browser, an old answer, the stream off -- never that the
+    // connection had no name. The panel must say so rather than leave a gap.
+    var a = suite.rawAlert()
+    a.net = { dst_ip: "142.250.80.14", dst_port: 443, domain: null }
+    var facts = Model.rawFacts(a)
+    compare(facts[facts.indexOf("domain") + 1], "not recorded")
+    compare(Model.domainLine(a.net), "not recorded")
+    compare(Model.domainLine(null), "")
+
+    a.net = { dst_ip: "142.251.154.119", dst_port: 443, domain: "www.google.com", domain_age_secs: 12 }
+    compare(Model.domainLine(a.net), "www.google.com  \u00b7  resolved 12 s before")
+    a.net.domain_age_secs = 7200
+    compare(Model.domainLine(a.net), "www.google.com  \u00b7  resolved 2 h before")
+    delete a.net.domain_age_secs
+    compare(Model.domainLine(a.net), "www.google.com")
+    a.net.domain_cname = "e13678.dscb.akamaiedge.net"
+    facts = Model.rawFacts(a)
+    compare(facts[facts.indexOf("domain_cname") + 1], "e13678.dscb.akamaiedge.net")
+
+    // The chain step line carries the name where it carries the address.
+    var step = Model.chainStepDetail({ exe: "/usr/bin/curl" }, { net: a.net })
+    verify(step.indexOf("142.251.154.119:443 (www.google.com)") >= 0, step)
+  }
+
   function test_status_summary() {
     var status = Model.normalizeStatus(JSON.stringify({
       ok: true, mode: "monitor", tetragon: "running", policies: 17,

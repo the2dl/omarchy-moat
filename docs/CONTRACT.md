@@ -193,7 +193,15 @@ One JSON object per line, UTF-8, no pretty printing. Fields:
     "ancestry": [ {"pid": 41230, "exe": "/usr/bin/sh"}, {"pid": 41201, "exe": ".../npm"} ]
   },
   "file":  { "path": "/home/dan/.ssh/id_rsa", "sha256": null },          // optional
-  "net":   { "dst_ip": "1.2.3.4", "dst_port": 443, "domain": null },      // optional
+  // optional. `domain` is the name this machine most recently resolved to
+  // dst_ip, from systemd-resolved's query stream (docs/DNS.md) -- keyed by
+  // address, not process; `domain_age_secs` is how long before the connection
+  // it was resolved. null means NOT RECORDED (literal address, DoH inside the
+  // program, older than the window, stream off) and `explain.evidence` has a
+  // `name: not recorded -- ...` line saying which. `domain_age_secs` and
+  // `domain_cname` are absent, not null, when there is no name.
+  "net":   { "dst_ip": "142.251.154.119", "dst_port": 443, "domain": "www.google.com",
+             "domain_age_secs": 12, "domain_cname": null },
   "ioc":   { "source": "hash-feed", "matched": "sha256:..." },            // optional
   "rotate": ["ssh-key"],
   "explain": {
@@ -486,6 +494,7 @@ use moatd to kill or move something the sensor did not already flag.
  "enforcing_verified":[],"enforcing_unverified":[],"enforcement_unhealthy":false,
  "arming_pending":false,
  "policies_failed":[],"feeds":{"updated":"...","hashes":123456,"domains":5432},
+ "names":{"source":"systemd-resolved","enabled":true,"state":"connected","addresses":812,"recorded":40210},
  "unacked":{"critical":0,"high":2,"medium":5,"low":11},"sandbox":false,
  "ledger":{"needs_you":2,"recorded":4812,"suppressed":1193,"signal":3904},
  "chains_open":0,"chains_formed":0,

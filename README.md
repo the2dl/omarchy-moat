@@ -39,6 +39,12 @@ transitions, and root-executed config nobody else watches. The audit behind
 those, including what is still not covered, is
 [docs/LPE.md](docs/LPE.md).
 
+Network alerts carry the name this machine resolved to reach the address,
+read from systemd-resolved's own query stream — no kernel work, no queries of
+moat's own — and say `not recorded` when there is none. The audit of where
+names can come from here, and what that artifact can and cannot claim, is
+[docs/DNS.md](docs/DNS.md).
+
 ## How it behaves
 
 **It ships watching, not blocking.** Monitor mode, containment off, killing off.
@@ -86,7 +92,8 @@ docs/           CONTRACT.md is the spec every component builds against
 `docs/CONTRACT.md` before touching anything. `docs/BASELINE.md` for the learning
 and noise model, `docs/TETRAGON-NOTES.md` for what the sensor actually reports.
 `docs/LPE.md` and `docs/CANARIES.md` cover the two newest detection surfaces,
-and `docs/PACKAGE-FEED.md` the malicious-package index the scanners read.
+`docs/DNS.md` the name-resolution artifact on network alerts, and
+`docs/PACKAGE-FEED.md` the malicious-package index the scanners read.
 
 ## Turning it on
 

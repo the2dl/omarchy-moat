@@ -3027,7 +3027,8 @@ function rawFacts(alert) {
   }
   if (a.net) {
     add("dst", String(a.net.dst_ip || "") + (a.net.dst_port ? ":" + a.net.dst_port : ""))
-    add("domain", a.net.domain)
+    add("domain", domainLine(a.net))
+    add("domain_cname", a.net.domain_cname)
   }
   add("rarity", a.rarity)
   add("rarity_text", a.rarity_text)
@@ -3316,6 +3317,12 @@ function normalizeStatus(raw) {
       domains: Number(feeds.domains || 0),
       urls: Number(feeds.urls || 0)
     },
+    // Whitelisted, like everything else here. Where the names on network
+    // alerts come from and whether that source is actually connected: a
+    // `domain` that is always null looks the same whether resolved refused
+    // the subscription or nothing was ever resolved, and this is the only
+    // field that tells the two apart (docs/DNS.md).
+    names: normalizeNames(s.names),
     unacked: s.unacked && typeof s.unacked === "object" ? s.unacked : null,
     sandbox: s.sandbox === true,
     // Whitelisted, and the count matters as much as the flag: `canaries` is how
@@ -3363,6 +3370,40 @@ function normalizeStatus(raw) {
     demoted_rules: demoted,
     error: String(s.error || "")
   }
+}
+
+function normalizeNames(raw) {
+  var n = raw && typeof raw === "object" ? raw : {}
+  return {
+    source: String(n.source || ""),
+    enabled: n.enabled === true,
+    state: String(n.state || "unknown"),
+    addresses: Number(n.addresses) || 0,
+    recorded: Number(n.recorded) || 0
+  }
+}
+
+/// "www.google.com", or the words for its absence. A connection with no name
+/// on it must never read as a connection that had none: the daemon writes
+/// `domain: null` for a literal address, a resolver it could not see (DoH in
+/// the browser), an answer older than its window, or the stream being off --
+/// and it says which in `explain.evidence`. Here there is room for one phrase.
+function domainLine(net) {
+  if (!net || typeof net !== "object") return ""
+  if (net.domain) {
+    var age = Number(net.domain_age_secs)
+    if (isFinite(age) && age >= 0 && net.domain_age_secs !== null && net.domain_age_secs !== undefined)
+      return String(net.domain) + "  \u00b7  resolved " + relativeAge(age) + " before"
+    return String(net.domain)
+  }
+  return "not recorded"
+}
+
+/// "12 s", "4 min", "2 h" -- for domainLine.
+function relativeAge(secs) {
+  if (secs < 60) return secs + " s"
+  if (secs < 3600) return Math.floor(secs / 60) + " min"
+  return Math.floor(secs / 3600) + " h"
 }
 
 function statusSummary(status, unacked, nowMs) {
@@ -4404,7 +4445,8 @@ function chainStepDetail(step, member) {
   if (m.file && m.file.path) return exe + "  \u00b7  " + shortenHome(String(m.file.path))
   if (m.net && m.net.dst_ip) {
     var port = m.net.dst_port ? ":" + m.net.dst_port : ""
-    return exe + "  \u00b7  \u2192 " + m.net.dst_ip + port
+    var name = m.net.domain ? " (" + m.net.domain + ")" : ""
+    return exe + "  \u00b7  \u2192 " + m.net.dst_ip + port + name
   }
   var args = m.process && m.process.args ? String(m.process.args) : ""
   return args ? exe + "  \u00b7  " + args : exe

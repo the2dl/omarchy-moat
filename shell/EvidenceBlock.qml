@@ -51,8 +51,12 @@ Rectangle {
         if (a.file)
             add("wrote", Model.shortenHome(String(a.file.path || "")));
 
-        if (a.net)
+        if (a.net) {
             add("connected to", String(a.net.dst_ip || "") + (a.net.dst_port ? ":" + a.net.dst_port : ""));
+            // Always a row, so "not recorded" is said rather than implied: a
+            // connection with no name on it is not a connection that had none.
+            add("resolved from", Model.domainLine(a.net));
+        }
 
         add("first seen here", a.rarity_text);
         add("context", root.service ? root.service.actorLine(a) : "");
