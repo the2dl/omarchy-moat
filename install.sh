@@ -21,7 +21,16 @@ set -euo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DO_BUILD=1
 CHECK_ONLY=0
-PLUGIN_URL=""
+# The canonical plugin URL. This repository IS the plugin -- manifest.json at
+# the root declares id io.github.the2dl.moat with its entry points under
+# shell/ -- so `omarchy plugin add` on this URL installs the panel and keeps it
+# updatable from upstream.
+#
+# It was empty until 2026-09-10, which meant a default install ended with "no
+# panel installed ... add it by hand" and most people simply did not have the
+# UI. --plugin-url still overrides, which is what a fork or a local checkout
+# needs.
+PLUGIN_URL="${MOAT_PLUGIN_URL:-https://github.com/the2dl/omarchy-moat.git}"
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -164,7 +173,8 @@ fi
 #
 # The package does not ship the shell plugin: `omarchy plugin add` takes a git
 # URL, and a plugin registered from a local copy would not update with the
-# package. So this is best-effort and honest about it.
+# package. So the URL above is the default and this stays best-effort -- a
+# machine with no `omarchy` on PATH, or no network, still gets everything else.
 
 say "Panel"
 if [ -n "$PLUGIN_URL" ]; then
