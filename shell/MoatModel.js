@@ -3315,9 +3315,18 @@ function normalizeStatus(raw) {
     policies_failed: Array.isArray(s.policies_failed) ? s.policies_failed.slice() : [],
     feeds: {
       updated: String(feeds.updated || ""),
+      packages: Number(feeds.packages || 0),
       hashes: Number(feeds.hashes || 0),
       domains: Number(feeds.domains || 0),
-      urls: Number(feeds.urls || 0)
+      urls: Number(feeds.urls || 0),
+      // The published domain list, kept apart from the operator's own file.
+      // This function has dropped a field five times now; the daemon sends
+      // these four together and they are read together.
+      domainFeed: Number(feeds.domain_feed || 0),
+      domainFeedSeq: Number(feeds.domain_feed_seq || 0),
+      domainFeedUpdated: String(feeds.domain_feed_updated || ""),
+      domainFeedSource: String(feeds.domain_feed_source || ""),
+      configured: feeds.configured === undefined ? undefined : !!feeds.configured
     },
     // Whitelisted, like everything else here. Where the names on network
     // alerts come from and whether that source is actually connected: a
@@ -4693,10 +4702,15 @@ function learningDoneCard(status, nowMs) {
 /// who believes nothing will be stopped will do things they would otherwise
 /// not.
 ///
-/// **"Never updated" is not a fault when nothing was configured.** The threat
-/// feeds need an abuse.ch auth key; without one `moat-feeds` refuses, says so,
-/// and exits successfully, so the reason lived only in a journal nobody reads.
-/// The footer reported the symptom as a defect with no remedy.
+/// **"Never updated" is not a fault when nothing was configured.** The feed
+/// fetcher can be switched off deliberately, and `moat-feeds` then exits
+/// successfully with its reason only in a journal nobody reads -- the footer
+/// used to report that as a defect with no remedy.
+///
+/// The remedy it named is gone. It said "no abuse.ch key", which was true when
+/// all three feeds wanted an `Auth-Key`; abuse.ch was dropped, both published
+/// lists are keyless, and telling somebody to go and get a key they can no
+/// longer use is worse than saying nothing.
 function footerFacts(status) {
   if (!status)
     return [];
@@ -4721,7 +4735,7 @@ function footerFacts(status) {
     var configured = feeds.configured === undefined ? true : !!feeds.configured;
     bits.push(configured
       ? "Threat feeds have never updated"
-      : "Threat feeds are off (no abuse.ch key)");
+      : "Threat feeds are switched off");
   }
 
   return bits;

@@ -49,9 +49,17 @@ const DEAD_PLACEHOLDER_URL: &str = "https://feed.omarchy-moat.org";
 pub const DEFAULT_PUBLIC_KEY_PATH: &str = "/usr/share/moat/feed-key.pub";
 
 /// Files the client owns. `hashes.txt`, `domains.txt` and `urls.txt` are *not*
-/// in this list: nothing fetches them any more, they are operator-supplied, and
-/// a refresh must never touch them.
+/// in this list: they are operator-supplied and a refresh must never touch
+/// them.
+///
+/// `domains-feed.txt` is a fourth file and a deliberately separate one. The
+/// aggregator now publishes a domain list, and writing it into `domains.txt`
+/// would silently eat whatever the operator had put there -- the one thing
+/// this module has always promised not to do. Two files, two owners, and
+/// `Feeds` reads both: an operator entry wins, because a line somebody typed
+/// on this machine is a deliberate act and the feed is a wholesale import.
 const PACKAGES_FILE: &str = "packages.txt";
+const DOMAINS_FEED_FILE: &str = "domains-feed.txt";
 const META_FILE: &str = "meta.json";
 const STATE_FILE: &str = "state.json";
 
@@ -244,12 +252,60 @@ pub struct FeedMeta {
     pub hashes: usize,
     pub domains: usize,
     pub urls: usize,
+    /// The fetched domain list, counted separately from the operator's.
+    pub domain_feed: usize,
+    pub domain_feed_seq: u64,
+    pub domain_feed_updated: Option<String>,
+}
+
+/// What the published domain list says about one entry.
+///
+/// The family and the compromised flag are not decoration. "your browser
+/// reached a hacked bakery" and "your shell reached a Cobalt Strike server"
+/// are the same event to a suffix match and completely different things to the
+/// person being woken up, and roughly one entry in five is the former.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DomainEntry {
+    pub family: String,
+    pub confidence: u8,
+    /// A legitimate site that has been broken into, rather than a domain
+    /// registered to do harm.
+    pub compromised: bool,
+    pub first_seen: String,
+}
+
+/// Which list an entry came from. An operator's file is a local decision and
+/// says so in the alert; the feed is a wholesale import and says that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DomainSource {
+    Operator,
+    Feed,
+}
+
+impl DomainSource {
+    pub fn file(self) -> &'static str {
+        match self {
+            DomainSource::Operator => "feeds/domains.txt",
+            DomainSource::Feed => "feeds/domains-feed.txt",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DomainHit {
+    /// The feed line that fired -- not the name that was resolved. The alert
+    /// says which entry matched, which is what whoever maintains the list needs.
+    pub entry: String,
+    pub source: DomainSource,
+    /// Present for a feed entry; an operator's file is bare domains.
+    pub info: Option<DomainEntry>,
 }
 
 #[derive(Debug, Default)]
 pub struct Feeds {
     pub hashes: HashSet<String>,
     pub domains: HashSet<String>,
+    pub domain_feed: BTreeMap<String, DomainEntry>,
     pub meta: FeedMeta,
     stamp: Option<Vec<(u64, u64)>>,
 }
@@ -264,6 +320,8 @@ impl Feeds {
             .map(|d| crate::names::normalize_name(&d))
             .collect();
         let urls = read_set(&dir.join("urls.txt"));
+        let domain_feed = read_domain_feed(&dir.join(DOMAINS_FEED_FILE));
+        let feed_header = domain_feed_header(&dir.join(DOMAINS_FEED_FILE));
         let meta_json = std::fs::read_to_string(dir.join(META_FILE))
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
@@ -286,9 +344,13 @@ impl Feeds {
                 hashes: hashes.len(),
                 domains: domains.len(),
                 urls: urls.len(),
+                domain_feed: domain_feed.len(),
+                domain_feed_seq: feed_header.0,
+                domain_feed_updated: feed_header.1,
             },
             hashes,
             domains,
+            domain_feed,
             stamp: stamp(dir),
         }
     }
@@ -309,15 +371,19 @@ impl Feeds {
         self.hashes.contains(&sha256.to_ascii_lowercase())
     }
 
-    /// The feed entry `name` falls under, if any: the name itself or any
-    /// parent domain of it down to two labels, so `cdn.evil.example` matches
-    /// an entry of `evil.example`. A feed of registrable domains is the common
-    /// shape, and a campaign rotates the leftmost label freely.
+    /// The entry `name` falls under, if any: the name itself or any parent
+    /// domain of it down to two labels, so `cdn.evil.example` matches an entry
+    /// of `evil.example`. A feed of registrable domains is the common shape,
+    /// and a campaign rotates the leftmost label freely.
     ///
-    /// Returns the ENTRY, not the name: the alert says which line of the feed
-    /// fired, which is what the operator who maintains the file needs.
-    pub fn domain_hit(&self, name: &str) -> Option<String> {
-        if self.domains.is_empty() {
+    /// The operator's file is consulted first. A line somebody typed on this
+    /// machine is a deliberate local decision; the published feed is a
+    /// wholesale import of forty-eight thousand names. When both cover a name,
+    /// the alert should say which one the reader can go and edit.
+    ///
+    /// Returns the ENTRY, not the name: the alert says which line fired.
+    pub fn domain_hit(&self, name: &str) -> Option<DomainHit> {
+        if self.domains.is_empty() && self.domain_feed.is_empty() {
             return None;
         }
         let name = crate::names::normalize_name(name);
@@ -328,18 +394,134 @@ impl Feeds {
         for i in 0..=labels.len() - 2 {
             let candidate = labels[i..].join(".");
             if self.domains.contains(&candidate) {
-                return Some(candidate);
+                return Some(DomainHit {
+                    entry: candidate,
+                    source: DomainSource::Operator,
+                    info: None,
+                });
+            }
+            if let Some(info) = self.domain_feed.get(&candidate) {
+                return Some(DomainHit {
+                    entry: candidate,
+                    source: DomainSource::Feed,
+                    info: Some(info.clone()),
+                });
             }
         }
         None
     }
+
+    /// Total entries across both lists, for the status surfaces.
+    pub fn domains_known(&self) -> usize {
+        self.domains.len() + self.domain_feed.len()
+    }
+}
+
+/// `domain \t family \t confidence \t flags \t first_seen`, as published.
+///
+/// Tolerant on purpose: a short line still yields the domain, because a feed
+/// that gains a column must not silently stop matching on a machine running an
+/// older build. The domain is the part that decides anything.
+fn read_domain_feed(path: &Path) -> BTreeMap<String, DomainEntry> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut f = line.split('\t');
+        let Some(domain) = f.next() else { continue };
+        let domain = crate::names::normalize_name(domain);
+        if domain.is_empty() {
+            continue;
+        }
+        let family = f.next().unwrap_or("").to_string();
+        let confidence = f.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let compromised = f.next() == Some("c");
+        let first_seen = f.next().unwrap_or("").to_string();
+        out.insert(
+            domain,
+            DomainEntry {
+                family: if family.is_empty() { "unknown".into() } else { family },
+                confidence,
+                compromised,
+                first_seen,
+            },
+        );
+    }
+    out
+}
+
+impl DomainHit {
+    /// The evidence line, identical wherever the hit is found.
+    ///
+    /// Names the file, because the reader's next move differs: an operator
+    /// entry is a line on this machine they can go and look at, a feed entry
+    /// came from the published list and is the same on every machine.
+    pub fn evidence(&self, name: &str, meta: &FeedMeta) -> String {
+        let mut line = format!("feed: {} matched entry {} of {}", name, self.entry, self.source.file());
+        match (self.source, &self.info) {
+            (DomainSource::Feed, Some(i)) => {
+                line.push_str(&format!(" ({} entries", meta.domain_feed));
+                if let Some(u) = &meta.domain_feed_updated {
+                    line.push_str(&format!(", published {}", u));
+                }
+                line.push(')');
+                if !i.family.is_empty() && i.family != "unknown" {
+                    line.push_str(&format!("; attributed to {}", i.family));
+                }
+                if i.confidence > 0 {
+                    line.push_str(&format!(" at {}% confidence", i.confidence));
+                }
+                if !i.first_seen.is_empty() {
+                    line.push_str(&format!("; first reported {}", i.first_seen));
+                }
+                if i.compromised {
+                    // Worth saying out loud. Roughly one entry in five is a
+                    // real business whose site was broken into, and "stop
+                    // visiting that bakery" is a different instruction from
+                    // "you are talking to a C2 server".
+                    line.push_str(
+                        "; reported as a legitimate site that was compromised, not a domain \
+                         registered to do harm",
+                    );
+                }
+            }
+            _ => line.push_str(&format!(" ({} entries)", meta.domains)),
+        }
+        line
+    }
+
+    /// What goes in `IocRef.matched`.
+    pub fn matched(&self) -> String {
+        format!("domain:{}", self.entry)
+    }
+}
+
+/// `# seq` and `# generated` off the top of the published list.
+fn domain_feed_header(path: &Path) -> (u64, Option<String>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (0, None);
+    };
+    let head: String = text.lines().take_while(|l| l.starts_with('#')).collect::<Vec<_>>().join("\n");
+    (
+        header_u64(&head, "# seq ").unwrap_or(0),
+        head.lines()
+            .find_map(|l| l.strip_prefix("# generated "))
+            .map(|v| v.trim().to_string()),
+    )
 }
 
 fn stamp(dir: &Path) -> Option<Vec<(u64, u64)>> {
     use std::os::unix::fs::MetadataExt;
     let mut out = Vec::new();
     // Watch the operator-supplied files too: they change without a refresh.
-    for f in [PACKAGES_FILE, META_FILE, "hashes.txt", "domains.txt", "urls.txt"] {
+    for f in [
+        PACKAGES_FILE, META_FILE, DOMAINS_FEED_FILE, "hashes.txt", "domains.txt", "urls.txt",
+    ] {
         match std::fs::metadata(dir.join(f)) {
             Ok(m) => out.push((m.mtime() as u64, m.size())),
             Err(_) => out.push((0, 0)),
@@ -368,6 +550,10 @@ fn read_set(path: &Path) -> HashSet<String> {
 struct State {
     seq: u64,
     pointer_etag: String,
+    /// Tracked separately because the two wings publish independently: a quiet
+    /// week for packages is a busy week for domains and the other way round.
+    #[serde(default)]
+    domains_seq: u64,
 }
 
 impl State {
@@ -405,6 +591,24 @@ pub struct Pointer {
     pub bytes: u64,
     #[serde(default)]
     pub deltas: BTreeMap<String, String>,
+    /// The domain wing. Absent on an aggregator older than it, and absent
+    /// here on a build older than the aggregator -- `serde` ignores what it
+    /// does not know, which is what lets the two roll out independently.
+    #[serde(default)]
+    pub domains: Option<DomainsRef>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DomainsRef {
+    pub seq: u64,
+    #[serde(default)]
+    pub generated: String,
+    #[serde(default)]
+    pub entries: usize,
+    pub artifact: String,
+    pub sha256: String,
+    #[serde(default)]
+    pub bytes: u64,
 }
 
 // ------------------------------------------------------------------ the client
@@ -419,6 +623,10 @@ pub struct RefreshSummary {
     pub packages: usize,
     pub added: usize,
     pub removed: usize,
+    /// The domain wing, reported separately: it can move when packages do not,
+    /// and it can fail without the package index being in any doubt.
+    pub domains_seq: u64,
+    pub domains: usize,
     pub errors: Vec<String>,
 }
 
@@ -476,9 +684,13 @@ pub fn refresh(cfg: &FeedsConfig, out_dir: &Path) -> RefreshSummary {
     let (pointer, etag) = match fetch_pointer(&agent, &base, &state.pointer_etag, cfg) {
         Ok(Some(p)) => p,
         Ok(None) => {
+            // A 304 on the pointer means neither wing moved: both live in that
+            // one document, and it is byte-identical to the one we already saw.
             sum.mode = "unchanged".into();
             sum.seq = state.seq;
             sum.packages = count_packages(out_dir);
+            sum.domains_seq = state.domains_seq;
+            sum.domains = count_domain_feed(out_dir);
             return sum;
         }
         Err(e) => {
@@ -512,7 +724,19 @@ pub fn refresh(cfg: &FeedsConfig, out_dir: &Path) -> RefreshSummary {
         return sum;
     }
 
-    // 2. nothing new.
+    // 2. the domain wing, before any early return below.
+    //
+    // The two wings share one pointer and move at completely different rates:
+    // a quiet quarter-hour for packages is exactly when ThreatFox has changed.
+    // Doing this after the `pointer.seq == state.seq` check would have pinned
+    // the domain list to whenever a malicious package happened to be published.
+    match refresh_domains(&agent, &base, &pointer, cfg, key.as_ref(), out_dir, &mut state) {
+        Ok(n) => sum.domains = n,
+        Err(e) => sum.errors.push(format!("domains: {}", e)),
+    }
+    sum.domains_seq = state.domains_seq;
+
+    // 3. nothing new.
     let have_index = out_dir.join(PACKAGES_FILE).exists();
     if pointer.seq == state.seq && have_index {
         state.pointer_etag = etag;
@@ -523,7 +747,7 @@ pub fn refresh(cfg: &FeedsConfig, out_dir: &Path) -> RefreshSummary {
         return sum;
     }
 
-    // 3. delta if we can chain to it, full otherwise.
+    // 4. delta if we can chain to it, full otherwise.
     let delta_path = if have_index && state.seq > 0 {
         pointer.deltas.get(&state.seq.to_string()).cloned()
     } else {
@@ -571,7 +795,7 @@ pub fn refresh(cfg: &FeedsConfig, out_dir: &Path) -> RefreshSummary {
     }
     .into();
 
-    // 4. commit.
+    // 5. commit.
     state.seq = pointer.seq;
     state.pointer_etag = etag;
     if let Err(e) = state.save(out_dir) {
@@ -704,6 +928,86 @@ fn verify_ed25519(key: &[u8; 32], msg: &[u8], sig: &[u8]) -> Result<(), String> 
     let vk = VerifyingKey::from_bytes(key).map_err(|e| format!("bad public key: {}", e))?;
     vk.verify(msg, &Signature::from_bytes(&sig))
         .map_err(|_| "SIGNATURE DID NOT VERIFY".to_string())
+}
+
+/// Fetch, verify and install the published domain list.
+///
+/// Never fatal to the package refresh. The six scanners read `packages.txt`
+/// before every install and that path has worked for a year; a new feed wing
+/// does not get to break it. Every failure here leaves the file that is on disk
+/// exactly where it is -- a stale domain list still matches yesterday's C2.
+///
+/// @returns the number of entries now on disk.
+#[allow(clippy::too_many_arguments)]
+fn refresh_domains(
+    agent: &ureq::Agent,
+    base: &str,
+    pointer: &Pointer,
+    cfg: &FeedsConfig,
+    key: Option<&[u8; 32]>,
+    out_dir: &Path,
+    state: &mut State,
+) -> Result<usize, String> {
+    let Some(d) = pointer.domains.as_ref() else {
+        // An aggregator that does not publish one. Not an error, and in
+        // particular not a reason to delete a list we already have.
+        return Ok(count_domain_feed(out_dir));
+    };
+
+    // The same rollback guard the package wing has, for the same reason:
+    // pointer.json is not signed, so replaying an old pointer with its old but
+    // perfectly valid artifact would roll the list back to before whichever
+    // domains the attacker cares about were added. The signature cannot see
+    // this; only a sequence that never decreases can.
+    if d.seq < state.domains_seq {
+        return Err(format!(
+            "pointer offers domain seq {} and this machine already has {}; refusing to roll back",
+            d.seq, state.domains_seq
+        ));
+    }
+
+    let have = out_dir.join(DOMAINS_FEED_FILE).exists();
+    if d.seq == state.domains_seq && have {
+        return Ok(count_domain_feed(out_dir));
+    }
+
+    let text = fetch_verified(agent, base, &d.artifact, cfg, key, Some(&d.sha256))?;
+
+    // The sequence is inside the signed bytes. Without this check a fresh
+    // pointer can serve a stale artifact whose signature is genuine.
+    match header_u64(&text, "# seq ") {
+        Some(seq) if seq == d.seq => {}
+        Some(seq) => {
+            return Err(format!(
+                "pointer says domain seq {} but the signed artifact says {}; refusing it",
+                d.seq, seq
+            ))
+        }
+        None => return Err("the domain artifact does not state its own seq; refusing it".into()),
+    }
+
+    let entries = text
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .count();
+    if entries == 0 {
+        return Err("domain list parsed to zero entries; refusing to install it".into());
+    }
+
+    crate::util::atomic_write(&out_dir.join(DOMAINS_FEED_FILE), text.as_bytes(), 0o644)
+        .map_err(|e| format!("{}: {}", DOMAINS_FEED_FILE, e))?;
+    state.domains_seq = d.seq;
+    Ok(entries)
+}
+
+fn count_domain_feed(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join(DOMAINS_FEED_FILE))
+        .map(|t| {
+            t.lines()
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 fn apply_full(
@@ -870,6 +1174,9 @@ fn write_meta(dir: &Path, pointer: &Pointer, packages: usize, mode: &str) -> Res
         "mode": mode,
         "source": "malicious-package index (OSSF malicious-packages + DataDog dataset)",
         "hash_feed": "operator-supplied; abuse.ch was dropped, see docs/PACKAGE-FEED.md",
+        "domain_feed_seq": pointer.domains.as_ref().map(|d| d.seq).unwrap_or(0),
+        "domain_feed": pointer.domains.as_ref().map(|d| d.entries).unwrap_or(0),
+        "domain_feed_source": "ThreatFox (abuse.ch), gated and signed by the aggregator",
     });
     crate::util::atomic_write(
         &dir.join(META_FILE),
@@ -924,13 +1231,442 @@ mod tests {
         std::fs::write(dir.path().join("domains.txt"), "# c2\nEvil.Example.\nexact.only.test\n").unwrap();
         let f = Feeds::load(dir.path());
         assert_eq!(f.meta.domains, 2);
-        assert_eq!(f.domain_hit("cdn.evil.example").as_deref(), Some("evil.example"));
-        assert_eq!(f.domain_hit("EVIL.example.").as_deref(), Some("evil.example"));
-        assert_eq!(f.domain_hit("exact.only.test").as_deref(), Some("exact.only.test"));
+        let entry = |n: &str| f.domain_hit(n).map(|h| h.entry);
+        assert_eq!(entry("cdn.evil.example").as_deref(), Some("evil.example"));
+        assert_eq!(entry("EVIL.example.").as_deref(), Some("evil.example"));
+        assert_eq!(entry("exact.only.test").as_deref(), Some("exact.only.test"));
+        assert_eq!(
+            f.domain_hit("cdn.evil.example").unwrap().source,
+            crate::feeds::DomainSource::Operator
+        );
         assert!(f.domain_hit("notevil.example").is_none(), "the walk is on label boundaries");
         assert!(f.domain_hit("example").is_none(), "one label is never a match");
         assert!(f.domain_hit("only.test").is_none(), "a subdomain entry does not cover its parent");
         assert!(Feeds::default().domain_hit("evil.example").is_none());
+    }
+
+    // --- a real server, because the fetch path had no test at all -----------
+    //
+    // Everything interesting about `refresh` happens over HTTP: the pointer,
+    // the detached signature, the sha256, the sequence inside the signed bytes
+    // and the rollback guard. None of it could be reached from a unit test, so
+    // none of it was covered. This is a two-route server on a loopback port --
+    // enough to answer a pointer and a pair of artifacts, and enough to lie in
+    // the specific ways the client is supposed to refuse.
+
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::mpsc;
+
+    struct Server {
+        base: String,
+        _stop: mpsc::Sender<()>,
+    }
+
+    /// Routes are absolute paths -> (content type, body).
+    fn serve(routes: std::collections::HashMap<String, Vec<u8>>) -> Server {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if rx.try_recv() != Err(mpsc::TryRecvError::Empty) {
+                    return;
+                }
+                let Ok(mut stream) = stream else { return };
+                let mut line = String::new();
+                if BufReader::new(&stream).read_line(&mut line).is_err() {
+                    continue;
+                }
+                let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let body = routes.get(&path);
+                let head = match &body {
+                    Some(b) => format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\netag: \"x\"\r\nconnection: close\r\n\r\n",
+                        b.len()
+                    ),
+                    None => "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
+                };
+                let _ = stream.write_all(head.as_bytes());
+                if let Some(b) = body {
+                    let _ = stream.write_all(b);
+                }
+                let _ = stream.flush();
+            }
+        });
+        Server { base, _stop: tx }
+    }
+
+    fn gz(text: &str) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        e.write_all(text.as_bytes()).unwrap();
+        e.finish().unwrap()
+    }
+
+    struct Keys {
+        signing: ed25519_dalek::SigningKey,
+        pub_hex: String,
+    }
+
+    fn keys() -> Keys {
+        use ed25519_dalek::SigningKey;
+        // Deterministic: a test that fails should fail the same way twice.
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let pub_hex = signing
+            .verifying_key()
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        Keys { signing, pub_hex }
+    }
+
+    fn sign(k: &Keys, bytes: &[u8]) -> Vec<u8> {
+        use ed25519_dalek::Signer;
+        k.signing.sign(bytes).to_bytes().to_vec()
+    }
+
+    fn domain_artifact(seq: u64, rows: &[&str]) -> String {
+        let mut s = format!(
+            "# moat-domains v1\n# generated 2026-09-11T00:00:00Z\n# entries {}\n# seq {}\n",
+            rows.len(),
+            seq
+        );
+        for r in rows {
+            s.push_str(r);
+            s.push('\n');
+        }
+        s
+    }
+
+    const ROWS: &[&str] = &[
+        "evil.example\tAsyncRAT\t100\t-\t2026-01-02",
+        "hacked.example\tClearFake\t90\tc\t2026-03-04",
+    ];
+
+    /// A server publishing package seq `pseq` and domain seq `dseq`.
+    fn feed_server(k: &Keys, pseq: u64, dseq: Option<u64>, rows: &[&str]) -> (Server, String) {
+        let mut routes = std::collections::HashMap::new();
+
+        let pkg = format!("# moat-packages v1\n# seq {}\nnpm\tevil\t*\n", pseq);
+        let pkg_gz = gz(&pkg);
+        let pkg_sha = crate::util::sha256_hex(&pkg_gz);
+        let pkg_path = format!("/v1/packages-{}-{}.txt.gz", pseq, &pkg_sha[..12]);
+        routes.insert(format!("{}.sig", pkg_path), sign(k, &pkg_gz));
+        routes.insert(pkg_path.clone(), pkg_gz.clone());
+
+        let mut pointer = serde_json::json!({
+            "version": 1, "seq": pseq, "generated": "2026-09-11T00:00:00Z",
+            "entries": 1, "artifact": pkg_path, "sha256": pkg_sha,
+            "bytes": pkg_gz.len(), "deltas": {},
+        });
+
+        let mut dom_path = String::new();
+        if let Some(dseq) = dseq {
+            let dom = domain_artifact(dseq, rows);
+            let dom_gz = gz(&dom);
+            let dom_sha = crate::util::sha256_hex(&dom_gz);
+            dom_path = format!("/v1/domains-{}-{}.txt.gz", dseq, &dom_sha[..12]);
+            routes.insert(format!("{}.sig", dom_path), sign(k, &dom_gz));
+            routes.insert(dom_path.clone(), dom_gz.clone());
+            pointer["domains"] = serde_json::json!({
+                "seq": dseq, "generated": "2026-09-11T00:00:00Z", "entries": rows.len(),
+                "artifact": dom_path, "sha256": dom_sha, "bytes": dom_gz.len(),
+            });
+        }
+        routes.insert(
+            "/v1/pointer.json".into(),
+            serde_json::to_vec_pretty(&pointer).unwrap(),
+        );
+        (serve(routes), dom_path)
+    }
+
+    fn cfg_for(server: &Server, k: &Keys) -> FeedsConfig {
+        FeedsConfig {
+            base_url: server.base.clone(),
+            public_key: k.pub_hex.clone(),
+            timeout_secs: 5,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_published_domain_list_is_fetched_verified_and_installed() {
+        let k = keys();
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _) = feed_server(&k, 1, Some(3), ROWS);
+        let sum = refresh(&cfg_for(&server, &k), dir.path());
+
+        assert!(sum.errors.is_empty(), "{:?}", sum.errors);
+        assert_eq!(sum.domains_seq, 3);
+        assert_eq!(sum.domains, 2);
+
+        let f = Feeds::load(dir.path());
+        assert_eq!(f.meta.domain_feed, 2);
+        assert_eq!(f.meta.domain_feed_seq, 3);
+
+        // Suffix matching works off the fetched list, with its metadata.
+        let hit = f.domain_hit("cdn.evil.example").expect("a parent-domain match");
+        assert_eq!(hit.entry, "evil.example");
+        assert_eq!(hit.source, DomainSource::Feed);
+        let info = hit.info.unwrap();
+        assert_eq!(info.family, "AsyncRAT");
+        assert_eq!(info.confidence, 100);
+        assert!(!info.compromised);
+
+        let hacked = f.domain_hit("hacked.example").unwrap();
+        assert!(hacked.info.as_ref().unwrap().compromised);
+        assert!(
+            hacked.evidence("hacked.example", &f.meta).contains("legitimate site that was compromised"),
+            "the alert has to say which kind of entry this is: {}",
+            hacked.evidence("hacked.example", &f.meta)
+        );
+    }
+
+    #[test]
+    fn a_refresh_never_touches_the_operators_own_domain_file() {
+        let k = keys();
+        let dir = tempfile::tempdir().unwrap();
+        // The one invariant this module has always promised. The published list
+        // has forty-eight thousand names in it; writing it into the operator's
+        // file would eat whatever they had put there.
+        std::fs::write(dir.path().join("domains.txt"), "# mine\nlab.internal\n").unwrap();
+
+        let (server, _) = feed_server(&k, 1, Some(1), ROWS);
+        let sum = refresh(&cfg_for(&server, &k), dir.path());
+        assert!(sum.errors.is_empty(), "{:?}", sum.errors);
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("domains.txt")).unwrap(),
+            "# mine\nlab.internal\n"
+        );
+        let f = Feeds::load(dir.path());
+        assert_eq!(f.meta.domains, 1);
+        assert_eq!(f.meta.domain_feed, 2);
+        assert_eq!(f.domains_known(), 3);
+    }
+
+    #[test]
+    fn an_operator_entry_wins_over_the_published_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("domains.txt"), "evil.example\n").unwrap();
+        std::fs::write(
+            dir.path().join(DOMAINS_FEED_FILE),
+            domain_artifact(1, ROWS),
+        )
+        .unwrap();
+        let f = Feeds::load(dir.path());
+        // Both lists cover it; the alert should point at the file the reader
+        // can actually go and edit.
+        let hit = f.domain_hit("evil.example").unwrap();
+        assert_eq!(hit.source, DomainSource::Operator);
+        assert_eq!(hit.source.file(), "feeds/domains.txt");
+        assert!(hit.info.is_none());
+        // And the one only the feed knows still matches.
+        assert_eq!(f.domain_hit("hacked.example").unwrap().source, DomainSource::Feed);
+    }
+
+    #[test]
+    fn a_pointer_replaying_an_older_domain_sequence_is_refused() {
+        let k = keys();
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _) = feed_server(&k, 1, Some(5), ROWS);
+        assert_eq!(refresh(&cfg_for(&server, &k), dir.path()).domains_seq, 5);
+        drop(server);
+
+        // pointer.json is not signed, so an old pointer with its old but
+        // perfectly valid artifact is a replay the signature cannot see.
+        // Dropping back to seq 2 would lose every domain added since.
+        let (old, _) = feed_server(&k, 1, Some(2), &["only.example\tx\t100\t-\t"]);
+        let sum = refresh(&cfg_for(&old, &k), dir.path());
+        assert!(
+            sum.errors.iter().any(|e| e.contains("refusing to roll back")),
+            "{:?}",
+            sum.errors
+        );
+        let f = Feeds::load(dir.path());
+        assert_eq!(f.meta.domain_feed_seq, 5, "the good list is still installed");
+        assert!(f.domain_hit("evil.example").is_some());
+    }
+
+    #[test]
+    fn a_domain_artifact_whose_signature_is_wrong_is_not_installed() {
+        let k = keys();
+        let dir = tempfile::tempdir().unwrap();
+
+        // A complete, correct feed in every respect except one: the domain
+        // artifact's detached signature was made with a different key. The
+        // pointer resolves, the sha256 matches, the sequence inside the bytes
+        // is right. Only the signature is a lie, and it is the only check that
+        // is supposed to matter.
+        let liar = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut routes = std::collections::HashMap::new();
+
+        let pkg = "# moat-packages v1\n# seq 1\nnpm\tevil\t*\n";
+        let pkg_gz = gz(pkg);
+        let pkg_sha = crate::util::sha256_hex(&pkg_gz);
+        let pkg_path = format!("/v1/packages-1-{}.txt.gz", &pkg_sha[..12]);
+        routes.insert(format!("{}.sig", pkg_path), sign(&k, &pkg_gz));
+        routes.insert(pkg_path.clone(), pkg_gz.clone());
+
+        let dom = domain_artifact(1, ROWS);
+        let dom_gz = gz(&dom);
+        let dom_sha = crate::util::sha256_hex(&dom_gz);
+        let dom_path = format!("/v1/domains-1-{}.txt.gz", &dom_sha[..12]);
+        routes.insert(dom_path.clone(), dom_gz.clone());
+        {
+            use ed25519_dalek::Signer;
+            routes.insert(format!("{}.sig", dom_path), liar.sign(&dom_gz).to_bytes().to_vec());
+        }
+
+        routes.insert(
+            "/v1/pointer.json".into(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1, "seq": 1, "generated": "2026-09-11T00:00:00Z",
+                "entries": 1, "artifact": pkg_path, "sha256": pkg_sha,
+                "bytes": pkg_gz.len(), "deltas": {},
+                "domains": {
+                    "seq": 1, "generated": "2026-09-11T00:00:00Z", "entries": ROWS.len(),
+                    "artifact": dom_path, "sha256": dom_sha, "bytes": dom_gz.len(),
+                },
+            }))
+            .unwrap(),
+        );
+        let server = serve(routes);
+
+        let sum = refresh(&cfg_for(&server, &k), dir.path());
+        assert!(
+            !dir.path().join(DOMAINS_FEED_FILE).exists(),
+            "an unverifiable domain list must not be written"
+        );
+        assert!(
+            sum.errors.iter().any(|e| e.contains("SIGNATURE DID NOT VERIFY")),
+            "and it must say why: {:?}",
+            sum.errors
+        );
+        // The package index is signed correctly and must still install: a
+        // domain failure is not a package failure.
+        assert_eq!(sum.packages, 1);
+        assert_eq!(sum.seq, 1);
+    }
+
+    /// A feed whose pointer and artifact are each internally consistent but
+    /// disagree with each other. `mangle` gets the artifact text to publish.
+    fn feed_with_domain_artifact(k: &Keys, claimed_seq: u64, body: String) -> Server {
+        let mut routes = std::collections::HashMap::new();
+        let pkg = "# moat-packages v1\n# seq 1\nnpm\tevil\t*\n";
+        let pkg_gz = gz(pkg);
+        let pkg_sha = crate::util::sha256_hex(&pkg_gz);
+        let pkg_path = format!("/v1/packages-1-{}.txt.gz", &pkg_sha[..12]);
+        routes.insert(format!("{}.sig", pkg_path), sign(k, &pkg_gz));
+        routes.insert(pkg_path.clone(), pkg_gz.clone());
+
+        let dom_gz = gz(&body);
+        let dom_sha = crate::util::sha256_hex(&dom_gz);
+        let dom_path = format!("/v1/domains-{}-{}.txt.gz", claimed_seq, &dom_sha[..12]);
+        routes.insert(format!("{}.sig", dom_path), sign(k, &dom_gz));
+        routes.insert(dom_path.clone(), dom_gz.clone());
+
+        routes.insert(
+            "/v1/pointer.json".into(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1, "seq": 1, "generated": "2026-09-11T00:00:00Z",
+                "entries": 1, "artifact": pkg_path, "sha256": pkg_sha,
+                "bytes": pkg_gz.len(), "deltas": {},
+                "domains": {
+                    "seq": claimed_seq, "generated": "2026-09-11T00:00:00Z", "entries": 2,
+                    "artifact": dom_path, "sha256": dom_sha, "bytes": dom_gz.len(),
+                },
+            }))
+            .unwrap(),
+        );
+        serve(routes)
+    }
+
+    #[test]
+    fn a_fresh_pointer_serving_a_stale_signed_list_is_refused() {
+        let k = keys();
+        let dir = tempfile::tempdir().unwrap();
+
+        // The attack the sequence-inside-the-signed-bytes exists for. Everything
+        // verifies: the signature is genuine, the sha256 matches, the pointer
+        // looks new. The artifact is an old one, so installing it would quietly
+        // drop every domain added since seq 2 -- and nothing in the signature
+        // can tell, because the old artifact really was signed by us.
+        let server = feed_with_domain_artifact(&k, 9, domain_artifact(2, ROWS));
+        let sum = refresh(&cfg_for(&server, &k), dir.path());
+
+        assert!(!dir.path().join(DOMAINS_FEED_FILE).exists());
+        assert!(
+            sum.errors.iter().any(|e| e.contains("the signed artifact says 2")),
+            "{:?}",
+            sum.errors
+        );
+    }
+
+    #[test]
+    fn a_domain_list_with_no_entries_is_refused() {
+        let k = keys();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(DOMAINS_FEED_FILE), domain_artifact(1, ROWS)).unwrap();
+
+        // A header-only artifact, correctly signed. Installing it would wipe
+        // the list on every machine at once and look like a successful refresh.
+        let server = feed_with_domain_artifact(&k, 2, domain_artifact(2, &[]));
+        let sum = refresh(&cfg_for(&server, &k), dir.path());
+
+        assert!(
+            sum.errors.iter().any(|e| e.contains("zero entries")),
+            "{:?}",
+            sum.errors
+        );
+        assert!(
+            Feeds::load(dir.path()).domain_hit("evil.example").is_some(),
+            "the list that was on disk is still there"
+        );
+    }
+
+    #[test]
+    fn the_domain_list_moves_when_the_package_index_does_not() {
+        let k = keys();
+        let dir = tempfile::tempdir().unwrap();
+        let (first, _) = feed_server(&k, 4, Some(1), ROWS);
+        let a = refresh(&cfg_for(&first, &k), dir.path());
+        assert_eq!(a.seq, 4);
+        assert_eq!(a.domains_seq, 1);
+        drop(first);
+
+        // Same package sequence, new domain sequence. This is the common case
+        // -- packages move a few times a day, ThreatFox moves constantly -- and
+        // the `pointer.seq == state.seq` early return used to skip it entirely.
+        let (second, _) = feed_server(
+            &k,
+            4,
+            Some(2),
+            &["evil.example\tAsyncRAT\t100\t-\t2026-01-02", "new.example\tVidar\t75\t-\t2026-09-10"],
+        );
+        let b = refresh(&cfg_for(&second, &k), dir.path());
+        assert_eq!(b.mode, "unchanged", "packages did not move");
+        assert_eq!(b.domains_seq, 2, "but the domain list did");
+        assert_eq!(b.domains, 2);
+        assert!(Feeds::load(dir.path()).domain_hit("new.example").is_some());
+    }
+
+    #[test]
+    fn an_aggregator_that_publishes_no_domain_list_does_not_delete_ours() {
+        let k = keys();
+        let dir = tempfile::tempdir().unwrap();
+        let (with, _) = feed_server(&k, 1, Some(1), ROWS);
+        assert_eq!(refresh(&cfg_for(&with, &k), dir.path()).domains, 2);
+        drop(with);
+
+        // A rollback of the aggregator, or a mirror that has not caught up.
+        // Absent is not the same as empty.
+        let (without, _) = feed_server(&k, 2, None, &[]);
+        let sum = refresh(&cfg_for(&without, &k), dir.path());
+        assert!(sum.errors.is_empty(), "{:?}", sum.errors);
+        assert_eq!(sum.domains, 2);
+        assert!(Feeds::load(dir.path()).domain_hit("evil.example").is_some());
     }
 
     #[test]

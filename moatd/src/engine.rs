@@ -3009,7 +3009,7 @@ impl Daemon {
     /// none. One place, for every path that builds a finding, so no rule can
     /// forget and no rule has to know where names come from.
     ///
-    /// A hit in `feeds/domains.txt` becomes the finding's IOC here too, so a
+    /// A hit in either domain list becomes the finding's IOC here too, so a
     /// first-contact or egress alert to a fed domain is scored as an IOC
     /// (`scoring::has_ioc`) whichever rule raised it. The dedicated
     /// `moat-x-net-domain-ioc` rule exists for the connections no other rule
@@ -3105,15 +3105,12 @@ impl Daemon {
                     f.extra_evidence.push(line);
                 }
                 if f.ioc.is_none() {
-                    if let Some(entry) = self.feeds.domain_hit(&l.name) {
+                    if let Some(hit) = self.feeds.domain_hit(&l.name) {
                         f.ioc = Some(crate::alert::IocRef {
                             source: "domain-feed".into(),
-                            matched: format!("domain:{}", entry),
+                            matched: hit.matched(),
                         });
-                        f.extra_evidence.push(format!(
-                            "feed: {} is in feeds/domains.txt ({} entries)",
-                            entry, self.feeds.meta.domains
-                        ));
+                        f.extra_evidence.push(hit.evidence(&l.name, &self.feeds.meta));
                     }
                 }
             }
@@ -5785,6 +5782,14 @@ impl Daemon {
                 "domains": self.feeds.meta.domains,
                 "urls": self.feeds.meta.urls,
                 "hashes_source": "operator-supplied",
+                // The published domain list, counted apart from the operator's
+                // for the same reason: they have different owners and the
+                // reader's next move differs. `domains` is a file on this
+                // machine somebody typed; `domain_feed` is the signed import.
+                "domain_feed": self.feeds.meta.domain_feed,
+                "domain_feed_seq": self.feeds.meta.domain_feed_seq,
+                "domain_feed_updated": self.feeds.meta.domain_feed_updated,
+                "domain_feed_source": "ThreatFox (abuse.ch)",
                 // Whether the fetcher is switched on at all. Without this,
                 // "never updated" is all anyone can say -- and it reads as a
                 // fault when the truth may be that it was deliberately pinned.

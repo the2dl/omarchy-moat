@@ -4511,15 +4511,43 @@ TestCase {
     compare(f[ai + 1], "/usr/bin/python3 (pid 42)")
   }
 
-  /// "Never updated" is a fault. "No key configured" is a setup step nobody
-  /// took. The footer said the first when it meant the second, and the reason
-  /// existed only in the journal of a service that exits successfully.
+  /// normalizeStatus is a whitelist and has dropped a field five times. The
+  /// domain wing sends four that travel together; one missing makes the panel
+  /// say a machine has no domain list when it has forty-eight thousand names.
+  function test_the_published_domain_list_survives_normalizeStatus() {
+    var s = Model.normalizeStatus({
+      mode: "monitor",
+      feeds: {
+        updated: "2026-09-11T00:00:00Z", packages: 241813, hashes: 0,
+        domains: 2, urls: 0,
+        domain_feed: 47750, domain_feed_seq: 7,
+        domain_feed_updated: "2026-09-11T14:20:00Z",
+        domain_feed_source: "ThreatFox (abuse.ch)"
+      }
+    })
+    compare(s.feeds.domainFeed, 47750)
+    compare(s.feeds.domainFeedSeq, 7)
+    compare(s.feeds.domainFeedUpdated, "2026-09-11T14:20:00Z")
+    compare(s.feeds.domainFeedSource, "ThreatFox (abuse.ch)")
+    // The operator's own file stays its own number.
+    compare(s.feeds.domains, 2)
+    compare(s.feeds.packages, 241813)
+  }
+
+  /// "Never updated" is a fault. "Switched off" is a choice somebody made. The
+  /// footer said the first when it meant the second, and the reason existed
+  /// only in the journal of a service that exits successfully.
+  ///
+  /// It used to blame a missing abuse.ch key. Both published lists are keyless
+  /// now, so that line sent people to get a credential that no longer buys
+  /// them anything.
   function test_unconfigured_feeds_are_not_reported_as_a_failure() {
     var off = Model.footerFacts({
       mode: "monitor", enforcing_rules: [],
       feeds: { updated: "", configured: false }
     })
-    verify(off.indexOf("Threat feeds are off (no abuse.ch key)") >= 0, off.join(" | "))
+    verify(off.indexOf("Threat feeds are switched off") >= 0, off.join(" | "))
+    verify(off.join(" ").indexOf("abuse.ch") < 0, "no dead remedy: " + off.join(" | "))
 
     // Configured and still empty IS worth reporting as a fault.
     var broken = Model.footerFacts({

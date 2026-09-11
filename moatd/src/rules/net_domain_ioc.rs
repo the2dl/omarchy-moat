@@ -1,7 +1,8 @@
 //! `moat-x-net-domain-ioc`.
 //!
-//! A connection to an address this machine resolved from a name in
-//! `feeds/domains.txt`. The second half of NOTES gap 4: the kernel sees
+//! A connection to an address this machine resolved from a name on one of the
+//! two domain lists -- the operator's `feeds/domains.txt` or the published
+//! `feeds/domains-feed.txt`. The second half of NOTES gap 4: the kernel sees
 //! addresses only, `names.rs` says which name was resolved to each, and this
 //! is the feed match on top -- the way `moat-x-new-exec-ioc` matches a hash.
 //!
@@ -59,7 +60,9 @@ impl UserRule for NetDomainIoc {
              name comes from systemd-resolved's own query stream, not from a reverse lookup.",
             "A shared host or CDN address that a fed domain also used, a sinkholed domain \
              being visited on purpose, or a feed entry broad enough to cover a legitimate \
-             parent domain. The resolution's age is on the alert for exactly this judgement.",
+             parent domain. About one published entry in five is a legitimate site that was \
+             broken into rather than a domain registered to do harm, and the alert says so \
+             when the feed does. The resolution's age is on the alert for the same judgement.",
             // No rotate list, and this used to hardcode browser/github/npm --
             // which is nonsense here. Those belong to a credential READ: they
             // answer "what did the program have in reach". A connection to a
@@ -75,7 +78,7 @@ impl UserRule for NetDomainIoc {
     }
 
     fn on_hook(&mut self, h: &HookHit, exec_id: &str, ctx: &RuleCtx) -> Vec<Finding> {
-        if ctx.feeds.domains.is_empty() {
+        if ctx.feeds.domains_known() == 0 {
             return Vec::new();
         }
         let Some((ip_s, port)) = h.dest() else {
@@ -87,7 +90,7 @@ impl UserRule for NetDomainIoc {
         let Some(l) = ctx.names.lookup(&ip, ctx.now) else {
             return Vec::new();
         };
-        let Some(entry) = ctx.feeds.domain_hit(&l.name) else {
+        let Some(hit) = ctx.feeds.domain_hit(&l.name) else {
             return Vec::new();
         };
         let Some(proc) = ctx.table.get(exec_id) else {
@@ -113,23 +116,32 @@ impl UserRule for NetDomainIoc {
         f.net = Some(net);
         f.ioc = Some(IocRef {
             source: "domain-feed".into(),
-            matched: format!("domain:{}", entry),
+            matched: hit.matched(),
         });
+        // The headline says what the list says about the name. A malware
+        // family is the single most useful word available here, and when the
+        // entry is a compromised legitimate site the sentence has to say so --
+        // otherwise the reader goes hunting for an intrusion that is somebody
+        // else's.
+        let says = match (&hit.info, hit.source) {
+            (Some(i), _) if i.compromised => format!(
+                "{} -- a legitimate site reported as compromised and serving {}",
+                hit.entry, i.family
+            ),
+            (Some(i), _) if i.family != "unknown" && !i.family.is_empty() => {
+                format!("{} -- attributed to {}", hit.entry, i.family)
+            }
+            _ => hit.entry.clone(),
+        };
         f.what_override = Some(format!(
-            "{} connected to {}:{}, which this machine resolved from {} -- a name on the local domain feed ({}).",
+            "{} connected to {}:{}, which this machine resolved from {} -- a name on the domain feed ({}).",
             proc.comm(),
             ip_s,
             port,
             l.name,
-            entry
+            says
         ));
-        f.extra_evidence = vec![format!(
-            "feed: {} matched entry {} of feeds/domains.txt ({} entries, last updated {})",
-            l.name,
-            entry,
-            ctx.feeds.meta.domains,
-            ctx.feeds.meta.updated.as_deref().unwrap_or("never")
-        )];
+        f.extra_evidence = vec![hit.evidence(&l.name, &ctx.feeds.meta)];
         vec![f]
     }
 }
@@ -220,6 +232,64 @@ mod tests {
         // The same program to the same address inside the window is said once.
         assert!(run(&mut rule, &t, &feeds, &names, 101).is_empty());
         assert_eq!(run(&mut rule, &t, &feeds, &names, 100 + SAID_WINDOW_SECS + 1).len(), 1);
+    }
+
+    #[test]
+    fn a_published_entry_puts_the_malware_family_in_the_sentence() {
+        let dir = tempfile::tempdir().unwrap();
+        let feeds_dir = dir.path().join("feeds");
+        std::fs::create_dir_all(&feeds_dir).unwrap();
+        std::fs::write(
+            feeds_dir.join("domains-feed.txt"),
+            "# moat-domains v1\n# generated 2026-09-11T00:00:00Z\n# seq 7\n\
+             evil.example\tCobalt Strike\t100\t-\t2026-01-02\n",
+        )
+        .unwrap();
+        let feeds = Feeds::load(&feeds_dir);
+        assert_eq!(feeds.meta.domain_feed, 1);
+
+        let mut names = NameCache::default();
+        names.record(&resolved("cdn.evil.example", "45.9.148.99"), 90);
+        let mut t = ProcTable::new(8, 60);
+        t.observe(&proc("e1", 4242, "/usr/bin/curl", "https://cdn.evil.example/", None));
+
+        let f = run(&mut NetDomainIoc::default(), &t, &feeds, &names, 100);
+        assert_eq!(f.len(), 1);
+        let what = f[0].what_override.as_ref().unwrap();
+        // The family is the single most useful word available, and a bare
+        // "a name on the domain feed" throws it away.
+        assert!(what.contains("Cobalt Strike"), "{}", what);
+        let ev = &f[0].extra_evidence[0];
+        assert!(ev.contains("feeds/domains-feed.txt"), "{}", ev);
+        assert!(ev.contains("100% confidence"), "{}", ev);
+        assert!(!ev.contains("compromised"), "{}", ev);
+    }
+
+    #[test]
+    fn a_compromised_legitimate_site_is_described_as_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let feeds_dir = dir.path().join("feeds");
+        std::fs::create_dir_all(&feeds_dir).unwrap();
+        std::fs::write(
+            feeds_dir.join("domains-feed.txt"),
+            "# moat-domains v1\n# seq 7\nbakery.example\tClearFake\t90\tc\t2026-03-04\n",
+        )
+        .unwrap();
+        let feeds = Feeds::load(&feeds_dir);
+
+        let mut names = NameCache::default();
+        names.record(&resolved("bakery.example", "45.9.148.99"), 90);
+        let mut t = ProcTable::new(8, 60);
+        t.observe(&proc("e1", 4242, "/usr/bin/firefox", "", None));
+
+        let f = run(&mut NetDomainIoc::default(), &t, &feeds, &names, 100);
+        // Roughly one published entry in five is a real business whose site was
+        // broken into. "Your browser reached a hacked bakery" and "your shell
+        // reached a C2" are the same event to a suffix match and completely
+        // different instructions to whoever is reading the alert.
+        let what = f[0].what_override.as_ref().unwrap();
+        assert!(what.contains("legitimate site reported as compromised"), "{}", what);
+        assert!(f[0].extra_evidence[0].contains("registered to do harm"), "{}", f[0].extra_evidence[0]);
     }
 
     #[test]

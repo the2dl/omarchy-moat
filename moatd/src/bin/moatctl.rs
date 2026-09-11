@@ -1635,11 +1635,33 @@ fn print_status(r: &Value) {
         }
     );
     println!(
-        "feeds      {} hashes, {} domains, updated {}",
+        "feeds      {} packages, {} hashes, updated {}",
+        r["feeds"]["packages"],
         r["feeds"]["hashes"],
-        r["feeds"]["domains"],
         r["feeds"]["updated"].as_str().unwrap_or("never")
     );
+    {
+        // Two domain lists with two owners. Rolling them into one number hides
+        // the only thing worth knowing when nothing is matching: whether the
+        // published list ever arrived.
+        let fed = r["feeds"]["domain_feed"].as_u64().unwrap_or(0);
+        let mine = r["feeds"]["domains"].as_u64().unwrap_or(0);
+        if fed > 0 {
+            println!(
+                "domains    {} from {} (seq {}, published {}){}",
+                fed,
+                r["feeds"]["domain_feed_source"].as_str().unwrap_or("the feed"),
+                r["feeds"]["domain_feed_seq"],
+                r["feeds"]["domain_feed_updated"].as_str().unwrap_or("?"),
+                if mine > 0 { format!(" + {} of your own", mine) } else { String::new() }
+            );
+        } else {
+            println!(
+                "domains    {} (no published list yet -- moat-feeds has not installed one)",
+                mine
+            );
+        }
+    }
     if let Some(n) = r["names"].as_object() {
         println!(
             "names      {}: {}, {} addresses known",

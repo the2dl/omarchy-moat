@@ -2876,7 +2876,7 @@ fn cmd_feeds(d: &mut Daemon, req: &Value) -> Value {
                 "feeds": {
                     "updated": d.feeds.meta.updated,
                     "hashes": d.feeds.meta.hashes,
-                    "domains": d.feeds.meta.domains,
+                    "domains": d.feeds.meta.domains + d.feeds.meta.domain_feed,
                 },
             }))
         }
