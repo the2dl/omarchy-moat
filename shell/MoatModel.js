@@ -1008,6 +1008,23 @@ function buildIncidents(alerts, options, memo) {
       if (rank < worst) { worst = rank; state = st }
     }
     g.state = state
+    // Did any of this ever reach a screen a person reads?
+    //
+    // The daemon already decides this per alert -- `surface` is "alerts" or
+    // "timeline" -- and History used to ignore it and show both. On a working
+    // machine that is 393 timeline rows for every 7 that were surfaced, so the
+    // record of what Moat showed you was buried under the record of what it
+    // merely noticed. The raw stream is still whole in alerts.jsonl, which is
+    // what the shipper sends; this is only about what the History screen is a
+    // history OF.
+    //
+    // Read off the member alerts, not off `state`: `state` folds in acking,
+    // demotion and the noise guard, and "was this ever put in front of you" is
+    // a simpler and more durable question than any of them.
+    g.surfaced = false
+    for (var sfc = 0; sfc < g.alerts.length; sfc++) {
+      if (alertSurface(g.alerts[sfc], set) === SURFACE_ALERTS) { g.surfaced = true; break }
+    }
     g.uncertainty = incidentUncertainty(head)
     // WHOSE decision made this quiet, for 1d's inline note. `suppressed_by`
     // covers an allowlist entry; a demoted rule is quiet because of the noise
@@ -3825,28 +3842,39 @@ function silenceScopes(alert, count) {
 // brightness of the title, so a page of history carries at most one red mark.
 // The counts a person actually scans for move into the day header.
 
-var HISTORY_FILTERS = ["everything", "needsYou", "covered"]
+// "shown" is the default and the point of the screen: History is the history
+// of NOW. "everything" is still here -- 1d's rule is that a quiet row recedes
+// rather than vanishing -- but it is no longer what the screen opens on.
+var HISTORY_FILTERS = ["shown", "needsYou", "covered", "everything"]
 
 function historyFilterLabel(filter) {
   switch (String(filter || "")) {
   case "needsYou": return "Needed you"
   case "covered": return "Silenced by a rule"
-  default: return "Everything"
+  case "everything": return "Everything Moat saw"
+  default: return "Shown to you"
   }
 }
 
 function filterHistory(incidents, filter) {
   var list = Array.isArray(incidents) ? incidents : []
-  var want = String(filter || "everything")
+  var want = String(filter || "shown")
   var out = []
   for (var i = 0; i < list.length; i++) {
-    var state = list[i] ? list[i].state : ""
+    var inc = list[i]
+    var state = inc ? inc.state : ""
     if (want === "needsYou") {
-      if (state === "needsYou" || state === "contained") out.push(list[i])
+      if (state === "needsYou" || state === "contained") out.push(inc)
     } else if (want === "covered") {
-      if (state === "expected") out.push(list[i])
+      if (state === "expected") out.push(inc)
+    } else if (want === "everything") {
+      out.push(inc)
     } else {
-      out.push(list[i])
+      // "shown": what Now put in front of you, which is what a history of Now
+      // means. An older incident built before `surfaced` existed has the field
+      // undefined; treat that as shown rather than silently emptying the
+      // screen for it.
+      if (inc && inc.surfaced !== false) out.push(inc)
     }
   }
   return out

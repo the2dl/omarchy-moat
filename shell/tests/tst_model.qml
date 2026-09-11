@@ -2852,6 +2852,42 @@ TestCase {
     compare(Model.filterHistory(inc, "covered").length, 1)
   }
 
+  /// History is the history of NOW, not of the raw stream.
+  ///
+  /// On a working machine 393 alerts in 400 are `surface: timeline` -- things
+  /// Moat noticed and deliberately did not put in front of anyone. Showing
+  /// them here buried the record of what it DID show under the record of what
+  /// it merely saw, at about one row a second. The full stream stays in
+  /// alerts.jsonl, which is what the shipper sends.
+  function test_history_defaults_to_what_was_actually_shown() {
+    var inc = incidentsOf([
+      incAlert({ id: "01A", rule: "r1", surface: "alerts" }),
+      incAlert({ id: "01B", rule: "r2", surface: "timeline" }),
+      incAlert({ id: "01C", rule: "r3", surface: "timeline" })
+    ], { showSuppressed: true })
+
+    compare(inc.length, 3)
+    // The default chip, and the one the screen opens on.
+    compare(Model.filterHistory(inc, "shown").length, 1)
+    compare(Model.filterHistory(inc, "shown")[0].key, inc.filter(function (g) {
+      return g.surfaced
+    })[0].key)
+    // A missing filter argument means the same thing.
+    compare(Model.filterHistory(inc, "").length, 1)
+    // Nothing is lost -- it is one chip away.
+    compare(Model.filterHistory(inc, "everything").length, 3)
+    compare(Model.HISTORY_FILTERS[0], "shown", "and it is the first chip")
+    compare(Model.historyFilterLabel("shown"), "Shown to you")
+    compare(Model.historyFilterLabel("everything"), "Everything Moat saw")
+  }
+
+  /// An incident built before `surfaced` existed has the field undefined.
+  /// Treating that as "not shown" would open History on an empty screen.
+  function test_an_incident_without_the_surfaced_field_is_still_shown() {
+    var legacy = [{ key: "k1", state: "needsYou" }]
+    compare(Model.filterHistory(legacy, "shown").length, 1)
+  }
+
   function test_a_covered_row_names_whose_decision_silenced_it() {
     // 1d appends the covering rule to the title in a dimmer colour. The daemon
     // names it as a fragment and an index, which is a file path and an ordinal

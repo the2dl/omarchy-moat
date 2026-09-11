@@ -266,8 +266,9 @@ flowchart TB
 
     <section id="history">
       <h2 class="group">The panel · History</h2>
-      <p class="group-note">Scanning the past without a page of red pills.</p>
-      <p>Filter chips across the top — <strong>Everything</strong>, <strong>Needed you</strong>, <strong>Silenced by a rule</strong> — then day groups, each headed with a one-line summary (“1 needed you · 3 explained · 41 covered by a rule”, or simply “nothing needed you”).</p>
+      <p class="group-note">A history of <em>Now</em> — not of everything the kernel said.</p>
+      <p><strong>This screen shows what Moat put in front of you.</strong> On a working machine roughly 97% of what the sensor reports is filed to the timeline and deliberately never surfaced — a normal desktop generates about one such event a second. Showing those here buried the record of what Moat <em>showed</em> you under the record of what it merely <em>noticed</em>. The complete stream is still written to <code>alerts.jsonl</code> untouched, which is what the log shipper sends to a SIEM; this screen is not that, and no longer pretends to be.</p>
+      <p>Filter chips across the top — <strong>Shown to you</strong> (the default), <strong>Needed you</strong>, <strong>Silenced by a rule</strong>, <strong>Everything Moat saw</strong> — then day groups, each headed with a one-line summary (“1 needed you · 3 explained · 41 covered by a rule”, or simply “nothing needed you”). Nothing is hidden: the last chip is the old firehose, one click away.</p>
       <p>Severity is a <strong>3px tick and text brightness</strong>, not a badge: a full page of history carries at most one red mark. Repeat counts and the covering rule are appended inline and dimmed — “· 68 times”, “· covered by: your SSH tools”.</p>
       <p>Opening a row gives the same detail as an incident card, plus <strong>what led here</strong> — the chain, in order, with times, and which steps were triggers versus context you had already allowed.</p>
     </section>

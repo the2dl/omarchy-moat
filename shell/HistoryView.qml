@@ -27,7 +27,10 @@ Item {
     /// setting keeps rule-covered rows off the other two.
     property var coveredIncidents: []
     property string selectedId: ""
-    property string filter: "everything"
+    /// "shown" by default: this screen is the history of Now, not of the raw
+    /// stream. The stream is whole in alerts.jsonl for the shipper, and
+    /// "Everything Moat saw" is one chip away.
+    property string filter: "shown"
     /// LEARNING 3. An install receipt is not an alert and never counts as one --
     /// it is the record of a package install Moat watched all the way through.
     /// It belongs on this screen because the point of a history is chronology,
@@ -36,7 +39,11 @@ Item {
     readonly property int receiptLimit: 6
     readonly property var receipts: root.service ? root.service.receipts : []
     readonly property var t: root.tokens
-    readonly property var shown: Model.filterHistory(root.filter === "covered" ? root.coveredIncidents : root.incidents, root.filter)
+    // `covered` and `everything` both need the list with nothing hidden --
+    // otherwise "Everything Moat saw" quietly means "everything except what the
+    // Advanced setting is holding back", which is the one label that must not
+    // be a half-truth.
+    readonly property var shown: Model.filterHistory(root.filter === "covered" || root.filter === "everything" ? root.coveredIncidents : root.incidents, root.filter)
     readonly property var days: Model.historyDays(root.shown, root.service ? root.service.nowMs : Date.now())
 
     signal openIncident(string id)
@@ -119,7 +126,15 @@ Item {
             if (root.filter === "covered")
                 return "No rule has silenced anything yet.";
 
-            return "Nothing has happened yet. Moat is watching.";
+            if (root.filter === "everything")
+                return "Nothing has happened yet. Moat is watching.";
+
+            // The default. "Nothing has happened" would be a lie here: plenty
+            // happens on a working machine and almost none of it is meant for
+            // a person, which is the entire reason this screen stopped
+            // defaulting to the raw stream. Say which question is being
+            // answered, and where the rest is.
+            return "Nothing has needed your attention. Everything Moat saw is still on the last chip.";
         }
         color: root.t ? root.t.faint : "grey"
         font.family: root.t ? root.t.family : "monospace"
