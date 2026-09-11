@@ -4604,6 +4604,40 @@ TestCase {
     verify(chips[chips.length - 1].broadest)
   }
 
+  /// The most dangerous sentence this panel can print.
+  ///
+  /// On a kernel built without BPF LSM (Asahi, most distro arm64) every LSM
+  /// policy runs as a kprobe: detection is intact, in-kernel REFUSAL is
+  /// unavailable to every rule. A footer reading "Blocking, not just watching"
+  /// there tells somebody they are protected when nothing can be refused, and
+  /// a person who believes that behaves differently from one who knows.
+  function test_a_kernel_that_cannot_block_is_never_reported_as_blocking() {
+    var armed = ["a", "b", "c"]
+
+    var noLsm = Model.footerFacts({
+      mode: "enforce", enforcing_rules: armed, bpfLsm: false
+    })
+    verify(noLsm.join(" ").indexOf("cannot block") >= 0, noLsm.join(" | "))
+    verify(noLsm.join(" ").indexOf("Blocking, not just watching") < 0,
+           "claimed blocking on a kernel that cannot: " + noLsm.join(" | "))
+    // The armed count is still stated -- the rules ARE armed, they just cannot
+    // refuse. Hiding that would be a different lie.
+    verify(noLsm.join(" ").indexOf("3 rules armed") >= 0, noLsm.join(" | "))
+
+    // A normal kernel is unchanged.
+    var ok = Model.footerFacts({ mode: "enforce", enforcing_rules: armed, bpfLsm: true })
+    verify(ok.indexOf("Blocking, not just watching") >= 0, ok.join(" | "))
+  }
+
+  /// An older daemon sends no bpf_lsm field. That must not read as "cannot
+  /// block" -- it would tell every machine running a previous release that it
+  /// is unprotected.
+  function test_a_daemon_without_the_field_is_assumed_capable() {
+    compare(Model.normalizeStatus({ mode: "monitor" }).bpfLsm, true)
+    compare(Model.normalizeStatus({ mode: "monitor", bpf_lsm: false }).bpfLsm, false)
+    compare(Model.normalizeStatus({ mode: "monitor", bpf_lsm: true }).bpfLsm, true)
+  }
+
   /// normalizeStatus is a whitelist and has dropped a field five times. The
   /// domain wing sends four that travel together; one missing makes the panel
   /// say a machine has no domain list when it has forty-eight thousand names.

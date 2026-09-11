@@ -59,8 +59,10 @@ say "Checking this machine"
 [ -f /etc/arch-release ] || die "this is an Arch package; /etc/arch-release is missing"
 ok "Arch"
 
-[ "$(uname -m)" = "x86_64" ] || die "the vendored Tetragon build is amd64 only (this is $(uname -m))"
-ok "x86_64"
+case "$(uname -m)" in
+	x86_64|aarch64) ok "$(uname -m)" ;;
+	*) die "Tetragon ships amd64 and arm64 builds only (this is $(uname -m))" ;;
+esac
 
 command -v systemctl >/dev/null || die "systemd is required"
 ok "systemd"
@@ -80,10 +82,27 @@ if grep -qw bpf /sys/kernel/security/lsm 2>/dev/null; then
 	ok "BPF LSM enabled ($(cat /sys/kernel/security/lsm))"
 else
 	warn "BPF LSM is NOT enabled: $(cat /sys/kernel/security/lsm 2>/dev/null || echo unknown)"
-	warn "Detection will work. Blocking will NOT -- deny policies and containment"
-	warn "will load, report enforce, and refuse nothing. To fix, add to the kernel"
-	warn "cmdline:  lsm=capability,landlock,lockdown,yama,bpf"
 	MOAT_NO_BPF_LSM=1
+	# Two different failures wearing the same symptom, and the fix for one is
+	# not the fix for the other. This used to say only "add bpf to the cmdline"
+	# and "detection will work" -- both true for the first case, both wrong for
+	# the second, and the second is what every Asahi and most distro arm64
+	# kernels are.
+	if grep -q '^CONFIG_BPF_LSM=y' "/boot/config-$(uname -r)" 2>/dev/null \
+		|| { [ -r /proc/config.gz ] && zgrep -q '^CONFIG_BPF_LSM=y' /proc/config.gz 2>/dev/null; }; then
+		warn "The kernel HAS BPF LSM built in, it is just not in the active list."
+		warn "Detection will work. Blocking will NOT -- deny policies and containment"
+		warn "will load, report enforce, and refuse nothing. To fix, add bpf to the"
+		warn "kernel cmdline, keeping the modules you already run:"
+		warn "  lsm=$(cat /sys/kernel/security/lsm 2>/dev/null),bpf"
+	else
+		warn "This kernel was BUILT WITHOUT BPF LSM (CONFIG_BPF_LSM is not set)."
+		warn "No boot parameter can enable it. Moat renders its LSM policies as"
+		warn "kprobes instead, so DETECTION IS INTACT -- including credentials and"
+		warn "the decoy files -- but nothing can be refused in the kernel, by any"
+		warn "rule, however armed it looks. moatctl status says so on every run."
+		MOAT_NO_BPF_LSM=built_out
+	fi
 fi
 
 if [ "$DO_BUILD" = 1 ]; then
@@ -216,10 +235,17 @@ if [ "${NEED_RELOGIN:-0}" = 1 ]; then
 EOF
 fi
 
-if [ "${MOAT_NO_BPF_LSM:-0}" = 1 ]; then
+if [ "${MOAT_NO_BPF_LSM:-0}" = built_out ]; then
+	cat <<EOF
+  REMEMBER: this kernel has no BPF LSM and cannot get one from a boot flag.
+  Moat detects -- all 55 policies load, as kprobes -- and refuses nothing.
+  Do not trust "enforce" on this machine. \`moatctl status\` states it plainly.
+
+EOF
+elif [ "${MOAT_NO_BPF_LSM:-0}" != 0 ]; then
 	cat <<EOF
   REMEMBER: BPF LSM is off on this kernel. Moat will detect but cannot block.
-  Do not trust "enforce" on this machine until that is fixed.
+  Add bpf to the kernel cmdline; until then, do not trust "enforce" here.
 
 EOF
 fi

@@ -3335,6 +3335,12 @@ function normalizeStatus(raw) {
     sensorLoading: s.sensor_loading === true,
     sensor_loading: s.sensor_loading === true,
     policies_failed: Array.isArray(s.policies_failed) ? s.policies_failed.slice() : [],
+    // Can this kernel block at all? False on a kernel built without BPF LSM
+    // (Asahi and most distro arm64 kernels), where every LSM policy runs as a
+    // kprobe: detection is intact, in-kernel refusal is not available to any
+    // rule. Absent on an older daemon, which is treated as "yes" so nothing
+    // changes for a machine that never had the question.
+    bpfLsm: s.bpf_lsm === undefined ? true : !!s.bpf_lsm,
     feeds: {
       updated: String(feeds.updated || ""),
       packages: Number(feeds.packages || 0),
@@ -4766,7 +4772,18 @@ function footerFacts(status) {
   var bits = [];
   var armed = Array.isArray(status.enforcing_rules) ? status.enforcing_rules.length : 0;
 
-  if (String(status.mode) === "enforce")
+  // The kernel gets the first word, because it overrides every other answer.
+  // On a machine with no BPF LSM nothing can be refused however many rules are
+  // armed, and "Blocking, not just watching" there is the single most
+  // dangerous sentence this panel could print: somebody who believes they are
+  // protected behaves differently from somebody who knows they are not.
+  if (status.bpfLsm === false) {
+    bits.push(armed > 0
+      ? "Watching only — this kernel cannot block (" + armed + " rule" +
+        (armed === 1 ? "" : "s") + " armed but unable to refuse)"
+      : "Watching only — this kernel cannot block");
+  }
+  else if (String(status.mode) === "enforce")
     bits.push("Blocking, not just watching");
   else if (armed === 1)
     bits.push("Watching, and blocking 1 rule");

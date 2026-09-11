@@ -98,6 +98,10 @@ pub struct RenderReport {
     pub skipped: Vec<(String, String)>,
     /// Telemetry class names that are on for this render.
     pub telemetry_classes: Vec<String>,
+    /// Policies rewritten from `lsmhooks` to `kprobes` because this kernel has
+    /// no BPF LSM. Reported, never silent: these rules detect but cannot
+    /// refuse, and a status line claiming `enforce` for them would be a lie.
+    pub kprobe_fallback: Vec<String>,
 }
 
 impl RenderReport {
@@ -135,6 +139,9 @@ pub struct RenderOptions<'a> {
     /// export allowlist. See the note at the write site -- a runtime policy
     /// whose name is not in this file is invisible to moatd.
     pub contain_slots: usize,
+    /// False when this kernel has no usable BPF LSM, which makes every
+    /// `lsmhooks:` policy render as a kprobe instead. See [`lsm_to_kprobes`].
+    pub bpf_lsm: bool,
 }
 
 impl Default for RenderOptions<'_> {
@@ -146,6 +153,10 @@ impl Default for RenderOptions<'_> {
             passwd: Path::new("/etc/passwd"),
             homes: None,
             telemetry: crate::config::TelemetryConfig::default(),
+            // Detected, not assumed. A default of `true` on a kernel without
+            // it renders 22 policies that cannot attach; a default of `false`
+            // on a kernel with it silently drops enforcement everywhere.
+            bpf_lsm: bpf_lsm_available(),
             canaries: Vec::new(),
             names_enabled: crate::names::NamesConfig::default().enabled,
             exclusions: std::collections::BTreeMap::new(),
@@ -228,8 +239,8 @@ pub fn render(opts: &RenderOptions) -> Result<RenderReport, String> {
                 .push((stem.clone(), "no canaries are planted".to_string()));
             continue;
         }
-        match render_one_with(tpl, &homes, &lists, &opts.exclusions) {
-            Ok((name, body)) => {
+        match render_one_with_lsm(tpl, &homes, &lists, &opts.exclusions, opts.bpf_lsm) {
+            Ok((name, body, rewritten)) => {
                 let out = opts.out_dir.join(&stem);
                 match atomic_write(&out, body.as_bytes(), 0o644) {
                     Ok(changed) => {
@@ -238,6 +249,9 @@ pub fn render(opts: &RenderOptions) -> Result<RenderReport, String> {
                         }
                         produced.insert(out);
                         names.insert(name.clone());
+                        if !rewritten.is_empty() {
+                            report.kprobe_fallback.push(name.clone());
+                        }
                         report.rendered.push(name);
                     }
                     Err(e) => report.failed.push((stem, format!("write: {}", e))),
@@ -301,8 +315,19 @@ pub fn render_one_with(
     lists: &BTreeMap<&'static str, Vec<String>>,
     exclusions: &BTreeMap<String, Vec<String>>,
 ) -> Result<(String, String), String> {
+    render_one_with_lsm(path, homes, lists, exclusions, true).map(|(n, b, _)| (n, b))
+}
+
+/// `render_one_with`, told whether BPF LSM is usable.
+pub fn render_one_with_lsm(
+    path: &Path,
+    homes: &[String],
+    lists: &BTreeMap<&'static str, Vec<String>>,
+    exclusions: &BTreeMap<String, Vec<String>>,
+    bpf_lsm: bool,
+) -> Result<(String, String, Vec<String>), String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    render_text(&text, homes, lists, exclusions)
+    render_text_with(&text, homes, lists, exclusions, bpf_lsm)
 }
 
 /// The list placeholders filled from the built-in `[telemetry]` defaults.
@@ -506,12 +531,176 @@ fn selector_enforces(map: &serde_yaml::Mapping) -> bool {
         .unwrap_or(false)
 }
 
+/// LSM hook -> the kallsyms symbol a kprobe attaches to.
+///
+/// Every LSM hook has a `security_*` global symbol with an identical
+/// prototype, which is what makes the fallback below possible at all
+/// (docs/TETRAGON-NOTES.md, the day 21 LSM policies blew the trampoline cap).
+///
+/// An explicit TABLE and not `"security_" + hook`, because that rule is wrong
+/// for exactly one of the seven hooks moat uses: `bprm_check_security` is
+/// reached through `security_bprm_check`, and there is no
+/// `security_bprm_check_security` in kallsyms. A prefix rule would have
+/// silently produced two policies that fail to attach --
+/// `exec-untrusted-home` and `exec-untrusted-tmpfs`, the two rules that watch
+/// a binary running out of a writable directory -- and the symptom would have
+/// been silence, months later, on the surface people most assume is covered.
+///
+/// Verified against /proc/kallsyms on 7.1.9-arch1-2 (x86_64) and
+/// 7.1.13-1-1-ARCH (aarch64, Asahi).
+const LSM_KPROBE_SYMBOL: &[(&str, &str)] = &[
+    ("bpf", "security_bpf"),
+    ("bprm_check_security", "security_bprm_check"), // NOT security_bprm_check_security
+    ("capset", "security_capset"),
+    ("file_post_open", "security_file_post_open"),
+    ("inode_setxattr", "security_inode_setxattr"),
+    ("path_chmod", "security_path_chmod"),
+    ("path_rename", "security_path_rename"),
+    ("path_truncate", "security_path_truncate"),
+    ("path_unlink", "security_path_unlink"),
+    ("ptrace_access_check", "security_ptrace_access_check"),
+    ("socket_connect", "security_socket_connect"),
+    ("task_fix_setuid", "security_task_fix_setuid"),
+];
+
+/// Is BPF LSM usable on this kernel?
+///
+/// Two ways to lose it and they are NOT the same failure:
+///
+/// * compiled in but absent from the active `lsm=` list -- the `bpf_lsm_*`
+///   trampolines exist, so policies ATTACH and simply never fire. Enforcement
+///   silently refuses nothing; detection is silently dead too.
+/// * `# CONFIG_BPF_LSM is not set` -- the symbols do not exist, attach fails,
+///   and Tetragon reports the policy as failed to load.
+///
+/// Both are answered by the same question, which is what this reads: is `bpf`
+/// in the kernel's ACTIVE LSM list. `/sys/kernel/security/lsm` is the list the
+/// kernel actually assembled, so a kernel that built the feature out cannot
+/// appear in it either way.
+pub fn bpf_lsm_available() -> bool {
+    std::fs::read_to_string("/sys/kernel/security/lsm")
+        .map(|s| s.split(',').any(|l| l.trim() == "bpf"))
+        .unwrap_or(false)
+}
+
+/// Rewrite `lsmhooks:` as `kprobes:` for a kernel with no BPF LSM.
+///
+/// Asahi (and most distro arm64 kernels) ship `# CONFIG_BPF_LSM is not set`,
+/// which no boot parameter can undo. Without this, 22 of moat's 55 policies
+/// fail to attach and the machine loses the entire `cred` family, the decoy
+/// files, and most of `priv` -- while `install.sh` cheerfully says "detection
+/// will work, blocking will not". Detection does not work; that sentence was
+/// written for the milder cmdline case.
+///
+/// **Enforcement is REMOVED, never converted.** A kprobe can only `Override` a
+/// function on the kernel's `ALLOW_ERROR_INJECTION` list and `security_*` is
+/// not on it, so refusing the read is genuinely unavailable here. `Sigkill`
+/// would still work -- and turning "refuse this read" into "kill this process"
+/// is a far more destructive act than the setting the user chose. A rule that
+/// cannot do what was asked does less, not something else.
+///
+/// @returns the hooks that were rewritten, so the caller can say so.
+fn lsm_to_kprobes(doc: &mut Value) -> Result<Vec<String>, String> {
+    let Some(spec) = doc.get_mut("spec").and_then(|s| s.as_mapping_mut()) else {
+        return Ok(Vec::new());
+    };
+    let Some(hooks) = spec.remove(Value::from("lsmhooks")) else {
+        return Ok(Vec::new());
+    };
+    let Some(list) = hooks.as_sequence().cloned() else {
+        return Ok(Vec::new());
+    };
+
+    let mut moved = Vec::new();
+    let mut kprobes: Vec<Value> = Vec::new();
+    for mut entry in list {
+        let Some(map) = entry.as_mapping_mut() else { continue };
+        let hook = map
+            .get(Value::from("hook"))
+            .and_then(|h| h.as_str())
+            .unwrap_or("")
+            .to_string();
+        let symbol = LSM_KPROBE_SYMBOL
+            .iter()
+            .find(|(h, _)| *h == hook)
+            .map(|(_, s)| *s)
+            .ok_or_else(|| {
+                format!(
+                    "no kprobe symbol known for LSM hook {:?}; add it to \
+                     LSM_KPROBE_SYMBOL after checking /proc/kallsyms. Guessing the \
+                     security_ prefix is how two policies silently stop attaching.",
+                    hook
+                )
+            })?;
+        map.remove(Value::from("hook"));
+        map.insert(Value::from("call"), Value::from(symbol));
+        map.insert(Value::from("syscall"), Value::from(false));
+        strip_enforcement(&mut entry);
+        moved.push(hook);
+        kprobes.push(entry);
+    }
+
+    // Appended, not replaced: a policy may already have kprobes of its own.
+    match spec.get_mut(Value::from("kprobes")).and_then(|k| k.as_sequence_mut()) {
+        Some(existing) => existing.extend(kprobes),
+        None => {
+            spec.insert(Value::from("kprobes"), Value::Sequence(kprobes));
+        }
+    }
+    Ok(moved)
+}
+
+/// Drop every in-kernel enforcement action from one hook entry.
+///
+/// `Override` cannot work from a kprobe here, and `Sigkill` must not be
+/// substituted for it. `Post` and the rest are left alone -- they are how the
+/// event reaches moatd at all.
+fn strip_enforcement(entry: &mut Value) {
+    let Some(sels) = entry
+        .get_mut("selectors")
+        .and_then(|s| s.as_sequence_mut())
+    else {
+        return;
+    };
+    for sel in sels.iter_mut() {
+        let Some(map) = sel.as_mapping_mut() else { continue };
+        let Some(actions) = map
+            .get_mut(Value::from("matchActions"))
+            .and_then(|a| a.as_sequence_mut())
+        else {
+            continue;
+        };
+        actions.retain(|a| {
+            !matches!(
+                a.get("action").and_then(|v| v.as_str()),
+                Some("Override") | Some("Sigkill") | Some("NotifyEnforcer") | Some("Signal")
+            )
+        });
+        if actions.is_empty() {
+            map.remove(Value::from("matchActions"));
+        }
+    }
+}
+
 pub fn render_text(
     text: &str,
     homes: &[String],
     lists: &BTreeMap<&'static str, Vec<String>>,
     exclusions: &BTreeMap<String, Vec<String>>,
 ) -> Result<(String, String), String> {
+    render_text_with(text, homes, lists, exclusions, true).map(|(n, b, _)| (n, b))
+}
+
+/// `render_text`, told whether BPF LSM is usable.
+///
+/// @returns `(name, body, rewritten_hooks)`.
+pub fn render_text_with(
+    text: &str,
+    homes: &[String],
+    lists: &BTreeMap<&'static str, Vec<String>>,
+    exclusions: &BTreeMap<String, Vec<String>>,
+    bpf_lsm: bool,
+) -> Result<(String, String, Vec<String>), String> {
     if text.contains(PLACEHOLDER) && homes.is_empty() {
         return Err("template uses {{HOME}} but no human user was found in /etc/passwd".into());
     }
@@ -544,12 +733,20 @@ pub fn render_text(
         exclude_binaries(&mut doc, bins)?;
     }
     split_container_enforcement(&mut doc);
+    // Last, so the container split and the exclusions above have already run
+    // against the shape the template declares. The rewrite only changes HOW
+    // the same hook is attached.
+    let rewritten = if bpf_lsm {
+        Vec::new()
+    } else {
+        lsm_to_kprobes(&mut doc)?
+    };
 
     let body = serde_yaml::to_string(&doc).map_err(|e| e.to_string())?;
     if body.contains(PLACEHOLDER) {
         return Err("placeholder survived expansion".into());
     }
-    Ok((name, format!("{}{}", HEADER, body)))
+    Ok((name, format!("{}{}", HEADER, body), rewritten))
 }
 
 const HEADER: &str = "# rendered by `moatd render-policies` — edit the template, not this file\n";
@@ -662,6 +859,7 @@ mod tests {
         .unwrap();
 
         let opts = RenderOptions {
+            bpf_lsm: true,
             templates_dir: tpl.path(),
             out_dir: out.path(),
             export_allowlist: None,
@@ -689,6 +887,7 @@ mod tests {
 
         // With paths, the same template renders and carries them exactly.
         let opts = RenderOptions {
+            bpf_lsm: true,
             canaries: vec!["/etc/rsync.secrets".into(), "/root/.pgpass".into()],
             names_enabled: true,
             ..opts
@@ -700,7 +899,8 @@ mod tests {
         assert!(!body.contains("{{CANARIES}}"), "the placeholder must be gone: {}", body);
 
         // And a stale render is swept when the last decoy goes away.
-        let opts = RenderOptions { canaries: Vec::new(), ..opts };
+        let opts = RenderOptions {
+            bpf_lsm: true, canaries: Vec::new(), ..opts };
         render(&opts).unwrap();
         assert!(
             !out.path().join("canary-file-read.yaml").exists(),
@@ -783,6 +983,7 @@ spec:
         std::fs::create_dir_all(&tpl).unwrap();
         std::fs::create_dir_all(&out).unwrap();
         let opts = RenderOptions {
+            bpf_lsm: true,
             templates_dir: &tpl,
             out_dir: &out,
             export_allowlist: Some(&al),
@@ -839,6 +1040,7 @@ spec:
         std::fs::write(tdir.join("a.yaml"), TPL).unwrap();
         let al = dir.path().join("export-allowlist");
         let opts = RenderOptions {
+            bpf_lsm: true,
             templates_dir: &tdir,
             out_dir: &odir,
             export_allowlist: Some(&al),
@@ -874,6 +1076,7 @@ spec:
         std::fs::write(tdir.join("ok.yaml"), TPL).unwrap();
         std::fs::write(tdir.join("bad.yaml"), "spec: [unclosed\n").unwrap();
         let opts = RenderOptions {
+            bpf_lsm: true,
             templates_dir: &tdir,
             out_dir: &dir.path().join("o"),
             export_allowlist: None,
@@ -986,6 +1189,7 @@ spec:
         let mut telemetry = crate::config::TelemetryConfig::default();
         assert!(!telemetry.file && !telemetry.network, "both ship off");
         let opts = RenderOptions {
+            bpf_lsm: true,
             templates_dir: &tdir,
             out_dir: &odir,
             export_allowlist: Some(&al),
@@ -1009,6 +1213,7 @@ spec:
         // Tetragon will actually export what it posts.
         telemetry.network = true;
         let opts = RenderOptions {
+            bpf_lsm: true,
             telemetry,
             ..opts
         };
@@ -1023,6 +1228,7 @@ spec:
         // …and turning it back off removes the rendered file, so a restart
         // does not silently keep collecting.
         let opts = RenderOptions {
+            bpf_lsm: true,
             telemetry: crate::config::TelemetryConfig::default(),
             ..opts
         };
@@ -1146,6 +1352,176 @@ spec:
             render_text(ARMED, &["/home/dan".into()], &default_lists(), &ex).unwrap().1
         };
         assert_eq!(plain, other, "an exclusion names one policy and touches only it");
+    }
+
+    // --- the kprobe fallback, for a kernel with no BPF LSM ------------------
+
+    const LSM_TEMPLATE: &str = r#"
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "moat-test-lsm"
+spec:
+  lsmhooks:
+  - hook: "file_post_open"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values: ["/etc/shadow"]
+      matchActions:
+      - action: Override
+        argError: -13
+      - action: Post
+"#;
+
+    fn render_without_lsm(text: &str) -> (String, serde_yaml::Value, Vec<String>) {
+        let (name, body, moved) =
+            render_text_with(text, &["/home/dan".into()], &default_lists(), &BTreeMap::new(), false)
+                .expect("renders");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&body).expect("yaml");
+        (name, doc, moved)
+    }
+
+    #[test]
+    fn without_bpf_lsm_an_lsm_policy_is_rendered_as_a_kprobe() {
+        let (_, doc, moved) = render_without_lsm(LSM_TEMPLATE);
+        assert_eq!(moved, vec!["file_post_open".to_string()]);
+        assert!(
+            doc["spec"]["lsmhooks"].is_null(),
+            "the lsmhooks block must be gone, not merely supplemented"
+        );
+        let k = &doc["spec"]["kprobes"][0];
+        assert_eq!(k["call"].as_str(), Some("security_file_post_open"));
+        assert_eq!(k["syscall"].as_bool(), Some(false));
+        // The selector survives untouched: same args, same prototype. That is
+        // the whole reason this conversion is safe.
+        assert_eq!(
+            k["selectors"][0]["matchArgs"][0]["values"][0].as_str(),
+            Some("/etc/shadow")
+        );
+    }
+
+    #[test]
+    fn the_fallback_drops_enforcement_and_never_substitutes_a_kill() {
+        let (_, doc, _) = render_without_lsm(LSM_TEMPLATE);
+        let actions = &doc["spec"]["kprobes"][0]["selectors"][0]["matchActions"];
+        let kinds: Vec<&str> = actions
+            .as_sequence()
+            .map(|s| s.iter().filter_map(|a| a["action"].as_str()).collect())
+            .unwrap_or_default();
+        // `Override` cannot work from a kprobe: security_* is not on the
+        // kernel's ALLOW_ERROR_INJECTION list.
+        assert!(!kinds.contains(&"Override"), "{:?}", kinds);
+        // And `Sigkill` WOULD work, which is exactly why it must not appear.
+        // Turning "refuse this read" into "kill this process" is a bigger
+        // action than the user asked for, arriving without them choosing it.
+        assert!(!kinds.contains(&"Sigkill"), "a kill was substituted for a refusal: {:?}", kinds);
+        // What reports the event is kept, or the rule would detect nothing.
+        assert!(kinds.contains(&"Post"), "{:?}", kinds);
+    }
+
+    #[test]
+    fn with_bpf_lsm_nothing_is_rewritten() {
+        let (_, body, moved) = render_text_with(
+            LSM_TEMPLATE, &["/home/dan".into()], &default_lists(), &BTreeMap::new(), true,
+        )
+        .expect("renders");
+        assert!(moved.is_empty());
+        let doc: serde_yaml::Value = serde_yaml::from_str(&body).unwrap();
+        assert!(doc["spec"]["kprobes"].is_null());
+        assert_eq!(doc["spec"]["lsmhooks"][0]["hook"].as_str(), Some("file_post_open"));
+        // Enforcement is untouched on a kernel that can do it.
+        let a = &doc["spec"]["lsmhooks"][0]["selectors"][0]["matchActions"][0];
+        assert_eq!(a["action"].as_str(), Some("Override"));
+    }
+
+    /// The trap: `"security_" + hook` is wrong for exactly one of the seven.
+    ///
+    /// `bprm_check_security` is reached through `security_bprm_check`; there is
+    /// no `security_bprm_check_security` in kallsyms. A prefix rule renders two
+    /// policies -- `exec-untrusted-home` and `exec-untrusted-tmpfs` -- that
+    /// fail to attach, and the symptom is silence on untrusted execs, noticed
+    /// weeks later if at all.
+    #[test]
+    fn every_shipped_lsm_hook_has_a_verified_kprobe_symbol() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("policies");
+        let mut seen = std::collections::BTreeSet::new();
+        for e in std::fs::read_dir(&dir).expect("policies/") {
+            let path = e.unwrap().path();
+            if path.extension().and_then(|x| x.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let doc: serde_yaml::Value = match serde_yaml::from_str(&text) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if let Some(hooks) = doc["spec"]["lsmhooks"].as_sequence() {
+                for h in hooks {
+                    if let Some(name) = h["hook"].as_str() {
+                        seen.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        assert!(!seen.is_empty(), "no lsmhooks found; did policies/ move?");
+        for hook in &seen {
+            assert!(
+                LSM_KPROBE_SYMBOL.iter().any(|(h, _)| h == hook),
+                "LSM hook {:?} is shipped but has no entry in LSM_KPROBE_SYMBOL, so it \
+                 would render as an unattachable kprobe on a kernel without BPF LSM",
+                hook
+            );
+        }
+        // The one that does not follow the obvious rule.
+        assert_eq!(
+            LSM_KPROBE_SYMBOL.iter().find(|(h, _)| *h == "bprm_check_security").map(|(_, s)| *s),
+            Some("security_bprm_check"),
+            "bprm_check_security does NOT map to security_bprm_check_security"
+        );
+    }
+
+    #[test]
+    fn every_shipped_lsm_policy_survives_the_fallback() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("policies");
+        let lists = default_lists();
+        let homes = vec!["/home/dan".to_string()];
+        let mut converted = 0;
+        for e in std::fs::read_dir(&dir).expect("policies/") {
+            let path = e.unwrap().path();
+            if path.extension().and_then(|x| x.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            if !text.contains("lsmhooks:") {
+                continue;
+            }
+            // Templates with unfilled placeholders are rendered elsewhere.
+            if text.contains("{{CANARIES}}") {
+                continue;
+            }
+            let (name, body, moved) =
+                match render_text_with(&text, &homes, &lists, &BTreeMap::new(), false) {
+                    Ok(v) => v,
+                    Err(e) => panic!("{}: {}", path.display(), e),
+                };
+            assert!(!moved.is_empty(), "{} declared lsmhooks but moved nothing", name);
+            let doc: serde_yaml::Value = serde_yaml::from_str(&body).unwrap();
+            assert!(doc["spec"]["lsmhooks"].is_null(), "{} kept an lsmhooks block", name);
+            for k in doc["spec"]["kprobes"].as_sequence().unwrap_or(&vec![]) {
+                let call = k["call"].as_str().unwrap_or("");
+                assert!(call.starts_with("security_"), "{}: odd call {:?}", name, call);
+            }
+            converted += 1;
+        }
+        assert!(converted >= 20, "expected the whole LSM family, converted {}", converted);
     }
 
     /// The template every container test below renders: one enforcing selector.

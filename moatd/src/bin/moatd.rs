@@ -205,6 +205,7 @@ fn cmd_render(cfg: Config, a: RenderArgs) -> std::process::ExitCode {
     };
     let passwd = a.passwd.unwrap_or(cfg.paths.passwd);
     let opts = RenderOptions {
+        bpf_lsm: moatd::render::bpf_lsm_available(),
         templates_dir: &templates,
         out_dir: &out,
         export_allowlist: allowlist.as_deref(),
@@ -455,6 +456,7 @@ fn cmd_telemetry(cfg: Config, cfg_path: PathBuf, a: TelemetryArgs) -> std::proce
     // ---- 1. render -------------------------------------------------------
     let out = cfg.paths.policies_dir.clone();
     let opts = RenderOptions {
+        bpf_lsm: moatd::render::bpf_lsm_available(),
         templates_dir: &cfg.paths.templates_dir,
         out_dir: &out,
         export_allowlist: Some(&cfg.paths.export_allowlist),

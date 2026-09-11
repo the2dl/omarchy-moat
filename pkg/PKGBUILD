@@ -14,10 +14,10 @@
 
 pkgname=omarchy-moat
 pkgver=0.1.0
-pkgrel=170
+pkgrel=175
 _tetragonver=1.7.1
 pkgdesc='eBPF supply-chain sensor for Omarchy: Tetragon policies, an alert daemon, a bubblewrap sandbox and pre-execution scanners for PKGBUILD, npm, cargo, pip and go'
-arch=('x86_64')
+arch=('x86_64' 'aarch64')
 url='https://github.com/the2dl/omarchy-moat'
 # Apache-2.0: the bundled, unmodified Tetragon v1.7.1 (its eBPF objects are
 # GPL-2.0, see /usr/share/licenses/omarchy-moat/LICENSE.tetragon-bpf).
@@ -45,18 +45,31 @@ install="${pkgname}.install"
 # The Tetragon tarball checksum is the one published next to the release as
 # tetragon-v1.7.1-amd64.tar.gz.sha256sum. Never SKIP: this is the one artifact
 # in the package we do not build ourselves.
+# The Tetragon release names its artifacts amd64/arm64 (not x86_64/aarch64),
+# so `$CARCH` cannot be interpolated directly -- `_tetarch` is the mapping, and
+# it is also the directory the tarball unpacks into.
+case "$CARCH" in
+	x86_64)  _tetarch=amd64 ;;
+	aarch64) _tetarch=arm64 ;;
+esac
+
 source=(
-	"https://github.com/cilium/tetragon/releases/download/v${_tetragonver}/tetragon-v${_tetragonver}-amd64.tar.gz"
 	"tetragon-${_tetragonver}-LICENSE::https://raw.githubusercontent.com/cilium/tetragon/v${_tetragonver}/LICENSE"
 	"tetragon-${_tetragonver}-LICENSE.bpf::https://raw.githubusercontent.com/cilium/tetragon/v${_tetragonver}/bpf/LICENSE.GPL-2.0"
 	'LICENSE.MIT'
 	'scanner-allow.conf'
 )
-sha256sums=('2f36a7bbb2b3d77a011383a01c8f804fe7761d934a76ff2fdf99ebad6f3e89ae'
-            'f096c31ac0fb2e66df5b7ec20049741ae15accd50c8cd4d100b4db6c9353f6aa'
+source_x86_64=("https://github.com/cilium/tetragon/releases/download/v${_tetragonver}/tetragon-v${_tetragonver}-amd64.tar.gz")
+source_aarch64=("https://github.com/cilium/tetragon/releases/download/v${_tetragonver}/tetragon-v${_tetragonver}-arm64.tar.gz")
+
+sha256sums=('f096c31ac0fb2e66df5b7ec20049741ae15accd50c8cd4d100b4db6c9353f6aa'
             '0d5bf346df9e635a29dcdddf832dc5b002ca6cdc1c5c9c6c567d2a61bb0c5c15'
             'bd2ac2c4267a46b64cb72015a57f64f63b40ba105b9c4824ff3ec6606f9dafd7'
             'af6f516a37ca5e5cbeef39fdf1db94c103b46dc92d30c805f267873a61acd048')
+# Both from the .sha256sum published beside the release. Never SKIP: this is
+# the one artifact in the package we do not build ourselves.
+sha256sums_x86_64=('2f36a7bbb2b3d77a011383a01c8f804fe7761d934a76ff2fdf99ebad6f3e89ae')
+sha256sums_aarch64=('aa71d12eddd962003e9fd78e3b3534185af5b2728c7d21ab3cb0f7fe2dc87702')
 
 # One flag per file, Tetragon's own convention (CONTRACT section 2). All of
 # them are backup= entries: they are the knobs a user turns.
@@ -177,7 +190,7 @@ check() {
 }
 
 package() {
-	local tetragon="${srcdir}/tetragon-v${_tetragonver}-amd64"
+	local tetragon="${srcdir}/tetragon-v${_tetragonver}-${_tetarch}"
 	local tree="${srcdir}/${_tree}"
 
 	# --- upstream Tetragon, unmodified ---------------------------------

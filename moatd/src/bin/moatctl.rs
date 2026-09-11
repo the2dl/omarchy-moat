@@ -1641,6 +1641,16 @@ fn print_status(r: &Value) {
             _ => String::new(),
         }
     );
+    // Said before the feed lines, because it changes what every "enforcing"
+    // line above means. A kernel with no BPF LSM cannot refuse anything, on
+    // any rule, however armed it looks.
+    if r["bpf_lsm"] == serde_json::Value::Bool(false) {
+        println!(
+            "kernel     NO BPF LSM -- every rule DETECTS, none can REFUSE\n\
+             \x20          LSM policies are running as kprobes; in-kernel blocking is \
+             unavailable on this kernel"
+        );
+    }
     println!(
         "feeds      {} packages, {} hashes, updated {}",
         r["feeds"]["packages"],

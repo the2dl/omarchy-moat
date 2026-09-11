@@ -2453,6 +2453,7 @@ impl Daemon {
         // Re-render everything: it is 46 small files, and rendering only the
         // one would need the template path, which the policy set does not keep.
         let opts = crate::render::RenderOptions {
+            bpf_lsm: crate::render::bpf_lsm_available(),
             templates_dir: &self.cfg.paths.templates_dir,
             out_dir: &self.cfg.paths.policies_dir,
             export_allowlist: Some(&self.cfg.paths.export_allowlist),
@@ -2524,6 +2525,7 @@ impl Daemon {
         }
 
         let opts = crate::render::RenderOptions {
+            bpf_lsm: crate::render::bpf_lsm_available(),
             templates_dir: &self.cfg.paths.templates_dir,
             out_dir: &self.cfg.paths.policies_dir,
             export_allowlist: Some(&self.cfg.paths.export_allowlist),
@@ -5561,6 +5563,7 @@ impl Daemon {
         };
 
         let opts = crate::render::RenderOptions {
+            bpf_lsm: crate::render::bpf_lsm_available(),
             templates_dir: &self.cfg.paths.templates_dir,
             out_dir: &self.cfg.paths.policies_dir,
             export_allowlist: Some(&self.cfg.paths.export_allowlist),
@@ -5801,6 +5804,14 @@ impl Daemon {
             // kernel is running. They are equal on a healthy machine and the
             // gap between them is the whole point of reporting both.
             "policies": self.policies.len(),
+            // A kernel with no BPF LSM runs every LSM policy as a kprobe
+            // instead (see render::lsm_to_kprobes). Detection is intact;
+            // in-kernel REFUSAL is not available at all, on any rule. Reported
+            // because the alternative is a panel that says "blocking 8 rules"
+            // on a machine that cannot block anything -- which is the exact
+            // failure the enforcing_verified check exists to prevent, arriving
+            // from the kernel side instead.
+            "bpf_lsm": crate::render::bpf_lsm_available(),
             "sensors_loaded": self.sensors_loaded(),
             "sensor_unhealthy": self.sensor_unhealthy(),
             "policies_failed": self.policies_failed,
