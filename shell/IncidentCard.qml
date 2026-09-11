@@ -457,6 +457,13 @@ Rectangle {
             tokens: root.t
             ancestry: root.head && root.head.process ? root.head.process.ancestry : []
             process: root.head ? root.head.process : null
+            alertTs: root.head ? root.head.ts : ""
+            // The incident's own members, grouped by pid. No round trip: an
+            // incident IS the alerts that share a process tree, so the events
+            // for an ancestor are already here.
+            events: root.service && root.incident
+                  ? root.service.processEvents(root.incident, root.head ? root.head.id : "")
+                  : ({})
         }
 
         // Only the two that answer "what, and by what". Everything else is evidence.

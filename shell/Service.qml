@@ -1183,6 +1183,11 @@ Item {
         return Model.rawSeverityLine(alert);
     }
 
+    /// `{ "<pid>": [{time, text, alert}] }` for the process tree's detail panel.
+    function processEvents(incident, headId) {
+        return Model.processEvents(incident, headId);
+    }
+
     function ancestryLines(alert) {
         return Model.ancestryLines(alert);
     }

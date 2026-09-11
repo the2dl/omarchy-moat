@@ -2929,6 +2929,46 @@ function suppressedLine(alert) {
 /// `ancestryChain` collapses the same data to basenames joined by arrows, which
 /// is the right thing in the default voice and the wrong thing here: two
 /// different /usr/bin/python3 are the same word in that rendering.
+/// What moat recorded for each pid in an incident, for the process tree's
+/// detail panel: `{ "<pid>": [{time, text, alert}] }`, newest first.
+///
+/// Built from the incident's own members rather than a new daemon query. Every
+/// alert already names the pid it happened to, and an incident is exactly the
+/// set of alerts that share a process tree -- so the events for a given
+/// ancestor are the members whose pid matches it, and no round trip is needed.
+///
+/// `alert: true` marks the one the card is currently about, which is the row
+/// the panel draws in the alarm colour with " · this alert" after it. Without
+/// it a selected process with four recorded events gives no clue which of them
+/// is the reason you are looking at this card.
+///
+/// Most ancestors will have nothing here. A login shell that spawned the thing
+/// that read a credential did not itself trip a rule, and the panel says
+/// "nothing recorded for this process" rather than leaving a blank.
+function processEvents(incident, headId) {
+  var out = {}
+  var list = incident && Array.isArray(incident.alerts) ? incident.alerts : []
+  for (var i = 0; i < list.length; i++) {
+    var a = list[i]
+    if (!a || !a.process) continue
+    var pid = a.process.pid
+    if (pid === undefined || pid === null || pid <= 0) continue
+    var key = String(pid)
+    if (!out[key]) out[key] = []
+    out[key].push({
+      // Time of day only: the date is on the card already, and a full
+      // timestamp in a 60px column elides to nothing.
+      "time": String(a.ts || "").slice(11, 19),
+      "text": String(a.title || a.rule || ""),
+      "alert": !!headId && a.id === headId
+    })
+  }
+  for (var k in out) {
+    out[k].sort(function (x, y) { return x.time < y.time ? 1 : (x.time > y.time ? -1 : 0) })
+  }
+  return out
+}
+
 function ancestryLines(alert) {
   var process = alert && alert.process ? alert.process : {}
   var ancestry = Array.isArray(process.ancestry) ? process.ancestry : []

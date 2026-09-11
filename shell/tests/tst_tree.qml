@@ -22,6 +22,10 @@ TestCase {
         });
     }
 
+    function makeFull(props) {
+        return createTemporaryObject(treeComponent, suite, props);
+    }
+
     /// The record stores ancestry nearest-parent-first because that is the
     /// order the kernel walks it. A person reads a causal chain the other way,
     /// and the alerting process -- which the record keeps outside the list --
@@ -46,6 +50,110 @@ TestCase {
 
     /// A short chain opens itself: three or four processes is the whole answer,
     /// and hiding it behind a click meant nobody found it.
+    /// The other children an ancestor started are context, and they are
+    /// per-node: opening one must not open the rest, or a deep tree becomes a
+    /// wall the moment you ask one question.
+    function test_other_children_reveal_one_node_at_a_time() {
+        var t = makeFull({
+            "ancestry": [{
+                "pid": 2,
+                "exe": "/bin/sh",
+                "others": [{
+                    "pid": 20,
+                    "exe": "/usr/bin/rustc",
+                    "state": "exited"
+                }]
+            }, {
+                "pid": 1,
+                "exe": "/usr/bin/systemd",
+                "others": [{
+                    "pid": 10,
+                    "exe": "/usr/bin/sshd",
+                    "state": "running"
+                }]
+            }],
+            "process": {
+                "pid": 3,
+                "exe": "/usr/bin/cargo"
+            }
+        });
+        compare(t.nodes.length, 3);
+        compare(t.othersOf(t.nodes[0]).length, 1, "systemd's other child");
+        compare(t.othersOf(t.nodes[1]).length, 1, "the shell's other child");
+        compare(t.othersOf(t.nodes[2]).length, 0, "the flagged leaf started nothing");
+        // Nothing revealed until asked.
+        compare(t.revealed[0] === true, false);
+        compare(t.revealed[1] === true, false);
+    }
+
+    /// The flagged process is the leaf and is selected when the card opens.
+    /// Previously you counted rows to find which one the alert was about.
+    function test_the_flagged_process_is_the_leaf_and_starts_selected() {
+        var t = makeFull({
+            "ancestry": [{
+                "pid": 2,
+                "exe": "/bin/sh"
+            }],
+            "process": {
+                "pid": 3,
+                "exe": "/usr/bin/cat"
+            }
+        });
+        compare(t.selected, t.nodes.length - 1);
+        compare(t.nodes[t.selected].pid, 3);
+    }
+
+    /// The header says how long the chain took, and says nothing rather than
+    /// inventing a duration when the record has no start time -- records
+    /// written before the daemon carried it do not, and a made-up number here
+    /// reads as evidence.
+    function test_the_duration_is_omitted_when_it_cannot_be_computed() {
+        var withTime = makeFull({
+            "ancestry": [{
+                "pid": 1,
+                "exe": "/a",
+                "start_time": "2026-09-11T00:39:00.000Z"
+            }],
+            "process": {
+                "pid": 2,
+                "exe": "/b"
+            },
+            "alertTs": "2026-09-11T00:39:50.000Z"
+        });
+        compare(withTime.headline, "2 processes  ·  50s from the first to the read");
+
+        var without = makeFull({
+            "ancestry": [{
+                "pid": 1,
+                "exe": "/a"
+            }],
+            "process": {
+                "pid": 2,
+                "exe": "/b"
+            },
+            "alertTs": "2026-09-11T00:39:50.000Z"
+        });
+        compare(without.headline, "2 processes", "no start time, no claim");
+    }
+
+    /// An older record has pid and exe and nothing else. It must still draw.
+    function test_a_record_without_the_detail_still_draws() {
+        var t = makeFull({
+            "ancestry": [{
+                "pid": 1,
+                "exe": "/usr/lib/systemd/systemd"
+            }],
+            "process": {
+                "pid": 2,
+                "exe": "/usr/bin/cat"
+            }
+        });
+        compare(t.nodes.length, 2);
+        compare(t.summary, "systemd  →  cat");
+        compare(t.othersOf(t.nodes[0]).length, 0, "absent is empty, never undefined");
+        compare(t.eventsFor(2).length, 0);
+    }
+
     function test_a_short_chain_opens_itself() {
         var t = make([{
             "pid": 1,

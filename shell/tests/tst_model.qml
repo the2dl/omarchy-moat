@@ -4372,6 +4372,46 @@ TestCase {
     compare(Model.normalizeStatus({}).sensorLoading, false)
   }
 
+  /// The detail panel's event list is built from the incident's own members,
+  /// not a new daemon query: an incident IS the alerts sharing a process tree,
+  /// so an ancestor's events are the members whose pid matches it.
+  function test_process_events_group_an_incidents_members_by_pid() {
+    var inc = { alerts: [
+      { id: "01A", ts: "2026-09-11T00:39:50.104Z", title: "read a token", process: { pid: 3169392 } },
+      { id: "01B", ts: "2026-09-11T00:39:12.000Z", title: "spawned a shell", process: { pid: 3169307 } },
+      { id: "01C", ts: "2026-09-11T00:39:55.000Z", title: "connected out",  process: { pid: 3169392 } }
+    ] }
+    var ev = Model.processEvents(inc, "01A")
+
+    compare(Object.keys(ev).length, 2, "two distinct pids")
+    compare(ev["3169392"].length, 2)
+    compare(ev["3169307"].length, 1)
+
+    // Newest first: the panel reads top-down and the last thing that happened
+    // is the one being asked about.
+    compare(ev["3169392"][0].time, "00:39:55")
+    compare(ev["3169392"][1].time, "00:39:50")
+
+    // Exactly one row is the alert this card is about.
+    compare(ev["3169392"][1].alert, true, "01A is the head")
+    compare(ev["3169392"][0].alert, false)
+    compare(ev["3169307"][0].alert, false)
+  }
+
+  /// A pid moat never recorded has no entry at all, and the panel says
+  /// "nothing recorded for this process" rather than drawing a blank.
+  function test_process_events_skips_members_with_no_usable_pid() {
+    var ev = Model.processEvents({ alerts: [
+      { id: "01A", ts: "t", title: "x", process: { pid: 0 } },
+      { id: "01B", ts: "t", title: "y", process: {} },
+      { id: "01C", ts: "t", title: "z" }
+    ] }, "01A")
+    compare(Object.keys(ev).length, 0, "pid 0, absent and missing are all not-a-pid")
+
+    // And no incident at all is an empty map, never undefined.
+    compare(Object.keys(Model.processEvents(null, "")).length, 0)
+  }
+
   /// "Never updated" is a fault. "No key configured" is a setup step nobody
   /// took. The footer said the first when it meant the second, and the reason
   /// existed only in the journal of a service that exits successfully.
