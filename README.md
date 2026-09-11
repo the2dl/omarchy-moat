@@ -27,6 +27,18 @@ exploit; you invited it.
 Root compromise is out of scope for enforcement, and detected best-effort. This
 is not a rootkit hunter and not a server EDR.
 
+It can also plant **decoy files** — fake credentials in `/etc`, `/root`, your
+home and the temp directories, with different names on every machine. Nothing
+on the system has a reason to open one, so unlike every other rule here that
+one needs no allowlist and no tuning: a read is the alert. Off by default; see
+[docs/CANARIES.md](docs/CANARIES.md).
+
+Local privilege escalation is watched at the four points that matter on this
+kind of machine — `/proc/sys` writes, capabilities gained at runtime, uid
+transitions, and root-executed config nobody else watches. The audit behind
+those, including what is still not covered, is
+[docs/LPE.md](docs/LPE.md).
+
 ## How it behaves
 
 **It ships watching, not blocking.** Monitor mode, containment off, killing off.
@@ -73,6 +85,8 @@ docs/           CONTRACT.md is the spec every component builds against
 
 `docs/CONTRACT.md` before touching anything. `docs/BASELINE.md` for the learning
 and noise model, `docs/TETRAGON-NOTES.md` for what the sensor actually reports.
+`docs/LPE.md` and `docs/CANARIES.md` cover the two newest detection surfaces,
+and `docs/PACKAGE-FEED.md` the malicious-package index the scanners read.
 
 ## Turning it on
 

@@ -52,10 +52,22 @@ targets, are missing from it.
 
 ## Gaps, in order of how much they matter
 
+> **All four were closed on 2026-09-09** by the policies in "The build" below,
+> and this section is kept as written because the reasoning is why those
+> policies have the shape they do. Read it as the case for them, not as an
+> open list: §1 is closed by `moat-priv-sysctl-write`, §2 by
+> `moat-priv-capability-gained`, §3 by the `matchNamespaces` guard on that same
+> policy plus `moat-priv-uid-transition`, and §4 by
+> `moat-priv-root-config-write`.
+>
+> One thing here did NOT age well and is corrected in place below: §1 says
+> `grep -rn "/proc/sys" policies/*.yaml` returns nothing, which is no longer
+> true.
+
 ### 1. Nothing watches `/proc/sys` at all
 
-`grep -rn "/proc/sys" policies/*.yaml` returns nothing. That leaves the
-best-known write-to-root primitives unmonitored:
+`grep -rn "/proc/sys" policies/*.yaml` returned nothing when this was written.
+That left the best-known write-to-root primitives unmonitored:
 
 * `/proc/sys/kernel/core_pattern` — a pipe here runs as root on the next crash.
   The standard container escape, and it works on the host too.
