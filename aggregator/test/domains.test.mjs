@@ -358,6 +358,31 @@ test('an upstream that collapses is refused, and the published list survives', a
   assert.equal(pointer.domains.entries, 40, 'clients still see the good list');
 });
 
+test('the first tick after a deploy can build the list on its own', async () => {
+  // The wing has nothing cached and the tick does not refresh. If it only ever
+  // read the cache it would throw here, every fifteen minutes, until the daily
+  // job ran -- which reads as "deployed and working" from every angle except
+  // the one where somebody fetches the pointer.
+  const { env } = await newEnv();
+  const f = installFetch(routes({
+    hostfile: hostfileText(['evil.com', 'other.com']),
+    csv: csvText([{ ioc: 'evil.com', printable: 'AsyncRAT' }, { ioc: 'other.com' }]),
+  }));
+  try {
+    const out = await runDomains(env, quietLog(), { full: false });
+    assert.equal(out.entries, 2);
+  } finally { f.restore(); }
+
+  const pointer = await (await env.FEED.get('v1/pointer.json')).json();
+  assert.equal(pointer.domains.seq, 1);
+  const rows = entriesOf(await artifactText(env, pointer.domains.artifact));
+  // And with metadata, not forty-eight thousand rows of "unknown" to be
+  // replaced wholesale the next morning.
+  assert.equal(rows.get('evil.com').family, 'AsyncRAT');
+  assert.ok(await env.FEED.get('state/psl.txt.gz'), 'the list was cached for next time');
+  assert.ok(await env.FEED.get('state/domain-meta.tsv.gz'));
+});
+
 test('a run without a public suffix list refuses to build rather than build ungated', async () => {
   const { env } = await newEnv();
   const f = installFetch([

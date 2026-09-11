@@ -351,7 +351,14 @@ const fetchText = async (env, url, cap) =>
  * public suffix, so `gateDomains` is never run with a null list.
  */
 async function loadPsl(env, refresh, dstate, log) {
-  if (refresh) {
+  // Fetch when asked to, and ALSO when there is nothing cached to fall back
+  // on. Without that second clause the wing could never start: a tick does not
+  // refresh, `gateDomains` is never run without the gate, so every tick threw
+  // and the first working domain list would have had to wait for 04:17. A
+  // feature that is inert until tomorrow looks exactly like a feature that
+  // works, right up until somebody checks.
+  const cachedPsl = await env.FEED.get(PSL_KEY);
+  if (refresh || !cachedPsl) {
     try {
       const text = await fetchText(env, PSL_URL, 8 << 20);
       const psl = parsePsl(text);
@@ -370,17 +377,21 @@ async function loadPsl(env, refresh, dstate, log) {
       log.add('psl refresh failed:', String(e), '- falling back to the cached copy');
     }
   }
-  const obj = await env.FEED.get(PSL_KEY);
-  if (!obj) return null;
+  if (!cachedPsl) return null;
   let text = '';
-  for await (const line of gunzipLines(obj.body)) text += line + '\n';
+  for await (const line of gunzipLines(cachedPsl.body)) text += line + '\n';
   return parsePsl(text);
 }
 
 /** The metadata table: rebuilt from the 23 MB CSV on the daily run, cached otherwise. */
 async function loadDomainMeta(env, refresh, dstate, stats, log) {
   const cached = await env.FEED.get(DOMAIN_META_KEY);
-  if (refresh) {
+  // Same bootstrap clause, for a different cost. Without it the first published
+  // list is forty-eight thousand domains with no malware family against any of
+  // them, replaced wholesale the next morning -- one wasted sequence and one
+  // wasted download for every machine, to publish something we could have got
+  // right the first time.
+  if (refresh || !cached) {
     try {
       const zip = await fetchBytes(env, THREATFOX_CSV_FULL, 64 << 20);
       const meta = await threatFoxMetadata(unzipCsvLines(zip), stats);
