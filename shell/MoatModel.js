@@ -3029,6 +3029,8 @@ function rawFacts(alert) {
     add("dst", String(a.net.dst_ip || "") + (a.net.dst_port ? ":" + a.net.dst_port : ""))
     add("domain", domainLine(a.net))
     add("domain_cname", a.net.domain_cname)
+    // The attribution, in the raw view too: who looked the name up.
+    add("asked by", a.net.domain_queried_by)
   }
   add("rarity", a.rarity)
   add("rarity_text", a.rarity_text)

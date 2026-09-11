@@ -487,9 +487,18 @@ Rectangle {
                     required property var modelData
                     required property int index
 
+                    // A value row is hot when its label -- the entry before it
+                    // in this flat list -- names the connection's domain. On a
+                    // network alert that is the finding, so it reads like one
+                    // here as well as in the evidence block.
+                    readonly property bool hot: index % 2 === 1
+                        && ["domain", "domain_cname", "asked by"].indexOf(String(root.rawFacts[index - 1])) >= 0
+
                     width: index % 2 === 0 ? (root.t ? root.t.s(120) : 90) : card.width - (root.t ? root.t.s(136) : 98)
                     text: modelData
-                    color: index % 2 === 0 ? (root.t ? root.t.fainter : "grey") : (root.t ? root.t.secondary : "white")
+                    color: index % 2 === 0 ? (root.t ? root.t.fainter : "grey")
+                         : hot ? (root.t ? root.t.accent : "orange")
+                         : (root.t ? root.t.secondary : "white")
                     font.family: root.t ? root.t.family : "monospace"
                     font.pixelSize: root.t ? root.t.fSecondary : 12
                     // Values here are argv, paths and a multi-line parent chain out of a

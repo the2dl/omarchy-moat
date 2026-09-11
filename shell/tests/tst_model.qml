@@ -4494,6 +4494,23 @@ TestCase {
     compare(Model.askedByLine(null), "")
   }
 
+  /// The raw/Advanced view carries the domain and who asked -- the finding on
+  /// a network alert -- so a person reading the record itself sees them.
+  function test_raw_facts_carry_the_domain_and_the_asker() {
+    var f = Model.rawFacts({
+      id: "01X", ts: "2026-09-11T00:00:00Z", rule: "moat-x-net-domain-ioc",
+      process: { exe: "/usr/bin/python3", pid: 42, uid: 1000 },
+      net: { dst_ip: "1.2.3.4", dst_port: 443, domain: "example.org",
+             domain_queried_by: "/usr/bin/python3 (pid 42)" }
+    })
+    var di = f.indexOf("domain")
+    verify(di >= 0, "domain is in the raw facts")
+    compare(String(f[di + 1]).indexOf("example.org") >= 0, true)
+    var ai = f.indexOf("asked by")
+    verify(ai >= 0, "the asker is in the raw facts")
+    compare(f[ai + 1], "/usr/bin/python3 (pid 42)")
+  }
+
   /// "Never updated" is a fault. "No key configured" is a setup step nobody
   /// took. The footer said the first when it meant the second, and the reason
   /// existed only in the journal of a service that exits successfully.
