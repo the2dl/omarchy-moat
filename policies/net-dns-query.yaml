@@ -1,0 +1,68 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: moat-net-dns-query
+  annotations:
+    moat.omarchy/severity: "low"
+    moat.omarchy/tier: "signal"
+    moat.omarchy/enforce: "none"
+    moat.omarchy/actions: "ignore"
+    moat.omarchy/title: "A program looked up a hostname"
+    moat.omarchy/why: >-
+      Who asked for a name, not just which name an address had. moatd reads systemd-resolved's
+      query stream for the second, and that stream cannot say which client made a request -- so
+      a name on a connection is an inference from the address. This is the request itself, seen
+      in the asking process's own context, so it says who looked it up.
+    moat.omarchy/expected: >-
+      Everything. Every browser tab, every kubectl, every package manager makes these. Nothing
+      here is ever raised on its own: moatd records the pid and the name and leaves, and the
+      answer is used when something ELSE fires later.
+    moat.omarchy/fp-hint: "exe"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  # `sendto(fd, buf, len, flags, addr, addrlen)`.
+  #
+  # nss-resolve sends the varlink request as a FLAT buffer on a connected
+  # AF_UNIX socket -- verified by strace on 2026-09-11, not assumed -- so the
+  # hostname is arg 1 in plaintext JSON and needs no iovec walking. Because it
+  # is a syscall, the kernel sees it in the CALLING process's context, which is
+  # the entire reason this exists.
+  #
+  # The alternative, a kprobe on UDP 53, was measured and rejected: resolved
+  # reported 139,032 transactions with 90,089 cache hits, so 85% of lookups
+  # never reach the wire and a port-53 probe would miss five in six while
+  # looking like it worked. It would also lose everything to DoH. What it WOULD
+  # catch and this does not is a Go binary, which uses its own resolver and
+  # never touches nss -- that is a second probe, not a reason against this one.
+  - call: "sys_sendto"
+    syscall: true
+    message: "A program looked up a hostname"
+    args:
+    - index: 0
+      type: "int"
+    - index: 1
+      type: "char_buf"
+      # arg 2 is the byte count, so Tetragon copies exactly what was sent.
+      sizeArgIndex: 3
+    selectors:
+    - matchArgs:
+      # The whole filter, and it runs in the kernel: a buffer that does not
+      # carry this method is never an event. Without it this hook is every
+      # sendto() on the machine.
+      #
+      # 34 characters, inside the 100-character SubString cap (NOTES section 2).
+      - index: 1
+        operator: "SubString"
+        values:
+        - "io.systemd.Resolve.ResolveHostname"
+      matchActions:
+      # Measured at 4.6 events/s with 76% of them one of four workers asking
+      # for `localhost` over and over. Per-process, because the noise is a
+      # single process repeating itself and a rate limit shared across the
+      # machine would let one chatty worker hide everyone else's lookups.
+      - action: Post
+        rateLimit: "5s"
+        rateLimitScope: "process"

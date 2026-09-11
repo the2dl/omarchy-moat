@@ -189,7 +189,8 @@ impl UserRule for NetFirstContact {
             domain: None,
             domain_age_secs: None,
             domain_cname: None,
-        });
+                domain_queried_by: None,
+            });
         f.extra_evidence = vec![
             format!("first connection from {} to {}:{} on this machine", proc.exe, ip_s, port),
             // Saying "reported once and never again" while reporting a

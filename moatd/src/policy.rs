@@ -365,7 +365,7 @@ spec:
     /// takes it off the badge for good; that should be a decision somebody
     /// makes on purpose and a test they had to update.
     #[test]
-    fn the_shipped_signal_rules_are_the_nine_the_docs_name() {
+    fn the_shipped_signal_rules_are_the_ones_the_docs_name() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().map(|p| p.join("policies"));
         // Building from a source tarball that ships only moatd/.
         let Some(dir) = dir.filter(|d| d.is_dir()) else { return };
@@ -383,6 +383,12 @@ spec:
             vec![
                 "moat-exec-untrusted-home",
                 "moat-exec-untrusted-tmpfs",
+                // Added 2026-09-11, and on purpose: a name lookup is never a
+                // finding on its own. Every browser tab and every kubectl makes
+                // them, measured at 4.6/s here. Its whole value is answering
+                // "who asked for this" when something ELSE fires later, so it
+                // records the asker and is never on the badge.
+                "moat-net-dns-query",
                 "moat-net-first-contact",
                 "moat-persist-desktop-entry-write",
                 "moat-persist-omarchy-menu-extension-write",

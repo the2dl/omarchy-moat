@@ -1221,7 +1221,8 @@ mod tests {
             domain: None,
             domain_age_secs: None,
             domain_cname: None,
-        });
+                domain_queried_by: None,
+            });
         let a = build_alert(&f, "01X", "t", "/x/user.toml", "not in allowlist: -");
         let scopes: Vec<&str> = a
             .explain
@@ -1247,7 +1248,9 @@ mod tests {
             f.file = None;
             f.proc.exe = exe.into();
             f.proc.pid = pid;
-            f.net = Some(NetRef { dst_ip: ip.into(), dst_port: port, domain: None, domain_age_secs: None, domain_cname: None });
+            f.net = Some(NetRef { dst_ip: ip.into(), dst_port: port, domain: None, domain_age_secs: None, domain_cname: None,
+                domain_queried_by: None,
+            });
             f
         };
         let a = base("/usr/bin/python3", 100, "192.168.44.122", 4873);

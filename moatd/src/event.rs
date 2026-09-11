@@ -346,6 +346,18 @@ impl<'a> HookHit<'a> {
         })
     }
 
+    /// A `char_buf` argument, decoded.
+    ///
+    /// Tetragon base64s the bytes and truncates at the arg's `maxData`, so a
+    /// caller must treat a short or malformed result as ordinary. Used for the
+    /// varlink resolve request, whose payload carries the hostname.
+    pub fn bytes_arg(&self) -> Option<Vec<u8>> {
+        self.ev.args.iter().find_map(|a| {
+            let b64 = a.get("bytes_arg")?.as_str()?;
+            crate::util::from_base64(b64)
+        })
+    }
+
     pub fn string_arg(&self) -> Option<String> {
         self.ev.args.iter().find_map(|a| {
             a.get("string_arg")

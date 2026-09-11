@@ -212,6 +212,7 @@ fn cmd_render(cfg: Config, a: RenderArgs) -> std::process::ExitCode {
         homes: (!a.homes.is_empty()).then_some(a.homes.clone()),
         telemetry: cfg.telemetry.clone(),
         canaries: moatd::canary::Manifest::load(&canary_manifest).paths(),
+        names_enabled: cfg.names.enabled,
         // Read from state.json, because `render-policies` runs as ExecStartPre
         // in its own process: an exclusion the user granted has to survive a
         // restart, or the program they allowed starts dying again after the
@@ -461,6 +462,7 @@ fn cmd_telemetry(cfg: Config, cfg_path: PathBuf, a: TelemetryArgs) -> std::proce
         homes: None,
         telemetry: cfg.telemetry.clone(),
         canaries: moatd::canary::Manifest::load(&cfg.paths.canaries()).paths(),
+        names_enabled: cfg.names.enabled,
         exclusions: moatd::engine::read_exclusions(&cfg.paths.state_file()),
         contain_slots: cfg.contain.max,
     };

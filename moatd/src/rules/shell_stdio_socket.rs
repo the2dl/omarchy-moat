@@ -496,6 +496,7 @@ impl ShellStdioSocket {
                 domain: None,
                 domain_age_secs: None,
                 domain_cname: None,
+                domain_queried_by: None,
             });
         }
         self.arm(&mut f, ctx);
@@ -554,6 +555,7 @@ impl ShellStdioSocket {
                 domain: None,
                 domain_age_secs: None,
                 domain_cname: None,
+                domain_queried_by: None,
             });
         }
         self.arm(&mut f, ctx);
@@ -662,7 +664,8 @@ impl ShellStdioSocket {
             domain: None,
             domain_age_secs: None,
             domain_cname: None,
-        });
+                domain_queried_by: None,
+            });
         self.arm(&mut f, ctx);
         Some(f)
     }

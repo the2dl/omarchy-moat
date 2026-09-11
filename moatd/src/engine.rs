@@ -208,6 +208,8 @@ pub struct Daemon {
     /// degraded path deterministically: removing a pin touches the directory
     /// mtime exactly like adding one, so at that instant the two are genuinely
     /// indistinguishable and only time tells them apart.
+    /// `name -> who asked`, from the varlink kprobe. Bounded and aged.
+    pub queries: crate::names::QueryLog,
     pub sensor_settle_secs: u64,
     pub cfg: Config,
     pub cfg_path: PathBuf,
@@ -516,6 +518,7 @@ impl Daemon {
         let cfg_names = cfg.names.clone();
         let mut d = Daemon {
             cfg,
+            queries: crate::names::QueryLog::new(cfg_names.retain_secs, cfg_names.max_addresses),
             sensor_settle_secs: SENSOR_SETTLE_SECS,
             cfg_path: cfg_path.to_path_buf(),
             policies,
@@ -726,6 +729,18 @@ impl Daemon {
             // and then we leave.
             if crate::telemetry::is_telemetry_policy(hook.policy_name()) {
                 self.note_hook_telemetry(&hook, &exec_id, ev.time.as_deref(), now);
+                return;
+            }
+
+            // THE ATTRIBUTION FORK, and the same argument as the telemetry one
+            // above. A name lookup is a record, not a claim: measured at 4.6/s
+            // on this machine, with 76% of them one process asking for
+            // `localhost` over and over. Running each against every rule --
+            // each of which walks ancestry -- is how a detection daemon melts,
+            // and there is nothing here to evaluate. It answers "who asked",
+            // which the resolved stream cannot, and then it leaves.
+            if hook.policy_name() == crate::names::QUERY_POLICY {
+                self.note_dns_query(&hook, &exec_id, now);
                 return;
             }
 
@@ -2445,6 +2460,7 @@ impl Daemon {
             homes: None,
             telemetry: self.cfg.telemetry.clone(),
             canaries: self.canary_paths(),
+            names_enabled: self.cfg.names.enabled,
             exclusions: self.kernel_exclusions.clone(),
         contain_slots: self.cfg.contain.max,
         };
@@ -2515,6 +2531,7 @@ impl Daemon {
             homes: None,
             telemetry: self.cfg.telemetry.clone(),
             canaries: self.canary_paths(),
+            names_enabled: self.cfg.names.enabled,
             exclusions: self.kernel_exclusions.clone(),
         contain_slots: self.cfg.contain.max,
         };
@@ -2845,6 +2862,7 @@ impl Daemon {
                 domain: None,
                 domain_age_secs: None,
                 domain_cname: None,
+                domain_queried_by: None,
             });
         }
 
@@ -3027,6 +3045,31 @@ impl Daemon {
                     line.push_str(&format!("; the record's TTL was {} s", ttl));
                 }
                 f.extra_evidence.push(line);
+                // Who ASKED, when the varlink kprobe saw it. This is the half
+                // the resolved stream cannot supply: it reports resolutions
+                // without saying which client made them, so `domain` alone is
+                // an inference from the address. This is observed in the asking
+                // process's own context.
+                if let Some(a) = self.queries.asked_by(&l.name, now) {
+                    let who = format!("{} (pid {})", a.exe, a.pid);
+                    net.domain_queried_by = Some(who.clone());
+                    let same = f.proc.pid == a.pid;
+                    f.extra_evidence.push(format!(
+                        "asked by: {} looked {} up {} before this connection{}",
+                        who,
+                        l.name,
+                        crate::util::human_secs(now.saturating_sub(a.at)),
+                        if same {
+                            " -- the same process that connected"
+                        } else {
+                            // Worth saying out loud. One process resolving and
+                            // another connecting is ordinary for a browser and
+                            // its helpers, and is also what a payload looks
+                            // like when it hands an address to something else.
+                            " -- a DIFFERENT process than the one that connected"
+                        }
+                    ));
+                }
                 if f.ioc.is_none() {
                     if let Some(entry) = self.feeds.domain_hit(&l.name) {
                         f.ioc = Some(crate::alert::IocRef {
@@ -5458,6 +5501,7 @@ impl Daemon {
             homes: None,
             telemetry: self.cfg.telemetry.clone(),
             canaries: manifest.paths(),
+            names_enabled: self.cfg.names.enabled,
             exclusions: self.kernel_exclusions.clone(),
             contain_slots: self.cfg.contain.max,
         };
@@ -5478,6 +5522,30 @@ impl Daemon {
             }
         }
         Ok((summary, failures))
+    }
+
+    /// Record that a process asked for a name.
+    ///
+    /// The payload is the varlink request, in the caller's context, so the pid
+    /// and the name arrive together -- which is the whole point, and the thing
+    /// the resolved monitor stream structurally cannot say.
+    ///
+    /// Nothing is raised here. A lookup is not a finding: every browser tab and
+    /// every `kubectl` makes them, and the value is entirely in being able to
+    /// answer "who asked for this" when something ELSE fires later.
+    fn note_dns_query(&mut self, hook: &crate::event::HookHit, exec_id: &str, now: u64) {
+        let Some(payload) = hook.bytes_arg() else { return };
+        let Some(name) = crate::names::query_name_from_payload(&payload) else {
+            return;
+        };
+        // The exe from the table, not from the event: a `/proc/self/fd/<n>`
+        // binary has already been resolved there, and this is the name a person
+        // will read off the alert.
+        let (pid, exe) = match self.table.get(exec_id) {
+            Some(p) => (p.pid, p.exe.clone()),
+            None => return,
+        };
+        self.queries.record(&name, pid, &exe, now);
     }
 
     /// The decoy paths this machine has planted, for the renderer.
@@ -7794,7 +7862,8 @@ mod tests {
                     domain: None,
                     domain_age_secs: None,
                     domain_cname: None,
-                });
+                domain_queried_by: None,
+            });
             } else {
                 f.hook = "file_post_open".into();
                 f.file = Some(crate::alert::FileRef {
@@ -7866,6 +7935,7 @@ mod tests {
                 domain: None,
                 domain_age_secs: None,
                 domain_cname: None,
+                domain_queried_by: None,
             });
             d.emit(f)
         };
@@ -7935,6 +8005,7 @@ mod tests {
                 domain: None,
                 domain_age_secs: None,
                 domain_cname: None,
+                domain_queried_by: None,
             });
             d.emit(f)
         };
@@ -8057,7 +8128,9 @@ mod tests {
             f.meta.severity = sev.into();
             f.ancestry = vec![root.clone()];
             if let Some(ip) = ip {
-                f.net = Some(crate::alert::NetRef { dst_ip: ip.into(), dst_port: 22, domain: None, domain_age_secs: None, domain_cname: None });
+                f.net = Some(crate::alert::NetRef { dst_ip: ip.into(), dst_port: 22, domain: None, domain_age_secs: None, domain_cname: None,
+                domain_queried_by: None,
+            });
             } else {
                 f.hook = "file_post_open".into();
                 f.file = Some(crate::alert::FileRef {
@@ -8219,7 +8292,8 @@ mod tests {
             domain: None,
             domain_age_secs: None,
             domain_cname: None,
-        });
+                domain_queried_by: None,
+            });
         let id = d.emit(f).expect("recorded");
         let a = d.store.find(&id).unwrap();
         assert_eq!(a.mode, "enforce", "the record carries the mode that governed the rule");
@@ -10284,7 +10358,8 @@ esac
             domain: None,
             domain_age_secs: None,
             domain_cname: None,
-        });
+                domain_queried_by: None,
+            });
         d.store.append_alert(&a).unwrap();
         let c = chain_over(&d, &[a.clone()], "critical");
 

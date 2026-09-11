@@ -122,6 +122,126 @@ pub struct NameCache {
 
 const PER_IP: usize = 4;
 
+/// The policy whose events carry `pid -> name`.
+///
+/// The resolved monitor stream answers "what name is this address", which is
+/// evidence; it cannot answer "who asked", because resolved does not say which
+/// client made a request. This does: the varlink request is a `sendto()` on a
+/// connected AF_UNIX socket, so the kernel sees it in the CALLING process's
+/// context, with the name in plaintext JSON.
+///
+/// Measured on 2026-09-11 with a throwaway policy: 46 events, 46 names parsed,
+/// `node -> us-east-4.pg.psdb.cloud`, `kubectl -> hcp-...rackspace.com`. Cache
+/// hits included, because nss-resolve asks resolved either way -- which is the
+/// 85% that never reaches the wire and that a port-53 probe cannot see.
+pub const QUERY_POLICY: &str = "moat-net-dns-query";
+
+/// The varlink method whose requests carry a hostname. Also the in-kernel
+/// SubString filter, so nothing else becomes an event.
+pub const QUERY_METHOD: &str = "io.systemd.Resolve.ResolveHostname";
+
+/// Who asked for a name, and when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Asker {
+    pub pid: u32,
+    pub exe: String,
+    pub at: u64,
+}
+
+/// `name -> who asked for it`, bounded and aged like the address cache.
+///
+/// Keyed by NAME rather than by pid: the question a reader has in front of an
+/// alert is "who looked this up", and answering "what did pid 1234 look up"
+/// from the same data is a scan of a small map. Keying by pid would make the
+/// common question the expensive one.
+///
+/// A name nobody asked for through nss -- a Go binary with its own resolver, a
+/// literal IP, a lookup from before moatd started -- is simply absent, and the
+/// record says `not recorded` rather than implying nobody asked.
+#[derive(Debug, Clone)]
+pub struct QueryLog {
+    by_name: HashMap<String, Asker>,
+    order: VecDeque<String>,
+    retain_secs: u64,
+    max_names: usize,
+    /// Queries seen since start, before deduplication.
+    pub seen: u64,
+}
+
+impl QueryLog {
+    pub fn new(retain_secs: u64, max_names: usize) -> QueryLog {
+        QueryLog {
+            by_name: HashMap::new(),
+            order: VecDeque::new(),
+            retain_secs,
+            max_names: max_names.max(1),
+            seen: 0,
+        }
+    }
+
+    /// Record that `pid` asked for `name`.
+    ///
+    /// Newest wins. Two processes resolving the same name is ordinary -- a
+    /// browser and its helper, four workers and `localhost` -- and the one that
+    /// asked most recently is the one a connection moments later belongs to.
+    pub fn record(&mut self, name: &str, pid: u32, exe: &str, now: u64) {
+        let name = normalize_name(name);
+        if name.is_empty() {
+            return;
+        }
+        self.seen += 1;
+        if self.by_name.insert(
+            name.clone(),
+            Asker { pid, exe: exe.to_string(), at: now },
+        )
+        .is_none()
+        {
+            self.order.push_back(name);
+        }
+        while self.by_name.len() > self.max_names {
+            let Some(oldest) = self.order.pop_front() else { break };
+            self.by_name.remove(&oldest);
+        }
+    }
+
+    pub fn asked_by(&self, name: &str, now: u64) -> Option<&Asker> {
+        let a = self.by_name.get(&normalize_name(name))?;
+        (now.saturating_sub(a.at) <= self.retain_secs).then_some(a)
+    }
+
+    pub fn prune(&mut self, now: u64) {
+        let retain = self.retain_secs;
+        self.by_name.retain(|_, a| now.saturating_sub(a.at) <= retain);
+        let live: std::collections::HashSet<&String> = self.by_name.keys().collect();
+        self.order.retain(|n| live.contains(n));
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_name.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
+}
+
+/// Pull the hostname out of a varlink `ResolveHostname` request.
+///
+/// The payload is NUL-terminated JSON; Tetragon hands it over base64-encoded
+/// and may truncate it at `maxData`, so a half-object is expected rather than
+/// exceptional and returns None instead of an error.
+pub fn query_name_from_payload(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let text = text.trim_end_matches('\0');
+    let v: Value = serde_json::from_str(text).ok()?;
+    if v.get("method")?.as_str()? != QUERY_METHOD {
+        return None;
+    }
+    let name = v.get("parameters")?.get("name")?.as_str()?;
+    let name = normalize_name(name);
+    (!name.is_empty()).then_some(name)
+}
+
 impl Default for NameCache {
     fn default() -> Self {
         let c = NamesConfig::default();
@@ -500,6 +620,88 @@ mod tests {
         let r = parse_monitor_reply(&v);
         assert_eq!(r[0].question, "evil.example");
         assert_eq!(r[0].answer_name, None, "case and the trailing dot are not a CNAME");
+    }
+
+    /// The payload is what nss-resolve actually sends -- captured by strace on
+    /// 2026-09-11, not invented -- so the parser is pinned against the real
+    /// shape rather than one that happens to suit it.
+    #[test]
+    fn the_query_name_comes_out_of_a_real_varlink_request() {
+        let real = br#"{"method":"io.systemd.Resolve.ResolveHostname","parameters":{"name":"us-east-4.pg.psdb.cloud","family":10,"flags":0,"ifindex":0}}"#;
+        assert_eq!(
+            query_name_from_payload(real).as_deref(),
+            Some("us-east-4.pg.psdb.cloud")
+        );
+
+        // A NUL terminator rides along on the wire and must not become part of
+        // the name -- `example.com\0` would never match a feed entry.
+        let with_nul = b"{\"method\":\"io.systemd.Resolve.ResolveHostname\",\"parameters\":{\"name\":\"Example.COM.\"}}\0";
+        assert_eq!(
+            query_name_from_payload(with_nul).as_deref(),
+            Some("example.com"),
+            "and the name is normalised the way the feed is"
+        );
+
+        // Another varlink method on the same socket is not a lookup. The
+        // in-kernel SubString filter should already have dropped it; this is
+        // the belt to that pair of braces.
+        //
+        // It carries a `name` PARAMETER on purpose. The obvious fixture --
+        // ResolveAddress, whose parameters are an address -- proves nothing,
+        // because it returns None for want of a `name` whether the method is
+        // checked or not. Caught by reverting the method check and watching
+        // this test pass anyway.
+        let other = b"{\"method\":\"io.systemd.Resolve.ResolveService\",\"parameters\":{\"name\":\"_ldap._tcp\",\"domain\":\"example.com\"}}";
+        assert_eq!(
+            query_name_from_payload(other),
+            None,
+            "a service lookup is not a hostname lookup, even though it has a name"
+        );
+
+        // Tetragon truncates at maxData, so half an object is ordinary input
+        // and must be None rather than a panic or a mangled name.
+        assert_eq!(query_name_from_payload(&with_nul[..40]), None);
+        assert_eq!(query_name_from_payload(b""), None);
+    }
+
+    /// Keyed by name, newest asker wins, and aged.
+    #[test]
+    fn the_query_log_answers_who_asked_and_forgets_on_time() {
+        let mut q = QueryLog::new(60, 100);
+        q.record("Example.COM.", 10, "/usr/bin/curl", 1_000);
+        // Trailing dot and case are the same name -- normalised on the way in,
+        // or a feed entry would never match what a program typed.
+        let a = q.asked_by("example.com", 1_005).expect("recorded");
+        assert_eq!((a.pid, a.exe.as_str()), (10, "/usr/bin/curl"));
+
+        // Two processes resolving the same name is ordinary; the most recent
+        // is the one a connection moments later belongs to.
+        q.record("example.com", 11, "/usr/bin/node", 1_010);
+        assert_eq!(q.asked_by("example.com", 1_011).unwrap().pid, 11);
+
+        // Past retention it is gone, not stale: a wrong asker on a security
+        // record is worse than no asker.
+        assert!(q.asked_by("example.com", 1_200).is_none());
+        q.prune(1_200);
+        assert!(q.is_empty());
+
+        // An empty name is not a lookup.
+        q.record("", 12, "/x", 1_300);
+        assert_eq!(q.len(), 0);
+    }
+
+    /// The cap evicts the oldest NAME, and the map cannot grow without bound
+    /// on a machine that resolves constantly.
+    #[test]
+    fn the_query_log_is_bounded() {
+        let mut q = QueryLog::new(3_600, 2);
+        q.record("a.example", 1, "/x", 1);
+        q.record("b.example", 2, "/x", 2);
+        q.record("c.example", 3, "/x", 3);
+        assert_eq!(q.len(), 2);
+        assert!(q.asked_by("a.example", 3).is_none(), "oldest name evicted");
+        assert!(q.asked_by("c.example", 3).is_some());
+        assert_eq!(q.seen, 3, "every lookup is counted, including evicted ones");
     }
 
     #[test]

@@ -141,7 +141,8 @@ impl UserRule for PkgEgress {
             domain: None,
             domain_age_secs: None,
             domain_cname: None,
-        });
+                domain_queried_by: None,
+            });
         f.what_override = Some(format!(
             "A `{}` install connected to {}:{}, which is not a known package registry.",
             pkg.comm(),

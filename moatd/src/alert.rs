@@ -107,6 +107,20 @@ pub struct NetRef {
     /// that a CDN address may since have been handed to someone else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain_age_secs: Option<u64>,
+    /// The process that ASKED for this name, from the varlink kprobe
+    /// (`moat-net-dns-query`). `"<exe> (pid N)"`.
+    ///
+    /// Separate from `domain`, and a stronger claim. `domain` is keyed by
+    /// ADDRESS -- this machine resolved that name to that address recently, so
+    /// a connection there probably belongs to it. This is keyed by the NAME and
+    /// observed in the asking process's own context, so it says who looked it
+    /// up rather than inferring it.
+    ///
+    /// `None` is NOT RECORDED, never "nobody asked": a Go binary with its own
+    /// resolver never touches nss, a literal-IP connection has no lookup at
+    /// all, and a lookup from before moatd started is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_queried_by: Option<String>,
     /// The owner name of the record that answered, when a CNAME chain ended
     /// somewhere other than the name asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -121,6 +135,7 @@ impl NetRef {
             domain: None,
             domain_age_secs: None,
             domain_cname: None,
+            domain_queried_by: None,
         }
     }
 

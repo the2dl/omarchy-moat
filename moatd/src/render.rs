@@ -129,6 +129,8 @@ pub struct RenderOptions<'a> {
     pub exclusions: std::collections::BTreeMap<String, Vec<String>>,
     /// Decoy paths for `canary-file-read.yaml`. Empty skips that template.
     pub canaries: Vec<String>,
+    /// `[names] enabled`. False skips `net-dns-query.yaml`.
+    pub names_enabled: bool,
     /// `[contain] max`: how many containment policy names to reserve in the
     /// export allowlist. See the note at the write site -- a runtime policy
     /// whose name is not in this file is invisible to moatd.
@@ -145,6 +147,7 @@ impl Default for RenderOptions<'_> {
             homes: None,
             telemetry: crate::config::TelemetryConfig::default(),
             canaries: Vec::new(),
+            names_enabled: crate::names::NamesConfig::default().enabled,
             exclusions: std::collections::BTreeMap::new(),
             contain_slots: crate::config::ContainConfig::default().max,
         }
@@ -209,6 +212,16 @@ pub fn render(opts: &RenderOptions) -> Result<RenderReport, String> {
         // The canary policy with no canaries is not a quieter policy, it is a
         // rule that matches nothing while reporting itself armed. Skip it, and
         // the sweep below deletes whatever was rendered last time.
+        // The attribution probe follows `[names]`. It is the other half of the
+        // same feature -- the resolved stream says what a name resolved to,
+        // this says who asked -- so one switch governs both. Loading it with
+        // the stream off would record askers nothing ever reads.
+        if stem == "net-dns-query.yaml" && !opts.names_enabled {
+            report
+                .skipped
+                .push((stem.clone(), "[names] is off".to_string()));
+            continue;
+        }
         if stem.starts_with("canary-") && opts.canaries.is_empty() {
             report
                 .skipped
@@ -656,6 +669,7 @@ mod tests {
             homes: Some(vec!["/home/x".into()]),
             telemetry: crate::config::TelemetryConfig::default(),
             canaries: Vec::new(),
+            names_enabled: true,
             exclusions: Default::default(),
             contain_slots: 4,
         };
@@ -676,6 +690,7 @@ mod tests {
         // With paths, the same template renders and carries them exactly.
         let opts = RenderOptions {
             canaries: vec!["/etc/rsync.secrets".into(), "/root/.pgpass".into()],
+            names_enabled: true,
             ..opts
         };
         render(&opts).unwrap();
@@ -831,6 +846,7 @@ spec:
             homes: Some(vec!["/home/dan".into()]),
             telemetry: crate::config::TelemetryConfig::default(),
             canaries: Vec::new(),
+            names_enabled: true,
             exclusions: Default::default(),
             contain_slots: 0,
         };
@@ -865,6 +881,7 @@ spec:
             homes: Some(vec!["/home/dan".into()]),
             telemetry: crate::config::TelemetryConfig::default(),
             canaries: Vec::new(),
+            names_enabled: true,
             exclusions: Default::default(),
             contain_slots: 0,
         };
@@ -976,6 +993,7 @@ spec:
             homes: Some(vec!["/home/dan".into()]),
             telemetry: telemetry.clone(),
             canaries: Vec::new(),
+            names_enabled: true,
             exclusions: Default::default(),
             contain_slots: 0,
         };
