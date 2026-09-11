@@ -1159,14 +1159,47 @@ spec:
             .collect()
     }
 
+    /// The CGROUP clause, not the mount one. The scope moved on 2026-09-11
+    /// because the mount namespace cannot tell a container from
+    /// `bwrap --unshare-user`, and every armed rule could be stepped around
+    /// with the latter.
     fn ns_of(m: &serde_yaml::Mapping) -> Option<String> {
         m.get(Value::String("matchNamespaces".into()))?
             .as_sequence()?
             .iter()
-            .find(|e| e.get("namespace").and_then(|v| v.as_str()) == Some("Mnt"))?
+            .find(|e| e.get("namespace").and_then(|v| v.as_str()) == Some("Cgroup"))?
             .get("operator")?
             .as_str()
             .map(|s| s.to_string())
+    }
+
+    /// The scope is the cgroup namespace and nothing else.
+    ///
+    /// Pinned separately from the operator assertions because the failure this
+    /// guards is silent: scoping on `Mnt` again would still produce a host
+    /// selector and a mirror, both tests above would still pass, and every
+    /// armed rule would quietly be bypassable with one `bwrap` prefix.
+    #[test]
+    fn enforcement_is_scoped_on_the_cgroup_namespace_not_the_mount_one() {
+        let s = sels(DENIES);
+        for (i, sel) in s.iter().enumerate() {
+            let clauses = sel
+                .get(Value::String("matchNamespaces".into()))
+                .and_then(|v| v.as_sequence())
+                .expect("both selectors carry a namespace clause");
+            let names: Vec<&str> = clauses
+                .iter()
+                .filter_map(|c| c.get("namespace").and_then(|v| v.as_str()))
+                .collect();
+            assert_eq!(
+                names,
+                vec!["Cgroup"],
+                "selector {i} must scope on Cgroup alone: a container gets a private \
+                 cgroup namespace, `bwrap --unshare-user` shares the host's, and only \
+                 that difference separates somebody else's filesystem from this machine \
+                 wearing a different view of itself"
+            );
+        }
     }
 
     #[test]
@@ -1223,6 +1256,11 @@ spec:
         // a container's own /etc/shadow being refused -- which fixed the denial
         // by making container activity invisible. The mirror must OVERWRITE
         // that clause, or the container copy inherits `In` and matches nothing.
+        //
+        // It matters more since the scope moved to the cgroup namespace: a
+        // leftover `Mnt In host_ns` beside the new clause would re-introduce
+        // exactly the bypass this replaced, ANDed into the host selector and
+        // invisible in the operator assertions.
         let already = DENIES.replace(
             "      matchActions:",
             "      matchNamespaces:\n      - namespace: Mnt\n        operator: \"In\"\n        values: [\"host_ns\"]\n      matchActions:",
@@ -1231,10 +1269,22 @@ spec:
         assert_eq!(s.len(), 2);
         assert_eq!(ns_of(&s[0]).as_deref(), Some("In"));
         assert_eq!(ns_of(&s[1]).as_deref(), Some("NotIn"), "the mirror now sees containers");
-        assert_eq!(
-            s[1].get(Value::String("matchNamespaces".into())).unwrap().as_sequence().unwrap().len(),
-            1,
-            "one Mnt clause, not two contradicting each other"
-        );
+        for (i, sel) in s.iter().enumerate() {
+            let clauses = sel
+                .get(Value::String("matchNamespaces".into()))
+                .unwrap()
+                .as_sequence()
+                .unwrap();
+            assert_eq!(
+                clauses.len(),
+                1,
+                "selector {i}: one clause, not the new one beside the hand-written Mnt"
+            );
+            assert_eq!(
+                clauses[0].get("namespace").and_then(|v| v.as_str()),
+                Some("Cgroup"),
+                "selector {i}: the hand-written Mnt clause must be gone, not kept"
+            );
+        }
     }
 }
