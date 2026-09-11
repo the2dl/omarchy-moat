@@ -55,9 +55,11 @@ impl UserRule for NetDomainIoc {
             "net",
             "high",
             "Connection to a domain on the local threat feed",
-            "This address was reached after this machine resolved a name that is in the \
-             local domain feed. The feed is operator-supplied (feeds/domains.txt) and the \
-             name comes from systemd-resolved's own query stream, not from a reverse lookup.",
+            "This address was reached after this machine resolved a name that is on the \
+             domain feed -- either the published list (feeds/domains-feed.txt, about 48,000 \
+             domains from ThreatFox, signed and refreshed every 15 minutes) or your own \
+             feeds/domains.txt. The name comes from systemd-resolved's own query stream, \
+             not from a reverse lookup.",
             "A shared host or CDN address that a fed domain also used, a sinkholed domain \
              being visited on purpose, or a feed entry broad enough to cover a legitimate \
              parent domain. About one published entry in five is a legitimate site that was \
@@ -259,6 +261,18 @@ mod tests {
         // The family is the single most useful word available, and a bare
         // "a name on the domain feed" throws it away.
         assert!(what.contains("Cobalt Strike"), "{}", what);
+        // The rule's own description is shown verbatim by `moatctl explain`,
+        // and it spent a release telling people the feed was operator-supplied
+        // and lived in domains.txt -- pointing whoever read it at an empty file
+        // on their machine instead of the list that actually fired.
+        let why = f[0].meta.why.clone();
+        assert!(why.contains("feeds/domains-feed.txt"), "{}", why);
+        assert!(
+            !why.contains("The feed is operator-supplied"),
+            "the published list is not operator-supplied: {}",
+            why
+        );
+
         let ev = &f[0].extra_evidence[0];
         assert!(ev.contains("feeds/domains-feed.txt"), "{}", ev);
         assert!(ev.contains("100% confidence"), "{}", ev);
