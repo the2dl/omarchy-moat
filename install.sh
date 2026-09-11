@@ -129,11 +129,34 @@ if [ "$DO_BUILD" = 1 ]; then
 	(cd "$HERE/pkg" && makepkg --force --syncdeps --noconfirm)
 fi
 
-# Newest by mtime, NUL-safe: pkgrel 9 sorts after 62 alphabetically, so this
-# must be time-ordered rather than name-ordered.
-PKG="$(find "$HERE/pkg" -maxdepth 1 -name '*.pkg.tar.zst' -printf '%T@ %p\n' 2>/dev/null |
-	sort -rn | head -1 | cut -d' ' -f2- || true)"
-[ -n "$PKG" ] || die "no package found in $HERE/pkg -- run without --no-build"
+# Ask makepkg where it put the package rather than guessing at the name.
+#
+# `--packagelist` honours PKGDEST and PKGEXT from makepkg.conf, which a glob
+# cannot: a host that sets PKGDEST builds into a shared cache directory and a
+# host that sets PKGEXT='.pkg.tar.xz' produces a name the pattern below never
+# matches. Either way `makepkg` reports success and the install then says "no
+# package found", which reads as a build failure and is not one.
+PKG=""
+if PKG_LIST="$(cd "$HERE/pkg" && makepkg --packagelist 2>/dev/null)"; then
+	# One line per split package; this PKGBUILD produces one.
+	for candidate in $PKG_LIST; do
+		[ -f "$candidate" ] && PKG="$candidate" && break
+	done
+fi
+
+# Fallback for an older makepkg without --packagelist. Newest by mtime,
+# NUL-safe: pkgrel 9 sorts after 62 alphabetically, so this must be
+# time-ordered rather than name-ordered.
+if [ -z "$PKG" ]; then
+	PKG="$(find "$HERE/pkg" -maxdepth 1 -name '*.pkg.tar.*' -printf '%T@ %p\n' 2>/dev/null |
+		sort -rn | head -1 | cut -d' ' -f2- || true)"
+fi
+if [ -z "$PKG" ]; then
+	die "makepkg reported success but no package file was found.
+   makepkg --packagelist says it should be at:
+$(cd "$HERE/pkg" && makepkg --packagelist 2>&1 | sed 's/^/     /')
+   Check PKGDEST and PKGEXT in /etc/makepkg.conf and ~/.makepkg.conf."
+fi
 ok "package: $(basename "$PKG")"
 
 say "Installing (needs root)"
