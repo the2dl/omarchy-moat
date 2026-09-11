@@ -381,15 +381,37 @@ ARGS=(
 	--ro-bind / /
 	--dev /dev
 	--proc /proc
-	# moatd's control socket lives here, it is group-writable, and the group is
-	# the one the sandboxed process runs as. Left visible, a hostile install
-	# script could drive the daemon from inside the box that exists to contain
-	# it: switch to monitor, allowlist itself, release a containment. The
-	# sandbox has to be closed on that side too.
-	--tmpfs /run/moat
 	--unshare-pid
 	--die-with-parent
 )
+
+# moatd's control socket lives in /run/moat, it is group-writable, and the
+# group is the one the sandboxed process runs as. Left visible, a hostile
+# install script could drive the daemon from inside the box that exists to
+# contain it: switch to monitor, allowlist itself, release a containment. The
+# sandbox has to be closed on that side too.
+#
+# Only when the directory EXISTS, though. `/` is bound read-only, so bwrap
+# cannot create a mountpoint that is not already there, and an unconditional
+# `--tmpfs /run/moat` fails the whole sandbox with
+#
+#     bwrap: Can't create file /run/moat: Read-only file system
+#
+# /run/moat is systemd's `RuntimeDirectory=moat`, so it appears when moatd
+# FIRST STARTS -- not when the package is installed. Until then every shimmed
+# `npm install` died on a machine where the sandbox was switched on before the
+# daemon, and every sandbox test failed inside makepkg's check() on a host that
+# had never run moat. It was invisible here because this machine has had moatd
+# running since before the sandbox was written.
+#
+# Skipping it is safe in exactly the case it is skipped: no directory means no
+# socket, so there is nothing to hide. The window between this test and the
+# exec below is real and not worth closing by refusing to sandbox at all --
+# that trades a hypothetical for a certainty, and the certainty is that the
+# command runs with no sandbox whatsoever.
+if [[ -d /run/moat ]]; then
+	ARGS+=(--tmpfs /run/moat)
+fi
 if need_new_session; then
 	ARGS+=(--new-session)
 fi

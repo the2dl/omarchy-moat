@@ -328,6 +328,32 @@ else
 	no "--dry-run runs nothing"
 fi
 
+# /run/moat is masked when it EXISTS, and not asked for when it does not.
+#
+# The socket test above passes either way -- it cannot tell "masked" from
+# "never existed" -- so it did not notice that an unconditional
+# `--tmpfs /run/moat` kills the whole sandbox on a host that has never run
+# moatd: `/` is bound read-only, so bwrap cannot create a mountpoint that is
+# not already there. Every sandbox test failed that way on the first aarch64
+# build, and the cause was not the architecture, it was a machine where
+# systemd's RuntimeDirectory had never been created.
+#
+# Asserted against this host's actual state, so it is a real check on both
+# machines rather than a skip on one of them.
+if grep -qF -- '--tmpfs /run/moat' <<<"$dry"; then
+	if [[ -d /run/moat ]]; then
+		ok "/run/moat exists here and the sandbox masks it"
+	else
+		no "the sandbox asks to mask /run/moat, which does not exist" \
+			"bwrap cannot create that mountpoint under a read-only /"
+	fi
+elif [[ -d /run/moat ]]; then
+	no "/run/moat exists here but the sandbox does not mask it" \
+		"moatd's control socket would be reachable from inside"
+else
+	ok "/run/moat does not exist here, so the sandbox does not ask to mask it"
+fi
+
 # --new-session decision logic. The sysctl path is faked so the test does not
 # depend on this machine's kernel. 0 = TIOCSTI already impossible -> keep the
 # controlling terminal so Ctrl-C works; 1 or missing -> defend against it.
