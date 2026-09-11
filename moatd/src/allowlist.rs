@@ -12,6 +12,11 @@
 //! exe    = "/home/dan/.local/share/mise/installs/node/*/bin/node"
 //! file   = "/home/dan/.ssh/id_rsa"
 //! parent = "/usr/bin/restic"
+//!
+//! # added 2026-09-11 from alert 01M28F...: a sinkhole I visit on purpose
+//! [[rule]]
+//! name   = "moat-x-net-domain-ioc"
+//! domain = "sinkhole.example"            # or "*.sinkhole.example"
 //! ```
 //!
 //! Comments matter: `moatctl allowlist` shows them, so an entry added six
@@ -46,6 +51,26 @@ pub struct RuleSpec {
     /// Now it can, so the entry says the true thing -- *gcloud* reading
     /// *gcloud's own store* -- rather than blessing an interpreter.
     pub script: Option<String>,
+    /// The hostname behind the connection, when the alert has one.
+    ///
+    /// 2026-09-11: the domain feed arrived with 47,755 entries and no way to
+    /// disagree with any of them. A false positive -- a sinkholed domain the
+    /// user visits on purpose, a shared host a fed name also used, a
+    /// compromised site they are the one cleaning up -- could only be answered
+    /// by allowing the PROGRAM for the whole rule (`firefox` never flags any
+    /// bad domain again) or switching the rule off. Neither is the thing
+    /// anybody meant.
+    ///
+    /// It matters more than it looks because a domain match sets `ioc`, and
+    /// `scoring::never_lowered` holds an IOC finding at its base severity
+    /// whatever the provenance or context says -- so the normal noise
+    /// machinery cannot quieten one, and a `high` net step can carry a chain
+    /// to the threshold where `maybe_contain` cuts the connection.
+    ///
+    /// Matched against BOTH the resolved name and the feed entry that fired,
+    /// like `parent` is matched against every ancestor: the user types what
+    /// the alert showed them, and the alert shows both.
+    pub domain: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +92,29 @@ pub struct Rule {
     file_m: Option<GlobMatcher>,
     parent_m: Option<GlobMatcher>,
     script_m: Option<GlobMatcher>,
+    domain_m: Option<GlobMatcher>,
+}
+
+/// The names a `domain` entry may be written against, narrowest last.
+///
+/// ONE function, called by both places that build a `Candidate`: the live
+/// evaluator in `engine::emit` and the blast-radius preview in
+/// `control::would_match`, whose whole promise is that it agrees with the
+/// evaluator. Two copies of this would be two copies that drift, and the
+/// direction they drift in is "the preview said it was narrower than it is".
+pub fn domain_candidates(resolved: Option<&str>, ioc_matched: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(n) = resolved {
+        if !n.is_empty() {
+            out.push(n.to_string());
+        }
+    }
+    if let Some(m) = ioc_matched.and_then(|m| m.strip_prefix("domain:")) {
+        if !m.is_empty() && !out.iter().any(|x| x == m) {
+            out.push(m.to_string());
+        }
+    }
+    out
 }
 
 /// What an event offers the allowlist.
@@ -78,6 +126,10 @@ pub struct Candidate<'a> {
     pub parents: Vec<String>,
     /// `Actor::script`: what the interpreter was actually running.
     pub script: Option<&'a str>,
+    /// The resolved name and the feed entry that matched it, in that order.
+    /// Empty when the event has no name -- a rule naming a domain then cannot
+    /// match, the same way one naming a file cannot match an event without one.
+    pub domains: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -177,6 +229,7 @@ impl Allowlist {
                 file_m: spec.file.as_deref().map(compile).transpose()?,
                 parent_m: spec.parent.as_deref().map(compile).transpose()?,
                 script_m: spec.script.as_deref().map(compile).transpose()?,
+                domain_m: spec.domain.as_deref().map(compile).transpose()?,
                 spec,
                 comment,
                 source: source.to_path_buf(),
@@ -218,6 +271,9 @@ impl Allowlist {
             file: file.as_deref(),
             parents: c.parents.clone(),
             script: script.as_deref(),
+            // Not normalised: a hostname has no `..` to collapse, and running a
+            // path normaliser over one could only mangle it.
+            domains: c.domains.clone(),
         };
         self.rules.iter().find(|r| r.matches(&c))
     }
@@ -250,6 +306,13 @@ impl Rule {
         }
         if let Some(m) = &self.parent_m {
             if !c.parents.iter().any(|p| m.is_match(p)) {
+                return false;
+            }
+        }
+        if let Some(m) = &self.domain_m {
+            // Any of them, like `parent`: the alert shows the resolved name and
+            // the entry that fired, and either is a reasonable thing to type.
+            if !c.domains.iter().any(|d| m.is_match(d)) {
                 return false;
             }
         }
@@ -301,6 +364,7 @@ pub fn rule_from_spec(spec: RuleSpec, source: &Path, index: usize) -> Result<Rul
         file_m: spec.file.as_deref().map(compile).transpose()?,
         parent_m: spec.parent.as_deref().map(compile).transpose()?,
         script_m: spec.script.as_deref().map(compile).transpose()?,
+        domain_m: spec.domain.as_deref().map(compile).transpose()?,
         spec,
         comment: String::new(),
         source: source.to_path_buf(),
@@ -325,6 +389,9 @@ pub fn render_block(spec: &RuleSpec) -> String {
     }
     if let Some(v) = &spec.script {
         s.push_str(&format!("script = {}\n", toml_str(v)));
+    }
+    if let Some(v) = &spec.domain {
+        s.push_str(&format!("domain = {}\n", toml_str(v)));
     }
     s
 }
@@ -593,6 +660,112 @@ exe = "/usr/bin/gnome-keyring-daemon"
         assert_eq!(blocks.len(), 2);
     }
 
+    // --- the domain dimension ---------------------------------------------
+
+    const DOMAIN_SAMPLE: &str = r#"
+# a sinkhole I visit on purpose
+[[rule]]
+name   = "moat-x-net-domain-ioc"
+domain = "sinkhole.example"
+"#;
+
+    fn net_cand<'a>(rule: &'a str, exe: &'a str, resolved: &'a str, entry: &'a str) -> Candidate<'a> {
+        Candidate {
+            rule,
+            exe,
+            file: None,
+            parents: vec![],
+            script: None,
+            domains: domain_candidates(Some(resolved), Some(&format!("domain:{}", entry))),
+        }
+    }
+
+    #[test]
+    fn a_domain_entry_allows_one_name_and_nothing_else() {
+        let a = al(DOMAIN_SAMPLE);
+        // The whole point: the program is NOT blessed. Before this field
+        // existed the only answer to a false positive was `exe`, which stops
+        // the browser ever flagging any fed domain again.
+        assert!(a
+            .find(&net_cand("moat-x-net-domain-ioc", "/usr/bin/firefox", "sinkhole.example", "sinkhole.example"))
+            .is_some());
+        assert!(
+            a.find(&net_cand("moat-x-net-domain-ioc", "/usr/bin/firefox", "evil.example", "evil.example"))
+                .is_none(),
+            "the same program reaching a different fed domain still alerts"
+        );
+    }
+
+    #[test]
+    fn a_domain_entry_matches_the_entry_that_fired_as_well_as_the_resolved_name() {
+        let a = al(DOMAIN_SAMPLE);
+        // The alert shows both -- `cdn.sinkhole.example` resolved, entry
+        // `sinkhole.example` fired -- and either is a reasonable thing to type.
+        assert!(a
+            .find(&net_cand(
+                "moat-x-net-domain-ioc",
+                "/usr/bin/curl",
+                "cdn.sinkhole.example",
+                "sinkhole.example",
+            ))
+            .is_some());
+    }
+
+    #[test]
+    fn a_rule_naming_a_domain_cannot_match_an_event_without_one() {
+        let a = al(DOMAIN_SAMPLE);
+        // Same guarantee `file` gives. Otherwise an entry written to quieten
+        // one hostname would quietly cover every nameless event of that rule.
+        assert!(a
+            .find(&Candidate {
+                rule: "moat-x-net-domain-ioc",
+                exe: "/usr/bin/curl",
+                file: None,
+                parents: vec![],
+                script: None,
+                domains: vec![],
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn a_domain_glob_covers_a_campaign_and_stops_at_the_label_boundary() {
+        let a = al("[[rule]]\nname = \"moat-x-net-domain-ioc\"\ndomain = \"*.lab.example\"\n");
+        assert!(a
+            .find(&net_cand("moat-x-net-domain-ioc", "/usr/bin/curl", "a.lab.example", "lab.example"))
+            .is_some());
+        assert!(
+            a.find(&net_cand("moat-x-net-domain-ioc", "/usr/bin/curl", "notlab.example", "notlab.example"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_domain_candidates_are_the_name_then_the_entry_without_duplicates() {
+        assert_eq!(
+            domain_candidates(Some("cdn.evil.example"), Some("domain:evil.example")),
+            vec!["cdn.evil.example".to_string(), "evil.example".to_string()]
+        );
+        // The common case: the resolved name IS the entry.
+        assert_eq!(
+            domain_candidates(Some("evil.example"), Some("domain:evil.example")),
+            vec!["evil.example".to_string()]
+        );
+        // A hash IOC is not a domain and must not become one.
+        assert_eq!(domain_candidates(None, Some("sha256:abc")), Vec::<String>::new());
+        assert_eq!(domain_candidates(None, None), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_domain_entry_round_trips_through_toml() {
+        let a = al(DOMAIN_SAMPLE);
+        let toml = a.rules[0].to_toml();
+        assert!(toml.contains("domain = \"sinkhole.example\""), "{}", toml);
+        // And parses back to the same matcher.
+        let again = Allowlist::parse(&toml, Path::new("x.toml")).unwrap();
+        assert_eq!(again[0].spec.domain.as_deref(), Some("sinkhole.example"));
+    }
+
     #[test]
     fn every_present_field_must_match() {
         let a = al(SAMPLE);
@@ -602,6 +775,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
             file: Some("/home/dan/.ssh/id_rsa"),
             parents: vec![],
                 script: None,
+            domains: vec![],
             });
         assert!(hit.is_some());
 
@@ -611,6 +785,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
             file: None,
             parents: vec![],
                 script: None,
+            domains: vec![],
             });
         assert!(miss.is_none(), "exe must match");
     }
@@ -625,6 +800,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 file: None,
                 parents: vec![],
                 script: None,
+            domains: vec![],
             })
             .is_some());
         // A rule id that EXISTS and is outside the glob's family. It read
@@ -638,6 +814,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 file: None,
                 parents: vec![],
                 script: None,
+            domains: vec![],
             })
             .is_none());
     }
@@ -652,6 +829,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 file: Some("/home/dan/.ssh/id_rsa"),
                 parents: vec![],
                 script: None,
+            domains: vec![],
             })
             .is_some());
         assert!(a
@@ -661,6 +839,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 file: None,
                 parents: vec![],
                 script: None,
+            domains: vec![],
             })
             .is_none());
     }
@@ -675,6 +854,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 file: None,
                 parents: vec!["/usr/bin/sh".into(), "/usr/bin/restic".into()],
                 script: None,
+            domains: vec![],
             })
             .is_some());
         assert!(a
@@ -684,6 +864,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 file: None,
                 parents: vec!["/usr/bin/npm".into()],
                 script: None,
+            domains: vec![],
             })
             .is_none());
     }
@@ -700,6 +881,7 @@ exe = "/usr/bin/gnome-keyring-daemon"
                 file: None,
                 parents: vec![],
                 script: None,
+            domains: vec![],
             })
             .is_some());
     }
@@ -873,6 +1055,7 @@ file   = "*/.config/gcloud/*"
             file: Some("/home/dan/.config/gcloud/credentials.db"),
             parents: vec![],
             script: Some("/usr/bin/../../opt/google-cloud-cli/lib/gcloud.py"),
+            domains: vec![],
         };
         assert!(a.find(&gcloud).is_some(), "gcloud reading its own store is allowed");
 
@@ -962,6 +1145,7 @@ file   = "*/.config/gcloud/*"
                     file: Some(plugin),
                     parents: under_shell.clone(),
                 script: None,
+            domains: vec![],
             })
                 .is_some(),
                 "{} running a plugin helper under the shell",
@@ -983,6 +1167,7 @@ file   = "*/.config/gcloud/*"
                     file: Some(file),
                     parents,
                 script: None,
+            domains: vec![],
             })
                 .is_none(),
                 "must still alert: executing {}",
@@ -998,6 +1183,7 @@ file   = "*/.config/gcloud/*"
                 file: Some("/home/dan/.claude/.credentials.json"),
                 parents: under_shell.clone(),
                 script: None,
+            domains: vec![],
             })
             .is_some()
         );
@@ -1014,6 +1200,7 @@ file   = "*/.config/gcloud/*"
                     file: Some(file),
                     parents: under_shell.clone(),
                 script: None,
+            domains: vec![],
             })
                 .is_none(),
                 "must still alert: {} reading {}",
@@ -1055,6 +1242,7 @@ file   = "*/.config/gcloud/*"
             file: Some(jar),
             parents,
             script: None,
+            domains: vec![],
         };
 
         // Control: the case the entry exists for still works. If this stops
@@ -1105,6 +1293,7 @@ file   = "*/.config/gcloud/*"
                 file: Some("/tmp/.tmpFIBj5s/nc"),
                 parents: vec![runner.into(), "/usr/bin/cargo".into(), "/usr/bin/bash".into()],
                 script: None,
+            domains: vec![],
             })
             .is_none(),
             "the shipped file must no longer excuse an attacker-creatable /tmp path"
@@ -1121,6 +1310,7 @@ file   = "*/.config/gcloud/*"
                 file: Some("/tmp/moat-shim-test.aBcD/nc"),
                 parents: vec![shim.into(), "/usr/bin/bash".into()],
                 script: None,
+            domains: vec![],
             })
             .is_none(),
             "the shipped file must no longer excuse a shim-parented /tmp path"
@@ -1137,6 +1327,7 @@ file   = "*/.config/gcloud/*"
                 file: Some("/tmp/.tmpgdwbQe/incidents/01M1SR6NRX4JVX1R993SAX2XYX/.pkg.json.663928.tmp"),
                 parents: vec!["/usr/bin/cargo".into(), "/usr/bin/bash".into()],
                 script: None,
+            domains: vec![],
             })
             .is_none(),
             "the setuid entry moved to moat-dev.toml.example"
@@ -1156,6 +1347,7 @@ file   = "*/.config/gcloud/*"
                     file: Some("/tmp/x/payload"),
                     parents: vec!["/usr/bin/makepkg".into(), "/usr/bin/bash".into()],
                 script: None,
+            domains: vec![],
             })
                 .is_none(),
                 "a dropper must still alert: {}",
@@ -1257,6 +1449,7 @@ mod dev_example {
                         "/usr/bin/makepkg".into(),
                     ],
                 script: None,
+            domains: vec![],
             })
                 .is_some(),
                 "the shim-suite case: {}",
@@ -1275,6 +1468,7 @@ mod dev_example {
                     file: None,
                     parents: vec![parent.to_string()],
                 script: None,
+            domains: vec![],
             })
                 .is_some(),
                 "moat-pkg-subtree-netcat-exec {} is the test suite",
@@ -1291,6 +1485,7 @@ mod dev_example {
                     file: Some(file),
                     parents: vec![parent.to_string()],
                 script: None,
+            domains: vec![],
             })
                 .is_some(),
                 "moat-exec-untrusted-tmpfs {} is the test suite",
@@ -1313,6 +1508,7 @@ mod dev_example {
                     file: Some(exe),
                     parents: parents.iter().map(|s| s.to_string()).collect(),
                 script: None,
+            domains: vec![],
             })
                 .is_none(),
                 "{} {} must still alert",
@@ -1340,6 +1536,7 @@ mod cloud_cli_paths {
                 file: Some(file),
                 parents: vec![],
                 script: Some(script),
+            domains: vec![],
             })
             .is_some()
     }
@@ -1427,6 +1624,7 @@ mod traversal {
             file: Some("/home/dan/.azure/config"),
             parents: vec![],
             script: Some(script),
+            domains: vec![],
         };
         assert!(
             a.find(&cand("/usr/lib/python3.14/site-packages/azure/cli/__main__.py")).is_some(),

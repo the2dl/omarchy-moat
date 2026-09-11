@@ -114,6 +114,14 @@ impl TupleStat {
             // was observed, and the interpreter case wants a hand-written
             // entry that says which script, not a guess.
             script: None,
+            // A learned proposal never names a domain either, and this one
+            // is not an omission to be filled in later. The baseline learns
+            // what it has SEEN, and "this machine has connected to that
+            // address a few times" is exactly the observation a beaconing
+            // implant produces -- learning from it would let a C2 quieten its
+            // own alert by being patient. A domain entry is only ever written
+            // because a person looked at an alert and disagreed with it.
+            domain: None,
         }
     }
 
@@ -596,6 +604,8 @@ impl Baseline {
             file: (!dir.is_empty()).then(|| format!("{}/*", dir.trim_end_matches('/'))),
             parent: (!parent.is_empty()).then(|| parent.clone()),
             script: None,
+            // Never learned; see `Tuple::spec`.
+            domain: None,
         };
         let id = ulid::Ulid::new().to_string();
         self.state.proposals.push(Proposal {

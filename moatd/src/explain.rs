@@ -675,6 +675,28 @@ fn if_expected(f: &Finding, id: &str, allowlist_file: &str) -> IfExpected {
             },
         );
     }
+    // Offered only when there is a name, and before `parent`: on a domain
+    // alert the domain IS the thing the user is disagreeing with, and the two
+    // scopes above it silence far more than they were asked to.
+    if let Some(domain) = finding_domain(f) {
+        push(
+            "domain",
+            RuleSpec {
+                name: f.rule.clone(),
+                domain: Some(literal(&domain)),
+                ..Default::default()
+            },
+        );
+        push(
+            "exe+domain",
+            RuleSpec {
+                name: f.rule.clone(),
+                exe: Some(literal(&f.proc.exe)),
+                domain: Some(literal(&domain)),
+                ..Default::default()
+            },
+        );
+    }
     if let Some(parent) = f.ancestry.first() {
         push(
             "parent",
@@ -725,8 +747,38 @@ fn literal(path: &str) -> String {
     globset::escape(path)
 }
 
+/// The narrowest name worth allowlisting off a finding.
+///
+/// The feed ENTRY, not the resolved name, when there is one: an entry of
+/// `evil.example` fires on every subdomain, so allowing the single name
+/// `cdn.evil.example` leaves the next one to alert all over again. Allowing
+/// what actually fired is what the user meant by "this is fine".
+fn finding_domain(f: &Finding) -> Option<String> {
+    if let Some(m) = f.ioc.as_ref().and_then(|i| i.matched.strip_prefix("domain:")) {
+        return Some(m.to_string());
+    }
+    f.net.as_ref().and_then(|n| n.domain.clone())
+}
+
 pub fn scope_spec(f: &Finding, scope: &str) -> Result<RuleSpec, String> {
     match scope {
+        "domain" => match finding_domain(f) {
+            Some(d) => Ok(RuleSpec {
+                name: f.rule.clone(),
+                domain: Some(literal(&d)),
+                ..Default::default()
+            }),
+            None => Err("this alert has no resolved name, so scope domain does not apply".into()),
+        },
+        "exe+domain" => match finding_domain(f) {
+            Some(d) => Ok(RuleSpec {
+                name: f.rule.clone(),
+                exe: Some(literal(&f.proc.exe)),
+                domain: Some(literal(&d)),
+                ..Default::default()
+            }),
+            None => Err("this alert has no resolved name, so scope exe+domain does not apply".into()),
+        },
         "exe" => Ok(RuleSpec {
             name: f.rule.clone(),
             exe: Some(literal(&f.proc.exe)),
@@ -754,16 +806,41 @@ pub fn scope_spec(f: &Finding, scope: &str) -> Result<RuleSpec, String> {
             ..Default::default()
         }),
         other => Err(format!(
-            "unknown scope {:?}; use exe, exe+file, parent or rule",
+            "unknown scope {:?}; use exe, exe+file, domain, exe+domain, parent or rule",
             other
         )),
     }
+}
+
+/// The same narrowing, from a stored alert.
+fn alert_domain(a: &Alert) -> Option<String> {
+    if let Some(m) = a.ioc.as_ref().and_then(|i| i.matched.strip_prefix("domain:")) {
+        return Some(m.to_string());
+    }
+    a.net.as_ref().and_then(|n| n.domain.clone())
 }
 
 /// Same thing, from a stored alert (the socket only has the alert, not the
 /// finding that produced it).
 pub fn scope_spec_from_alert(a: &Alert, scope: &str) -> Result<RuleSpec, String> {
     match scope {
+        "domain" => match alert_domain(a) {
+            Some(d) => Ok(RuleSpec {
+                name: a.rule.clone(),
+                domain: Some(literal(&d)),
+                ..Default::default()
+            }),
+            None => Err("this alert has no resolved name, so scope domain does not apply".into()),
+        },
+        "exe+domain" => match alert_domain(a) {
+            Some(d) => Ok(RuleSpec {
+                name: a.rule.clone(),
+                exe: Some(literal(&a.process.exe)),
+                domain: Some(literal(&d)),
+                ..Default::default()
+            }),
+            None => Err("this alert has no resolved name, so scope exe+domain does not apply".into()),
+        },
         "exe" => Ok(RuleSpec {
             name: a.rule.clone(),
             exe: Some(literal(&a.process.exe)),
@@ -791,7 +868,7 @@ pub fn scope_spec_from_alert(a: &Alert, scope: &str) -> Result<RuleSpec, String>
             ..Default::default()
         }),
         other => Err(format!(
-            "unknown scope {:?}; use exe, exe+file, parent or rule",
+            "unknown scope {:?}; use exe, exe+file, domain, exe+domain, parent or rule",
             other
         )),
     }

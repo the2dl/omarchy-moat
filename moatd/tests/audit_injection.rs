@@ -194,6 +194,7 @@ fn ignoring_one_program_cannot_allowlist_a_whole_subtree() {
         file: None,
         parents: vec![],
         script: None,
+            domains: vec![],
     });
     assert!(
         hit.is_none(),

@@ -224,6 +224,54 @@ is reading the alert.
 The rule recommends rotating **nothing**. A connection to a fed domain is not a
 credential read; see the comment in `rules/net_domain_ioc.rs`.
 
+## Disagreeing with an entry
+
+A feed of 47,755 names will be wrong about one of them eventually: a sinkhole
+somebody visits on purpose, a shared host a flagged name also used, a
+compromised site the user is the one cleaning up.
+
+The allowlist takes a `domain` field, matched as a glob against **both** the
+resolved name and the feed entry that fired — the alert shows both, and either
+is a reasonable thing to type.
+
+```toml
+# added 2026-09-11 from alert 01M28F...: a sinkhole I visit on purpose
+[[rule]]
+name   = "moat-x-net-domain-ioc"
+domain = "sinkhole.example"        # or "*.lab.example"
+```
+
+From an alert, `moatctl ignore <ID> --scope domain` writes exactly that, and
+`--scope exe+domain` adds the program. The panel draws them as chips named
+after the entry — *"only sinkhole.example"* — because a chip that says "only
+this domain" is asking the user to trust that it picked the right one out of
+forty-eight thousand.
+
+Two details that are deliberate:
+
+- **The entry is written, not the resolved leaf.** `cdn.evil.example` resolved
+  but `evil.example` is what fired; allowing the leaf would leave the next
+  rotated label to alert tomorrow.
+- **`domain` is the recommended scope for this rule**, not `exe`. `exe` reads
+  like the narrow option and is not: it means this browser never flags any of
+  the 47,755 names again.
+
+**The baseline never learns a domain.** Every other allowlist dimension has a
+learned path — moat proposes entries for tuples it has seen often enough. A
+domain must not, because "this machine has connected to that address a few
+times" is precisely the observation a beaconing implant produces, and learning
+from it would let a C2 quieten its own alert by being patient. A `domain` entry
+is only ever written because a person looked at an alert and disagreed.
+
+### Why this needed its own dimension
+
+A domain match sets `ioc`, and `scoring::never_lowered` holds an IOC finding at
+its base severity whatever the provenance or interactive context says. So the
+normal noise machinery cannot quieten one, and a `high` net step can carry a
+chain to the threshold where `maybe_contain` cuts the connection. Before the
+`domain` field the only answers were allowing the program for the whole rule or
+switching the rule off.
+
 ## Operating it
 
 ```

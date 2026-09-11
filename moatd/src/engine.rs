@@ -3215,6 +3215,12 @@ impl Daemon {
             // What the interpreter was actually running, so an entry can name
             // `gcloud.py` instead of blessing `python3`.
             script: f.actor.script.as_deref(),
+            // The resolved name and the entry that fired, so an allowlist entry
+            // can name the domain instead of blessing the browser.
+            domains: crate::allowlist::domain_candidates(
+                f.net.as_ref().and_then(|n| n.domain.as_deref()),
+                f.ioc.as_ref().map(|i| i.matched.as_str()),
+            ),
         };
         if let Some(hit) = self.allowlist.find(&cand) {
             let by = format!(

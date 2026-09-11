@@ -225,6 +225,7 @@ One JSON object per line, UTF-8, no pretty printing. Fields:
         {"scope": "exe",      "cmd": "moatctl ignore 01J8ZK... --scope exe",
          "line": "[[rule]]\nname = \"moat-cred-ssh-private-key-read\"\nexe = \"/home/dan/.local/share/mise/installs/node/26.5.0/bin/node\""},
         {"scope": "exe+file", "cmd": "moatctl ignore 01J8ZK... --scope exe+file", "line": "..."},
+        {"scope": "domain",   "cmd": "moatctl ignore 01J8ZK... --scope domain",   "line": "..."},
         {"scope": "parent",   "cmd": "moatctl ignore 01J8ZK... --scope parent",   "line": "..."},
         {"scope": "rule",     "cmd": "moatctl ignore 01J8ZK... --scope rule",     "line": "..."}
       ],
@@ -449,14 +450,16 @@ Requests:
                                           {"chain":null} when it is not in one
 {"cmd":"chain","limit":20}                the chains on record, newest first, plus
                                           "open" (live now) and "formed" (since start)
-{"cmd":"ignore","id":"<alert id>","scope":"exe|exe+file|parent|rule","comment":"..."}
+{"cmd":"ignore","id":"<alert id>","scope":"exe|exe+file|domain|exe+domain|parent|rule",
+                                          "comment":"..."}
                                           appends a [[rule]] block to allowlist.d/user.toml
                                           with a `# added <date> from alert <id>: <title>`
                                           comment, and acks the alert. Returns the exact
                                           block it wrote.
 {"cmd":"explain","id":"<alert id>"}       returns the alert with its full explain block
 {"cmd":"unignore","rule":"<n>"}           removes the n-th [[rule]] block from user.toml
-{"cmd":"allow","action":"preview","name":"...","exe":"...","file":"...","parent":"...","script":"..."}
+{"cmd":"allow","action":"preview","name":"...","exe":"...","file":"...","parent":"...",
+                                          "script":"...","domain":"..."}
                                           what this [[rule]] WOULD suppress, over every
                                           alert on record: {"matched":N,"by_rule":{},
                                           "sample":[...]}. Writes nothing, needs no root.
@@ -611,6 +614,12 @@ sudoers rule.
    name   = "moat-cred-ssh-private-key-read"   # or "moat-cred-*"
    exe    = "/home/dan/.local/share/mise/installs/node/*/bin/node"
    file   = "/home/dan/.ssh/id_rsa"                # exe+file scope adds this
+   domain = "sinkhole.example"                     # domain / exe+domain scope; matched
+                                                   # against BOTH the resolved name and
+                                                   # the feed entry that fired, and never
+                                                   # written by the baseline (a beacon
+                                                   # must not be able to learn its own
+                                                   # way out). docs/DOMAIN-FEED.md
    parent = "/usr/bin/restic"                      # parent scope: any exe under this parent
    script = "/opt/google-cloud-cli/lib/gcloud.py"  # what an INTERPRETER was running
    ```

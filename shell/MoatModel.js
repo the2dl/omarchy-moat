@@ -544,7 +544,12 @@ function normalizeAlert(record) {
 // The allowlist scopes CONTRACT 5's `ignore` accepts, narrowest first. Order
 // matters: it is the tiebreak when an alert offers options in an arbitrary
 // order and declares no recommendation.
-var IGNORE_SCOPES = ["exe+file", "exe", "parent", "rule"]
+// `domain` and `exe+domain` joined on 2026-09-11 with the domain feed. This
+// list is a WHITELIST -- `isIgnoreScope` drops anything not in it -- so a scope
+// the daemon offers and this array has not heard of is a chip that silently
+// never appears, and the user is left with `exe` (bless the browser for every
+// bad domain) or `rule` (turn the detection off) as their only answers.
+var IGNORE_SCOPES = ["exe+domain", "exe+file", "domain", "exe", "parent", "rule"]
 
 function isIgnoreScope(scope) {
   return IGNORE_SCOPES.indexOf(String(scope || "").toLowerCase()) !== -1
@@ -3759,6 +3764,20 @@ function setupSteps(needsPackage, needsGroup, group) {
 
 /// The parent program, as a person would name it: the nearest ancestor's
 /// basename. Used for the "anything makepkg starts" chip.
+/// The hostname an alert is about, for the chip labels.
+///
+/// The feed ENTRY when there is one, matching what the daemon writes into the
+/// rule: allowing the single resolved name would leave the next rotated label
+/// to alert all over again.
+function alertDomain(alert) {
+  if (!alert) return ""
+  var ioc = alert.ioc && typeof alert.ioc === "object" ? alert.ioc : null
+  var matched = ioc ? String(ioc.matched || "") : ""
+  if (matched.indexOf("domain:") === 0) return matched.slice(7)
+  var net = alert.net && typeof alert.net === "object" ? alert.net : null
+  return net ? String(net.domain || "") : ""
+}
+
 function parentProgram(alert) {
   var ancestry = alert && alert.process && Array.isArray(alert.process.ancestry)
     ? alert.process.ancestry : []
@@ -3775,6 +3794,7 @@ function silenceScopes(alert, count) {
   var options = ignoreOptions(alert)
   var program = incidentProgram(alert)
   var parent = parentProgram(alert)
+  var domain = alertDomain(alert)
   var out = []
   for (var i = 0; i < options.length; i++) {
     var o = options[i]
@@ -3785,8 +3805,8 @@ function silenceScopes(alert, count) {
       cmd: o.cmd,
       recommended: o.recommended && !broadest,
       broadest: broadest,
-      label: Copy.scopeChipLabel(o.scope, program, parent),
-      consequence: Copy.scopeConsequence(o.scope, program, parent, count)
+      label: Copy.scopeChipLabel(o.scope, program, parent, domain),
+      consequence: Copy.scopeConsequence(o.scope, program, parent, count, domain)
     })
   }
   out.sort(function (a, b) {

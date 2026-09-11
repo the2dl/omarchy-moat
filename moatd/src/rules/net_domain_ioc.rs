@@ -75,7 +75,12 @@ impl UserRule for NetDomainIoc {
             // wrong thing entirely. The finding is the connection.
             &[],
             &["kill", "ignore"],
-            "exe",
+            // The recommended scope, and `exe` was the wrong one from the day
+            // the feed arrived: it means "this browser never flags any of the
+            // 47,755 names again", when what the user is disagreeing with is
+            // ONE of them. `domain` is the narrow answer, and it is narrow in
+            // the dimension the alert is actually about.
+            "domain",
         )
     }
 
@@ -277,6 +282,57 @@ mod tests {
         assert!(ev.contains("feeds/domains-feed.txt"), "{}", ev);
         assert!(ev.contains("100% confidence"), "{}", ev);
         assert!(!ev.contains("compromised"), "{}", ev);
+    }
+
+    #[test]
+    fn the_offered_way_out_is_the_domain_and_not_the_browser() {
+        let dir = tempfile::tempdir().unwrap();
+        let feeds_dir = dir.path().join("feeds");
+        std::fs::create_dir_all(&feeds_dir).unwrap();
+        std::fs::write(
+            feeds_dir.join("domains-feed.txt"),
+            "# moat-domains v1\n# seq 7\nsinkhole.example\tClearFake\t90\t-\t2026-03-04\n",
+        )
+        .unwrap();
+        let feeds = Feeds::load(&feeds_dir);
+
+        let mut names = NameCache::default();
+        names.record(&resolved("cdn.sinkhole.example", "45.9.148.99"), 90);
+        let mut t = ProcTable::new(8, 60);
+        t.observe(&proc("e1", 4242, "/usr/bin/firefox", "", None));
+
+        let f = run(&mut NetDomainIoc::default(), &t, &feeds, &names, 100);
+        assert_eq!(f.len(), 1);
+
+        // A user who disagrees with one of 47,755 entries must not have to
+        // choose between blessing their browser for ALL of them and switching
+        // the detection off. `exe` was the recommendation until 2026-09-11 and
+        // it is the first of those two.
+        assert_eq!(f[0].meta.fp_hint, "domain");
+
+        let spec = crate::explain::scope_spec(&f[0], "domain").unwrap();
+        // The ENTRY, not the resolved leaf: allowing `cdn.sinkhole.example`
+        // alone leaves the next rotated label to alert tomorrow.
+        assert_eq!(spec.domain.as_deref(), Some("sinkhole.example"));
+        assert!(spec.exe.is_none(), "the program is not blessed: {:?}", spec);
+
+        let narrow = crate::explain::scope_spec(&f[0], "exe+domain").unwrap();
+        assert_eq!(narrow.exe.as_deref(), Some("/usr/bin/firefox"));
+        assert_eq!(narrow.domain.as_deref(), Some("sinkhole.example"));
+
+        // And the entry it writes actually covers the alert it came from.
+        let rule = crate::allowlist::rule_from_spec(spec, std::path::Path::new("user.toml"), 1).unwrap();
+        assert!(rule.matches(&crate::allowlist::Candidate {
+            rule: ID,
+            exe: "/usr/bin/firefox",
+            file: None,
+            parents: vec![],
+            script: None,
+            domains: crate::allowlist::domain_candidates(
+                Some("cdn.sinkhole.example"),
+                Some("domain:sinkhole.example"),
+            ),
+        }));
     }
 
     #[test]

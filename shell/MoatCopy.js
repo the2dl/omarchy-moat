@@ -599,11 +599,17 @@ var CHAIN_MEMBER_NOTE =
 ///
 /// `program` and `parent` are basenames out of the alert, so they render as
 /// PlainText everywhere and are never interpolated into a command.
-function scopeChipLabel(scope, program, parent) {
+function scopeChipLabel(scope, program, parent, domain) {
   var p = String(program || "this program")
+  var d = String(domain || "this name")
   switch (String(scope || "").toLowerCase()) {
   case "exe": return "when " + p + " does it"
   case "exe+file": return "only " + p + ", only this file"
+  // Named, not "this domain": the whole reason this scope exists is that the
+  // user is disagreeing with one specific entry out of forty-eight thousand,
+  // and a chip that does not say which one is asking them to trust it.
+  case "domain": return "only " + d
+  case "exe+domain": return "only " + p + ", only " + d
   case "parent": return parent ? "anything " + parent + " starts"
                                : "anything that same parent starts"
   case "rule": return "this detection, everywhere"
@@ -620,8 +626,9 @@ function scopeIsBroadest(scope) {
 
 /// The consequence card for the selected chip: one sentence on what goes quiet,
 /// one on what still reaches you and where to undo it.
-function scopeConsequence(scope, program, parent, count) {
+function scopeConsequence(scope, program, parent, count, domain) {
   var p = String(program || "this program")
+  var d = String(domain || "this name")
   var n = Number(count) || 0
   var many = n > 1 ? "Silences all " + n + " and anything like them, "
                    : "Silences this, and anything like it, "
@@ -636,6 +643,18 @@ function scopeConsequence(scope, program, parent, count) {
     return {
       silences: many + "as long as it is " + p + " and this same file.",
       through: p + " touching anything else still reaches you. " + undo
+    }
+  case "domain":
+    return {
+      silences: many + "as long as the name is " + d + " or something under it.",
+      through: "Every other name on the feed still reaches you, including from " +
+               p + ". " + undo
+    }
+  case "exe+domain":
+    return {
+      silences: many + "as long as it is " + p + " reaching " + d + ".",
+      through: "Anything else reaching " + d + ", and " + p + " reaching any other " +
+               "flagged name, still reaches you. " + undo
     }
   case "parent":
     return {

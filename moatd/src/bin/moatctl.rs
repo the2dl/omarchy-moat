@@ -130,7 +130,7 @@ enum Cmd {
     /// Stop alerting on this pattern; writes a [[rule]] block and acks.
     Ignore {
         id: String,
-        /// exe | exe+file | parent | rule
+        /// exe | exe+file | domain | exe+domain | parent | rule
         #[arg(long, default_value = "exe")]
         scope: String,
         /// Appended to the generated comment.
@@ -168,6 +168,11 @@ enum Cmd {
         /// without allowing every python program on the machine.
         #[arg(long)]
         script: Option<String>,
+        /// The hostname behind the connection, e.g. sinkhole.example or
+        /// *.lab.example. This is how you disagree with ONE entry of the
+        /// domain feed without blessing the program that reached it.
+        #[arg(long)]
+        domain: Option<String>,
         /// Appended to the generated comment. Say WHY; `moatctl allowlist`
         /// will still be showing it in six months.
         #[arg(long)]
@@ -418,6 +423,7 @@ fn main() -> ExitCode {
             file,
             parent,
             script,
+            domain,
             comment,
             yes,
         } => json!({
@@ -428,6 +434,7 @@ fn main() -> ExitCode {
             "file": file.clone().unwrap_or_default(),
             "parent": parent.clone().unwrap_or_default(),
             "script": script.clone().unwrap_or_default(),
+            "domain": domain.clone().unwrap_or_default(),
             "comment": comment.clone().unwrap_or_default(),
         }),
         Cmd::Allowlist => json!({"cmd": "allowlist"}),
@@ -1998,6 +2005,9 @@ fn print_allowlist(r: &Value) {
             // `gcloud.py` displayed as nothing but `exe = /usr/bin/python3.14`,
             // so the review read WIDER than the rule actually was.
             ("script", "script"),
+            // Same reason: an entry that names one hostname displayed as if it
+            // named the whole rule, which reads far WIDER than it is.
+            ("domain", "domain"),
         ] {
             if let Some(v) = x[key].as_str() {
                 println!("     {} = {}", label, v);

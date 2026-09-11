@@ -4511,6 +4511,63 @@ TestCase {
     compare(f[ai + 1], "/usr/bin/python3 (pid 42)")
   }
 
+  /// IGNORE_SCOPES is a whitelist, so a scope the daemon offers and the panel
+  /// has not heard of is a chip that silently never appears -- leaving the
+  /// user with "bless this browser for all 47,755 names" or "turn the
+  /// detection off" as their only two buttons.
+  function test_a_domain_alert_offers_a_chip_for_the_domain_itself() {
+    var alert = {
+      id: "01M28F", rule: "moat-x-net-domain-ioc", severity: "high",
+      process: { exe: "/usr/bin/firefox", ancestry: [] },
+      ioc: { source: "domain-feed", matched: "domain:sinkhole.example" },
+      net: { dst_ip: "45.9.148.99", dst_port: 443, domain: "cdn.sinkhole.example" },
+      explain: {
+        if_expected: {
+          hint: "domain",
+          file: "/etc/moat/allowlist.d/user.toml",
+          options: [
+            { scope: "domain", cmd: "moatctl ignore 01M28F --scope domain",
+              line: "[[rule]]\nname = \"moat-x-net-domain-ioc\"\ndomain = \"sinkhole.example\"\n" },
+            { scope: "exe+domain", cmd: "moatctl ignore 01M28F --scope exe+domain",
+              line: "[[rule]]\nname = \"moat-x-net-domain-ioc\"\nexe = \"/usr/bin/firefox\"\ndomain = \"sinkhole.example\"\n" },
+            { scope: "exe", cmd: "moatctl ignore 01M28F --scope exe",
+              line: "[[rule]]\nname = \"moat-x-net-domain-ioc\"\nexe = \"/usr/bin/firefox\"\n" },
+            { scope: "rule", cmd: "moatctl ignore 01M28F --scope rule",
+              line: "[[rule]]\nname = \"moat-x-net-domain-ioc\"\n" }
+          ]
+        }
+      }
+    }
+    // Through the real normalizer, not straight into silenceScopes: the
+    // whitelist runs in normalizeIfExpectedOption, and a test that skips it
+    // passes with `domain` deleted from IGNORE_SCOPES -- which is exactly what
+    // this test exists to catch.
+    var norm = Model.normalizeAlert(alert)
+    compare(norm.explain.if_expected.hint, "domain",
+            "an unknown scope blanks the hint and the fallback picks exe")
+    compare(norm.explain.if_expected.other.length, 0,
+            "domain chips must not fall through into the other-options section")
+
+    var chips = Model.silenceScopes(norm, 1)
+    var scopes = chips.map(function (c) { return c.scope })
+    verify(scopes.indexOf("domain") >= 0, "no domain chip: " + scopes.join(", "))
+    verify(scopes.indexOf("exe+domain") >= 0, "no exe+domain chip: " + scopes.join(", "))
+
+    var dom = chips.filter(function (c) { return c.scope === "domain" })[0]
+    // The chip has to NAME the entry. "only this domain" asks the user to
+    // trust that it picked the right one out of forty-eight thousand.
+    verify(dom.label.indexOf("sinkhole.example") >= 0, "label: " + dom.label)
+    verify(dom.recommended, "the narrow option is the recommendation, not exe")
+    verify(!dom.broadest)
+    // And the consequence says what still gets through.
+    verify(dom.consequence.through.indexOf("Every other name") >= 0,
+           "through: " + dom.consequence.through)
+
+    // The machine-wide chip is still drawn last and still dull.
+    compare(chips[chips.length - 1].scope, "rule")
+    verify(chips[chips.length - 1].broadest)
+  }
+
   /// normalizeStatus is a whitelist and has dropped a field five times. The
   /// domain wing sends four that travel together; one missing makes the panel
   /// say a machine has no domain list when it has forty-eight thousand names.

@@ -1761,6 +1761,7 @@ fn spec_from_req(req: &Value) -> RuleSpec {
         file: f("file"),
         parent: f("parent"),
         script: f("script"),
+        domain: f("domain"),
     }
 }
 
@@ -1782,6 +1783,10 @@ fn would_match(d: &Daemon, rule: &crate::allowlist::Rule) -> Value {
             file: a.file.as_ref().map(|x| x.path.as_str()),
             parents,
             script: a.actor.script.as_deref(),
+            domains: crate::allowlist::domain_candidates(
+                a.net.as_ref().and_then(|n| n.domain.as_deref()),
+                a.ioc.as_ref().map(|i| i.matched.as_str()),
+            ),
         };
         if !rule.matches(&cand) {
             continue;
@@ -2083,6 +2088,10 @@ fn cmd_allowlist(d: &Daemon) -> Value {
                 // showing something WIDER than the rule, which is the one
                 // direction a review must never be misled in.
                 "script": r.spec.script,
+                // Same lesson, 2026-09-11: a `domain` entry left out here
+                // would list as "allow moat-x-net-domain-ioc", i.e. the entire
+                // rule, when it allows exactly one hostname.
+                "domain": r.spec.domain,
                 "toml": r.to_toml(),
             })
         })
@@ -2279,6 +2288,8 @@ fn baseline_accept(d: &mut Daemon, id: &str, who: &str) -> Value {
         file: (!p.dir.is_empty()).then(|| format!("{}/*", p.dir.trim_end_matches('/'))),
         parent: (!p.parent.is_empty()).then(|| p.parent.clone()),
         script: None,
+        // Never learned; see `baseline::Tuple::spec`.
+        domain: None,
     };
     let block = match crate::allowlist::append_rule(&path, &comment, &spec) {
         Ok(b) => b,
@@ -5723,6 +5734,48 @@ mod tests {
             "{:?}",
             listed
         );
+    }
+
+    /// The preview and the evaluator have to agree about domains.
+    ///
+    /// `would_match` builds its own `Candidate` and its whole promise is that
+    /// it answers the same question the daemon will. Two hand-built candidates
+    /// is the shape this codebase gets wrong most often, so both now go
+    /// through `allowlist::domain_candidates` -- and this is the test that
+    /// notices if one of them stops.
+    #[test]
+    fn the_preview_sees_the_same_domains_the_evaluator_does() {
+        use crate::allowlist::{domain_candidates, rule_from_spec, Candidate, RuleSpec};
+
+        let spec = RuleSpec {
+            name: "moat-x-net-domain-ioc".into(),
+            domain: Some("evil.example".into()),
+            ..Default::default()
+        };
+        let rule = rule_from_spec(spec, std::path::Path::new("user.toml"), 1).unwrap();
+
+        // Exactly what a stored alert offers: a resolved subdomain and the
+        // parent entry that actually fired.
+        let resolved = "cdn.evil.example";
+        let matched = "domain:evil.example";
+        let cand = Candidate {
+            rule: "moat-x-net-domain-ioc",
+            exe: "/usr/bin/curl",
+            file: None,
+            parents: vec![],
+            script: None,
+            domains: domain_candidates(Some(resolved), Some(matched)),
+        };
+        assert!(rule.matches(&cand), "the entry covers the alert it was written from");
+
+        // And the narrowing is the entry, not the leaf: allowing what fired
+        // must cover the next rotated label too, or the user allows one name
+        // and gets alerted again tomorrow.
+        let rotated = Candidate {
+            domains: domain_candidates(Some("cdn2.evil.example"), Some(matched)),
+            ..cand
+        };
+        assert!(rule.matches(&rotated));
     }
 
     /// The blast radius, before the grant.
