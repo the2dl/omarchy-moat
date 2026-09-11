@@ -53,6 +53,45 @@ case "$CARCH" in
 	aarch64) _tetarch=arm64 ;;
 esac
 
+# --- aarch64 only: the Tetragon RELEASE cannot start on a 16K-page kernel ----
+#
+# Apple Silicon runs CONFIG_ARM64_16K_PAGES=y, and v1.7.1 dies there before any
+# moat policy is considered:
+#
+#   sensor __base__ failed to load: map tg_rb_events: map create:
+#   invalid argument (ring map size 4096 not a multiple of page size 16384)
+#
+# The ring-buffer placeholder in bpf/lib/bpf_event.h is 4096 and the kernel
+# wants a multiple of PAGE_SIZE. Upstream fixed it in PR #5027 (issue #5026),
+# raising the placeholder to 65536 -- valid across 4K, 16K and 64K -- and
+# merged it to main on 2026-05-25. v1.7.0 was cut in April, BEFORE that, and
+# v1.7.1 is a patch on the v1.7 branch that never took the backport. So the
+# newest release is the one release that cannot run on this hardware.
+#
+# Until a release carries it, aarch64 takes Tetragon from the CI build of main,
+# pinned by OCI layer digest. A digest IS the sha256 of the blob, so the rule
+# that the one artifact we do not build ourselves is never SKIP-checksummed
+# still holds -- prepare() verifies each blob against the digest below and
+# refuses on a mismatch.
+#
+# Everything comes from main TOGETHER. The 94 object names are identical
+# between the two, but main is 830 commits ahead of v1.7.1, so pairing v1.7.1's
+# userspace with main's BPF is the one combination nobody tests. `bpftool` is
+# the single exception: main's image does not ship one, it is a standalone
+# kernel tool rather than part of Tetragon, and nothing in moat or tetragon
+# invokes it -- so it keeps coming from the release tarball.
+#
+# DELETE ALL OF THIS once a Tetragon release contains #5027: drop the digests,
+# drop the prepare() hook, and aarch64 goes back to the tarball like x86_64.
+# https://github.com/cilium/tetragon/pull/5027
+_tetragon_ci_ref='quay.io/cilium/tetragon-ci@sha256:770ca23ad8b22011fe918fd9ba72c677ec0f1bce9b441e0ca285970087cc69ee'
+_tetragon_ci_layers=(
+	'sha256:f3fc0095f3f7abf9c615a58c811df19e6434c4e41be85a066d952ef70ea8b8db'  # usr/bin/tetragon
+	'sha256:573ee5231bbbcb945524baf4034343ed81608ce12b42ea0079072f51596e4a71'  # usr/bin/tetra
+	'sha256:a22adaf7282b31c9bff95e36348790f0a57e700bb610cae5085281bb09286fd4'  # usr/bin/gops
+	'sha256:7578345112324c2217aa8b909a7c08b94337e487222bd7ced32b6fd03b369a0e'  # var/lib/tetragon/*.o
+)
+
 source=(
 	"tetragon-${_tetragonver}-LICENSE::https://raw.githubusercontent.com/cilium/tetragon/v${_tetragonver}/LICENSE"
 	"tetragon-${_tetragonver}-LICENSE.bpf::https://raw.githubusercontent.com/cilium/tetragon/v${_tetragonver}/bpf/LICENSE.GPL-2.0"
@@ -119,12 +158,86 @@ backup=(
 # The repository working tree, copied into $srcdir by prepare().
 _tree="${pkgname}-tree"
 
+# Fetch the pinned Tetragon CI layers and lay them over the release tarball.
+#
+# Only on aarch64, and only until a release carries PR #5027 -- see the long
+# note beside `_tetragon_ci_layers`. `source=` cannot express this: quay needs a
+# bearer token (anonymous, but still a header) that makepkg's download agents do
+# not send, so the fetch lives here and does its own integrity check. That check
+# is not weaker than makepkg's: an OCI digest is the sha256 of the blob, so
+# comparing them is exactly what `sha256sums` would do.
+_tetragon_from_ci() {
+	local dir="${srcdir}/tetragon-v${_tetragonver}-${_tetarch}"
+	local repo='cilium/tetragon-ci'
+	local token blob got n=0
+
+	token="$(curl -fsSL --max-time 60 \
+		"https://quay.io/v2/auth?service=quay.io&scope=repository:${repo}:pull" \
+		| python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')" || {
+		error 'could not get a quay.io pull token for the Tetragon CI image'
+		return 1
+	}
+
+	for blob in "${_tetragon_ci_layers[@]}"; do
+		n=$((n + 1))
+		msg2 "Tetragon CI layer ${n}/${#_tetragon_ci_layers[@]}"
+		if ! curl -fsSL --max-time 600 -H "Authorization: Bearer ${token}" \
+			"https://quay.io/v2/${repo}/blobs/${blob}" -o "${srcdir}/tglayer${n}.tgz"; then
+			# CI images are garbage-collected eventually. When that happens this
+			# is the message that has to be useful, because the build is dead
+			# until somebody re-pins or a release ships the fix.
+			error "Tetragon CI layer ${blob} is gone from quay.io."
+			error 'Re-pin from a current tetragon-ci build, or switch aarch64 back'
+			error 'to the release tarball if a release now contains PR #5027.'
+			return 1
+		fi
+		got="sha256:$(sha256sum "${srcdir}/tglayer${n}.tgz" | cut -d' ' -f1)"
+		if [[ ${got} != "${blob}" ]]; then
+			error "Tetragon CI layer ${n}: expected ${blob}, got ${got}"
+			return 1
+		fi
+	done
+
+	# The CI image lays things out differently from the release tarball:
+	# /usr/bin/{tetragon,tetra,gops} and a FLAT /var/lib/tetragon/*.o, against
+	# the tarball's usr/local/{bin,lib/tetragon/bpf}. Overwrite in place so
+	# package() keeps reading one layout and does not learn about any of this.
+	local tmp="${srcdir}/tgci"
+	rm -rf "${tmp}"; install -d "${tmp}"
+	for n in 1 2 3 4; do
+		bsdtar -xf "${srcdir}/tglayer${n}.tgz" -C "${tmp}" 2>/dev/null || true
+	done
+
+	install -Dm755 "${tmp}/usr/bin/tetragon" "${dir}/usr/local/bin/tetragon"
+	install -Dm755 "${tmp}/usr/bin/tetra"    "${dir}/usr/local/bin/tetra"
+	install -Dm755 "${tmp}/usr/bin/gops"     "${dir}/usr/local/lib/tetragon/gops"
+
+	rm -f "${dir}/usr/local/lib/tetragon/bpf/"*.o
+	install -d "${dir}/usr/local/lib/tetragon/bpf"
+	install -m644 "${tmp}/var/lib/tetragon/"*.o "${dir}/usr/local/lib/tetragon/bpf/"
+
+	# The reason the whole detour exists. If this is ever 4096 again the sensor
+	# will not start on a 16K-page kernel, and it must not be discovered by a
+	# user watching tetragon.service crash-loop.
+	local probe="${dir}/usr/local/lib/tetragon/bpf/bpf_execve_map_update_v511.o"
+	if [[ -f ${probe} ]] && ! grep -qa 'tg_rb_events' "${probe}"; then
+		error 'the CI objects do not contain tg_rb_events; the layout changed'
+		return 1
+	fi
+
+	msg2 "Tetragon: userspace and BPF from ${_tetragon_ci_ref}, bpftool from v${_tetragonver}"
+}
+
 prepare() {
 	local repo="${startdir}/.."
 
 	if [[ ! -f ${repo}/docs/CONTRACT.md || ! -f ${repo}/moatd/Cargo.toml ]]; then
 		error 'run makepkg from the pkg/ directory of the omarchy-moat checkout'
 		return 1
+	fi
+
+	if [[ ${CARCH} == aarch64 ]]; then
+		_tetragon_from_ci || return 1
 	fi
 
 	# `shell` is NOT installed by package() -- the panel is a separate Omarchy
