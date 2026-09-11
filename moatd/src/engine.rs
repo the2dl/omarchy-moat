@@ -3014,11 +3014,59 @@ impl Daemon {
     /// (`scoring::has_ioc`) whichever rule raised it. The dedicated
     /// `moat-x-net-domain-ioc` rule exists for the connections no other rule
     /// reports -- a familiar /24, a registry CIDR.
+    /// "Who asked for this name", if the varlink probe saw the lookup.
+    ///
+    /// Returns `(who, evidence line)`. Split out because it has to run in two
+    /// places: when the name arrived from the resolved-stream cache, and when a
+    /// rule set it by matching the feed. The claim is about the NAME, not about
+    /// how the name got onto the finding.
+    ///
+    /// "a DIFFERENT process" is called out rather than left for the reader: a
+    /// browser and its helpers split resolve-and-connect constantly, and so
+    /// does a payload that resolves a name and hands the address to something
+    /// else.
+    fn asker_evidence(
+        queries: &crate::names::QueryLog,
+        name: &str,
+        connecting_pid: u32,
+        now: u64,
+    ) -> Option<(String, String)> {
+        let a = queries.asked_by(name, now)?;
+        let who = format!("{} (pid {})", a.exe, a.pid);
+        let same = connecting_pid == a.pid;
+        let line = format!(
+            "asked by: {} looked {} up {} before this connection{}",
+            who,
+            name,
+            crate::util::human_secs(now.saturating_sub(a.at)),
+            if same {
+                " -- the same process that connected"
+            } else {
+                " -- a DIFFERENT process than the one that connected"
+            }
+        );
+        Some((who, line))
+    }
+
     fn enrich_names(&self, f: &mut Finding, now: u64) {
         let Some(net) = f.net.as_mut() else {
             return;
         };
-        if net.domain.is_some() {
+        // A rule may already have put a name here by matching the feed. The
+        // address cache below cannot improve on that -- but the query probe can
+        // still say WHO asked, and a feed hit is exactly the alert where that
+        // matters most. Until 2026-09-11 this early-returned on a set domain,
+        // so a `moat-x-net-domain-ioc` alert never named the asker: the one
+        // alert that most needed it was the one that never got it.
+        if let Some(name) = net.domain.clone() {
+            if net.domain_queried_by.is_none() {
+                if let Some((who, line)) =
+                    Self::asker_evidence(&self.queries, &name, f.proc.pid, now)
+                {
+                    net.domain_queried_by = Some(who);
+                    f.extra_evidence.push(line);
+                }
+            }
             return;
         }
         let looked_up = net
@@ -3050,25 +3098,11 @@ impl Daemon {
                 // without saying which client made them, so `domain` alone is
                 // an inference from the address. This is observed in the asking
                 // process's own context.
-                if let Some(a) = self.queries.asked_by(&l.name, now) {
-                    let who = format!("{} (pid {})", a.exe, a.pid);
-                    net.domain_queried_by = Some(who.clone());
-                    let same = f.proc.pid == a.pid;
-                    f.extra_evidence.push(format!(
-                        "asked by: {} looked {} up {} before this connection{}",
-                        who,
-                        l.name,
-                        crate::util::human_secs(now.saturating_sub(a.at)),
-                        if same {
-                            " -- the same process that connected"
-                        } else {
-                            // Worth saying out loud. One process resolving and
-                            // another connecting is ordinary for a browser and
-                            // its helpers, and is also what a payload looks
-                            // like when it hands an address to something else.
-                            " -- a DIFFERENT process than the one that connected"
-                        }
-                    ));
+                if let Some((who, line)) =
+                    Self::asker_evidence(&self.queries, &l.name, f.proc.pid, now)
+                {
+                    net.domain_queried_by = Some(who);
+                    f.extra_evidence.push(line);
                 }
                 if f.ioc.is_none() {
                     if let Some(entry) = self.feeds.domain_hit(&l.name) {
@@ -6942,6 +6976,64 @@ mod tests {
         // Retention: `tick` prunes, and a pruned address reads as unknown.
         d.tick(now + d.cfg.names.retain_secs + 1, false);
         assert!(d.names.is_empty());
+    }
+
+    /// The attribution has to survive a name that a RULE put on the finding.
+    ///
+    /// `moat-x-net-domain-ioc` sets `net.domain` itself, because it matched
+    /// that name against the feed -- and until 2026-09-11 `enrich_names`
+    /// early-returned whenever a domain was already present, so the one alert
+    /// where "who asked for this bad name" matters most was the one that never
+    /// carried it. Found live: a domain-feed hit with the asker blank while a
+    /// plain first-contact alert to the same machine had it.
+    #[test]
+    fn a_name_put_on_the_finding_by_a_rule_still_gets_its_asker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.thresholds.dedupe_secs = 0;
+        d.names_state = "connected".into();
+
+        // The varlink probe saw curl look the name up, a moment before.
+        let now = util::unix_secs();
+        d.queries.record("evil.example", 7100, "/usr/bin/curl", now - 3);
+
+        // A finding that already carries the name, exactly as the domain-ioc
+        // rule leaves it -- not from the resolved-stream cache, which is empty.
+        let proc = ProcInfo {
+            exec_id: "e-curl".into(),
+            pid: 7100,
+            uid: 1000,
+            exe: "/usr/bin/curl".into(),
+            args: String::new(),
+            cwd: "/home/dan".into(),
+            start_time: util::now_rfc3339(),
+            ..Default::default()
+        };
+        let mut f = Finding::new(
+            "moat-x-net-domain-ioc",
+            crate::policy::PolicyMeta::fallback("moat-x-net-domain-ioc"),
+            proc,
+        );
+        f.meta.family = "net".into();
+        f.meta.severity = "high".into();
+        let mut net = crate::alert::NetRef::new("45.9.148.99", 443);
+        net.domain = Some("evil.example".into());
+        f.net = Some(net);
+
+        let id = d.emit(f).expect("recorded");
+        let a = d.store.find(&id).unwrap();
+        let net = a.net.as_ref().unwrap();
+        assert_eq!(
+            net.domain_queried_by.as_deref(),
+            Some("/usr/bin/curl (pid 7100)"),
+            "a rule-set name must still be attributed to who asked for it"
+        );
+        assert!(
+            a.explain.evidence.iter().any(|l| l.starts_with("asked by: /usr/bin/curl (pid 7100)")
+                && l.contains("the same process that connected")),
+            "{:?}",
+            a.explain.evidence
+        );
     }
 
     // ------------------------------------------------------------- telemetry

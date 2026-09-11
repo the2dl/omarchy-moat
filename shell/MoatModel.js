@@ -3388,6 +3388,39 @@ function normalizeNames(raw) {
 /// `domain: null` for a literal address, a resolver it could not see (DoH in
 /// the browser), an answer older than its window, or the stream being off --
 /// and it says which in `explain.evidence`. Here there is room for one phrase.
+/// Who looked the name up: `node (pid 1484076)`, and whether that was the same
+/// process that connected.
+///
+/// A separate row from `resolved from`, because it is a different and stronger
+/// claim. `domain` is keyed by the ADDRESS -- this machine resolved that name
+/// to that address recently, so a connection there probably belongs to it,
+/// which on a shared CDN address is a guess. This is keyed by the NAME and
+/// observed in the asking process's own context.
+///
+/// "a DIFFERENT process" is called out rather than left for the reader to
+/// notice: a browser and its helpers do it constantly, and so does a payload
+/// that resolves a name and hands the address to something else.
+function askedByLine(alert) {
+  var net = alert && alert.net
+  if (!net || typeof net !== "object") return ""
+  var who = net.domain_queried_by
+  if (!who) {
+    // Only worth a row once there is a name to have asked for. On a literal-IP
+    // connection there was no lookup at all, and saying "not recorded" there
+    // implies one is missing.
+    return net.domain ? "not recorded" : ""
+  }
+  var exe = String(alert.process && alert.process.exe ? alert.process.exe : "")
+  var pid = alert.process ? Number(alert.process.pid) : NaN
+  var same = false
+  if (exe && isFinite(pid)) {
+    // `who` is "<exe> (pid N)" as the daemon formatted it.
+    same = String(who) === exe + " (pid " + pid + ")"
+  }
+  return String(who) + (same ? "  ·  the process that connected"
+                             : "  ·  a different process")
+}
+
 function domainLine(net) {
   if (!net || typeof net !== "object") return ""
   if (net.domain) {

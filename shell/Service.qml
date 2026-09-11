@@ -1184,6 +1184,11 @@ Item {
     }
 
     /// `{ "<pid>": [{time, text, alert}] }` for the process tree's detail panel.
+    /// Who looked the connection's name up, for the evidence block.
+    function askedByLine(alert) {
+        return Model.askedByLine(alert);
+    }
+
     function processEvents(incident, headId) {
         return Model.processEvents(incident, headId);
     }

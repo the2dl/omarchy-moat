@@ -4458,6 +4458,42 @@ TestCase {
     compare(Object.keys(Model.processEvents(null, "")).length, 0)
   }
 
+  /// Who asked is a different and stronger claim than what the address
+  /// resolved to, so it gets its own row -- and the row says whether the asker
+  /// was the process that connected, because a browser and its helpers split
+  /// those constantly and so does a payload handing an address to something
+  /// else.
+  function test_the_asked_by_row_names_the_process_and_whether_it_connected() {
+    var same = Model.askedByLine({
+      process: { exe: "/usr/bin/node", pid: 1484076 },
+      net: { dst_ip: "1.2.3.4", domain: "psdb.cloud",
+             domain_queried_by: "/usr/bin/node (pid 1484076)" }
+    })
+    compare(same, "/usr/bin/node (pid 1484076)  ·  the process that connected")
+
+    var other = Model.askedByLine({
+      process: { exe: "/usr/bin/curl", pid: 99 },
+      net: { dst_ip: "1.2.3.4", domain: "psdb.cloud",
+             domain_queried_by: "/usr/bin/node (pid 1484076)" }
+    })
+    compare(other, "/usr/bin/node (pid 1484076)  ·  a different process")
+  }
+
+  /// The distinction the row has to keep: a name with no asker is a gap worth
+  /// stating, and a connection with no name had no lookup to attribute at all.
+  function test_asked_by_is_blank_only_when_there_was_no_lookup() {
+    // A name, but nobody recorded asking -- a Go binary, or a lookup from
+    // before moatd started. Worth saying.
+    compare(Model.askedByLine({ net: { domain: "example.com" } }), "not recorded")
+
+    // A literal-IP connection. There was no lookup, so no row.
+    compare(Model.askedByLine({ net: { dst_ip: "1.2.3.4" } }), "")
+
+    // No net at all, and a missing alert, are both empty rather than errors.
+    compare(Model.askedByLine({}), "")
+    compare(Model.askedByLine(null), "")
+  }
+
   /// "Never updated" is a fault. "No key configured" is a setup step nobody
   /// took. The footer said the first when it meant the second, and the reason
   /// existed only in the journal of a service that exits successfully.

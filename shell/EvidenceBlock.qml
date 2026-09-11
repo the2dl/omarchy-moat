@@ -56,6 +56,9 @@ Rectangle {
             // Always a row, so "not recorded" is said rather than implied: a
             // connection with no name on it is not a connection that had none.
             add("resolved from", Model.domainLine(a.net));
+            // Who ASKED, when the attribution probe saw it. Blank on a
+            // literal-IP connection, where there was no lookup to attribute.
+            add("asked by", Model.askedByLine(a));
         }
 
         add("first seen here", a.rarity_text);
