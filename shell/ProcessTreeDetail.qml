@@ -67,7 +67,7 @@ Rectangle {
             text: detail.base(detail.node ? detail.node.exe : "") || "?"
             color: detail.t ? detail.t.primary : "white"
             font.family: detail.t ? detail.t.family : "monospace"
-            font.pixelSize: detail.t ? detail.t.fBody : 13
+            font.pixelSize: detail.t ? detail.t.fSecondary : 12
             font.weight: Font.Medium
             wrapMode: Text.WrapAnywhere
         }
@@ -110,7 +110,7 @@ Rectangle {
                             ? (detail.t ? detail.t.ramp(0.78) : "grey")
                             : (detail.t ? detail.t.secondary : "white"))
                     font.family: detail.t ? detail.t.family : "monospace"
-                    font.pixelSize: detail.t ? detail.t.fSecondary : 12
+                    font.pixelSize: detail.t ? detail.t.fMeta : 11
                     wrapMode: index % 2 === 0 ? Text.NoWrap : Text.WrapAnywhere
                 }
             }

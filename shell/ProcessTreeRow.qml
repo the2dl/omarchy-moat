@@ -72,12 +72,24 @@ Item {
             text: row.depth === 0 ? "" : (row.isSibling ? "╌─" : "└─")
             color: row.t ? row.t.fainter : "grey"
             font.family: row.t ? row.t.family : "monospace"
-            font.pixelSize: row.t ? row.t.fSecondary : 12
+            font.pixelSize: row.t ? row.t.fMeta : 11
+        }
+
+        ProcessTreeMark {
+            anchors.verticalCenter: parent.verticalCenter
+            height: row.t ? row.t.s(9) : 7
+            kind: row.isFlagged ? "flagged" : "lineage"
+            // Siblings are context, not lineage: no mark, so the column of
+            // marks reads as the path and nothing else.
+            visible: !row.isSibling
+            tone: row.isFlagged ? (row.t ? row.t.alarm : "red")
+                : row.isSelected ? (row.t ? row.t.faint : "grey")
+                : (row.t ? row.t.fainter : "grey")
         }
 
         Text {
             anchors.verticalCenter: parent.verticalCenter
-            width: row.t ? row.t.s(62) : 46
+            width: row.t ? row.t.s(58) : 43
             horizontalAlignment: Text.AlignRight
             text: {
                 var p = row.node ? row.node.pid : undefined;
@@ -87,7 +99,7 @@ Item {
                  : (row.isSibling ? (row.t ? row.t.ramp(0.78) : "grey")
                                   : (row.t ? row.t.fainter : "grey"))
             font.family: row.t ? row.t.family : "monospace"
-            font.pixelSize: row.t ? row.t.fSecondary : 12
+            font.pixelSize: row.t ? row.t.fMeta : 11
         }
 
         Text {
@@ -97,7 +109,10 @@ Item {
                  : row.isSelected ? (row.t ? row.t.primary : "white")
                  : (row.t ? row.t.secondary : "grey")
             font.family: row.t ? row.t.family : "monospace"
-            font.pixelSize: row.isSibling ? (row.t ? row.t.fSecondary : 12) : (row.t ? row.t.fBody : 13)
+            // fSecondary, not fBody. The rest of the card is fSecondary and
+            // fMeta almost everywhere -- 14 uses to 1 -- so a tree at fBody
+            // read as a larger, separate thing bolted onto the card.
+            font.pixelSize: row.isSibling ? (row.t ? row.t.fMeta : 11) : (row.t ? row.t.fSecondary : 12)
             font.weight: row.isSibling ? Font.Normal : Font.Medium
         }
 

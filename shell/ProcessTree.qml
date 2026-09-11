@@ -162,7 +162,9 @@ Column {
         text: root.summary
         color: root.t ? root.t.primary : "white"
         font.family: root.t ? root.t.family : "monospace"
-        font.pixelSize: root.t ? root.t.fBody : 13
+        // fSecondary like the rest of the card; this was the one line at
+        // fBody and it made the whole block look oversized.
+        font.pixelSize: root.t ? root.t.fSecondary : 12
         elide: Text.ElideRight
         // One line, always. The summary is meant to be scanned; a chain deep
         // enough to wrap is a chain to open rather than to read across.
