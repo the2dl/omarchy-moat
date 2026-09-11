@@ -96,11 +96,14 @@ net_first_contact = true
 # matching the local hash feed (feeds/hashes.txt, operator-supplied).
 new_exec_ioc = true
 
-# A connection to an address this machine resolved from a name in
-# feeds/domains.txt (operator-supplied, one domain per line, `#` comments; an
-# entry matches itself and every subdomain). The name comes from
-# systemd-resolved's query stream -- see [names] below and docs/DNS.md -- so
-# this is inert when that is off. `high`: a domain feed is coarser than a hash.
+# A connection to an address this machine resolved from a name on either
+# domain list: feeds/domains-feed.txt (fetched, signed, ~48k domains from
+# ThreatFox) or feeds/domains.txt (yours, one domain per line, `#` comments).
+# An entry matches itself and every subdomain, and yours wins a tie. The name
+# comes from systemd-resolved's query stream -- see [names] below and
+# docs/DNS.md -- so this is inert when that is off. `high`: a domain feed is
+# coarser than a hash, and about one published entry in five is a legitimate
+# site that was broken into rather than one registered to do harm.
 net_domain_ioc = true
 
 # One process reading many distinct CREDENTIAL files in seconds -- the files

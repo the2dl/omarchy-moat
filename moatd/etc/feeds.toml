@@ -2,9 +2,17 @@
 #
 # No credential lives here any more. moat used to fetch abuse.ch
 # (MalwareBazaar / ThreatFox / URLhaus), which requires an Auth-Key, so a
-# machine without a key had no feed at all. It now pulls a signed, keyless
-# malicious-package index that the six scanners read offline before an install
-# runs. See docs/PACKAGE-FEED.md.
+# machine without a key had no feed at all. It now pulls signed, keyless
+# artifacts from an aggregator: the malicious-package index that the six
+# scanners read offline before an install runs (docs/PACKAGE-FEED.md), and a
+# ~48k-entry malicious-domain list matched against the hostname behind each
+# outbound connection (docs/DOMAIN-FEED.md). ThreatFox is the source of the
+# second one and still needs no key here: its bulk exports are unauthenticated
+# and only the aggregator reads them.
+#
+# Both arrive through one pointer.json and are verified with the same key.
+# The domain list installs as feeds/domains-feed.txt. Your own
+# feeds/domains.txt is never written by a refresh, and wins a tie.
 
 enabled = true
 

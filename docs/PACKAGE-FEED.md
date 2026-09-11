@@ -307,11 +307,26 @@ seeing it, from an hour to a few minutes. Because the common tick is a 304 on a
 Jitter is not optional. Without `RandomizedDelaySec`, every machine fires on the
 quarter hour and the aggregate looks like a thundering herd.
 
+## A second wing: domains
+
+Since 2026-09-11 the same aggregator publishes a second signed artifact, a
+~48k-entry malicious-domain list built from ThreatFox, referenced from a
+`domains` block in this same `pointer.json`. It has its own sequence and is
+published independently: the two feeds move at completely different rates and
+neither should pay the other's bandwidth. `moat-feeds` installs it as
+`domains-feed.txt`, which is a fourth file and not a rewrite of the operator's
+`domains.txt`. Format, gates and client contract: `docs/DOMAIN-FEED.md`.
+
+That ThreatFox is usable at all revises the note below. It wanted an `Auth-Key`
+and still does — for its JSON API. Its bulk exports are unauthenticated, and
+one aggregator reading them serves the whole fleet.
+
 ## What was lost by dropping abuse.ch
 
-`hashes.txt`, `domains.txt` and `urls.txt` are no longer fetched by anything.
-The files are still **read** if present, so an operator can drop in their own
-indicators, and `moat-x-new-exec-ioc` still matches against `hashes.txt`.
+`hashes.txt` and `urls.txt` are no longer fetched by anything (`domains.txt`
+has a published companion again; see above). The files are still **read** if
+present, so an operator can drop in their own indicators, and
+`moat-x-new-exec-ioc` still matches against `hashes.txt`.
 
 There is no keyless replacement for the sha256 feed: OSV malicious-package
 records identify packages, not file hashes. This is a real reduction in what

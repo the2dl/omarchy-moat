@@ -92,8 +92,9 @@ docs/           CONTRACT.md is the spec every component builds against
 `docs/CONTRACT.md` before touching anything. `docs/BASELINE.md` for the learning
 and noise model, `docs/TETRAGON-NOTES.md` for what the sensor actually reports.
 `docs/LPE.md` and `docs/CANARIES.md` cover the two newest detection surfaces,
-`docs/DNS.md` the name-resolution artifact on network alerts, and
-`docs/PACKAGE-FEED.md` the malicious-package index the scanners read.
+`docs/DNS.md` the name-resolution artifact on network alerts,
+`docs/PACKAGE-FEED.md` the malicious-package index the scanners read, and
+`docs/DOMAIN-FEED.md` the malicious-domain list matched against it.
 
 ## Turning it on
 

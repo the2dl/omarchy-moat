@@ -166,7 +166,7 @@
     <!-- ---------------------------------------------------- architecture -->
     <section id="arch">
       <h2 class="group">How it works</h2>
-      <p class="group-note">The sensor is upstream Tetragon and is never forked — Moat ships policies for it and makes sense of what comes back. Two parts sit outside that loop: the install-time scanners, which read a signed malicious-package index offline before a package manager runs anything, and the decoy files, which are ordinary paths the kernel watches like any other.</p>
+      <p class="group-note">The sensor is upstream Tetragon and is never forked — Moat ships policies for it and makes sense of what comes back. Two parts sit outside that loop: the install-time scanners, which read a signed malicious-package index offline before a package manager runs anything, and the decoy files, which are ordinary paths the kernel watches like any other. The same signed feed carries a second list — about 48,000 malicious domains — which is matched against the hostname behind each outbound connection.</p>
 
       <div class="diagram">
 <pre class="mermaid">
@@ -192,7 +192,7 @@ flowchart TB
   end
   SHIM["sandbox shims<br/>npm · pip · cargo · go · makepkg"]
   SCAN["scanners<br/>read, never execute"]
-  FEED[("/var/lib/moat/feeds<br/>malicious-package index<br/>signed · refreshed every 15 min")]
+  FEED[("/var/lib/moat/feeds<br/>malicious-package index · domain list<br/>signed · refreshed every 15 min")]
   CANARY["decoy files<br/>/etc · /root · $HOME · tmp"]
 
   EBPF --> TG
@@ -384,7 +384,8 @@ flowchart TB
 <span class="hi">enforcing</span>  moat-cred-etc-shadow-read, moat-cred-ssh-private-key-read, …
 tetragon   running
 <span class="hi">policies   44   (44 loaded in the kernel)</span>
-feeds      0 hashes, 0 domains, updated never
+feeds      241852 packages, 0 hashes, updated 2026-09-11T14:51Z
+<span class="hi">domains    47755 from ThreatFox (abuse.ch) (seq 1, published 2026-09-11T14:51:56Z)</span>
 <span class="hi">needs you  7</span>   <span class="dim">(recorded 1115, of which 162 signal; suppressed 3425)</span>
 unacked    critical 0  high 5  medium 0  low 2
 sandbox    off
@@ -395,6 +396,7 @@ demoted    moat-exec-untrusted-home, …   <span class="dim">(timeline only)</sp
         <tr><td>policies</td><td><strong>The two numbers must match.</strong> The first is what was rendered to disk, the second what the kernel has pinned. A gap is a silent sensor outage — one cost 25 minutes of blindness while every other surface read “running”.</td></tr>
         <tr><td>enforcing</td><td>Rules armed to block. <code>*** NOT ARMED IN KERNEL ***</code> means Moat asked the kernel and the kernel disagreed; it re-arms once a minute and says so until it clears.</td></tr>
         <tr><td>needs you</td><td>The only number asking for something.</td></tr>
+        <tr><td>domains</td><td>The malicious-domain list, matched against the hostname behind each outbound connection. Counted apart from any entries you added to <code>feeds/domains.txt</code> yourself, because they have different owners and different fixes: <em>“no published list yet”</em> means <code>moat-feeds</code> has not installed one, which is a fault; an empty file of your own is not.</td></tr>
         <tr><td>INERT</td><td>A rule that is enabled and <em>structurally cannot fire</em> — reading a sensor field the sensor is not configured to send, for instance. Silence that reads as coverage is worse than a rule that is off, so it is named with the fix.</td></tr>
       </table></div>
     </section>

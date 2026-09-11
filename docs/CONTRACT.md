@@ -90,7 +90,12 @@ Tetragon itself is **upstream, unmodified**, v1.7.1, from
 /var/lib/moat/ship/cursor.json         0640, owned by moat-ship: how far the
                                            shipper has got, and what it dropped
 /var/lib/moat/state.json               0640 root:moat, daemon status
-/var/lib/moat/feeds/{hashes.txt,domains.txt,urls.txt,meta.json}
+/var/lib/moat/feeds/{packages.txt,meta.json,state.json}
+                                           written by moat-feeds
+/var/lib/moat/feeds/domains-feed.txt   written by moat-feeds: the published
+                                           domain list (docs/DOMAIN-FEED.md)
+/var/lib/moat/feeds/{hashes.txt,domains.txt,urls.txt}
+                                           operator-supplied, never written
 /run/moat/control.sock                 0660 root:moat
 ```
 
@@ -737,6 +742,14 @@ sudoers rule.
    consulted no feed whatsoever. `hashes.txt`, `domains.txt` and `urls.txt` are
    still *read* if an operator supplies them, and are never written by a
    refresh. See `docs/PACKAGE-FEED.md`.
+
+   ThreatFox is back, through the aggregator and without a key: its bulk
+   exports are unauthenticated even though its JSON API is not, and one
+   aggregator fetching them serves the whole fleet. It publishes a second
+   signed artifact, referenced from the same `pointer.json`, which `moat-feeds`
+   installs as `domains-feed.txt`. That is a FOURTH file and not a rewrite of
+   `domains.txt`: the operator's three files keep their guarantee. Both domain
+   lists are matched, the operator's first. See `docs/DOMAIN-FEED.md`.
 
 ## 7. Plugin responsibilities (shell/)
 

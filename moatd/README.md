@@ -588,7 +588,10 @@ trains people to ignore the warning.
 fails hard and an offline machine never loses what it has. A signature that does
 not verify is logged at error rather than warn — it is not routine staleness.
 
-`hashes.txt`, `domains.txt` and `urls.txt` are no longer fetched by anything.
+`hashes.txt` and `urls.txt` are no longer fetched by anything. `domains.txt`
+has a published companion again as of 2026-09-11 — `domains-feed.txt`, ~48k
+domains from ThreatFox, signed and installed by `moat-feeds`, a separate file
+so the operator's own list is still never written (`docs/DOMAIN-FEED.md`).
 They are still read if an operator drops them in, and `moat-x-new-exec-ioc`
 still matches `hashes.txt`. There is no keyless replacement for the sha256 feed:
 OSV malicious-package records identify packages, not file hashes. That is a real

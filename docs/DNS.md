@@ -265,10 +265,12 @@ In the order they are worth doing.
 2. **Persist the cache across restarts.** Six hours of names is lost on every
    moatd restart, and moatd restarts whenever Tetragon does. `state.json` is
    the place; the shape is small.
-3. **A keyless domain feed.** `domains.txt` is operator-supplied, like
-   `hashes.txt`, and the same aggregator that publishes the package index
-   could publish one. Until then the rule is inert on a fresh install, and
-   `status.feeds.domains: 0` is the only sign.
+3. ~~**A keyless domain feed.**~~ **DONE (2026-09-11).** The aggregator now
+   publishes one: ~48k domains from ThreatFox, gated, signed, and installed by
+   `moat-feeds` into `feeds/domains-feed.txt` -- a separate file, because
+   `domains.txt` stays the operator's and a refresh must never write it. The
+   rule is live on a fresh install. `status.feeds.domain_feed` is the count;
+   `feeds.domains` remains the operator's own. See `docs/DOMAIN-FEED.md`.
 4. **Resolver bypass as a signal.** The kprobe from §2, reduced to "UDP to
    port 53, not loopback, not from resolved": one policy, no LSM slot, a
    Tetragon restart to test. It is about DNS behaviour rather than evidence,

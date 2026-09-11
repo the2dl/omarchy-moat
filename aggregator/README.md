@@ -15,8 +15,19 @@ of that contract and nothing here may drift from it.
 
 | cron | job | budget | what it does |
 |---|---|---|---|
-| `*/15 * * * *` | `runTick` | 30 s CPU | GitHub compare since the last known commit, fetch only the changed OSV files from `raw.githubusercontent.com`, conditional-GET the four Datadog manifests, refold, publish |
-| `17 4 * * *` | `runFull` | 15 min CPU | stream the 44 MB / 479k-file tarball, rebuild from scratch, publish |
+| `*/15 * * * *` | `runTick` | 30 s CPU | GitHub compare since the last known commit, fetch only the changed OSV files from `raw.githubusercontent.com`, conditional-GET the four Datadog manifests, refold, publish — then the domain wing off the 1.6 MB ThreatFox hostfile |
+| `17 4 * * *` | `runFull` | 15 min CPU | stream the 44 MB / 479k-file tarball, rebuild from scratch, publish — then the domain wing, additionally re-reading the 23 MB ThreatFox CSV dump and the public suffix list |
+
+Both crons end with the **domain wing** (`runDomains`), which publishes a
+second, independently-sequenced artifact into the same `pointer.json`. It is
+wrapped so that it can never fail a package run: the six scanners read
+`packages.txt` before every install and that path is not allowed to break
+because abuse.ch had a bad afternoon. `docs/DOMAIN-FEED.md` is the contract;
+`/admin/domains` runs it alone.
+
+A quiet quarter-hour for packages is the common case and is exactly when
+ThreatFox has moved, so the domain step runs on those ticks too — including the
+ones that return early having found nothing.
 
 The 15-minute cron's interval is under an hour, which caps it at 30 s of CPU —
 that is why it never touches the tarball. The daily cron's interval is over an
