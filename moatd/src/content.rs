@@ -1572,11 +1572,26 @@ mod tests {
         }
     }
 
+    /// What `machine_name` should say for the machine running the test.
+    ///
+    /// These tests parse the HOST's own /bin/sh, so a literal "x86-64" asserts
+    /// the architecture of whoever ran them last rather than that the parser
+    /// decodes e_machine correctly. It failed the first time this package was
+    /// built on aarch64 -- during makepkg's check(), so the build aborted and
+    /// the failure looked like a port problem instead of a hardcoded string.
+    fn host_machine() -> &'static str {
+        match std::env::consts::ARCH {
+            "x86_64" => "x86-64",
+            "aarch64" => "aarch64",
+            other => panic!("no expected e_machine name for host arch {other:?}"),
+        }
+    }
+
     #[test]
     fn a_real_dynamic_binary_reads_the_way_ldd_and_nm_do() {
         let e = elf_of("/bin/sh");
         assert_eq!(e.class, "elf64");
-        assert_eq!(e.machine, "x86-64");
+        assert_eq!(e.machine, host_machine());
         assert_eq!(e.linkage, "dynamic");
         assert!(
             e.needed.iter().any(|n| n.starts_with("libc.so")),
@@ -1785,7 +1800,7 @@ mod tests {
         let a = inspect(&std::fs::read("/bin/sh").unwrap());
         let v = a.to_json();
         let back: FileAnalysis = serde_json::from_value(v).unwrap();
-        assert_eq!(back.elf.unwrap().machine, "x86-64");
+        assert_eq!(back.elf.unwrap().machine, host_machine());
     }
 
     /// `cargo test -- --ignored --nocapture bench_` — the number quoted in the

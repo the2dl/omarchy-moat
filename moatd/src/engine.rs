@@ -8951,11 +8951,25 @@ esac
             .find(|a| a.rule == "moat-x-was-not-running")
             .expect("the outage must be recorded");
         assert_eq!(a.severity, "high");
+        // The gap is twenty minutes; how it SPLITS depends on the host's boot
+        // time, which this test does not control. On a machine awake
+        // throughout, all twenty were blind. On one that booted inside the
+        // window -- a laptop, or a build running minutes after a reboot -- the
+        // same twenty come back as "N unwatched" plus "the full gap was 20
+        // minutes, of which M powered off".
+        //
+        // Asserting only the first form made this test depend on the uptime of
+        // whoever ran it. It went unnoticed for months and then failed the
+        // first `makepkg` on a freshly rebooted machine, inside check(), where
+        // it read as an architecture problem and aborted the build.
+        //
+        // What must be true either way: the record accounts for the whole
+        // twenty minutes. The split itself is covered by `split_downtime`'s own
+        // unit tests, which take every clock as an argument.
+        let ev = a.explain.evidence.join(" | ");
         assert!(
-            a.explain
-                .evidence
-                .iter()
-                .any(|e| e.contains("20 minutes unwatched while the machine was awake")),
+            ev.contains("20 minutes unwatched while the machine was awake")
+                || ev.contains("the full gap was 20 minutes"),
             "the record says how long: {:?}",
             a.explain.evidence
         );
