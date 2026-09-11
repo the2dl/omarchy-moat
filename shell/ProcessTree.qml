@@ -36,6 +36,10 @@ Column {
     property var events: ({})
     /// Timestamp of the alert, for the header's duration.
     property string alertTs: ""
+    /// The connection this alert is about: `{ dst_ip, dst_port, domain }`, so
+    /// the flagged process's detail can show what it reached, with the domain
+    /// -- the IOC on a network alert -- highlighted.
+    property var endpoint: null
     property bool open: root.nodes.length > 0 && root.nodes.length <= autoOpenMax
 
     /// Chains up to this deep open themselves. Five covers the ordinary shapes;
@@ -259,6 +263,8 @@ Column {
             ProcessTreeDetail {
                 id: detail
                 tokens: root.t
+                // Only the flagged leaf connected; ancestors did not.
+                endpoint: root.selected === root.nodes.length - 1 ? root.endpoint : null
                 width: root.width >= root.twoColumnMin
                      ? Math.min(420, Math.round(root.width * 0.42))
                      : root.width

@@ -30,14 +30,15 @@ Rectangle {
 
     signal copyBundleRequested(string id)
 
-    /// The label/value pairs, flattened so one Repeater fills a two-column Grid.
+    /// The label/value pairs. `{ k, v, hot }`; `hot` accent-colours the value,
+    /// for the rows whose value IS the finding -- the resolved domain and who
+    /// asked for it. A network alert is about a name, so the name is the thing
+    /// the eye should land on, the way the flagged process is in the tree.
     function facts() {
-        function add(label, value) {
+        function add(label, value, hot) {
             var text = String(value === undefined || value === null ? "" : value);
-            if (text) {
-                out.push(label);
-                out.push(text);
-            }
+            if (text)
+                out.push({ "k": label, "v": text, "hot": hot === true && text !== "not recorded" });
         }
 
         var a = root.alert;
@@ -55,10 +56,10 @@ Rectangle {
             add("connected to", String(a.net.dst_ip || "") + (a.net.dst_port ? ":" + a.net.dst_port : ""));
             // Always a row, so "not recorded" is said rather than implied: a
             // connection with no name on it is not a connection that had none.
-            add("resolved from", Model.domainLine(a.net));
+            add("resolved from", Model.domainLine(a.net), true);
             // Who ASKED, when the attribution probe saw it. Blank on a
             // literal-IP connection, where there was no lookup to attribute.
-            add("asked by", Model.askedByLine(a));
+            add("asked by", Model.askedByLine(a), true);
         }
 
         add("first seen here", a.rarity_text);
@@ -169,35 +170,48 @@ Rectangle {
 
         // The facts, as a label/value grid. Two columns, and the label column is
         // the dimmest thing in the block: a person reads down the values.
-        Grid {
+        Column {
             width: parent.width
             visible: !root.raw
-            columns: 2
-            columnSpacing: root.t ? root.t.s(16) : 10
-            rowSpacing: root.t ? root.t.s(7) : 4
+            spacing: root.t ? root.t.s(7) : 4
 
             Repeater {
                 model: root.raw ? [] : root.facts()
 
-                delegate: Text {
+                delegate: Row {
                     required property var modelData
-                    required property int index
 
-                    width: index % 2 === 0 ? (root.t ? root.t.s(110) : 90) : column.width - (root.t ? root.t.s(126) : 100)
-                    text: modelData
-                    color: index % 2 === 0 ? (root.t ? root.t.fainter : "grey") : (root.t ? root.t.secondary : "white")
-                    font.family: root.t ? root.t.family : "monospace"
-                    font.pixelSize: root.t ? root.t.fSecondary : 12
-                    wrapMode: Text.WrapAnywhere
-                    // args and paths out of a hostile process. Evidence is where the long
-                    // version belongs, but "long" still has a ceiling.
-                    maximumLineCount: 8
-                    elide: Text.ElideRight
-                    textFormat: Text.PlainText
+                    width: parent.width
+                    spacing: root.t ? root.t.s(16) : 10
+
+                    Text {
+                        width: root.t ? root.t.s(110) : 90
+                        text: modelData.k
+                        color: root.t ? root.t.fainter : "grey"
+                        font.family: root.t ? root.t.family : "monospace"
+                        font.pixelSize: root.t ? root.t.fSecondary : 12
+                    }
+
+                    Text {
+                        width: parent.width - (root.t ? root.t.s(126) : 100)
+                        text: modelData.v
+                        // Accent for a hot row -- the domain and its asker. The
+                        // accent, not the alarm colour: it is the thing to read,
+                        // not itself an alarm. Everything else is the ordinary
+                        // value colour.
+                        color: modelData.hot ? (root.t ? root.t.accent : "orange")
+                                             : (root.t ? root.t.secondary : "white")
+                        font.family: root.t ? root.t.family : "monospace"
+                        font.pixelSize: root.t ? root.t.fSecondary : 12
+                        wrapMode: Text.WrapAnywhere
+                        // args and paths out of a hostile process. Evidence is
+                        // where the long version belongs, but "long" has a ceiling.
+                        maximumLineCount: 8
+                        elide: Text.ElideRight
+                        textFormat: Text.PlainText
+                    }
                 }
-
             }
-
         }
 
         // 2b. The old panel had this as one line with arrows in it and no times,

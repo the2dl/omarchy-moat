@@ -464,6 +464,9 @@ Rectangle {
             events: root.service && root.incident
                   ? root.service.processEvents(root.incident, root.head ? root.head.id : "")
                   : ({})
+            // The connection this alert is about, so the flagged process's
+            // detail shows what it reached with the domain highlighted.
+            endpoint: root.head ? root.head.net : null
         }
 
         // Only the two that answer "what, and by what". Everything else is evidence.

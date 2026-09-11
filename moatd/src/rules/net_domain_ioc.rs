@@ -60,7 +60,15 @@ impl UserRule for NetDomainIoc {
             "A shared host or CDN address that a fed domain also used, a sinkholed domain \
              being visited on purpose, or a feed entry broad enough to cover a legitimate \
              parent domain. The resolution's age is on the alert for exactly this judgement.",
-            &["browser", "github-token", "npm-token"],
+            // No rotate list, and this used to hardcode browser/github/npm --
+            // which is nonsense here. Those belong to a credential READ: they
+            // answer "what did the program have in reach". A connection to a
+            // fed domain says nothing was read; it says something talked to a
+            // place the operator flagged. Rotating your GitHub token because a
+            // process reached a bad domain is advice nobody can act on, and the
+            // "what that program could read" section it drove is about the
+            // wrong thing entirely. The finding is the connection.
+            &[],
             &["kill", "ignore"],
             "exe",
         )
@@ -194,6 +202,15 @@ mod tests {
         let f = run(&mut rule, &t, &feeds, &names, 100);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].meta.severity, "high");
+        // No rotation advice: a connection to a fed domain is not a credential
+        // read, so it must not claim one was exposed. This drove a "rotate your
+        // browser/github/npm creds" line and a "what that program could read"
+        // section on a network egress alert.
+        assert!(
+            f[0].meta.rotate.is_empty(),
+            "a domain-match must not recommend rotating anything: {:?}",
+            f[0].meta.rotate
+        );
         let net = f[0].net.as_ref().unwrap();
         assert_eq!(net.domain.as_deref(), Some("cdn.evil.example"));
         assert_eq!(net.domain_age_secs, Some(10));

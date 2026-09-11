@@ -21,6 +21,9 @@ Rectangle {
     property int distance: 0
     /// `[{time, text, alert}]` for this pid, newest first.
     property var events: []
+    /// The connection the flagged process made: `{ dst_ip, dst_port, domain }`.
+    /// Null on every ancestor -- only the leaf connected.
+    property var endpoint: null
 
     readonly property var t: detail.tokens
 
@@ -113,6 +116,46 @@ Rectangle {
                     font.pixelSize: detail.t ? detail.t.fMeta : 11
                     wrapMode: index % 2 === 0 ? Text.NoWrap : Text.WrapAnywhere
                 }
+            }
+        }
+
+        // What the flagged process connected to. The domain is the finding on a
+        // network alert, so it is accent-coloured -- the thing to read -- while
+        // the address it rode in on is muted.
+        Column {
+            width: parent.width
+            spacing: detail.t ? detail.t.s(3) : 2
+            visible: !!detail.endpoint && (detail.endpoint.dst_ip || detail.endpoint.domain)
+
+            Text {
+                text: "CONNECTED TO"
+                color: detail.t ? detail.t.fainter : "grey"
+                font.family: detail.t ? detail.t.family : "monospace"
+                font.pixelSize: detail.t ? detail.t.fMeta : 11
+                font.letterSpacing: detail.t ? detail.t.lsLabel : 0
+            }
+
+            Text {
+                width: parent.width
+                visible: !!detail.endpoint && !!detail.endpoint.domain
+                text: detail.endpoint && detail.endpoint.domain ? String(detail.endpoint.domain) : ""
+                color: detail.t ? detail.t.accent : "orange"
+                font.family: detail.t ? detail.t.family : "monospace"
+                font.pixelSize: detail.t ? detail.t.fSecondary : 12
+                font.weight: Font.Medium
+                wrapMode: Text.WrapAnywhere
+            }
+
+            Text {
+                width: parent.width
+                text: detail.endpoint
+                    ? String(detail.endpoint.dst_ip || "")
+                      + (detail.endpoint.dst_port ? ":" + detail.endpoint.dst_port : "")
+                    : ""
+                color: detail.t ? detail.t.dimmer : "grey"
+                font.family: detail.t ? detail.t.family : "monospace"
+                font.pixelSize: detail.t ? detail.t.fSecondary : 12
+                wrapMode: Text.WrapAnywhere
             }
         }
 
