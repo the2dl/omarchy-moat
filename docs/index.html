@@ -140,6 +140,7 @@
     <h2>moatctl</h2>
     <a href="#cli-rules">Two rules</a>
     <a class="mono" href="#status">status</a>
+    <a class="mono" href="#canary">canary</a>
     <a class="mono" href="#looking">list · explain · chain</a>
     <a class="mono" href="#decisions">decisions · contain</a>
     <a class="mono" href="#ack">ack</a>
@@ -158,13 +159,14 @@
       <h2 class="group">What it is</h2>
       <p><strong>The threat model is a hijacked package.</strong> An npm postinstall, a PyPI wheel, an AUR PKGBUILD, an editor extension — running as you, with your permissions, reading credentials out of <code>$HOME</code> and arranging to run again after a reboot. It does not need an exploit; you invited it.</p>
       <p>Moat is not a rootkit hunter and not a server EDR. It watches the handful of things that shape of attack must do, correlates them, and asks you about the sequence rather than the steps.</p>
+      <p><strong>Two additions since that model was written.</strong> <em>Local privilege escalation</em> is now watched at the four points this kind of machine actually presents — writes under <code>/proc/sys</code>, capabilities gained at runtime, uid transitions, and root-executed config nothing else looks at — because the outcomes of an escalation were covered well and the escalation itself was not. And <em>decoy files</em> invert the usual problem: every other file rule watches a real secret and then subtracts the programs allowed to read it, which is where the false positives live, while a decoy has no legitimate reader at all.</p>
       <div class="note"><strong>It ships watching, not blocking.</strong> Monitor mode, containment off, killing off. A wrong guess on day one should be noisy, not expensive — and everything that changes that is root-gated and recorded.</div>
     </section>
 
     <!-- ---------------------------------------------------- architecture -->
     <section id="arch">
       <h2 class="group">How it works</h2>
-      <p class="group-note">Four moving parts. The sensor is upstream Tetragon and is never forked — Moat ships policies for it and makes sense of what comes back.</p>
+      <p class="group-note">The sensor is upstream Tetragon and is never forked — Moat ships policies for it and makes sense of what comes back. Two parts sit outside that loop: the install-time scanners, which read a signed malicious-package index offline before a package manager runs anything, and the decoy files, which are ordinary paths the kernel watches like any other.</p>
 
       <div class="diagram">
 <pre class="mermaid">
@@ -174,7 +176,7 @@ flowchart TB
   end
   subgraph S["sensor — upstream Tetragon"]
     TG["tetragon"]
-    POL["/run/moat/policies<br/>44 rendered policies"]
+    POL["/run/moat/policies<br/>51 rendered policies"]
     LOG[("/var/log/moat/tetragon.log<br/>JSON export")]
   end
   subgraph D["moatd — root daemon"]
@@ -190,6 +192,8 @@ flowchart TB
   end
   SHIM["sandbox shims<br/>npm · pip · cargo · go · makepkg"]
   SCAN["scanners<br/>read, never execute"]
+  FEED[("/var/lib/moat/feeds<br/>malicious-package index<br/>signed · refreshed every 15 min")]
+  CANARY["decoy files<br/>/etc · /root · $HOME · tmp"]
 
   EBPF --> TG
   POL --> TG
@@ -205,7 +209,9 @@ flowchart TB
   CTL -.->|"control socket 0660 root:moat"| D
   PANEL -.-> CTL
   SHIM --> SCAN
+  FEED --> SCAN
   SHIM -.->|"runs the real tool"| EBPF
+  CANARY -.->|"a read is the alert"| EBPF
 </pre>
       </div>
       <p class="caption">Solid arrows carry events; dotted arrows carry decisions. Note the loop at the gate: when a correlated sequence is confident enough, moatd writes a new policy naming one binary and one address, and Tetragon enforces it in the kernel — no userspace round trip on the blocking path.</p>
@@ -286,7 +292,9 @@ flowchart TB
         <tr><td>Stop things?</td><td><em>“Should Moat stop things, or just tell you?”</em> — <strong>Just tell me</strong> / <strong>Stop things</strong>. The help text says plainly that a wrong guess kills a real program mid-write, and to stay on telling-you until Rules has been quiet for a week. <span class="chip">sudo</span></td></tr>
         <tr><td>Cut a sequence</td><td><em>“Cut off a sequence Moat is sure about”</em> — the network cut. One binary, one address, ten minutes, auto-released. Nothing is killed. <span class="chip">sudo</span></td></tr>
         <tr><td>And the programs?</td><td>Appears only when the above is on: <strong>Nothing</strong> / <strong>Write down what it would end</strong> / <strong>End them</strong>. “End them” is deliberately the dull chip — it is the option whose worst case you cannot see from this screen. <span class="chip">sudo</span></td></tr>
-        <tr><td>Hide your keys</td><td>The bubblewrap shims: package installs run without your credentials in reach. Needs a new login shell. <span class="chip">sudo</span></td></tr>
+        <tr><td>Check and sandbox package installs</td><td>Two things, one switch. Installs are checked against the malicious-package feed first — a match stops the install — and then <code>npm</code>, <code>pip</code>, <code>cargo</code>, <code>go</code> and <code>makepkg</code> run under bubblewrap without your credentials in reach. Left off, the feed still refreshes and nothing reads it. Needs a new login shell. <span class="chip">sudo</span></td></tr>
+        <tr><td>Plant decoy files</td><td>Fake credentials in <code>/etc</code>, <code>/root</code>, your home and the temp directories, with different names on every machine. Nothing has a reason to open one, so this is the only rule with no allowlist and nothing to tune: a read is the alert. Shows the count, and turns red if decoys have been deleted from disk — the rule still reports armed but cannot fire for those. <span class="chip">sudo</span></td></tr>
+        <tr><td>Refuse the read as well</td><td>Arms the decoy rule: the open itself fails with a permission error and the bytes never reach the caller. Denies rather than kills, because the one false positive this rule has is a backup. Greyed out until decoys exist. <span class="chip">sudo</span></td></tr>
         <tr><td>Interrupt me</td><td><strong>Anything odd</strong> / <strong>Only if it needs me</strong> / <strong>Never</strong>, with the cooldown stated underneath as a fact rather than a second control.</td></tr>
         <tr><td>Weekly note</td><td>The digest. A preference, so no root.</td></tr>
         <tr><td>Advanced</td><td>Collapsed: show rule-covered events, raw severities, policy paths. Implementation details, kept out of the way.</td></tr>
@@ -419,6 +427,17 @@ demoted    moat-exec-untrusted-home, …   <span class="dim">(timeline only)</sp
 
       <h3 class="cmd">moatctl exclusions <span class="chip free">--remove rule:binary</span></h3>
       <p class="purpose">Binaries a rule has been told to stop watching <em>in the kernel</em>. This is what “allow this program” means for an armed rule — a userspace entry cannot help there, because the process dies before Moat sees the event.</p>
+    </section>
+
+    <section id="canary">
+      <h3 class="cmd">moatctl canary <span class="chip free">no root</span></h3>
+      <p class="purpose">Decoy files: fake credentials in <code>/etc</code>, <code>/root</code>, your home and the temp directories. Nothing on the machine references them, so unlike every other file rule this one has no legitimate reader and needs no allowlist — a read is the alert, at <strong>critical</strong>.</p>
+      <div class="scroll"><table class="t">
+        <tr><td>--on</td><td>Plant a set. Names differ on every machine, nothing existing is ever overwritten, and it says which places it could <em>not</em> cover. <span class="chip">sudo</span></td></tr>
+        <tr><td>--off</td><td>Remove them. Refuses to delete anything that is no longer one of ours. <span class="chip">sudo</span></td></tr>
+        <tr><td>--enforce on|off</td><td>On: the read itself fails with a permission error. Off: it is allowed, and alerts. <span class="chip">sudo</span></td></tr>
+      </table></div>
+      <div class="note"><strong>The paths need root; the counts do not.</strong> Anything that can read the list can walk around every decoy in it — and the attacker in this threat model is a package running as you, in the same <code>moat</code> group. Without sudo you still get how many, which of etc/root/home/tmp are covered, how many have gone missing, and whether reads are refused. See <a href="https://github.com/the2dl/omarchy-moat/blob/main/docs/CANARIES.md">CANARIES.md</a>.</div>
     </section>
 
     <section id="ack">
