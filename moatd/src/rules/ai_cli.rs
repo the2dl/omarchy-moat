@@ -260,6 +260,7 @@ mod tests {
             mode: "monitor",
             armed: &crate::rules::NO_RULES_ARMED,
             cred_read_sessions: &crate::rules::NO_CRED_SESSIONS,
+            names: &crate::rules::NO_NAMES,
         };
         AiCliHeadless.on_exec(&ExecEvent::default(), exec_id, &ctx)
     }

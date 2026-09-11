@@ -257,7 +257,12 @@ pub struct Feeds {
 impl Feeds {
     pub fn load(dir: &Path) -> Feeds {
         let hashes = read_set(&dir.join("hashes.txt"));
-        let domains = read_set(&dir.join("domains.txt"));
+        // Normalised like the names they are matched against: a trailing dot
+        // or a capital in the operator's file must not make an entry inert.
+        let domains: HashSet<String> = read_set(&dir.join("domains.txt"))
+            .into_iter()
+            .map(|d| crate::names::normalize_name(&d))
+            .collect();
         let urls = read_set(&dir.join("urls.txt"));
         let meta_json = std::fs::read_to_string(dir.join(META_FILE))
             .ok()
@@ -302,6 +307,31 @@ impl Feeds {
 
     pub fn hash_hit(&self, sha256: &str) -> bool {
         self.hashes.contains(&sha256.to_ascii_lowercase())
+    }
+
+    /// The feed entry `name` falls under, if any: the name itself or any
+    /// parent domain of it down to two labels, so `cdn.evil.example` matches
+    /// an entry of `evil.example`. A feed of registrable domains is the common
+    /// shape, and a campaign rotates the leftmost label freely.
+    ///
+    /// Returns the ENTRY, not the name: the alert says which line of the feed
+    /// fired, which is what the operator who maintains the file needs.
+    pub fn domain_hit(&self, name: &str) -> Option<String> {
+        if self.domains.is_empty() {
+            return None;
+        }
+        let name = crate::names::normalize_name(name);
+        let labels: Vec<&str> = name.split('.').filter(|l| !l.is_empty()).collect();
+        if labels.len() < 2 {
+            return None;
+        }
+        for i in 0..=labels.len() - 2 {
+            let candidate = labels[i..].join(".");
+            if self.domains.contains(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
     }
 }
 
@@ -886,6 +916,21 @@ mod tests {
             s.push_str(&format!("{}\t{}\t{}\n", e, n, sp));
         }
         s
+    }
+
+    #[test]
+    fn a_domain_hit_walks_parent_domains_and_names_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("domains.txt"), "# c2\nEvil.Example.\nexact.only.test\n").unwrap();
+        let f = Feeds::load(dir.path());
+        assert_eq!(f.meta.domains, 2);
+        assert_eq!(f.domain_hit("cdn.evil.example").as_deref(), Some("evil.example"));
+        assert_eq!(f.domain_hit("EVIL.example.").as_deref(), Some("evil.example"));
+        assert_eq!(f.domain_hit("exact.only.test").as_deref(), Some("exact.only.test"));
+        assert!(f.domain_hit("notevil.example").is_none(), "the walk is on label boundaries");
+        assert!(f.domain_hit("example").is_none(), "one label is never a match");
+        assert!(f.domain_hit("only.test").is_none(), "a subdomain entry does not cover its parent");
+        assert!(Feeds::default().domain_hit("evil.example").is_none());
     }
 
     #[test]

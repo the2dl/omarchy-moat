@@ -1640,6 +1640,14 @@ fn print_status(r: &Value) {
         r["feeds"]["domains"],
         r["feeds"]["updated"].as_str().unwrap_or("never")
     );
+    if let Some(n) = r["names"].as_object() {
+        println!(
+            "names      {}: {}, {} addresses known",
+            n.get("source").and_then(|v| v.as_str()).unwrap_or("?"),
+            n.get("state").and_then(|v| v.as_str()).unwrap_or("?"),
+            n.get("addresses").and_then(|v| v.as_u64()).unwrap_or(0)
+        );
+    }
     // A rule that is on and cannot fire is worse than one that is off: it
     // reads as coverage. Printed above the counts, because it changes what
     // those counts mean.
@@ -1781,7 +1789,20 @@ fn print_explain(a: &Alert) {
         println!("  file:    {}", f.path);
     }
     if let Some(n) = &a.net {
-        println!("  network: {}:{}", n.dst_ip, n.dst_port);
+        // "not recorded" rather than nothing: a connection with no name on
+        // it must not read as a connection that had none (docs/DNS.md).
+        match &n.domain {
+            Some(d) => println!(
+                "  network: {}:{} ({}{})",
+                n.dst_ip,
+                n.dst_port,
+                d,
+                n.domain_age_secs
+                    .map(|a| format!(", resolved {} s before", a))
+                    .unwrap_or_default()
+            ),
+            None => println!("  network: {}:{} (name not recorded)", n.dst_ip, n.dst_port),
+        }
     }
     if let Some(i) = &a.ioc {
         println!("  ioc:     {} {}", i.source, i.matched);

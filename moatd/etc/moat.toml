@@ -93,8 +93,15 @@ pkg_egress = true
 net_first_contact = true
 
 # sha256 of a newly executed file under $HOME, /tmp, /var/tmp or /dev/shm
-# matching the abuse.ch hash feed.
+# matching the local hash feed (feeds/hashes.txt, operator-supplied).
 new_exec_ioc = true
+
+# A connection to an address this machine resolved from a name in
+# feeds/domains.txt (operator-supplied, one domain per line, `#` comments; an
+# entry matches itself and every subdomain). The name comes from
+# systemd-resolved's query stream -- see [names] below and docs/DNS.md -- so
+# this is inert when that is off. `high`: a domain feed is coarser than a hash.
+net_domain_ioc = true
 
 # One process reading many distinct CREDENTIAL files in seconds -- the files
 # the cred-* policies posted, wherever they live. See [thresholds] below.
@@ -358,6 +365,29 @@ arm_wait_secs = 120
 # state.json write interval, and feed-file mtime poll interval.
 state_interval_secs = 5
 feeds_poll_secs = 60
+
+[names]
+# Which name was resolved to reach an address (docs/DNS.md). Every network
+# alert carries `net.domain`; this is where it comes from. moatd subscribes to
+# systemd-resolved's query stream (io.systemd.Resolve.Monitor), which sees
+# every resolution on the machine whichever way it arrived -- nss-resolve,
+# the 127.0.0.53 stub, the Docker bridge stub -- cache hits included. Nothing
+# is resolved by moat itself: a reverse lookup would answer a different
+# question ("what does the owner call this address") and add queries of moat's
+# own. Root passes the polkit gate on the subscription without a prompt.
+#
+# What it cannot see, and says "not recorded" for: a program that connects to
+# a literal address; DNS the program did itself (DNS-over-HTTPS inside a
+# browser, a container with its own resolver); a resolution older than
+# retain_secs. resolved does not say WHICH process asked, so the name on an
+# alert is "the most recent name this machine resolved to that address", with
+# its age -- evidence, not attribution.
+enabled = true
+socket = "/run/systemd/resolve/io.systemd.Resolve.Monitor"
+# Programs keep their own caches well past the DNS TTL; six hours is the
+# window inside which a name is still attached to an address.
+retain_secs = 21600
+max_addresses = 8192
 
 [net]
 # Destinations a package install may reach without an alert. There is no DNS in

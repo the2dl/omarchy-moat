@@ -10,6 +10,7 @@
 //! | `moat-x-ai-cli-headless`            | ancestry beyond one level (gap 1)             |
 //! | `moat-x-pkg-egress`                 | registry allowlists, no DNS in kernel (gap 4) |
 //! | `moat-x-new-exec-ioc`               | sha256 of the executed file (gap 6)           |
+//! | `moat-x-net-domain-ioc`             | the name behind an address vs domains.txt (gap 4) |
 //! | `moat-x-mass-read`                  | counting inside a window (gap 5)              |
 //! | `moat-pkg-subtree-interpreter-spawn`| exact package-subtree membership              |
 //! | `moat-pkg-subtree-downloader`       | exact package-subtree membership              |
@@ -34,6 +35,7 @@ pub mod exec_properties;
 pub mod ai_cli;
 pub mod mass_read;
 pub mod netmatch;
+pub mod net_domain_ioc;
 pub mod net_first_contact;
 pub mod new_exec_ioc;
 pub mod pkg_egress;
@@ -114,6 +116,10 @@ pub static NO_RULES_ARMED: std::collections::BTreeSet<String> = std::collections
 /// An empty cred-session map, for tests that build a RuleCtx by hand.
 pub static NO_CRED_SESSIONS: std::sync::LazyLock<std::collections::HashMap<u32, u64>> =
     std::sync::LazyLock::new(std::collections::HashMap::new);
+
+/// An empty name cache, for the same tests.
+pub static NO_NAMES: std::sync::LazyLock<crate::names::NameCache> =
+    std::sync::LazyLock::new(crate::names::NameCache::default);
 
 /// "Have I already said this?" — the memory a rule needs when it fires because
 /// some silence was OVERRIDDEN.
@@ -223,6 +229,10 @@ pub struct RuleCtx<'a> {
     /// rule ask "did the task I belong to just read a secret", which is the
     /// exfil context that /24 familiarity would otherwise hide.
     pub cred_read_sessions: &'a std::collections::HashMap<u32, u64>,
+    /// address -> the name this machine resolved to it, from systemd-resolved
+    /// (`names.rs`). Read-only; the engine fills it. A name is evidence, not
+    /// attribution: resolved does not say which process asked.
+    pub names: &'a crate::names::NameCache,
 }
 
 impl RuleCtx<'_> {
@@ -288,6 +298,7 @@ pub fn all() -> Vec<Box<dyn UserRule>> {
         Box::new(pkg_egress::PkgEgress::default()),
         Box::new(net_first_contact::NetFirstContact::default()),
         Box::new(new_exec_ioc::NewExecIoc::default()),
+        Box::new(net_domain_ioc::NetDomainIoc::default()),
         Box::new(mass_read::MassRead::default()),
         Box::new(exec_properties::ExecMemfd),
         Box::new(exec_properties::ExecPrivilegesRaised),
@@ -748,11 +759,11 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), n, "rule ids must be unique");
         assert_eq!(
-            n, 15,
+            n, 16,
             "four gap rules, the four that replaced pkg policies, net-first-contact, \
              the three that read what the sensor already sends about privilege (memfd, \
-             privileges raised, capability held), shell-stdio-socket, and the two ransom \
-             rules (file-churn, snapshot-command)"
+             privileges raised, capability held), shell-stdio-socket, the two ransom \
+             rules (file-churn, snapshot-command), and net-domain-ioc"
         );
 
         // Every rule must be switchable off, or `[rules]` is a lie.
@@ -773,6 +784,7 @@ mod tests {
             shell_stdio_socket: false,
             ransom_file_churn: false,
             ransom_snapshot_command: false,
+            net_domain_ioc: false,
         };
         for r in &rules {
             assert!(r.enabled(&cfg()), "{} is off by default", r.id());

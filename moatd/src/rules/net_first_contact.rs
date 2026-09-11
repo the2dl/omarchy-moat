@@ -182,10 +182,13 @@ impl UserRule for NetFirstContact {
         f.net = Some(crate::alert::NetRef {
             dst_ip: ip_s.clone(),
             dst_port: port,
-            // No DNS in the kernel and none in the export (NOTES gap 4): moat
-            // genuinely does not know the name, and saying so is better than
-            // implying it looked.
+            // No DNS in the kernel and none in the export (NOTES gap 4). The
+            // engine fills this from systemd-resolved's query stream in one
+            // place for every net finding (`Daemon::enrich_names`), and says
+            // "not recorded" when it cannot.
             domain: None,
+            domain_age_secs: None,
+            domain_cname: None,
         });
         f.extra_evidence = vec![
             format!("first connection from {} to {}:{} on this machine", proc.exe, ip_s, port),
@@ -260,6 +263,7 @@ mod tests {
             mode: "monitor",
             armed: &crate::rules::NO_RULES_ARMED,
             cred_read_sessions: &crate::rules::NO_CRED_SESSIONS,
+            names: &crate::rules::NO_NAMES,
         };
         let ev = HookEvent {
             function_name: Some("tcp_connect".into()),
@@ -371,7 +375,7 @@ mod tests {
         let quiet = RuleCtx {
             rarity: &seen, cfg: &cfg, table: &t, feeds: &feeds, homes: &[],
             now, mode: "monitor",
-            armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &none,
+            armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &none, names: &crate::rules::NO_NAMES,
         };
         assert!(
             NetFirstContact::default().on_hook(&h, "e-node", &quiet).is_empty(),
@@ -384,7 +388,7 @@ mod tests {
         let after_read = RuleCtx {
             rarity: &seen, cfg: &cfg, table: &t, feeds: &feeds, homes: &[],
             now, mode: "monitor",
-            armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &creds,
+            armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &creds, names: &crate::rules::NO_NAMES,
         };
         // 2026-09-07: a FAMILIAR PRIVATE destination no longer fires on the
         // exfil override. This is the deliberate hole, and it is this shape:
@@ -434,7 +438,7 @@ mod tests {
         let ctx = RuleCtx {
             rarity: &seen, cfg: &cfg, table: &t, feeds: &feeds, homes: &[],
             now, mode: "monitor",
-            armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &creds,
+            armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &creds, names: &crate::rules::NO_NAMES,
         };
         let out = NetFirstContact::default().on_hook(&h, "e-node", &ctx);
         assert_eq!(out.len(), 1, "familiar but PUBLIC, after a cred read: still fires");
@@ -489,7 +493,7 @@ mod tests {
             let ctx = RuleCtx {
                 rarity: &seen, cfg: &cfg, table: &t, feeds: &feeds, homes: &[],
                 now, mode: "monitor",
-                armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &creds,
+                armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &creds, names: &crate::rules::NO_NAMES,
             };
             fired += rule.on_hook(&h, "e-kubectl", &ctx).len();
         }
@@ -512,7 +516,7 @@ mod tests {
             let ctx = RuleCtx {
                 rarity: &seen, cfg: &cfg, table: &t2, feeds: &feeds, homes: &[],
                 now, mode: "monitor",
-                armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &creds2,
+                armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &creds2, names: &crate::rules::NO_NAMES,
             };
             assert_eq!(
                 rule.on_hook(&h, "e-other", &ctx).len(),
@@ -539,7 +543,7 @@ mod tests {
         let ctx2 = RuleCtx {
             rarity: &seen, cfg: &cfg, table: &t, feeds: &feeds, homes: &[],
             now, mode: "monitor",
-            armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &creds,
+            armed: &crate::rules::NO_RULES_ARMED, cred_read_sessions: &creds, names: &crate::rules::NO_NAMES,
         };
         assert_eq!(
             rule.on_hook(&HookHit { kind: HookKind::Kprobe, ev: &ev2 }, "e-kubectl", &ctx2).len(),

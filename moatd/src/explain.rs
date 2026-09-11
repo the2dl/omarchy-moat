@@ -386,7 +386,7 @@ fn summary(f: &Finding) -> String {
             };
             s.push_str(&format!(" {} {}.", verb, file.path));
         }
-        (None, Some(net)) => s.push_str(&format!(" connected to {}:{}.", net.dst_ip, net.dst_port)),
+        (None, Some(net)) => s.push_str(&format!(" connected to {}.", net.endpoint())),
         _ => s.push_str(&format!(" matched {}.", f.rule)),
     }
     if !f.ancestry_line.is_empty() {
@@ -399,10 +399,7 @@ fn summary(f: &Finding) -> String {
 fn what_sentence(f: &Finding) -> String {
     let comm = f.proc.comm();
     let file = f.file.as_ref().map(|x| x.path.as_str());
-    let dst = f
-        .net
-        .as_ref()
-        .map(|n| format!("{}:{}", n.dst_ip, n.dst_port));
+    let dst = f.net.as_ref().map(|n| n.endpoint());
     match f.meta.family.as_str() {
         "cred" => match file {
             Some(p) => format!("{} read {}.", comm, describe_secret(p)),
@@ -536,7 +533,7 @@ fn evidence(f: &Finding, allowlist_note: &str) -> Vec<String> {
     if let Some(file) = &f.file {
         hook_line.push_str(&format!(" on {}", file.path));
     } else if let Some(net) = &f.net {
-        hook_line.push_str(&format!(" to {}:{}", net.dst_ip, net.dst_port));
+        hook_line.push_str(&format!(" to {}", net.endpoint()));
     } else if !f.proc.args.is_empty() && !f.hook.starts_with("userland") {
         hook_line.push_str(&format!(" with args {}", f.proc.args));
     }
@@ -1176,6 +1173,44 @@ mod tests {
     }
 
     #[test]
+    fn a_net_alert_names_the_resolved_domain_wherever_it_names_the_address() {
+        let mut f = finding();
+        f.file = None;
+        f.hook = "security_socket_connect".into();
+        f.hook_detail = None;
+        f.meta.family = "net".into();
+        let mut net = NetRef::new("142.251.154.119", 443);
+        net.domain = Some("www.google.com".into());
+        net.domain_age_secs = Some(12);
+        f.net = Some(net);
+        let a = build_alert(&f, "01X", "t", "/x/user.toml", "not in allowlist: -");
+        assert!(a.summary.contains("142.251.154.119:443 (www.google.com)"), "{}", a.summary);
+        assert!(a.explain.what.contains("(www.google.com)"), "{}", a.explain.what);
+        assert!(
+            a.explain.evidence[0].contains("to 142.251.154.119:443 (www.google.com)"),
+            "{:?}",
+            a.explain.evidence
+        );
+        // The fields survive the record, and the optional ones are absent
+        // rather than null when there is no name -- an old reader sees the
+        // shape it always saw.
+        let j = serde_json::to_string(&a).unwrap();
+        assert!(j.contains("\"domain_age_secs\":12"), "{}", j);
+        let back: Alert = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.net, a.net);
+
+        let mut g = finding();
+        g.file = None;
+        g.meta.family = "net".into();
+        g.net = Some(NetRef::new("185.220.101.55", 4444));
+        let b = build_alert(&g, "01Y", "t", "/x/user.toml", "-");
+        let j = serde_json::to_string(&b).unwrap();
+        assert!(j.contains("\"domain\":null"), "{}", j);
+        assert!(!j.contains("domain_age_secs"), "{}", j);
+        assert!(b.summary.contains("185.220.101.55:4444."), "{}", b.summary);
+    }
+
+    #[test]
     fn a_netless_alert_has_no_exe_file_scope() {
         let mut f = finding();
         f.file = None;
@@ -1184,6 +1219,8 @@ mod tests {
             dst_ip: "185.220.101.55".into(),
             dst_port: 4444,
             domain: None,
+            domain_age_secs: None,
+            domain_cname: None,
         });
         let a = build_alert(&f, "01X", "t", "/x/user.toml", "not in allowlist: -");
         let scopes: Vec<&str> = a
@@ -1210,7 +1247,7 @@ mod tests {
             f.file = None;
             f.proc.exe = exe.into();
             f.proc.pid = pid;
-            f.net = Some(NetRef { dst_ip: ip.into(), dst_port: port, domain: None });
+            f.net = Some(NetRef { dst_ip: ip.into(), dst_port: port, domain: None, domain_age_secs: None, domain_cname: None });
             f
         };
         let a = base("/usr/bin/python3", 100, "192.168.44.122", 4873);

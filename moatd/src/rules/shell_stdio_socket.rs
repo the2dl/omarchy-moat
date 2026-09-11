@@ -494,6 +494,8 @@ impl ShellStdioSocket {
                 // No DNS anywhere in moat (NOTES gap 4), and this destination
                 // never went through a resolver we can see.
                 domain: None,
+                domain_age_secs: None,
+                domain_cname: None,
             });
         }
         self.arm(&mut f, ctx);
@@ -550,6 +552,8 @@ impl ShellStdioSocket {
                 dst_ip: ip,
                 dst_port: port,
                 domain: None,
+                domain_age_secs: None,
+                domain_cname: None,
             });
         }
         self.arm(&mut f, ctx);
@@ -656,6 +660,8 @@ impl ShellStdioSocket {
             dst_ip: ip,
             dst_port: port,
             domain: None,
+            domain_age_secs: None,
+            domain_cname: None,
         });
         self.arm(&mut f, ctx);
         Some(f)
@@ -942,6 +948,7 @@ mod tests {
             mode,
             armed: &crate::rules::NO_RULES_ARMED,
             cred_read_sessions: &crate::rules::NO_CRED_SESSIONS,
+            names: &crate::rules::NO_NAMES,
         };
         let mut r = ShellStdioSocket {
             proc_root: root.to_path_buf(),

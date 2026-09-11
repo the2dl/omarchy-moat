@@ -177,6 +177,10 @@ pub struct RuleToggles {
     /// `borg delete`. Argv is not visible to a kernel selector, so this is
     /// matched on the exec event, which is exported unconditionally.
     pub ransom_snapshot_command: bool,
+    /// `moat-x-net-domain-ioc`: a connection to an address this machine
+    /// resolved from a name in `feeds/domains.txt`. Needs `[names]` on -- the
+    /// kernel sees addresses only, and the name comes from systemd-resolved.
+    pub net_domain_ioc: bool,
 }
 
 impl Default for RuleToggles {
@@ -197,6 +201,7 @@ impl Default for RuleToggles {
             shell_stdio_socket: true,
             ransom_file_churn: true,
             ransom_snapshot_command: true,
+            net_domain_ioc: true,
         }
     }
 }
@@ -847,6 +852,8 @@ pub struct Config {
     pub digest: DigestConfig,
     pub telemetry: TelemetryConfig,
     pub contain: ContainConfig,
+    /// Name resolution artifacts (`names.rs`, docs/DNS.md).
+    pub names: crate::names::NamesConfig,
 }
 
 /// Correlation-driven containment (`contain.rs`). Off by default: it is the one
@@ -931,6 +938,7 @@ impl Default for Config {
             digest: DigestConfig::default(),
             telemetry: TelemetryConfig::default(),
             contain: ContainConfig::default(),
+            names: crate::names::NamesConfig::default(),
         }
     }
 }

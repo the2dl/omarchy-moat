@@ -849,6 +849,7 @@ mod tests {
             mode: "monitor",
             armed: &set,
             cred_read_sessions: &crate::rules::NO_CRED_SESSIONS,
+            names: &crate::rules::NO_NAMES,
         };
         rule.on_hook(&HookHit { kind: HookKind::Kprobe, ev: e }, exec_id, &ctx)
     }

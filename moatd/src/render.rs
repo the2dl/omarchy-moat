@@ -387,8 +387,41 @@ fn exclude_binaries(doc: &mut Value, bins: &[String]) -> Result<(), String> {
 /// and have no namespace to hide in, so they are deliberately left alone below.
 fn split_container_enforcement(doc: &mut Value) {
     fn ns_clause(op: &str) -> Value {
+        // CGROUP, not MNT. This scoped on the mount namespace until
+        // 2026-09-11, and the premise in the comment above -- "an attacker who
+        // can start a container can already reach root on the host" -- is true
+        // of Docker and false of `bwrap --unshare-user`, which needs no
+        // privileges at all and ships on every Omarchy machine because moat
+        // itself depends on it. So every armed rule could be stepped around by
+        // prefixing the command:
+        //
+        //     cat ~/.ssh/id_ed25519                            -> denied
+        //     bwrap --unshare-user --ro-bind / / cat <same>    -> read SUCCEEDS
+        //
+        // Measured on this machine, seconds apart, with the rule armed. Seven
+        // of the eight armed rules were bypassable that way; only the one
+        // carrying the `global` annotation was not.
+        //
+        // The mount namespace cannot tell the two apart -- both differ from the
+        // host -- and Tetragon's container selectors are Kubernetes-only. The
+        // CGROUP namespace can:
+        //
+        //     host                      cgroup:[4026531835]
+        //     bwrap --unshare-user      cgroup:[4026531835]   same as host
+        //     docker container          cgroup:[4026532784]   private
+        //
+        // runc gives every container a private cgroup namespace by default;
+        // bwrap only unshares one if asked, and nothing asks. So this keeps the
+        // exemption for the case it was written for -- `pg_isready` denied
+        // reading its own image's shadow file -- while a plain namespace, which
+        // is just this machine with a different view of it, is enforced like
+        // any other process here.
+        //
+        // A container deliberately started with `--cgroupns=host` is enforced
+        // too. That is the right answer: it shares this machine's cgroup view,
+        // so its `/etc/shadow` is far more likely to be ours.
         serde_yaml::from_str(&format!(
-            "namespace: Mnt\noperator: \"{}\"\nvalues:\n- \"host_ns\"",
+            "namespace: Cgroup\noperator: \"{}\"\nvalues:\n- \"host_ns\"",
             op
         ))
         .expect("literal parses")

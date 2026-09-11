@@ -41,6 +41,7 @@
 //! | `control`   | the `/run/moat/control.sock` protocol of CONTRACT §5        |
 //! | `engine`    | the run loop that wires all of the above together               |
 //! | `feeds`     | signed malicious-package index client + local feed cache        |
+//! | `names`     | which name resolved to an address, from systemd-resolved's stream|
 //! | `telemetry` | selectable telemetry classes and `telemetry.jsonl`              |
 //! | `ship`      | `moat-ship`: NDJSON/syslog export, cursor, buffer, redaction    |
 
@@ -62,6 +63,7 @@ pub mod event;
 pub mod evidence;
 pub mod explain;
 pub mod feeds;
+pub mod names;
 pub mod incident;
 pub mod mtree;
 pub mod policy;

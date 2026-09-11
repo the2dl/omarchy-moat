@@ -283,6 +283,18 @@ pub struct Daemon {
     /// notified, never counted (BASELINE §8).
     pub alerts_suppressed: u64,
     dedupe: HashMap<String, Dedupe>,
+    /// address -> the name this machine resolved to it (`names.rs`). Filled
+    /// from systemd-resolved's query stream by `drain_names`; read once per
+    /// net finding in `emit`, and by `moat-x-net-domain-ioc` through
+    /// `RuleCtx`. Plain data, no lock: the reader thread owns a channel, the
+    /// daemon owns the cache.
+    pub names: crate::names::NameCache,
+    names_rx: Option<std::sync::mpsc::Receiver<crate::names::Msg>>,
+    /// What the reader last said: `off`, `not started`, `connecting`,
+    /// `connected`, `refused: ...`, `unavailable: ...`. Reported in `status`
+    /// because a name that is never recorded looks exactly like a machine
+    /// that never resolves anything, and the difference is this string.
+    pub names_state: String,
     /// When a process last read a credential file, keyed by SESSION id.
     ///
     /// The exfil-context signal: `net_first_contact` normally goes quiet once a
@@ -501,6 +513,7 @@ impl Daemon {
             .unwrap_or(false);
         let digest_last_sent = persisted_u64(&state, "digest_summary", "last_sent_unix");
 
+        let cfg_names = cfg.names.clone();
         let mut d = Daemon {
             cfg,
             sensor_settle_secs: SENSOR_SETTLE_SECS,
@@ -560,6 +573,9 @@ impl Daemon {
             alerts_emitted: 0,
             alerts_suppressed: 0,
             dedupe: HashMap::new(),
+            names: crate::names::NameCache::new(cfg_names.retain_secs, cfg_names.max_addresses),
+            names_rx: None,
+            names_state: if cfg_names.enabled { "not started".into() } else { "off".into() },
             cred_read_sessions: HashMap::new(),
             pending_kill: HashMap::new(),
             provenance,
@@ -969,6 +985,7 @@ impl Daemon {
             mode: &self.mode,
             armed: &self.enforcing_rules,
             cred_read_sessions: &self.cred_read_sessions,
+            names: &self.names,
         }
     }
 
@@ -2826,6 +2843,8 @@ impl Daemon {
                 dst_ip: ip,
                 dst_port: port,
                 domain: None,
+                domain_age_secs: None,
+                domain_cname: None,
             });
         }
 
@@ -2927,6 +2946,118 @@ impl Daemon {
         f
     }
 
+    /// Subscribe to systemd-resolved's query stream. Called from `run`, not
+    /// from `new`: a constructor that spawns a thread and connects to a
+    /// socket is a constructor every test pays for.
+    pub fn start_names(&mut self) {
+        if !self.cfg.names.enabled || self.names_rx.is_some() {
+            return;
+        }
+        self.names_rx = Some(crate::names::spawn(&self.cfg.names));
+        self.names_state = "connecting".into();
+    }
+
+    /// Move what the reader has seen into the cache. Runs on every pass of
+    /// the loop, BEFORE the sensor's lines are handled, so a resolution that
+    /// preceded a connection is in the cache when the connection is judged.
+    pub fn drain_names(&mut self, now: u64) {
+        let Some(rx) = self.names_rx.as_ref() else {
+            return;
+        };
+        loop {
+            match rx.try_recv() {
+                Ok(crate::names::Msg::State(st)) => {
+                    if st != self.names_state {
+                        log::info!("names: {}", st);
+                    }
+                    self.names_state = st;
+                }
+                Ok(crate::names::Msg::Resolved(rs)) => {
+                    for r in &rs {
+                        self.names.record(r, now);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.names_state = "reader exited".into();
+                    self.names_rx = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Put the resolved name on a net finding, or say plainly that there is
+    /// none. One place, for every path that builds a finding, so no rule can
+    /// forget and no rule has to know where names come from.
+    ///
+    /// A hit in `feeds/domains.txt` becomes the finding's IOC here too, so a
+    /// first-contact or egress alert to a fed domain is scored as an IOC
+    /// (`scoring::has_ioc`) whichever rule raised it. The dedicated
+    /// `moat-x-net-domain-ioc` rule exists for the connections no other rule
+    /// reports -- a familiar /24, a registry CIDR.
+    fn enrich_names(&self, f: &mut Finding, now: u64) {
+        let Some(net) = f.net.as_mut() else {
+            return;
+        };
+        if net.domain.is_some() {
+            return;
+        }
+        let looked_up = net
+            .dst_ip
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .and_then(|ip| self.names.lookup(&ip, now));
+        match looked_up {
+            Some(l) => {
+                net.domain = Some(l.name.clone());
+                net.domain_age_secs = Some(l.age_secs);
+                net.domain_cname = l.cname.clone();
+                let mut line = format!(
+                    "name: {} was resolved to {} {} before this connection ({})",
+                    l.name,
+                    net.dst_ip,
+                    crate::util::human_secs(l.age_secs),
+                    crate::names::SOURCE
+                );
+                if let Some(c) = &l.cname {
+                    line.push_str(&format!("; the answer came via {}", c));
+                }
+                if let Some(ttl) = l.ttl {
+                    line.push_str(&format!("; the record's TTL was {} s", ttl));
+                }
+                f.extra_evidence.push(line);
+                if f.ioc.is_none() {
+                    if let Some(entry) = self.feeds.domain_hit(&l.name) {
+                        f.ioc = Some(crate::alert::IocRef {
+                            source: "domain-feed".into(),
+                            matched: format!("domain:{}", entry),
+                        });
+                        f.extra_evidence.push(format!(
+                            "feed: {} is in feeds/domains.txt ({} entries)",
+                            entry, self.feeds.meta.domains
+                        ));
+                    }
+                }
+            }
+            None => {
+                let why = match self.names_state.as_str() {
+                    "off" => "name resolution artifacts are off ([names] enabled = false)".to_string(),
+                    "connected" => format!(
+                        "no resolution of {} was seen by {} in the last {} -- a literal address, \
+                         a name resolved before that, or DNS that bypassed the system resolver \
+                         (DNS-over-HTTPS inside the program, a container with its own DNS)",
+                        net.dst_ip,
+                        crate::names::SOURCE,
+                        crate::util::human_secs(self.cfg.names.retain_secs)
+                    ),
+                    other => format!("the {} query stream is not available: {}", crate::names::SOURCE, other),
+                };
+                f.extra_evidence.push(format!("name: not recorded -- {}", why));
+            }
+        }
+    }
+
     fn emit_all(&mut self, findings: Vec<Finding>) {
         for f in findings {
             self.emit(f);
@@ -2966,6 +3097,8 @@ impl Daemon {
             f.context,
             &self.cfg.context,
         ));
+        // Before scoring: a domain-feed hit sets `ioc`, and the score reads it.
+        self.enrich_names(&mut f, now);
 
         // --- 2. severity (BASELINE §2 and §2b) ------------------------------
         let build_tool = self.build_tool_in_chain(&f.exec_id);
@@ -4786,6 +4919,7 @@ impl Daemon {
         self.arm_tick(now);
         self.verify_tick(now);
         self.sweep_tick(now);
+        self.names.prune(now);
     }
 
     /// Check package-owned executables against their recorded checksums, a
@@ -5580,6 +5714,16 @@ impl Daemon {
             "alerts": self.alerts_emitted,
             "alerts_suppressed": self.alerts_suppressed,
             "processes": self.table.len(),
+            // docs/DNS.md. `state` is the reader's last word; `addresses` is
+            // how many the cache currently holds. "connected" with 0 addresses
+            // a minute after boot is normal; "refused" or "unavailable" is not.
+            "names": {
+                "source": crate::names::SOURCE,
+                "enabled": self.cfg.names.enabled,
+                "state": self.names_state,
+                "addresses": self.names.len(),
+                "recorded": self.names.recorded,
+            },
             "allowlist_rules": self.allowlist.len(),
 
             // --- BASELINE §8 "Resolved shapes" ---------------------------
@@ -6446,6 +6590,7 @@ pub fn run(daemon: Arc<Mutex<Daemon>>, opts: RunOptions) {
         // against a sensor that did not have those names yet.
         let mut d = daemon.lock().expect("daemon lock");
         d.on_start(util::unix_secs());
+        d.start_names();
     }
     let (log_path, state_every, feeds_every, feeds_dir) = {
         let d = daemon.lock().expect("daemon lock");
@@ -6494,6 +6639,9 @@ pub fn run(daemon: Arc<Mutex<Daemon>>, opts: RunOptions) {
         let got = !lines.is_empty();
         if got {
             let mut d = daemon.lock().expect("daemon lock");
+            // Names first: the resolution precedes the connection on the wire
+            // and must precede it in the cache.
+            d.drain_names(util::unix_secs());
             for l in lines {
                 d.handle_line(&l);
             }
@@ -6504,6 +6652,9 @@ pub fn run(daemon: Arc<Mutex<Daemon>>, opts: RunOptions) {
             last_state = now;
             let mut d = daemon.lock().expect("daemon lock");
             d.table.prune(now);
+            // Idle machines resolve names too, and the reader's state has to
+            // reach `status` without waiting for the sensor to say something.
+            d.drain_names(now);
             // One stat of /var/lib/pacman/local; a reload only happens when a
             // transaction actually moved it (BASELINE §1).
             d.on_pacman_change();
@@ -7507,6 +7658,8 @@ mod tests {
                     dst_ip: ip.into(),
                     dst_port: 4873,
                     domain: None,
+                    domain_age_secs: None,
+                    domain_cname: None,
                 });
             } else {
                 f.hook = "file_post_open".into();
@@ -7577,6 +7730,8 @@ mod tests {
                 dst_ip: "162.209.114.112".into(),
                 dst_port: 443,
                 domain: None,
+                domain_age_secs: None,
+                domain_cname: None,
             });
             d.emit(f)
         };
@@ -7644,6 +7799,8 @@ mod tests {
                 dst_ip: "192.168.44.122".into(),
                 dst_port: 4873,
                 domain: None,
+                domain_age_secs: None,
+                domain_cname: None,
             });
             d.emit(f)
         };
@@ -7766,7 +7923,7 @@ mod tests {
             f.meta.severity = sev.into();
             f.ancestry = vec![root.clone()];
             if let Some(ip) = ip {
-                f.net = Some(crate::alert::NetRef { dst_ip: ip.into(), dst_port: 22, domain: None });
+                f.net = Some(crate::alert::NetRef { dst_ip: ip.into(), dst_port: 22, domain: None, domain_age_secs: None, domain_cname: None });
             } else {
                 f.hook = "file_post_open".into();
                 f.file = Some(crate::alert::FileRef {
@@ -7926,6 +8083,8 @@ mod tests {
             dst_ip: "203.0.113.9".into(),
             dst_port: 443,
             domain: None,
+            domain_age_secs: None,
+            domain_cname: None,
         });
         let id = d.emit(f).expect("recorded");
         let a = d.store.find(&id).unwrap();
@@ -9989,6 +10148,8 @@ esac
             dst_ip: "203.0.113.9".into(),
             dst_port: 443,
             domain: None,
+            domain_age_secs: None,
+            domain_cname: None,
         });
         d.store.append_alert(&a).unwrap();
         let c = chain_over(&d, &[a.clone()], "critical");
@@ -12383,5 +12544,139 @@ mod downtime_tests {
                 d
             );
         }
+    }
+
+    /// docs/DNS.md. The one place every net finding is enriched, tested end
+    /// to end: reader message -> cache -> record, with the feed match on top,
+    /// and the honest line when there is nothing to say.
+    #[test]
+    fn net_findings_carry_the_resolved_name_or_say_it_is_not_recorded() {
+        use crate::names::{Msg, Resolved};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.cfg.thresholds.dedupe_secs = 0;
+        let feeds_dir = d.cfg.paths.feeds();
+        std::fs::create_dir_all(&feeds_dir).unwrap();
+        std::fs::write(feeds_dir.join("domains.txt"), "evil.example\n").unwrap();
+        d.feeds = crate::feeds::Feeds::load(&feeds_dir);
+
+        // Off: the record says so, in words.
+        let proc = ProcInfo {
+            exec_id: "e-curl".into(),
+            pid: 7100,
+            uid: 1000,
+            exe: "/usr/bin/curl".into(),
+            args: String::new(),
+            cwd: "/home/dan".into(),
+            start_time: util::now_rfc3339(),
+            ..Default::default()
+        };
+        let mk = |ip: &str| {
+            let mut f = Finding::new(
+                "moat-net-first-contact",
+                crate::policy::PolicyMeta::fallback("moat-net-first-contact"),
+                proc.clone(),
+            );
+            f.meta.family = "net".into();
+            f.meta.severity = "low".into();
+            f.net = Some(crate::alert::NetRef::new(ip, 443));
+            f
+        };
+        d.names_state = "off".into();
+        let id = d.emit(mk("142.250.80.14")).expect("recorded");
+        let a = d.store.find(&id).unwrap();
+        assert_eq!(a.net.as_ref().unwrap().domain, None);
+        assert!(
+            a.explain.evidence.iter().any(|l| l.starts_with("name: not recorded -- name resolution artifacts are off")),
+            "{:?}",
+            a.explain.evidence
+        );
+
+        // Connected, with what the reader saw: the name lands on the record,
+        // with its age, and a fed name becomes the IOC.
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        d.names_rx = Some(rx);
+        tx.send(Msg::State("connected".into())).unwrap();
+        tx.send(Msg::Resolved(vec![
+            Resolved {
+                question: "api.evil.example".into(),
+                answer_name: Some("edge.evil-cdn.example".into()),
+                ip: "45.9.148.99".parse().unwrap(),
+                ttl: Some(300),
+            },
+            Resolved {
+                question: "www.google.com".into(),
+                answer_name: None,
+                ip: "142.251.154.119".parse().unwrap(),
+                ttl: None,
+            },
+        ]))
+        .unwrap();
+        let now = util::unix_secs();
+        d.drain_names(now - 30);
+        assert_eq!(d.names_state, "connected");
+        let st = d.status();
+        assert_eq!(st["names"]["state"], "connected");
+        assert_eq!(st["names"]["addresses"], 2);
+        assert_eq!(st["names"]["source"], "systemd-resolved");
+
+        let id = d.emit(mk("142.251.154.119")).expect("recorded");
+        let a = d.store.find(&id).unwrap();
+        let net = a.net.as_ref().unwrap();
+        assert_eq!(net.domain.as_deref(), Some("www.google.com"));
+        assert!(net.domain_age_secs.unwrap() >= 30, "{:?}", net);
+        assert!(a.ioc.is_none(), "google is not on the feed");
+        assert!(a.summary.contains("(www.google.com)"), "{}", a.summary);
+        assert!(
+            a.explain.evidence.iter().any(|l| l.starts_with("name: www.google.com was resolved to 142.251.154.119")),
+            "{:?}",
+            a.explain.evidence
+        );
+
+        let id = d.emit(mk("45.9.148.99")).expect("recorded");
+        let a = d.store.find(&id).unwrap();
+        let net = a.net.as_ref().unwrap();
+        assert_eq!(net.domain.as_deref(), Some("api.evil.example"));
+        assert_eq!(net.domain_cname.as_deref(), Some("edge.evil-cdn.example"));
+        let ioc = a.ioc.as_ref().expect("a fed name is the finding's IOC");
+        assert_eq!(ioc.source, "domain-feed");
+        assert_eq!(ioc.matched, "domain:evil.example");
+        assert!(
+            a.explain.evidence.iter().any(|l| l.contains("the answer came via edge.evil-cdn.example")),
+            "{:?}",
+            a.explain.evidence
+        );
+
+        // Connected and nothing known about the address: the line says what
+        // that can mean, and names the window.
+        let id = d.emit(mk("203.0.113.9")).expect("recorded");
+        let a = d.store.find(&id).unwrap();
+        assert_eq!(a.net.as_ref().unwrap().domain, None);
+        let line = a
+            .explain
+            .evidence
+            .iter()
+            .find(|l| l.starts_with("name: not recorded -- no resolution of 203.0.113.9"))
+            .unwrap_or_else(|| panic!("{:?}", a.explain.evidence));
+        assert!(line.contains("6 h"), "{}", line);
+        assert!(line.contains("DNS-over-HTTPS"), "{}", line);
+
+        // The reader going away is a state, not a silent null.
+        drop(tx);
+        d.drain_names(now);
+        assert_eq!(d.names_state, "reader exited");
+        assert!(d.names_rx.is_none());
+        let id = d.emit(mk("203.0.113.9")).expect("recorded");
+        let a = d.store.find(&id).unwrap();
+        assert!(
+            a.explain.evidence.iter().any(|l| l.contains("query stream is not available: reader exited")),
+            "{:?}",
+            a.explain.evidence
+        );
+
+        // Retention: `tick` prunes, and a pruned address reads as unknown.
+        d.tick(now + d.cfg.names.retain_secs + 1, false);
+        assert!(d.names.is_empty());
     }
 }

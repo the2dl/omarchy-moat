@@ -139,6 +139,8 @@ impl UserRule for PkgEgress {
             // No DNS in the kernel and none in the export: we genuinely do not
             // know the name (NOTES gap 4).
             domain: None,
+            domain_age_secs: None,
+            domain_cname: None,
         });
         f.what_override = Some(format!(
             "A `{}` install connected to {}:{}, which is not a known package registry.",
@@ -191,6 +193,7 @@ mod tests {
             mode: "monitor",
             armed: &crate::rules::NO_RULES_ARMED,
             cred_read_sessions: &crate::rules::NO_CRED_SESSIONS,
+            names: &crate::rules::NO_NAMES,
         };
         let h = HookHit {
             kind: HookKind::Kprobe,
@@ -277,6 +280,7 @@ mod tests {
             mode: "monitor",
             armed: &crate::rules::NO_RULES_ARMED,
             cred_read_sessions: &crate::rules::NO_CRED_SESSIONS,
+            names: &crate::rules::NO_NAMES,
         };
         let h = HookHit {
             kind: HookKind::Kprobe,

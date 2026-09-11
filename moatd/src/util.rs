@@ -1553,3 +1553,21 @@ mod ancestry_container_tests {
         assert!(!looks(&chain(&["/usr/bin/podman-compose-wrapper"])));
     }
 }
+
+/// `12 s`, `4 min`, `2 h 10 min` -- for an evidence line, where "12 s before
+/// this connection" reads and "12 seconds" is fine but "7391 s" is not.
+pub fn human_secs(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{} s", secs);
+    }
+    if secs < 3_600 {
+        return format!("{} min", secs / 60);
+    }
+    let h = secs / 3_600;
+    let m = (secs % 3_600) / 60;
+    if m == 0 {
+        format!("{} h", h)
+    } else {
+        format!("{} h {} min", h, m)
+    }
+}

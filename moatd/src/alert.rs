@@ -92,8 +92,47 @@ pub struct FileRef {
 pub struct NetRef {
     pub dst_ip: String,
     pub dst_port: u16,
+    /// The name this machine most recently resolved to `dst_ip`, as the
+    /// program asked for it, from systemd-resolved's query stream
+    /// (`names.rs`, docs/DNS.md). `None` means NOT RECORDED -- a literal-IP
+    /// connection, a resolution that bypassed resolved (DoH in a browser, a
+    /// container with its own DNS), an answer older than `names.retain_secs`,
+    /// or the stream being off -- never "there was no name". moat never
+    /// resolves anything itself: a reverse lookup would answer a different
+    /// question and add queries of moat's own.
     #[serde(default)]
     pub domain: Option<String>,
+    /// Seconds between that resolution and this connection. The name is
+    /// keyed by address, not by process, so a large age is the reader's cue
+    /// that a CDN address may since have been handed to someone else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_age_secs: Option<u64>,
+    /// The owner name of the record that answered, when a CNAME chain ended
+    /// somewhere other than the name asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_cname: Option<String>,
+}
+
+impl NetRef {
+    pub fn new(dst_ip: impl Into<String>, dst_port: u16) -> NetRef {
+        NetRef {
+            dst_ip: dst_ip.into(),
+            dst_port,
+            domain: None,
+            domain_age_secs: None,
+            domain_cname: None,
+        }
+    }
+
+    /// `ip:port`, with the name the record has for it: `142.251.154.119:443
+    /// (www.google.com)`. An absent name adds nothing here; the explain block
+    /// says "not recorded" in a line of its own.
+    pub fn endpoint(&self) -> String {
+        match &self.domain {
+            Some(d) => format!("{}:{} ({})", self.dst_ip, self.dst_port, d),
+            None => format!("{}:{}", self.dst_ip, self.dst_port),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
