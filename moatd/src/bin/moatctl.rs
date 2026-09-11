@@ -1057,11 +1057,20 @@ fn print_human(cmd: &Cmd, r: &Value) {
                 println!("no decoy files planted. `sudo moatctl canary --on` plants a set.");
                 return;
             }
+            let visible = r["paths_visible"].as_bool() == Some(true);
             println!(
                 "{} decoy file(s) across {}. Nothing reads these; a read is the alert.\n",
                 rows.len(),
                 places.join(", ")
             );
+            if !visible {
+                // The whole point. A threat actor who knows this tool can log
+                // in as you -- they are in the `moat` group, that is the threat
+                // model -- and one command would otherwise hand them every path
+                // to avoid.
+                println!("  The paths are root-only: `sudo moatctl canary` shows them.");
+                println!("  Anything that can read the list can walk around every decoy in it.\n");
+            }
             for want in ["etc", "root", "home", "tmp"] {
                 if !places.contains(&want) {
                     println!(
@@ -1073,7 +1082,13 @@ fn print_human(cmd: &Cmd, r: &Value) {
             }
             for row in &rows {
                 let gone = if row["present"].as_bool() == Some(true) { "" } else { "   (MISSING)" };
-                println!("  {}{}", row["path"].as_str().unwrap_or("?"), gone);
+                match row["path"].as_str() {
+                    Some(p) => println!("  {}{}", p, gone),
+                    // Still says WHERE in the coarse sense -- which of etc,
+                    // root, home, tmp -- because that answers "is it covering
+                    // the places I care about" without naming a file to avoid.
+                    None => println!("  one in {}{}", row["kind"].as_str().unwrap_or("?"), gone),
+                }
                 println!("    a read here means {}", row["means"].as_str().unwrap_or(""));
             }
             if r["sensor_loading"] == Value::Bool(true) {
@@ -1081,7 +1096,10 @@ fn print_human(cmd: &Cmd, r: &Value) {
                     "\n  the sensor is still attaching -- these are not being watched yet."
                 );
             }
-            let missing = r["missing"].as_array().map(|a| a.len()).unwrap_or(0);
+            let missing = match r["missing"].as_array() {
+                Some(a) => a.len(),
+                None => r["missing"].as_u64().unwrap_or(0) as usize,
+            };
             if missing > 0 {
                 // The rule still loads and still reports armed, so its silence
                 // stops meaning anything. Say so where it will be read.

@@ -369,7 +369,7 @@ pub fn dispatch(d: &mut Daemon, req: &Value) -> Value {
         "digest" => cmd_digest(d, req),
         "contain" => cmd_contain(d, req, &id()),
         "exclusions" => cmd_exclusions(d, req),
-        "canary" => cmd_canary(d),
+        "canary" => cmd_canary(d, req),
         "" => err("missing `cmd`"),
         other => err(format!("unknown command {:?}", other)),
     }
@@ -2736,10 +2736,28 @@ fn set_canary(d: &mut Daemon, value: &str, who: &str, per_kind: usize) -> Value 
 
 /// What is planted, and whether any of it has gone missing.
 ///
-/// Reading is not gated. A person cannot decide whether a critical alert was
-/// their own decoy without being able to see the list, and evidence behind sudo
-/// does not get read -- the same argument that keeps `baseline list` open.
-fn cmd_canary(d: &Daemon) -> Value {
+/// The PATHS are root-only; the counts are not.
+///
+/// The first cut left the whole list open, reasoning that a person cannot judge
+/// a critical alert without seeing what is planted. That reasoning was wrong on
+/// its own terms -- the alert already says "a decoy file Moat planted" and
+/// names it -- and it contradicted the rest of the feature out loud. The
+/// manifest is 0600 root:root with a comment saying why: "anything that can
+/// read it can step around every one of them." Serving the same list over a
+/// group-readable socket handed it to exactly the attacker this is built
+/// against, a package running as the user, who is in the `moat` group. One
+/// `moatctl canary` and every decoy on the machine is avoidable.
+///
+/// What stays open is everything needed to answer "is this working?" -- how
+/// many, which places, how many have gone missing, whether reads are refused.
+/// Knowing decoys EXIST without knowing where is not a weakness; it is most of
+/// the deterrent, and it is what the panel's Settings row draws.
+fn cmd_canary(d: &Daemon, req: &Value) -> Value {
+    let root = req
+        .get("_peer_uid")
+        .and_then(|v| v.as_u64())
+        // Absent means dispatch was driven directly (tests, moatd itself).
+        .is_none_or(|uid| uid == 0);
     let m = crate::canary::Manifest::load(&d.cfg.paths.canaries());
     let missing = crate::canary::missing(&m);
     let rows: Vec<Value> = m
@@ -2747,7 +2765,9 @@ fn cmd_canary(d: &Daemon) -> Value {
         .iter()
         .map(|c| {
             json!({
-                "path": c.path,
+                // The one field that is the map. Everything else describes the
+                // posture rather than giving it away.
+                "path": if root { Value::from(c.path.clone()) } else { Value::Null },
                 "kind": c.kind.as_str(),
                 "means": c.kind.meaning(),
                 "planted": c.planted,
@@ -2762,7 +2782,9 @@ fn cmd_canary(d: &Daemon) -> Value {
         // as a policy and can never fire again. Silence from this rule is
         // supposed to mean nothing went looking; if the file is gone it means
         // nothing at all, and only this field can tell the two apart.
-        "missing": missing,
+        // The COUNT of missing ones, never their paths, for the same reason.
+        "missing": if root { json!(missing) } else { json!(missing.len()) },
+        "paths_visible": root,
         "enforcing": d.mode_for("moat-canary-file-read") == "enforce",
     }))
 }
@@ -3396,6 +3418,66 @@ mod tests {
                 line.trim()
             );
         }
+    }
+
+    /// The decoy PATHS are the whole detection, and a group-readable socket
+    /// would hand them over.
+    ///
+    /// The threat model is written at the top of this file: the attacker is a
+    /// package running as the user, and that user is in the `moat` group. So is
+    /// a person who knows this tool and has a shell. Either could type one
+    /// command, read the list, and step around all seven -- the manifest is
+    /// 0600 root:root precisely so that cannot happen, and serving the same
+    /// content over the socket undid it.
+    ///
+    /// The counts stay open: "is this working, and is it covering the places I
+    /// care about" has to be answerable without being handed a map.
+    #[test]
+    fn the_decoy_paths_are_root_only_but_the_counts_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon(dir.path());
+        let manifest = crate::canary::Manifest {
+            canaries: vec![
+                crate::canary::Canary {
+                    path: "/etc/backup.secrets".into(),
+                    kind: crate::canary::Kind::Etc,
+                    planted: 1,
+                },
+                crate::canary::Canary {
+                    path: "/root/.rclone.conf".into(),
+                    kind: crate::canary::Kind::Root,
+                    planted: 1,
+                },
+            ],
+        };
+        manifest.save(&d.cfg.paths.canaries()).unwrap();
+
+        let as_user = json!({"cmd": "canary", "_peer_uid": 1000, "_peer": "uid 1000"});
+        let r = dispatch(&mut d, &as_user);
+        assert_eq!(r["ok"], true, "listing is not refused, only redacted");
+        assert_eq!(r["paths_visible"], false);
+        let rows = r["canaries"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "the count is still the truth");
+        for row in rows {
+            assert!(row["path"].is_null(), "a path reached a non-root caller: {row}");
+            assert!(
+                row["kind"].as_str().is_some(),
+                "which PLACE stays visible -- that answers coverage without naming a file"
+            );
+        }
+        let blob = serde_json::to_string(&r).unwrap();
+        assert!(
+            !blob.contains("backup.secrets") && !blob.contains("rclone"),
+            "no path may appear anywhere in the response: {blob}"
+        );
+
+        // Root gets the map.
+        let as_root = json!({"cmd": "canary", "_peer_uid": 0, "_peer": "uid 0"});
+        let r = dispatch(&mut d, &as_root);
+        assert_eq!(r["paths_visible"], true);
+        let blob = serde_json::to_string(&r).unwrap();
+        assert!(blob.contains("/etc/backup.secrets"), "{blob}");
+        assert!(blob.contains("/root/.rclone.conf"), "{blob}");
     }
 
     /// Turning protection off is a root action.
