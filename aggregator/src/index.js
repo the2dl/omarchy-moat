@@ -19,6 +19,11 @@ import {
 } from './delta.js';
 import { gzipStrings, gunzipLines, sha256Hex } from './gz.js';
 import { importSigner, signBytes } from './sign.js';
+import {
+  THREATFOX_HOSTFILE, THREATFOX_CSV_FULL, PSL_URL, DEFAULT_MIN_CONFIDENCE,
+  newDomainStats, threatFoxMetadata, hostfileDomains, upstreamStamp, parsePsl,
+  gateDomains, domainArtifactLines, metaTableLines, parseMetaTable, unzipCsvLines,
+} from './domains.js';
 
 const OSSF_REPO = 'ossf/malicious-packages';
 const OSSF_TARBALL = `https://codeload.github.com/${OSSF_REPO}/tar.gz/refs/heads/main`;
@@ -28,6 +33,15 @@ const DD_RAW = 'https://raw.githubusercontent.com/DataDog/malicious-software-pac
 const POINTER_KEY = 'v1/pointer.json';
 const STATE_KEY = 'state/state.json';
 const RECORDS_KEY = 'state/records.tsv.gz';
+
+// The domain wing keeps its own state and its own sequence. Sharing the package
+// sequence would mean every ThreatFox change republishes the 1.6 MB package
+// artifact and all 48 deltas, and every package change republishes the domain
+// list -- two feeds moving at completely different rates, each paying the
+// other's bandwidth.
+const DOMAINS_STATE_KEY = 'state/domains.json';
+const DOMAIN_META_KEY = 'state/domain-meta.tsv.gz';
+const PSL_KEY = 'state/psl.txt.gz';
 
 const IMMUTABLE = 'public, max-age=31536000, immutable';
 const POINTER_CACHE = 'public, max-age=60';
@@ -230,9 +244,7 @@ async function publish(env, state, index, sources, log, statsExtra = {}) {
     deltas,
     sources,
   };
-  await env.FEED.put(POINTER_KEY, JSON.stringify(pointer, null, 2), {
-    httpMetadata: { contentType: 'application/json', cacheControl: POINTER_CACHE },
-  });
+  await writePointer(env, pointer);
 
   Object.assign(state, {
     seq, generated, entries: index.size, artifact: '/v1/' + artName,
@@ -243,6 +255,56 @@ async function publish(env, state, index, sources, log, statsExtra = {}) {
   await prune(env, seq, keep, log);
   return pointer;
 }
+
+/**
+ * Write pointer.json, carrying the other wing's half across untouched.
+ *
+ * The packages feed and the domains feed publish independently and each owns
+ * part of this one document. Whichever writes last must not drop what the other
+ * just put there, and neither can hold the whole thing in its own state without
+ * the two copies drifting. So the rule is: read what is live, replace only your
+ * own keys, write it back.
+ *
+ * @param {object|null} packages top-level package fields, or null to keep them
+ * @param {object|null|undefined} domains the `domains` block, or undefined to keep it
+ */
+async function writePointer(env, packages, domains) {
+  let current = {};
+  const obj = await env.FEED.get(POINTER_KEY);
+  if (obj) { try { current = await obj.json(); } catch { current = {}; } }
+
+  const next = packages ? { ...packages } : { ...current };
+  if (domains !== undefined) {
+    if (domains) next.domains = domains;
+    else delete next.domains;
+  } else if (current.domains) {
+    next.domains = current.domains;
+  }
+  next.version = 1;
+
+  await env.FEED.put(POINTER_KEY, JSON.stringify(next, null, 2), {
+    httpMetadata: { contentType: 'application/json', cacheControl: POINTER_CACHE },
+  });
+  return next;
+}
+
+const emptyDomainsState = () => ({
+  version: 1, seq: 0, generated: null, entries: 0, artifact: null, sha256: null,
+  bytes: 0, upstream: null, meta_refreshed: null, psl_refreshed: null,
+  stats: {}, last_error: null,
+});
+
+async function loadDomainsState(env) {
+  const obj = await env.FEED.get(DOMAINS_STATE_KEY);
+  if (!obj) return emptyDomainsState();
+  try { return { ...emptyDomainsState(), ...(await obj.json()) }; }
+  catch { return emptyDomainsState(); }
+}
+
+const saveDomainsState = (env, s) =>
+  env.FEED.put(DOMAINS_STATE_KEY, JSON.stringify(s, null, 2), {
+    httpMetadata: { contentType: 'application/json', cacheControl: 'no-store' },
+  });
 
 /** Drop artifacts and deltas the pointer no longer references. One sequence of
  *  grace, so a client mid-download of the previous round still finishes. */
@@ -262,6 +324,223 @@ async function prune(env, seq, keep, log) {
   } while (cursor);
   for (let i = 0; i < doomed.length; i += 100) await env.FEED.delete(doomed.slice(i, i + 100));
   if (doomed.length) log.add('pruned', doomed.length, 'objects');
+}
+
+// --- the domain wing --------------------------------------------------------
+
+const UA = (env) => env.USER_AGENT || 'omarchy-moat-aggregator/1';
+
+async function fetchBytes(env, url, cap) {
+  const res = await fetch(url, { headers: { 'user-agent': UA(env) } });
+  if (!res.ok) throw new Error(`${url} -> ${res.status}`);
+  const buf = new Uint8Array(await res.arrayBuffer());
+  if (cap && buf.length > cap) throw new Error(`${url} returned ${buf.length} bytes, cap is ${cap}`);
+  return buf;
+}
+
+const fetchText = async (env, url, cap) =>
+  new TextDecoder().decode(await fetchBytes(env, url, cap));
+
+/**
+ * The public suffix list, refreshed daily and cached in R2.
+ *
+ * Cached rather than fetched every tick because it is 334 KB that changes a few
+ * times a month, and because a tick that cannot reach publicsuffix.org must
+ * still be able to publish. Missing entirely is the one case worth refusing on:
+ * without the gate a single bad upstream row could widen the feed to an entire
+ * public suffix, so `gateDomains` is never run with a null list.
+ */
+async function loadPsl(env, refresh, dstate, log) {
+  if (refresh) {
+    try {
+      const text = await fetchText(env, PSL_URL, 8 << 20);
+      const psl = parsePsl(text);
+      // An error page, a captive portal or a truncated body all parse to
+      // something; none of them parse to a thousand rules. The real list has
+      // over twelve thousand, so this only ever catches a body that is not the
+      // list at all.
+      if (psl.exact.size < 100) throw new Error(`only ${psl.exact.size} rules; refusing it`);
+      await env.FEED.put(PSL_KEY, await gzipStrings([text]), {
+        httpMetadata: { contentType: 'application/gzip', cacheControl: 'no-store' },
+      });
+      dstate.psl_refreshed = isoNow();
+      log.add('psl refreshed:', psl.exact.size, 'rules,', psl.wild.size, 'wildcards');
+      return psl;
+    } catch (e) {
+      log.add('psl refresh failed:', String(e), '- falling back to the cached copy');
+    }
+  }
+  const obj = await env.FEED.get(PSL_KEY);
+  if (!obj) return null;
+  let text = '';
+  for await (const line of gunzipLines(obj.body)) text += line + '\n';
+  return parsePsl(text);
+}
+
+/** The metadata table: rebuilt from the 23 MB CSV on the daily run, cached otherwise. */
+async function loadDomainMeta(env, refresh, dstate, stats, log) {
+  const cached = await env.FEED.get(DOMAIN_META_KEY);
+  if (refresh) {
+    try {
+      const zip = await fetchBytes(env, THREATFOX_CSV_FULL, 64 << 20);
+      const meta = await threatFoxMetadata(unzipCsvLines(zip), stats);
+      // Relative, not absolute. The question worth asking is "did the dump
+      // collapse since yesterday", and the answer lives in the table already on
+      // disk -- an absolute floor would have to be guessed, and would be wrong
+      // the first time abuse.ch's corpus legitimately changed size. With
+      // nothing cached there is nothing to compare against, and the publish
+      // floor downstream still guards the output.
+      if (cached) {
+        const had = Number(cached.httpMetadata && cached.httpMetadata.domains) || 0;
+        if (had > 0 && meta.size < Math.floor(had / 2)) {
+          throw new Error(`dump holds ${meta.size} domains against ${had} cached; refusing it`);
+        }
+      }
+      await env.FEED.put(DOMAIN_META_KEY, await gzipStrings(metaTableLines(meta)), {
+        httpMetadata: {
+          contentType: 'application/gzip', cacheControl: 'no-store',
+          // Carried so the next run can compare sizes without inflating it.
+          domains: String(meta.size),
+        },
+      });
+      dstate.meta_refreshed = isoNow();
+      log.add('domain metadata:', stats.csv_rows, 'rows ->', meta.size, 'domains');
+      return meta;
+    } catch (e) {
+      log.add('domain metadata refresh failed:', String(e), '- falling back to the cached table');
+    }
+  }
+  if (!cached) return new Map();
+  return parseMetaTable(gunzipLines(cached.body));
+}
+
+/**
+ * A content digest that ignores `generated` and `seq`.
+ *
+ * Both of those move on every run and both are inside the artifact, so hashing
+ * the artifact bytes would say "changed" every fifteen minutes forever. The
+ * package wing answers the same question with a merge join against the previous
+ * artifact; this list is small enough that a digest of its own contents is
+ * simpler and exact.
+ */
+async function domainContentSha(accepted) {
+  const parts = [];
+  for (const d of [...accepted.keys()].sort()) {
+    const m = accepted.get(d);
+    parts.push(`${d}\t${m.family}\t${m.confidence}\t${m.compromised ? 'c' : '-'}\n`);
+  }
+  return sha256Hex(new TextEncoder().encode(parts.join('')));
+}
+
+/**
+ * Build and publish the domain list.
+ *
+ * `full` reads the 23 MB CSV for metadata and refreshes the public suffix list;
+ * a tick reads only the 1.6 MB hostfile and reuses both from R2.
+ */
+export async function runDomains(env, log, { full = false } = {}) {
+  const dstate = await loadDomainsState(env);
+  const stats = newDomainStats();
+  const minConfidence = num(env.DOMAIN_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE);
+
+  const psl = await loadPsl(env, full, dstate, log);
+  if (!psl) {
+    throw new Error('no public suffix list available; refusing to build a domain feed without the gate');
+  }
+  const meta = await loadDomainMeta(env, full, dstate, stats, log);
+
+  const hostText = await fetchText(env, THREATFOX_HOSTFILE, 32 << 20);
+  const corpus = hostfileDomains(hostText, stats);
+  const upstream = upstreamStamp(hostText);
+  const accepted = gateDomains(corpus, meta, psl, minConfidence, stats);
+
+  // A feed that collapses is worse than a feed that is stale: every machine
+  // would quietly lose coverage and nothing would look broken. A truncated
+  // response, a half-written upstream file or an outage behind a 200 all land
+  // here, and the right answer to all three is to keep what is already
+  // published. A deliberate shrink still gets through -- it just takes two runs.
+  const floor = Math.floor(dstate.entries / 2);
+  if (dstate.entries > 0 && accepted.size < floor) {
+    const why = `upstream returned ${accepted.size} domains against ${dstate.entries} published; `
+      + `below the ${floor} floor, keeping the existing list`;
+    dstate.last_error = why;
+    await saveDomainsState(env, dstate);
+    log.add('domains REFUSED:', why);
+    return null;
+  }
+
+  const contentSha = await domainContentSha(accepted);
+  if (contentSha === dstate.content_sha && dstate.artifact) {
+    dstate.upstream = upstream;
+    dstate.last_error = null;
+    dstate.stats = stats;
+    await saveDomainsState(env, dstate);
+    log.add('domains unchanged at seq', dstate.seq, `(${accepted.size} entries)`);
+    return null;
+  }
+
+  const signer = await importSigner(env.FEED_SIGNING_KEY);
+  const seq = dstate.seq + 1;
+  const generated = isoNow();
+  const gz = await gzipStrings(domainArtifactLines(accepted, generated, seq, { upstream }));
+  const sha = await sha256Hex(gz);
+  const name = `domains-${seq}-${sha.slice(0, 12)}.txt.gz`;
+  await putSigned(env, signer, 'v1/' + name, gz, 'application/gzip');
+
+  Object.assign(dstate, {
+    seq, generated, entries: accepted.size, artifact: '/v1/' + name,
+    sha256: sha, bytes: gz.length, upstream, content_sha: contentSha,
+    stats, last_error: null,
+  });
+  await saveDomainsState(env, dstate);
+  await writePointer(env, null, {
+    seq, generated, entries: accepted.size, artifact: '/v1/' + name,
+    sha256: sha, bytes: gz.length,
+    source: { name: 'threatfox', upstream, min_confidence: minConfidence },
+  });
+  await pruneDomains(env, seq, num(env.KEEP_ARTIFACTS, 4), log);
+
+  log.add('published', name, accepted.size, 'entries,', gz.length, 'bytes;',
+    'dropped', stats.dropped_shared_suffix, 'shared-suffix,',
+    stats.dropped_never, 'never-list,', stats.dropped_confidence, 'low-confidence;',
+    stats.no_metadata, 'without metadata,', stats.compromised, 'compromised sites');
+  return { seq, entries: accepted.size, stats };
+}
+
+async function pruneDomains(env, seq, keep, log) {
+  let cursor;
+  const doomed = [];
+  do {
+    const listed = await env.FEED.list({ prefix: 'v1/domains-', cursor, limit: 1000 });
+    for (const o of listed.objects) {
+      const m = /^v1\/domains-(\d+)-/.exec(o.key);
+      if (m && Number(m[1]) <= seq - keep) doomed.push(o.key);
+    }
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
+  for (let i = 0; i < doomed.length; i += 100) await env.FEED.delete(doomed.slice(i, i + 100));
+  if (doomed.length) log.add('pruned', doomed.length, 'domain objects');
+}
+
+/**
+ * Run the domain wing without letting it take the package wing down with it.
+ *
+ * The packages feed is what the six scanners read before an install, and it has
+ * worked for a year. abuse.ch going down, changing a column or serving a broken
+ * zip must not stop a package tick from publishing.
+ */
+async function runDomainsSafely(env, log, opts) {
+  try {
+    return await runDomains(env, log, opts);
+  } catch (err) {
+    log.add('domains FAILED:', err && err.stack ? err.stack : err);
+    try {
+      const d = await loadDomainsState(env);
+      d.last_error = String(err);
+      await saveDomainsState(env, d);
+    } catch { /* the error line in the log is the record that matters */ }
+    return null;
+  }
 }
 
 // --- the daily full rebuild -------------------------------------------------
@@ -297,7 +576,13 @@ export async function runFull(env, log = new RunLog('full')) {
     datadog: { etag: etags.npm || null, fetched: now },
   };
   const pointer = await publish(env, state, ctx.index, sources, log, { stats: ctx.stats });
-  log.done({ seq: pointer ? pointer.seq : state.seq, entries: ctx.index.size, stats: ctx.stats });
+  // Last, and never fatal: the domain wing reads a 23 MB CSV here, which is
+  // affordable only in this job's 15-minute CPU budget.
+  const domains = await runDomainsSafely(env, log, { full: true });
+  log.done({
+    seq: pointer ? pointer.seq : state.seq, entries: ctx.index.size, stats: ctx.stats,
+    domains: domains ? domains.entries : null,
+  });
   return pointer;
 }
 
@@ -307,7 +592,8 @@ export async function runTick(env, log = new RunLog('tick')) {
   const state = await loadState(env);
   if (state.needs_rebuild || !state.sources.ossf || !state.sources.ossf.commit) {
     log.add('needs_rebuild is set; waiting for the daily rebuild');
-    log.done({ skipped: 'needs_rebuild' });
+    const domains = await runDomainsSafely(env, log, { full: false });
+    log.done({ skipped: 'needs_rebuild', domains: domains ? domains.entries : null });
     return null;
   }
   const recObj = await env.FEED.get(RECORDS_KEY);
@@ -315,7 +601,8 @@ export async function runTick(env, log = new RunLog('tick')) {
     state.needs_rebuild = true;
     await saveState(env, state);
     log.add('records state missing; flagged for rebuild');
-    log.done({ skipped: 'no records' });
+    const domains = await runDomainsSafely(env, log, { full: false });
+    log.done({ skipped: 'no records', domains: domains ? domains.entries : null });
     return null;
   }
 
@@ -324,7 +611,8 @@ export async function runTick(env, log = new RunLog('tick')) {
     state.needs_rebuild = true;
     await saveState(env, state);
     log.add('FALLBACK to full rebuild:', cmp.rebuild);
-    log.done({ skipped: 'fallback', reason: cmp.rebuild });
+    const domains = await runDomainsSafely(env, log, { full: false });
+    log.done({ skipped: 'fallback', reason: cmp.rebuild, domains: domains ? domains.entries : null });
     return null;
   }
   const dd = await fetchDatadog(env, state.dd_etags || {});
@@ -334,7 +622,11 @@ export async function runTick(env, log = new RunLog('tick')) {
     state.sources.ossf.commit = cmp.head;
     state.sources.ossf.fetched = isoNow();
     await saveState(env, state);
-    log.done({ seq: state.seq, changed: 0 });
+    // A quiet quarter-hour for packages is the COMMON case, and it is exactly
+    // when ThreatFox is most likely to have moved. Returning here without
+    // touching the domain wing would have pinned it to the daily run.
+    const domains = await runDomainsSafely(env, log, { full: false });
+    log.done({ seq: state.seq, changed: 0, domains: domains ? domains.entries : null });
     return null;
   }
   log.add(cmp.changed.length, 'changed,', cmp.removed.length, 'removed OSV files;',
@@ -406,13 +698,17 @@ export async function runTick(env, log = new RunLog('tick')) {
   if (ddChanged.length) sources.datadog.fetched = now;
 
   const pointer = await publish(env, state, index, sources, log, { stats });
-  log.done({ seq: pointer ? pointer.seq : state.seq, entries: index.size, stats });
+  const domains = await runDomainsSafely(env, log, { full: false });
+  log.done({
+    seq: pointer ? pointer.seq : state.seq, entries: index.size, stats,
+    domains: domains ? domains.entries : null,
+  });
   return pointer;
 }
 
 // --- serving ----------------------------------------------------------------
 
-const ARTIFACT_RE = /^v1\/(packages-\d+-[0-9a-f]{12}|delta-\d+-\d+-[0-9a-f]{12})\.txt\.gz(\.sig)?$/;
+const ARTIFACT_RE = /^v1\/(packages-\d+-[0-9a-f]{12}|domains-\d+-[0-9a-f]{12}|delta-\d+-\d+-[0-9a-f]{12})\.txt\.gz(\.sig)?$/;
 
 function contentTypeFor(key) {
   if (key.endsWith('.sig')) return 'application/octet-stream';
@@ -446,7 +742,8 @@ export async function serve(request, env, ctx) {
   // Guarded by a secret, because it does real work and writes to R2. Without
   // TRIGGER_TOKEN set it is closed entirely rather than open -- a missing
   // secret must not mean a public button.
-  if (url.pathname === '/admin/tick' || url.pathname === '/admin/rebuild') {
+  if (url.pathname === '/admin/tick' || url.pathname === '/admin/rebuild'
+      || url.pathname === '/admin/domains') {
     if (request.method !== 'POST') {
       return new Response('method not allowed\n', { status: 405, headers: { allow: 'POST' } });
     }
@@ -454,6 +751,24 @@ export async function serve(request, env, ctx) {
     const got = (request.headers.get('authorization') || '').replace(/^Bearer\s+/i, '');
     if (!want || !got || !timingSafeEqual(got, want)) {
       return new Response('unauthorized\n', { status: 401 });
+    }
+    // /admin/domains runs the domain wing alone. It is the lever for the case
+    // the package crons cannot serve: refreshing the list after changing
+    // DOMAIN_MIN_CONFIDENCE or the never-list, without waiting for 04:17 and
+    // without dragging the 44 MB package rebuild along with it. `?full=1` reads
+    // the CSV dump for metadata rather than reusing the cached table.
+    if (url.pathname === '/admin/domains') {
+      const log = new RunLog('domains');
+      const full = url.searchParams.get('full') === '1';
+      try {
+        const out = await runDomains(env, log, { full });
+        log.done(out || { unchanged: true });
+        return json({ ok: true, run: log.kind, result: out, lines: log.lines }, 'no-store');
+      } catch (err) {
+        log.add('FAILED:', err && err.stack ? err.stack : err);
+        log.done({ error: String(err) });
+        return json({ ok: false, run: log.kind, error: String(err), lines: log.lines }, 'no-store', 500);
+      }
     }
     const full = url.pathname.endsWith('rebuild');
     const log = new RunLog(full ? 'full' : 'tick');
@@ -474,9 +789,15 @@ export async function serve(request, env, ctx) {
 
   if (key === 'healthz') {
     const state = await loadState(env);
+    const d = await loadDomainsState(env);
     return json({
       seq: state.seq, entries: state.entries, generated: state.generated,
       needs_rebuild: !!state.needs_rebuild, sources: state.sources,
+      domains: {
+        seq: d.seq, entries: d.entries, generated: d.generated, upstream: d.upstream,
+        meta_refreshed: d.meta_refreshed, psl_refreshed: d.psl_refreshed,
+        last_error: d.last_error, stats: d.stats,
+      },
     }, 'no-store');
   }
 
