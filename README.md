@@ -63,6 +63,14 @@ what an attacker can manufacture. Everything else waits for a human decision.
 a password prompt does not get read, and prompting for trivia is how the prompt
 that matters gets waved through.
 
+**Network calls are strictly inbound data pulls, never telemetry.** The only
+outbound request Moat makes by default is a periodic unauthenticated HTTP `GET`
+to `feed.runts.net` (via `moat-feeds.timer`) to fetch public, Ed25519-signed
+threat feeds (the malicious package index and ThreatFox C2 domains). It transmits
+zero telemetry, zero metrics, no machine identifiers, and no details about what
+you install or execute—nothing leaves your machine. The feed mirror can be
+changed or disabled entirely in `/etc/moat/feeds.toml`.
+
 ## Install
 
 ```sh

@@ -159,6 +159,7 @@ Moat maintains two independent, offline-accessible threat feeds updated on a 15-
   * Applies intelligent Public Suffix List (PSL) base gating to eliminate false positives on shared hosting (e.g. `workers.dev`, `compute-1.amazonaws.com`) while preserving active single-tenant tunnels.
   * Matched at runtime against outbound connections using `moat-x-net-domain-ioc`.
 * **DNS Query Attribution:** Listens to `systemd-resolved`'s Varlink/D-Bus interface to map kernel-level IP socket events back to the specific domain name queried by the process.
+* **Network Privacy & Downstream-Only Pulls:** The periodic network request to `feed.runts.net` (executed by `moat-feeds.timer`) is strictly an unauthenticated HTTP `GET` for public, static, Ed25519-signed threat intelligence data. Moat transmits zero telemetry, zero metrics, no machine IDs, and no records of what you install or run. Nothing leaves your machine, and the feed source can be pointed at an internal mirror or disabled in `/etc/moat/feeds.toml`.
 
 ### E. Baselining, Noise Guard, & Auto-Demotion
 * **7-Day Learning Window:** Allows new developer workstations to baseline recurring development workloads.
