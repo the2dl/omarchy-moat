@@ -77,6 +77,8 @@ spec:
         - "/opt/cni/bin/calico"
         - "/usr/bin/ip"
         - "/usr/bin/tc"
+        - "/usr/bin/NetworkManager"
+        - "/usr/sbin/NetworkManager"
       matchArgs:
       - index: 0
         operator: "Equal"

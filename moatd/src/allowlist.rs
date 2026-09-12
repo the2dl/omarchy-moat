@@ -1113,28 +1113,116 @@ file   = "*/.config/gcloud/*"
         };
         assert_eq!(
             al.len(),
-            2,
-            "the omarchy-shell plugin exec entry and the agent-usage credential \
-             read — nothing else. The twelve moat-test-suite entries moved to \
-             moat-dev.toml.example on 2026-09-09: every one matched a path an \
-             moat-test-suite entries moved to moat-dev.toml.example on 2026-09-09: \
-             every one matched a path an attacker can create (/tmp/.tmp*/nc, \
-             */target/*/deps/moatd-*), and they were shipped to everyone to protect \
-             a case only moat's own developers hit, which additionally needs \
-             `contain.enabled` -- off by default. Moat's own \
-             triage pass has NO entry: see the note at the end of \
-             omarchy-default.toml"
+            10,
+            "omarchy-default.toml covers quickshell bar widgets (agent-usage, \
+             weather, network-status), desktop/menu configuration writes, and \
+             cargo plugin builds under ~/.config/omarchy/plugins — nothing wider."
+        );
+
+        let under_shell = vec![
+            "/usr/bin/python3.14".to_string(),
+            "/usr/bin/quickshell".to_string(),
+            "/usr/bin/Hyprland".to_string(),
+        ];
+
+        // quickshell's own direct read of Claude credentials.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-cred-ai-credentials-read",
+                exe: "/usr/bin/quickshell",
+                file: Some("/home/dan/.claude/.credentials.json"),
+                parents: under_shell.clone(),
+                script: None,
+                domains: vec![],
+            })
+            .is_some()
+        );
+
+        // quickshell plugins writing menu extension configuration.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-persist-omarchy-menu-extension-write",
+                exe: "/usr/bin/python3.14",
+                file: Some("/home/dan/.config/omarchy/extensions/omarchy-menu.jsonc"),
+                parents: under_shell.clone(),
+                script: None,
+                domains: vec![],
+            })
+            .is_some()
+        );
+
+        // quickshell plugins writing desktop entry.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-persist-desktop-entry-write",
+                exe: "/usr/bin/sed",
+                file: Some("/home/dan/.local/share/applications/themebook.desktop"),
+                parents: under_shell.clone(),
+                script: None,
+                domains: vec![],
+            })
+            .is_some()
+        );
+
+        // omarchy-network-status checking network with ping.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-priv-uid-transition",
+                exe: "/usr/bin/ping",
+                file: None,
+                parents: vec![
+                    "/usr/share/omarchy/bin/omarchy-network-status".to_string(),
+                    "/usr/bin/quickshell".to_string(),
+                ],
+                script: None,
+                domains: vec![],
+            })
+            .is_some()
+        );
+
+        // omarchy-shell bar weather fetch with curl.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-net-first-contact",
+                exe: "/usr/bin/curl",
+                file: None,
+                parents: under_shell.clone(),
+                script: None,
+                domains: vec!["wttr.in".to_string()],
+            })
+            .is_some()
+        );
+
+        // cargo building Omarchy plugins in ~/.config/omarchy/plugins/*.
+        let cargo_parents = vec!["/usr/bin/cargo".to_string(), "/usr/bin/bash".to_string()];
+        let plugin_artifact = "/home/dan/.config/omarchy/plugins/my-plugin/daemon/target/release/deps/lib.rmeta";
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-persist-omarchy-plugin-write",
+                exe: "/usr/bin/rustc",
+                file: Some(plugin_artifact),
+                parents: cargo_parents.clone(),
+                script: None,
+                domains: vec![],
+            })
+            .is_some()
+        );
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-exec-untrusted-home",
+                exe: "/usr/bin/cargo",
+                file: Some("/home/dan/.config/omarchy/plugins/my-plugin/daemon/target/release/build-script"),
+                parents: cargo_parents.clone(),
+                script: None,
+                domains: vec![],
+            })
+            .is_some()
         );
 
         // omarchy-shell running its own plugins' helper scripts. Scoped to that
         // actor and that tree: everything else executing from there still fires,
         // and quickshell executing from anywhere else still fires.
         let plugin = "/home/dan/.config/omarchy/plugins/io.github.x.thing/scripts/config";
-        let under_shell = vec![
-            "/usr/bin/python3.14".to_string(),
-            "/usr/bin/quickshell".to_string(),
-            "/usr/bin/Hyprland".to_string(),
-        ];
         // Scoped by ancestry, because the helper is as often run through an
         // interpreter as by the shell directly: both must be covered.
         for exe in ["/usr/bin/quickshell", "/usr/bin/python3.14", "/usr/bin/bash"] {
@@ -1266,6 +1354,126 @@ file   = "*/.config/gcloud/*"
         assert!(
             al.find(&cand(vec![])).is_none(),
             "and neither must one with no ancestry at all"
+        );
+    }
+
+    #[test]
+    fn default_shipped_desktop_and_tool_entries_match() {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("etc/allowlist.d/default.toml");
+        let al = Allowlist {
+            rules: Allowlist::load_file(&p).unwrap(),
+            ..Default::default()
+        };
+
+        // Kernel kthreads loading BPF progs (e.g. HID-BPF).
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-rootkit-bpf-prog-load",
+                exe: "<kernel>",
+                file: None,
+                parents: vec![],
+                script: None,
+                domains: vec![],
+            })
+            .is_some()
+        );
+
+        // NetworkManager loading BPF progs and network checks.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-rootkit-bpf-prog-load",
+                exe: "/usr/bin/NetworkManager",
+                file: None,
+                parents: vec!["/usr/lib/systemd/systemd".into()],
+                script: None,
+                domains: vec![],
+            })
+            .is_some()
+        );
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-net-first-contact",
+                exe: "/usr/bin/NetworkManager",
+                file: None,
+                parents: vec!["/usr/lib/systemd/systemd".into()],
+                script: None,
+                domains: vec!["redirect.archlinux.org".into()],
+            })
+            .is_some()
+        );
+
+        // Nautilus reading credentials and mass read when opening dotfiles.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-cred-registry-token-read",
+                exe: "/usr/bin/nautilus",
+                file: Some("/home/dan/.pypirc"),
+                parents: vec![],
+                script: None,
+                domains: vec![],
+            })
+            .is_some()
+        );
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-x-mass-read",
+                exe: "/usr/bin/nautilus",
+                file: None,
+                parents: vec![],
+                script: None,
+                domains: vec![],
+            })
+            .is_some()
+        );
+
+        // Recursive search tools doing mass read.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-x-mass-read",
+                exe: "/usr/bin/grep",
+                file: None,
+                parents: vec![],
+                script: None,
+                domains: vec![],
+            })
+            .is_some()
+        );
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-x-mass-read",
+                exe: "/usr/bin/rg",
+                file: None,
+                parents: vec![],
+                script: None,
+                domains: vec![],
+            })
+            .is_some()
+        );
+
+        // mise reading forge credentials.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-cred-vcs-token-read",
+                exe: "/usr/bin/mise",
+                file: Some("/home/dan/.config/gh/hosts.yml"),
+                parents: vec![],
+                script: None,
+                domains: vec![],
+            })
+            .is_some()
+        );
+
+        // Must NOT match arbitrary processes.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-rootkit-bpf-prog-load",
+                exe: "/tmp/evil",
+                file: None,
+                parents: vec![],
+                script: None,
+                domains: vec![],
+            })
+            .is_none()
         );
     }
 

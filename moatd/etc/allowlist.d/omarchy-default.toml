@@ -85,6 +85,54 @@ name = "moat-cred-ai-credentials-read"
 exe = "/usr/share/omarchy/bin/omarchy-agent-usage-claude"
 file = "/home/*/.claude/.credentials.json"
 
+# quickshell's agent-usage bar widget reads the Claude credentials directly.
+[[rule]]
+name = "moat-cred-ai-credentials-read"
+exe = "/usr/bin/quickshell"
+file = "/home/*/.claude/.credentials.json"
+
+# quickshell plugins update their menu extension configuration.
+[[rule]]
+name = "moat-persist-omarchy-menu-extension-write"
+parent = "/usr/bin/quickshell"
+file = "/home/*/.config/omarchy/extensions/*"
+
+# quickshell plugins update their desktop entry.
+[[rule]]
+name = "moat-persist-desktop-entry-write"
+parent = "/usr/bin/quickshell"
+file = "/home/*/.local/share/applications/*"
+
+# omarchy-network-status checks gateway reachability with ping.
+[[rule]]
+name = "moat-priv-uid-transition"
+exe = "/usr/bin/ping"
+parent = "/usr/share/omarchy/bin/omarchy-network-status"
+
+# omarchy-shell bar fetches weather status with curl.
+[[rule]]
+name = "moat-net-first-contact"
+exe = "/usr/bin/curl"
+parent = "/usr/bin/quickshell"
+
+# omarchy-agent-usage-claude queries Anthropic API for usage stats.
+[[rule]]
+name = "moat-net-first-contact"
+exe = "/usr/share/omarchy/bin/omarchy-agent-usage-claude"
+
+# cargo and rustc building native Omarchy plugins write artifacts into target.
+[[rule]]
+name = "moat-persist-omarchy-plugin-write"
+parent = "/usr/bin/cargo"
+file = "/home/*/.config/omarchy/plugins/*"
+
+# cargo building native Omarchy plugins executes build scripts from target directories.
+[[rule]]
+name = "moat-exec-untrusted-home"
+parent = "/usr/bin/cargo"
+file = "/home/*/.config/omarchy/plugins/*"
+
+
 # The sandbox suite builds a fake toolchain under /tmp/moat-sandbox-test.*/bin
 # and runs the real shims against it, so the shim execs a binary from a tmpfs —
 # which is the rule, exercised on purpose. Scoped by ancestry rather than by

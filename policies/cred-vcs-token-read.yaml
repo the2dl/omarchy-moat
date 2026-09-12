@@ -43,6 +43,7 @@ spec:
         - "/tea"
         - "/hub"
         - "/lazygit"
+        - "/mise"
       matchArgs:
       # Postfix, not Equal against {{HOME}}: a credential file read from a
       # non-canonical path (a copy, a backup, a bind mount, a bundled decoy)

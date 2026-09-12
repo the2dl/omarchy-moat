@@ -62,6 +62,10 @@ spec:
         - "/kate"
         - "/git"
         - "/git-remote-http"
+        - "/cargo"
+        - "/rustc"
+        - "/ld.lld"
+        - "/gcc"
       matchArgs:
       - index: 0
         operator: "Prefix"

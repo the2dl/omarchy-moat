@@ -1,5 +1,5 @@
 target/
-*.pkg.tar.zst
+*.pkg.tar.*
 pkg/src/
 pkg/pkg/
 pkg/*.tar.gz

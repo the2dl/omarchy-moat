@@ -71,6 +71,47 @@ exe = "/usr/lib/systemd/systemd-coredump"
 name = "moat-priv-setuid-*"
 parent = "/usr/bin/pacman"
 
+# nautilus file manager reads dotfiles and previews when browsing the home directory.
+[[rule]]
+name = "moat-cred-*"
+exe = "/usr/bin/nautilus"
+
+# nautilus opening a directory with dotfiles touches multiple private paths in seconds.
+[[rule]]
+name = "moat-x-mass-read"
+exe = "/usr/bin/nautilus"
+
+# grep recursively searching directories reads private files in sequence.
+[[rule]]
+name = "moat-x-mass-read"
+exe = "/usr/bin/grep"
+
+# ripgrep recursively searching directories reads private files in sequence.
+[[rule]]
+name = "moat-x-mass-read"
+exe = "/usr/bin/rg"
+
+# Kernel internal threads (HID-BPF, scheduler extensions, net devices) have no
+# userspace executable and report `<kernel>`.
+[[rule]]
+name = "moat-rootkit-bpf-prog-load"
+exe = "<kernel>"
+
+# NetworkManager loads BPF programs for IPv6 tokenized interfaces and socket filters.
+[[rule]]
+name = "moat-rootkit-bpf-prog-load"
+exe = "/usr/bin/NetworkManager"
+
+# NetworkManager connectivity check probes known distro endpoints.
+[[rule]]
+name = "moat-net-first-contact"
+exe = "/usr/bin/NetworkManager"
+
+# mise checks GitHub credentials in ~/.config/gh/hosts.yml to avoid API rate limits.
+[[rule]]
+name = "moat-cred-vcs-token-read"
+exe = "/usr/bin/mise"
+
 # The AI CLIs are exactly what moat-x-ai-cli-headless watches. If you run
 # one from a systemd user unit or a cron job on purpose, uncomment and edit this
 # rather than turning the rule off, so an *unexpected* headless agent still
