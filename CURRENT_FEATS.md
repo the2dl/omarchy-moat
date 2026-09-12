@@ -148,20 +148,38 @@ Provides zero-false-positive detection tripwires and supervisory health checks.
 * **The Containment Gate (`moatctl set contain on`):** When enabled, Moat can automatically sever outbound network traffic for a specific offending binary and destination address for 10 minutes without killing the process tree, giving the developer time to inspect the alert.
 * **The Kill Gate (`moatctl set kill kill`):** Provides automated process termination for high-confidence threats. Features a dry-run review mode (`moatctl decisions`) that records exactly what would have been killed or spared.
 
-### D. Threat Intelligence & Network Attribution
-* **DNS Query Attribution:** Listens to `systemd-resolved`'s Varlink/D-Bus interface to correlate raw IP socket events back to the specific domain names resolved on the machine.
-* **ThreatFox Integration:** Ingests and maintains Abuse.ch ThreatFox indicators (~48,000+ malicious domains and IPs) to detect outbound command-and-control communication.
-* **Malicious Package Feeds:** Ingests open-source vulnerability databases (OSV, GitHub Advisory) to cross-reference package installs against known malicious registries.
+### D. Threat Intelligence Feeds (Packages & Domains)
+Moat maintains two independent, offline-accessible threat feeds updated on a 15-minute jittered timer via the `moat-feeds.timer` background service:
+* **Malicious Package Feed (`packages.txt`):**
+  * Aggregates ~242,000+ malicious package entries across **npm, PyPI, crates.io, and Go** sourced from OSSF Malicious Packages and the DataDog Malicious Software Dataset.
+  * Published as immutable, content-addressed, ed25519-signed artifacts with monotonic sequence numbers. Verified before installation into `/var/lib/moat/feeds/packages.txt`.
+  * Scanned completely offline via binary-search mmap lookups—zero network queries at install time, zero latency, and zero leakage of what you are installing.
+* **ThreatFox Malicious Domain Feed (`domains-feed.txt`):**
+  * Synchronizes ~48,000+ active command-and-control (C2) domains and IPs from Abuse.ch ThreatFox bulk feeds.
+  * Applies intelligent Public Suffix List (PSL) base gating to eliminate false positives on shared hosting (e.g. `workers.dev`, `compute-1.amazonaws.com`) while preserving active single-tenant tunnels.
+  * Matched at runtime against outbound connections using `moat-x-net-domain-ioc`.
+* **DNS Query Attribution:** Listens to `systemd-resolved`'s Varlink/D-Bus interface to map kernel-level IP socket events back to the specific domain name queried by the process.
 
 ### E. Baselining, Noise Guard, & Auto-Demotion
 * **7-Day Learning Window:** Allows new developer workstations to baseline recurring development workloads.
 * **Noise Guard:** Automatically demotes noisy, benign single-primitive rules to the background timeline if they repeat without accompanying attack signals, preventing alert fatigue while keeping them active inside correlated chains.
 * **Allowlist Proposal Engine (`moatctl baseline`):** Automatically generates structured allowlist proposals for signed, recurring system packages.
 
-### F. Build Sandboxing & Pre-Execution Scanners
-* **Bubblewrap PATH Shims (`sandbox/`):** Transparent shims for `npm`, `npx`, `pnpm`, `yarn`, `bun`, `pip`, `pip3`, `uv`, `cargo`, `go`, and `makepkg` that run builds inside restricted filesystem and network namespaces.
-* **Static Pre-Install Scanners (`scanner/`):** Python-based AST scanners that analyze `PKGBUILD`, `.install`, `package.json`, and Cargo manifests for dangerous patterns prior to execution.
-* **Install Receipts (`moatctl receipts`):** Writes an append-only audit ledger recording every network connection, file touch, and child process spawned during each package installation.
+### F. Build Sandboxing, Pre-Execution Scanners, & Blocking
+Moat prevents malicious packages from executing or persisting before, during, and after installation:
+* **Automatic Pre-Execution Blocking (PATH Shims):**
+  * Transparent wrappers and PATH shims intercept package manager commands before lifecycle scripts run: `npm`, `npx`, `pnpm`, `yarn`, `bun`, `pip`, `pip3`, `uv`, `cargo`, `go`, and `makepkg`.
+  * Shims automatically run the corresponding offline scanner (`moat-scan-npm`, `moat-scan-pip`, `moat-scan-cargo`, `moat-scan-go`, `moat-scan-pkgbuild`) against the local malicious package feed (`packages.txt`) and AST rules.
+  * **When a bad package is found in the feed:**
+    * The scanner flags it as `feed.malicious-package` with **HIGH severity** (exit code `2`).
+    * **Non-interactive sessions (CI, background jobs, automated scripts):** The shim **refuses and blocks the install immediately** (`exit 1`), aborting execution before any postinstall code can run.
+    * **Interactive terminals:** The install is **halted** and prompts the user with an explicit confirmation (`HIGH findings. Continue anyway? [y/N]`), defaulting to **aborting** (`N`).
+* **Bubblewrap Sandbox Isolation (`sandbox/`):** Restricts package builds to isolated network and filesystem namespaces, preventing postinstall scripts from wandering into `$HOME` or external networks unless permitted.
+* **Static Pre-Install Scanners (`scanner/`):** Python-based AST scanners inspect `PKGBUILD`, `.install`, `package.json`, `setup.py`, and Cargo manifests for obfuscated commands, reverse shells, or suspicious network tools prior to execution.
+* **Runtime Containment & Termination:**
+  * If a running package attempts an outbound connection to a ThreatFox domain or performs an attack sequence, Moat's **Containment Gate** (`moatctl set contain on`) severs its network access for 10 minutes.
+  * If armed (`moatctl set kill kill`), the **Kill Gate** terminates the offending process tree with `SIGKILL`.
+* **Install Receipts (`moatctl receipts`):** Writes an append-only audit ledger recording every file touch, network connection, and child process spawned during each package installation.
 
 ### G. Omarchy Desktop & Shell Integration
 * **Desktop Bar Widget (`BarWidget.qml`):** Minimalist 3-state shield indicator embedded in the Omarchy top bar:
