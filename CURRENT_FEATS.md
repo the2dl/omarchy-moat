@@ -28,17 +28,17 @@ Moat consists of five integrated layers operating between the Linux kernel and t
 │  - ThreatFox (Abuse.ch) & Malicious Package feed integration │
 │  - Noise guard & 7-day automated baseline learning           │
 │  - Containment gate & Process kill gate                      │
-└───────────────────────────────┬──────────────────────────────┘
-                                │ Protobuf / JSON over UNIX socket
-                                ▼
-┌──────────────────────────────────────────────────────────────┐
-│                In-Kernel Sensors (Tetragon)                  │
-│  - 52 TracingPolicy rules loaded via eBPF                    │
-│  - Hooks: kprobes, tracepoints, and BPF LSM security hooks   │
-│  - Dual modes: monitor (audit) and enforce (kernel-level deny)│
-└──────────────────────────────────────────────────────────────┘
-                                │
-   ┌────────────────────────────┴───────────────────────────┐
+└───────────────┬───────────────────────────────┬──────────────┘
+                │ alerts.jsonl / telemetry.jsonl│ Protobuf / JSON over UNIX socket
+                ▼                               ▼
+┌───────────────────────────────────────────┐ ┌──────────────────────────────────┐
+│          moat-ship (SIEM Export)          │ │   In-Kernel Sensors (Tetragon)   │
+│  - Privilege-free shipper (User=moat-ship)│ │ - 52 TracingPolicy rules in eBPF │
+│  - HTTPS: Splunk HEC, Elastic, Loki, DD   │ │ - Hooks: kprobes, LSM, traces    │
+│  - Syslog: RFC5424 / RFC6587 (TCP, /dev)  │ │ - Dual modes: monitor & enforce  │
+└───────────────────────────────────────────┘ └─────────────────┬────────────────┘
+                                                                │
+   ┌────────────────────────────────────────────────────────────┘
    ▼                                                        ▼
 ┌──────────────────────────────────────┐  ┌───────────────────────────────────┐
 │        sandbox/ (Bubblewrap)         │  │             scanner/              │
@@ -175,6 +175,29 @@ Provides zero-false-positive detection tripwires and supervisory health checks.
 * **Desktop Notifications:** Dispatched via `omarchy-notification-send` with native action deep links to summon the panel directly to the flagged alert.
 * **AI Agent Triage Integration (`moatctl analyze`):** Built-in bridge to package incidents into markdown bundles and hand them off directly to coding agents (Antigravity, Claude, etc.) for automated triage and reasoning.
 * **Weekly Posture Digest:** Automated systemd user timer producing a weekly summary of watched installs, suppressed events, and active protections.
+
+### H. Log Shipping & SIEM Export (`moat-ship`)
+Moat includes a dedicated log shipper binary (`/usr/bin/moat-ship`, documented in [`docs/SHIPPING.md`](docs/SHIPPING.md)) to export alerts and telemetry off the workstation to central SIEMs and log aggregators:
+* **Privilege-Free Architecture:** `moatd` (running as root) does no external outbound network I/O to avoid blocking or remote attack surfaces. Instead, `moat-ship` runs as an unprivileged service (`User=moat-ship`, supplementary group `moat`) with **zero capabilities**, reading `/var/lib/moat/alerts.jsonl` and `/var/lib/moat/telemetry.jsonl`.
+* **Supported Transports & SIEM Destinations:**
+  * **HTTPS (NDJSON):** Ships full, structured alert records and evidence blocks in batches to **Splunk HEC**, **Elasticsearch**, **Grafana Loki**, **Datadog**, or custom ingestion endpoints. Configured in `/etc/moat/ship.toml` with safe token substitution (`/etc/moat/ship.token`, permissions `0600`).
+  * **Syslog (RFC5424 / RFC6587):** Ships compact, single-line alert summaries over `/dev/log` (UNIX datagram/stream) or remote TCP (`tcp://host:port`) with truncation markers and alert IDs for quick lookup.
+* **Configurable Telemetry Classes (`[telemetry]` in `/etc/moat/moat.toml`):**
+  * `alerts` (Default ON): High-value alert stream, state update events, and package install receipts.
+  * `process` (Optional): Compact projection of all exec/exit events on the machine (~0.99 GB/day using `parent_exec_id`).
+  * `network` (Optional): All outbound connections to public internet addresses (~6.8 MB/day).
+  * `file` (Optional): Two-stage kernel/userspace filter capturing creates and modifications of executable-shaped files (~9.7 MB/day).
+* **SIEM Query Faceting (`moat_tier`):** Every exported record carries an indexed `moat_tier` facet for simplified querying in SIEM dashboards:
+  * `gator`: Highest-value events where Moat actively defended the machine (blocked, contained, killed, quarantined).
+  * `alert`: Active incidents waiting for human review.
+  * `duck`: Events matching allowlist/baseline suppressions.
+  * `ripple`: Signal-tier building blocks forming parts of attack chains.
+  * `silt`: Quiet timeline items and receipts.
+  * `current`: Raw background telemetry.
+* **Delivery Guarantees & Privacy:**
+  * At-least-once delivery with persistent cursor tracking (`/var/lib/moat/ship/cursor.json`).
+  * Bounded backpressure buffer with drop-oldest protection if the SIEM collector goes offline.
+  * Automatic redaction of sensitive credentials, tokens, and home directory prefixes before logs leave the machine.
 
 ---
 
