@@ -23,6 +23,38 @@ use crate::rules::{meta, RuleCtx, UserRule};
 
 pub const ID: &str = "moat-x-pkg-egress";
 
+/// Narrow registry context, never a blanket exemption for a shared CDN range.
+/// Require a fresh DNS answer and the connecting Go process's own query.
+pub(crate) fn attributed_go_registry(
+    f: &Finding,
+    names: &crate::names::NameCache,
+    queries: &crate::names::QueryLog,
+    now: u64,
+) -> bool {
+    if f.rule != ID || f.ioc.is_some()
+        || f.actor.provenance != crate::provenance::Provenance::Official
+        || f.actor.modified.is_some()
+        || f.actor.package.as_deref().and_then(|p| p.split_whitespace().next()) != Some("go")
+        || crate::util::basename(&f.proc.exe) != "go"
+    {
+        return false;
+    }
+    let Some(net) = &f.net else { return false };
+    if net.dst_port != 443 { return false; }
+    let Some(lookup) = net.dst_ip.parse().ok().and_then(|ip| names.lookup(&ip, now)) else {
+        return false;
+    };
+    if !matches!(lookup.name.as_str(), "proxy.golang.org" | "sum.golang.org")
+        || !lookup.ttl.map(|ttl| lookup.age_secs < u64::from(ttl).min(60)).unwrap_or(false)
+    {
+        return false;
+    }
+    queries.asked_by(&lookup.name, now).map(|asker| {
+        asker.pid == f.proc.pid && asker.exe == f.proc.exe
+            && now.saturating_sub(asker.at) < 60
+    }).unwrap_or(false)
+}
+
 /// Has this machine never talked to this destination from this binary before?
 ///
 /// The whole discrimination in one predicate, and it is
@@ -144,7 +176,7 @@ impl UserRule for PkgEgress {
                 domain_queried_by: None,
             });
         f.what_override = Some(format!(
-            "A `{}` install connected to {}:{}, which is not a known package registry.",
+            "A `{}` install connected to {}:{}, which is outside the configured registry address ranges.",
             pkg.comm(),
             ip_s,
             port
@@ -156,7 +188,7 @@ impl UserRule for PkgEgress {
                 ip_s,
                 ctx.cfg.net.registry_cidrs.len()
             ),
-            "no hostname is available: Tetragon reports addresses only".to_string(),
+            "registry classification uses configured address ranges; any resolved hostname is shown separately".to_string(),
         ];
         vec![f]
     }
@@ -201,6 +233,38 @@ mod tests {
             ev,
         };
         PkgEgress::default().on_hook(&h, exec_id, &ctx)
+    }
+
+    #[test]
+    fn registry_context_requires_attributed_fresh_dns_and_unmodified_go() {
+        use crate::names::{NameCache, QueryLog, Resolved};
+        let t = table_with_install();
+        let mut config = cfg();
+        config.net.registry_cidrs.clear();
+        let mut f = run(&t, &config, &sock_event("2607:f8b0:4006:816::2011", 443), "e-node").remove(0);
+        f.proc.exe = "/usr/bin/go".into();
+        f.actor.provenance = crate::provenance::Provenance::Official;
+        f.actor.package = Some("go 2:1.27.0-1".into());
+        let mut names = NameCache::new(300, 16);
+        let mut queries = QueryLog::new(300, 16);
+        names.record(&Resolved {
+            question: "proxy.golang.org".into(), answer_name: None,
+            ip: "2607:f8b0:4006:816::2011".parse().unwrap(), ttl: Some(120),
+        }, 100);
+        assert!(!attributed_go_registry(&f, &names, &queries, 101));
+        queries.record("proxy.golang.org", f.proc.pid + 1, &f.proc.exe, 100);
+        assert!(!attributed_go_registry(&f, &names, &queries, 101));
+        queries.record("proxy.golang.org", f.proc.pid, &f.proc.exe, 100);
+        assert!(attributed_go_registry(&f, &names, &queries, 101));
+        assert!(!attributed_go_registry(&f, &names, &queries, 161));
+        f.ioc = Some(crate::alert::IocRef { source: "test".into(), matched: "proxy.golang.org".into() });
+        assert!(!attributed_go_registry(&f, &names, &queries, 101));
+        f.ioc = None;
+        f.actor.modified = Some("hash mismatch".into());
+        assert!(!attributed_go_registry(&f, &names, &queries, 101));
+        f.actor.modified = None;
+        f.net.as_mut().unwrap().dst_port = 4444;
+        assert!(!attributed_go_registry(&f, &names, &queries, 101));
     }
 
     #[test]

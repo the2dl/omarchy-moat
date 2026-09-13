@@ -552,9 +552,25 @@ pub fn extract_json(stdout: &str) -> Option<&str> {
     None
 }
 
+/// Recognize provider-wide exhaustion without logging arbitrary agent output.
+/// Only inspect plain failure responses, never a valid verdict's reasoning.
+pub fn quota_exhausted(output: &str) -> bool {
+    if extract_json(output).is_some() {
+        return false;
+    }
+    let text = output.trim().to_ascii_lowercase();
+    text.starts_with("you've hit your weekly limit")
+        || text.starts_with("you've hit your limit")
+        || text.starts_with("you have exceeded your usage limit")
+        || text.starts_with("quota exceeded")
+}
+
 /// Parse and validate one agent answer. Every failure is a no-op for the
 /// alert, so the message is for the log and the panel, not for a retry.
 pub fn parse_result(stdout: &str) -> Result<TriageResult, String> {
+    if quota_exhausted(stdout) {
+        return Err("agent usage quota exhausted; triage is paused for this batch until capacity is available".into());
+    }
     let json = extract_json(stdout).ok_or("no JSON object in the agent's output")?;
     let r: TriageResult = serde_json::from_str(json).map_err(|e| format!("unusable answer: {e}"))?;
     if r.summary.trim().is_empty() {
@@ -602,6 +618,15 @@ mod tests {
     /// The safe direction: a confident malicious verdict raises an under-scored
     /// alert onto the badge. "How is it still LOW when the agent saw it was
     /// doing bad" -- 2026-09-06.
+    #[test]
+    fn provider_quota_is_distinct_from_a_malformed_verdict() {
+        let response = "You've hit your weekly limit · resets 1pm (America/New_York)";
+        assert!(quota_exhausted(response));
+        assert!(parse_result(response).unwrap_err().contains("quota exhausted"));
+        assert!(!quota_exhausted("some malformed response"));
+        assert!(!quota_exhausted(r#"{"summary":"You've hit your weekly limit"}"#));
+    }
+
     #[test]
     fn a_confident_malicious_verdict_raises_a_low_alert() {
         // low -> Raise

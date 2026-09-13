@@ -95,6 +95,7 @@ PID_OPERATORS = {"In", "NotIn"}
 
 # notes section 1: KProbeArg types.
 ARG_TYPES = {
+    "cap_effective",  # Tetragon v1.7.1 testCapabilitiesGained
     "int", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32",
     "uint64", "size_t", "long", "ulong", "string", "char_buf", "char_iovec",
     "fd", "file", "filename", "path", "dentry", "linux_binprm", "sock",
@@ -197,6 +198,14 @@ def check_matchargs(p, where, margs, argtypes):
             p.add(w, "operator %r not in the verified enum" % (op,))
             continue
         values = f.get("values", [])
+        if op == "CapabilitiesGained":
+            # Multi-argument selectors index the exported argument list, not
+            # the function's original argument positions. No values needed.
+            args = f.get("args", [])
+            if (len(args) != 2 or len(set(args)) != 2
+                    or any(not isinstance(a, int) or a < 0 or a >= len(argtypes) for a in args)):
+                p.add(w, "CapabilitiesGained requires two distinct exported argument indexes")
+            continue
         if not values:
             p.add(w, "no values")
         idx = f.get("index")

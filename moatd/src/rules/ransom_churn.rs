@@ -78,6 +78,8 @@ const BUILD_TREES: &[&str] = &[
     "/.venv/",
     "/site-packages/",
     "/.cargo/registry/",
+    // GOPATH may live inside a source checkout; module cache is regenerable.
+    "/pkg/mod/cache/download/",
     "/dist/",
     "/build/",
     // 2026-09-07, when ~/Projects, ~/src and ~/code came into scope. Every one
@@ -286,7 +288,7 @@ impl RansomChurn {
             f.request_kill = true;
         } else {
             f.extra_evidence.push(format!(
-                "monitor mode: nothing was killed and the files already named are gone. \
+                "monitor mode: nothing was killed; the recorded operations may have moved or replaced files. \
                  `moatctl kill <id>` stops it now; arming this one rule with `moatctl set \
                  mode enforce --rule {}` ends the next sweep at the threshold instead, \
                  which is the difference between losing eight files and losing all of them",
@@ -315,8 +317,8 @@ impl UserRule for RansomChurn {
              document, and did it to many different files inside a minute. That is what \
              encrypting a directory looks like from the kernel: the plaintext is read, the \
              ciphertext is written somewhere, and the original is made to go away. Builds \
-             delete files they never read and backups read files they never delete; doing \
-             both to the same file, over and over, is the one shape they do not share. The \
+             and caches can also read and replace their own files. Repeated operations on \
+             existing documents are suspicious but do not by themselves prove encryption. The \
              other shape reported here is many different files renamed to one new extension \
              -- files of many kinds becoming files of one kind.",
             "Rarely. A script you wrote to reorganise photos by moving them across \
@@ -1298,6 +1300,27 @@ mod tests {
             fire(&mut rule, &t, &c, &read(&p), "e-node", 1200);
             assert!(fire(&mut rule, &t, &c, &rename(&p, &format!("{}.locked", p)), "e-node", 1200).is_empty());
         }
+    }
+
+    #[test]
+    fn go_module_download_finalization_is_not_ransomware() {
+        let t = table();
+        let c = cfg();
+        let mut rule = RansomChurn::default();
+        for i in 0..30 {
+            let base = format!("/home/dan/Projects/app/gopath/pkg/mod/cache/download/example.org/lib{}/@v/v1.0.0.zip", i);
+            let tmp = format!("{}123.tmp", base);
+            fire(&mut rule, &t, &c, &read(&tmp), "e-node", 1200);
+            assert!(fire(&mut rule, &t, &c, &rename(&tmp, &base), "e-node", 1200).is_empty());
+        }
+        // The exception must not cover project source adjacent to GOPATH.
+        let mut hits = Vec::new();
+        for i in 0..8 {
+            let p = format!("/home/dan/Projects/app/src/file{}.go", i);
+            fire(&mut rule, &t, &c, &read(&p), "e-node", 1201);
+            hits.extend(fire(&mut rule, &t, &c, &unlink(&p), "e-node", 1201));
+        }
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]

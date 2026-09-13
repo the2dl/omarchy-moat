@@ -117,6 +117,13 @@ pub const MATRIX: &[MatrixRow] = &[
         service: Outcome::Sev("medium"),
     },
     MatrixRow {
+        key: "exec-go-cache-build",
+        event: "exec from the Go build cache with a build tool in the chain",
+        interactive: Outcome::Timeline,
+        pkg_install: Outcome::Sev("low"),
+        service: Outcome::Sev("medium"),
+    },
+    MatrixRow {
         key: "exec-project-tree",
         event: "exec of a binary under a project worktree, target/, node_modules/.bin, \
                 .venv/bin, ~/.cargo/bin, ~/.local/bin, ~/go/bin, ~/.bun/bin, mise, pnpm",
@@ -413,6 +420,13 @@ pub fn classify_row(f: &EventFacts) -> Option<&'static MatrixRow> {
             } else {
                 "exec-opaque-dir"
             });
+        }
+        if f.build_tool_in_chain && f.homes.iter().any(|home| {
+            path.strip_prefix(&format!("{}/.cache/go-build/", home.trim_end_matches('/')))
+                .map(|tail| !tail.split('/').any(|part| part == "..") && tail.contains('/'))
+                .unwrap_or(false)
+        }) {
+            return row("exec-go-cache-build");
         }
         if matches_any(path, PROJECT_TREE_MARKERS) {
             return row("exec-project-tree");
@@ -808,7 +822,7 @@ mod tests {
                 r.service.label()
             );
         }
-        assert_eq!(MATRIX.len(), 10, "BASELINE §2b defines ten rows");
+        assert_eq!(MATRIX.len(), 11, "context matrix includes the Go cache output row");
         let mut keys: Vec<&str> = MATRIX.iter().map(|r| r.key).collect();
         let n = keys.len();
         keys.sort_unstable();
@@ -907,6 +921,25 @@ mod tests {
         assert_eq!(classify_row(&f).unwrap().key, "exec-opaque-dir");
         f.build_tool_in_chain = true;
         assert_eq!(classify_row(&f).unwrap().key, "exec-tmp-build");
+    }
+
+    #[test]
+    fn go_cache_exec_requires_build_context_and_an_actual_home_cache() {
+        let homes = vec!["/home/dan".to_string()];
+        let mut f = EventFacts {
+            file: Some("/home/dan/.cache/go-build/e3/hash-d/provider-retry-check"),
+            homes: &homes,
+            build_tool_in_chain: true,
+            ..facts("exec", "moat-exec-untrusted-home")
+        };
+        assert_eq!(classify_row(&f).unwrap().key, "exec-go-cache-build");
+        f.build_tool_in_chain = false;
+        assert_eq!(classify_row(&f).unwrap().key, "exec-opaque-dir");
+        f.build_tool_in_chain = true;
+        f.file = Some("/home/dan/.cache/other/payload");
+        assert_eq!(classify_row(&f).unwrap().key, "exec-opaque-dir");
+        f.file = Some("/home/dan/.cache/go-build/../../payload");
+        assert_ne!(classify_row(&f).unwrap().key, "exec-go-cache-build");
     }
 
     // ---------------------------------------------------------------- scoring

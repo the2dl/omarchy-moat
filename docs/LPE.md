@@ -204,7 +204,7 @@ because a policy that fails to load crash-loops Tetragon and takes moatd with it
 caught a real rejection (see the DAC_OVERRIDE note in TETRAGON-NOTES) that would
 otherwise have shipped.
 
-Final hook budget: `file_post_open` 10/19, `capset` 1/19, `task_fix_setuid`
+Final hook budget: `file_post_open` 10/19, `capset` 0/19, `task_fix_setuid`
 1/19.
 
 ### 1. Parse `process.cap` — moatd only, no policy
@@ -219,18 +219,21 @@ moat already had and never showed.
 
 Do this first: items 2 and 6 are worth much less without it.
 
-### 2. `moat-priv-capability-gained` — LSM `capset`, 1/19
+### 2. `moat-priv-capability-gained` — kprobe `security_capset`
 
-`matchCapabilityChanges` with `CapabilitiesGained`. The escalation moment, which
-nothing currently sees: `moat-x-exec-privileges-raised` covers privilege gained
-*at exec*, and this covers a `capset` by a running process — how most kernel
-LPEs actually end.
+The policy compares the old effective capability mask with the requested mask
+using `matchArgs: CapabilitiesGained`, and filters to the host user namespace.
+It observes a request by an already-running process; it does not prove that
+the kernel granted it or that an exploit succeeded. Privileged programs may
+legitimately enable capabilities already in their permitted set.
 
-Detection only. The capability is already granted by the time the hook reports,
-so `Override` here would be theatre; the honest action is `Post`.
-
-Expected near-silent: dropping capabilities is constant on a desktop and
-`CapabilitiesGained` does not fire on it. That is what earns it a loud severity.
+The previous `matchCapabilityChanges` selector matched drops as well as gains
+in Tetragon 1.7.1. It repeatedly reported Moat's bubblewrap setup as privilege
+escalation. The replacement follows upstream's `testCapabilitiesGained` argument
+pair (old cred argument 1, requested effective argument 2). Live validation on
+2026-09-13 observed one event when re-enabling CAP_NET_RAW, no event for its
+drop, and no events from three Moat sandbox launches. Old, requested and added
+masks are preserved in the alert evidence. This uses no LSM trampoline slot.
 
 ### 3. `moat-priv-sysctl-write` — LSM `file_post_open`, 9/19
 
@@ -297,7 +300,7 @@ alert of its own.
 
 ### Budget after all of it
 
-`file_post_open` 10/19, `capset` 1/19, `task_fix_setuid` 1/19. Nine slots still
+`file_post_open` 10/19, `capset` 0/19, `task_fix_setuid` 1/19. Nine slots still
 free on the busiest hook.
 
 ## What prevention would mean, and why it is mostly not on offer

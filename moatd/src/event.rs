@@ -336,6 +336,16 @@ impl<'a> HookHit<'a> {
         })
     }
 
+    /// Old/proposed effective masks exported by the capability request policy.
+    pub fn capability_request(&self) -> Option<(u64, u64)> {
+        let mask = |label: &str| {
+            self.ev.args.iter().find(|a| a["label"].as_str() == Some(label))
+                .and_then(|a| a["cap_effective_arg"].as_str())
+                .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+        };
+        Some((mask("old_effective")?, mask("requested_effective")?))
+    }
+
     /// First `int_arg` — the access mask on `file_post_open` /
     /// `file_permission`, the mode on `path_chmod`, the id on module hooks.
     pub fn int_arg(&self) -> Option<i64> {
@@ -532,6 +542,15 @@ mod tests {
         assert_eq!(ip, "185.220.101.55");
         assert_eq!(port, 4444);
         assert!(h.action_is_kill());
+    }
+
+    #[test]
+    fn capability_request_preserves_the_observed_old_and_new_masks() {
+        let ev = RawEvent::parse(r#"{"process_kprobe":{"function_name":"security_capset","args":[{"cap_effective_arg":"000001ffffffdfff","label":"old_effective"},{"cap_effective_arg":"000001ffffffffff","label":"requested_effective"}]}}"#).unwrap();
+        let (old, requested) = ev.hook().unwrap().capability_request().unwrap();
+        assert_eq!(requested & !old, 1 << 13);
+        let missing = RawEvent::parse(r#"{"process_kprobe":{"function_name":"security_capset","args":[]}}"#).unwrap();
+        assert!(missing.hook().unwrap().capability_request().is_none());
     }
 
     #[test]

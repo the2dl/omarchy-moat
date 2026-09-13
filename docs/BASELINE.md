@@ -110,6 +110,7 @@ Then the same event is scored by context. Examples that define the matrix:
 | exec of a binary under a project worktree, `target/`, `node_modules/.bin`, `.venv/bin`, `~/.cargo/bin`, `~/.local/bin`, `~/go/bin`, `~/.bun/bin`, `~/.local/share/mise`, `~/.local/share/pnpm` | timeline only | medium | high |
 | exec of a binary under `~/.cache`, `~/Downloads`, `~/.config`, `~/.local/share/<other>`, a hidden dir, or `/tmp` when no build tool (cmake, make, ninja, cargo, gcc, clang, configure, pytest, go) is in the chain | medium | **high** | **high** |
 | exec from `/tmp` with a build tool in the chain (cmake try_compile, autoconf, cargo build scripts, pytest tmp dirs) | timeline only | low | medium |
+| exec from `~/.cache/go-build/` with a build tool in the chain | timeline only | low | medium |
 | curl/wget with non-registry destination | timeline only (developers curl things) | **high** | medium |
 | write to `.git/hooks/*`, `.husky/`, `.envrc`, `.vscode/tasks.json`, `.claude/settings.json`, `CLAUDE.md` inside the current project | low (lefthook, husky, direnv allow) | **high** | high |
 | write to shell rc, autostart, systemd user units, hyprland conf | medium (dotfile managers, installers) | **critical** | high |
@@ -455,3 +456,14 @@ machine produces rotates a week of real detections out of it. That is a change
 to the file format every reader is built against — the plugin's tail-and-fold,
 `Tailer`, rotation detection, the bundle, `moatctl list --since` — so it is a
 follow-up with its own migration, not a rider on a wording fix.
+
+### Go registry context (2026-09-13)
+
+An official, unmodified Go executable connecting to port 443 may receive low,
+timeline-only registry context when the same PID/executable just queried
+`proxy.golang.org` or `sum.golang.org` and the destination has a matching DNS
+answer younger than both its TTL and 60 seconds. Missing attribution, expired
+answers, other domains/ports and IOC matches retain normal scoring. This only
+adjusts the default low/medium package-egress finding; a configured high or
+critical severity remains intact. Shared CDN address ranges are not added to
+an allowlist.

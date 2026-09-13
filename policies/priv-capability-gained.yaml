@@ -4,82 +4,48 @@ metadata:
   name: moat-priv-capability-gained
   annotations:
     moat.omarchy/severity: "high"
-    moat.omarchy/title: "A running process gained a root-equivalent capability"
+    moat.omarchy/title: "A process requested additional effective capabilities"
     moat.omarchy/enforce: "none"
     moat.omarchy/actions: "kill,ignore"
-    # There is one kernel and capabilities are not namespaced in a way that
-    # makes a gain somebody else's business. Same argument as module load.
     moat.omarchy/namespace: "global"
     moat.omarchy/why: >-
-      moat-x-exec-privileges-raised catches privilege gained AT EXEC -- a setuid
-      binary, a file capability. This catches a process that was already running and
-      gained one, which is what a successful kernel exploit looks like from the
-      outside: no new binary, no new process, the same pid holding CAP_SYS_ADMIN it
-      did not have a moment ago. It was the largest gap in docs/LPE.md.
+      A process requested effective capabilities it did not previously hold in
+      the host user namespace. This can make privileged operations available
+      without executing a new program. The event records the request, not proof
+      that the kernel granted it or that an exploit succeeded.
     moat.omarchy/expected: >-
-      Very little. Dropping capabilities is constant on a desktop and does not match
-      -- only a GAIN does. Container runtimes and systemd set up capabilities for
-      children at exec, which is the other rule, not this one.
+      Privileged programs may enable capabilities already in their permitted
+      set. Capability drops do not match. Requests made from a child user
+      namespace do not match. Check the old and requested sets and the caller.
     moat.omarchy/fp-hint: "exe"
 spec:
   options:
   - name: "policy-mode"
     value: "monitor"
-  lsmhooks:
-  # A hook nothing else uses, so 1/19 and no pressure on the trampoline cap.
-  # Detection only, and that is not timidity: by the time capset reports, the
-  # capability is granted. An Override here would be theatre.
-  - hook: "capset"
-    message: "A running process gained a root-equivalent capability"
+  kprobes:
+  # Tetragon v1.7.1 testCapabilitiesGained uses this exact argument pair.
+  # matchCapabilityChanges compares cached/current sets in BOTH directions:
+  # it cannot support a claim that a capability was gained. security_capset
+  # exposes the old credentials and proposed effective set directly.
+  - call: "security_capset"
+    syscall: false
+    message: "A process requested additional effective capabilities"
+    args:
+    - index: 1
+      type: "cap_effective"
+      resolve: "cap_effective"
+      label: "old_effective"
+    - index: 2
+      type: "cap_effective"
+      label: "requested_effective"
     selectors:
-    # Shape from cilium/tetragon types.go, CapabilitiesSelector: `type` is
-    # Effective|Inheritable|Permitted and `operator` is In|NotIn ONLY.
-    # `CapabilitiesGained` is in the CRD operator enum but belongs to matchArgs,
-    # not here -- it does not validate in this field.
-    # ONLY in the host user namespace.
-    #
-    # Without this the rule fired 37 times in minutes on 2026-09-10, all of it
-    # `bwrap`: a sandbox creates a user namespace and is handed a full
-    # capability set INSIDE it, which is what a sandbox is. Chrome, Flatpak and
-    # moat's own moat-sandbox all do it on every launch, and the noise guard had
-    # demoted the rule to the timeline within minutes of it shipping -- so the
-    # detection was off before anyone read one of its alerts.
-    #
-    # `isNamespaceCapability: false` does NOT express this; it describes how the
-    # values are read, not which namespace to watch. The namespace filter does.
-    #
-    # What is kept is the case the rule is for: a process in THIS machine's user
-    # namespace gaining a root-equivalent capability it did not exec with. A
-    # process that first unshares into its own namespace has escalated inside a
-    # box it built, which is not the same claim -- and the escalation that
-    # matters, breaking OUT of that box, lands back in the host namespace where
-    # this still sees it.
     - matchNamespaces:
       - namespace: User
         operator: "In"
         values:
         - "host_ns"
-      matchCapabilityChanges:
-      - type: "Effective"
-        operator: "In"
-        isNamespaceCapability: false
-        values:
-        # The set that converts directly into root with no further exploit.
-        # Kept identical to event::Capabilities::is_dangerous in moatd, so the
-        # kernel rule and the userspace evidence agree about what "grave" means.
-        - "CAP_SYS_ADMIN"
-        # NOT "CAP_DAC_OVERRIDE". It is the ONE value in Tetragon's
-        # CapabilitiesType enum without the CAP_ prefix -- 1 of 41 -- and the
-        # policy is rejected outright with "value CAP_DAC_OVERRIDE unknown".
-        # Verified by a load test against the live sensor.
-        - "DAC_OVERRIDE"
-        - "CAP_DAC_READ_SEARCH"
-        - "CAP_SETUID"
-        - "CAP_SETGID"
-        - "CAP_SYS_MODULE"
-        - "CAP_SYS_PTRACE"
-        - "CAP_SYS_RAWIO"
-        - "CAP_BPF"
-        - "CAP_SYS_BOOT"
+      matchArgs:
+      - args: [0, 1]
+        operator: "CapabilitiesGained"
       matchActions:
       - action: Post

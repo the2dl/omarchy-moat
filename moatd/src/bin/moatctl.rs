@@ -659,6 +659,10 @@ fn run_triage(resp: &Value, socket: &std::path::Path, dry_run: bool, json_out: b
                 continue;
             }
         };
+        if triage::quota_exhausted(&output.stdout) || triage::quota_exhausted(&output.stderr) {
+            eprintln!("moatctl triage: agent usage quota exhausted; stopping this batch without changing pending alerts");
+            return ExitCode::from(2);
+        }
         let result = match triage::parse_result(&output.stdout) {
             Ok(r) => r,
             // The alert stays untouched and stays on the badge, which is the

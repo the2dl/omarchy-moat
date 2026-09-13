@@ -205,45 +205,17 @@ impl Finding {
                 self.rule, self.proc.exe, net.dst_ip, net.dst_port, self.proc.pid
             );
         }
-        // pid, like the `cred` and `net` branches above.
-        //
-        // Without it the key was `(rule, exe, file)` and two DIFFERENT process
-        // trees writing the same well-known path -- `~/.bashrc`,
-        // `~/.ssh/authorized_keys`, a `.desktop` autostart -- folded into one
-        // row, and a fold returns before `note_chain` (engine::emit), so the
-        // second tree's persist/priv/rootkit step never reached correlation.
-        // The fold exists to collapse ONE process rewriting one file in a loop,
-        // which pid preserves; two distinct executions were never one event.
-        // The test `a_second_unrelated_install_is_a_second_chain` documented
-        // this collapse by disabling dedupe to work around it.
-        // An EXEC-shaped finding -- no file, no destination -- is "this binary
-        // ran", and the pid is new by construction every single time. Keeping it
-        // in the key meant the fold could never fire for the rules that need it
-        // most: measured 2026-09-10, one `themebook/scripts/config` produced 74
-        // separate rows in ten minutes, and 141 exec rows came from 9 distinct
-        // binaries. The kernel's own rateLimit fails the same way for the same
-        // reason (`rateLimitScope: process` on an exec rule keys on a process
-        // that did not exist a moment ago), so nothing upstream collapsed them
-        // either.
-        //
-        // The pid was only ever here to protect chain correlation, and the
-        // comment at the fold site says that protection is no longer needed:
-        // "the fold now correlates too, and the key no longer needs to carry a
-        // pid to protect it". Every repeat still reaches the correlator; what
-        // changes is that it is one row with a count instead of 74 rows.
-        //
-        // A finding WITH a file keeps the pid. That is the ~/.bashrc case the
-        // comment above describes -- two different trees writing one well-known
-        // path are two things that happened, and merging them was the trap.
-        if self.file.is_none() {
-            return format!("{}|{}", self.rule, self.proc.exe);
-        }
+        // Display grouping belongs in the client. Reusing an alert ID across
+        // executions makes a chain point at another process's snapshot/verdict.
+        // Keep PID as well as the sensor exec identity to survive PID reuse.
         format!(
-            "{}|{}|{}|pid:{}",
+            "{}|{}|{}|pid:{}|exec:{}|start:{}",
             self.rule,
             self.proc.exe,
             self.file.as_ref().map(|f| f.path.as_str()).unwrap_or("-"),
-            self.proc.pid
+            self.proc.pid,
+            self.proc.exec_id,
+            self.proc.start_time
         )
     }
 }
@@ -1350,14 +1322,10 @@ mod tests {
         assert_ne!(a.dedupe_key(), other_host.dedupe_key(), "different host must not fold");
     }
 
-    /// The same binary running again is one row with a count, not a new row.
-    ///
-    /// Measured 2026-09-10 on the live machine: `themebook/scripts/config` ran
-    /// 74 times in ten minutes and produced 74 rows, because the key carried a
-    /// pid that is new by construction for an exec. 141 exec rows came from 9
-    /// distinct binaries.
+    /// UI grouping can collapse repeated programs; persisted event identity
+    /// must still select the right process evidence and response target.
     #[test]
-    fn the_same_binary_executed_again_folds_into_one_row() {
+    fn separate_executions_keep_separate_evidence() {
         let mut a = finding();
         a.meta.family = "exec".into();
         a.rule = "moat-exec-untrusted-home".into();
@@ -1367,11 +1335,11 @@ mod tests {
 
         let mut again = a.clone();
         again.proc.pid = a.proc.pid + 4000; // a new process, as every exec is
-        assert_eq!(
-            a.dedupe_key(),
-            again.dedupe_key(),
-            "a new pid must not make a repeat of the same binary a new row"
-        );
+        assert_ne!(a.dedupe_key(), again.dedupe_key());
+        again.proc.pid = a.proc.pid;
+        again.proc.exec_id = "another-execution".into();
+        assert_ne!(a.dedupe_key(), again.dedupe_key(), "PID reuse must not reuse evidence");
+        assert_eq!(a.dedupe_key(), a.clone().dedupe_key());
 
         let mut other = a.clone();
         other.proc.exe = "/home/dan/.config/omarchy/plugins/other/bin/thing".into();

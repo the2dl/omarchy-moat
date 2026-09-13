@@ -2809,6 +2809,14 @@ impl Daemon {
         // armed individually even while the daemon stays in monitor.
         f.mode = self.mode_for(name);
         f.kill_expected = hook.action_is_kill();
+        if name == "moat-priv-capability-gained" {
+            if let Some((old, requested)) = hook.capability_request() {
+                f.extra_evidence.push(format!(
+                    "effective capabilities: old=0x{old:016x}, requested=0x{requested:016x}, added=0x{:016x}; request observed, grant not confirmed",
+                    requested & !old
+                ));
+            }
+        }
         // Tetragon reports the CONFIGURED action in monitor mode too (NOTES
         // §7 says so for Sigkill, and Override is the same field). The kill
         // path waits for process_exit to prove it; a refusal has no such
@@ -3209,6 +3217,17 @@ impl Daemon {
                 self.cfg.baseline.provenance_downgrade,
             )
         };
+        let mut score = score;
+        if crate::rules::pkg_egress::attributed_go_registry(&f, &self.names, &self.queries, now)
+            && crate::alert::severity_rank(&f.meta.severity) <= crate::alert::severity_rank("medium")
+        {
+            score.severity = "low".into();
+            score.surface = "timeline".into();
+            score.severity_reason = "low: official Go connected to a registry it just resolved; same-process query and unexpired DNS answer".into();
+            score.matrix_row = None;
+            score.pkg_install_escalation = false;
+            f.extra_evidence.push("registry context is limited to this attributed HTTPS connection; other processes and shared CDN addresses are not exempt".into());
+        }
         f.score = Some(score);
 
         // --- 3. rarity (LEARNING §1), whether or not this is suppressed -----
@@ -3336,26 +3355,9 @@ impl Daemon {
                 log::error!("alerts.jsonl: {}", e);
             }
             self.note_baseline(&f, now);
-            // A FOLD IS STILL A THING THAT HAPPENED.
-            //
-            // Until 2026-09-07 this returned here, so a folded event never
-            // reached correlation -- and that is why `dedupe_key` carries the
-            // pid: without it, a second process tree writing ~/.bashrc folded
-            // into the first and its persist step never formed a chain. The
-            // key was made narrower to protect the chain.
-            //
-            // The cost was that the deduper stopped collapsing anything from
-            // repeated SHORT-LIVED processes, which is what a CLI tool is:
-            // measured, `kubectl` produced 69 rows with 69 distinct pids and
-            // one destination. Two jobs -- "is this a new row" and "does this
-            // reach correlation" -- were being decided by one key, and only
-            // one of them wanted the pid.
-            //
-            // So the fold now correlates too, and the key no longer needs to
-            // carry a pid to protect it. The alert is rebuilt rather than
-            // stored on the dedupe entry: `build_alert` is assembly, and
-            // keeping a live Alert per key would put an unbounded copy of the
-            // record in memory beside the record.
+            // A repeat from the same execution still reaches correlation.
+            // Separate executions keep separate IDs and incident snapshots;
+            // rebuilding here must never attach another process to this ID.
             let folded_alert = build_alert(
                 &f,
                 &existing,
