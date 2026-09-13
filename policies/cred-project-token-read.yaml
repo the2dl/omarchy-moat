@@ -4,16 +4,15 @@ metadata:
   name: moat-cred-project-token-read
   annotations:
     moat.omarchy/severity: "medium"
-    moat.omarchy/title: "Project-local credential file read (.env, .npmrc, .git-credentials)"
+    moat.omarchy/title: "Project-local credential file read (.env, .netrc, .git-credentials)"
     moat.omarchy/rotate: "npm-token,pypi-token,git-credentials,github-token"
     moat.omarchy/enforce: "none"
     moat.omarchy/actions: "quarantine,ignore"
     moat.omarchy/why: >-
-      Every other credential rule watches an absolute path under your home directory,
-      and real tokens do not live there: they live in the repository you are working in.
-      A .env beside the code, a project .npmrc with a registry token, a .git/config with
-      the token embedded in the remote URL. A postinstall script reads those with the
-      same permissions you have, and nothing in the rest of this ruleset would see it.
+      Secrets also live in the repository you are working in: a .env beside the code,
+      a .netrc, or a .git/config with a token embedded in the remote URL. A postinstall
+      script can read those with the same permissions you have. The registry-token
+      rule separately covers .npmrc and .pypirc at any location.
     moat.omarchy/expected: >-
       Constantly, and that is the point of scoring it by who is asking. Your dev server,
       test runner and framework read .env every time they start; that is an ordinary
@@ -35,9 +34,9 @@ spec:
     - index: 1
       type: "int"
     selectors:
-    # Registry credentials. A project .npmrc is read by the package manager on
-    # every single command, so the registry clients are excluded here exactly as
-    # they are for the $HOME copy of the same files (cred-registry-token-read).
+    # Other client credentials. .npmrc and .pypirc are already covered at any
+    # location by cred-registry-token-read; watching them here too duplicates
+    # one read into two alerts and two triage questions.
     - matchBinaries:
       - operator: "NotPostfix"
         values:
@@ -74,9 +73,7 @@ spec:
       - index: 0
         operator: "Postfix"
         values:
-        - "/.npmrc"
         - "/.yarnrc.yml"
-        - "/.pypirc"
         - "/.netrc"
       - index: 1
         operator: "Mask"

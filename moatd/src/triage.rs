@@ -475,6 +475,10 @@ pub fn headless_argv(agent: &str, prompt: &str) -> Result<Vec<String>, Unsupport
         "claude" => vec![
             "claude",
             "-p",
+            // Keep auth, but do not load user/project plugins, hooks or MCP
+            // servers while investigating an alert. Plugin startup used to
+            // create credential/config alerts and trigger another triage run.
+            "--safe-mode",
             "--output-format",
             "text",
             "--permission-mode",
@@ -909,6 +913,7 @@ mod tests {
     fn the_headless_invocations_are_read_only_and_non_interactive() {
         let c = headless_argv("claude", "P").expect("claude is supported");
         assert!(c.contains(&"-p".to_string()));
+        assert!(c.contains(&"--safe-mode".to_string()), "triage must not start user plugins or hooks");
         assert!(c.windows(2).any(|w| w == ["--permission-mode", "plan"]));
         assert_eq!(c.last().unwrap(), "P");
         // Never the auto-approving modes omarchy-agent uses.

@@ -356,6 +356,50 @@ TestCase {
     compare(result.newIds[0], "01ZZZZZZZZZZZZZZZZZZZZZZZZ")
   }
 
+  function test_raw_feed_preserves_daemon_surfaces_across_polls() {
+    // Real socket rows do not contain normalizeAlert's surfaceStamped marker.
+    function payload(surface) {
+      return { alerts: [
+        { id: "quiet", ts: "2026-09-13T10:00:00Z", rule: "signal", severity: "high",
+          surface: surface, process: { exe: "/usr/bin/chrome" }, action_taken: "none" },
+        { id: "loud", ts: "2026-09-13T10:01:00Z", rule: "demoted-rule", severity: "low",
+          surface: "alerts", process: { exe: "/usr/bin/test" }, action_taken: "none" }
+      ], receipts: [] }
+    }
+    var store = Model.createStore()
+    var options = { demotedRules: ["demoted-rule"] }
+    var first = Model.ingestFeed(store, payload("timeline"), options)
+    compare(first.byId.quiet.surface, "timeline")
+    compare(first.byId.loud.surface, "alerts", "the daemon can re-surface a demoted rule")
+    compare(Model.needsYouIncidents(Model.buildIncidents(first.alerts, options)).length, 1)
+    var second = Model.ingestFeed(store, payload("timeline"), options)
+    compare(second.reused, 2)
+    verify(second.byId.quiet === first.byId.quiet)
+    compare(second.byId.quiet.surface, "timeline")
+    var third = Model.ingestFeed(store, payload("alerts"), options)
+    compare(third.byId.quiet.surface, "alerts")
+    compare(Model.needsYouIncidents(Model.buildIncidents(third.alerts, options)).length, 2)
+  }
+
+  function test_now_head_is_the_alert_that_still_needs_a_decision() {
+    var alerts = Model.foldText([
+      JSON.stringify({ id: "01older", ts: "2026-09-13T10:00:00Z", rule: "cred", severity: "high",
+        surface: "alerts", process: { exe: "/usr/bin/claude" }, file: { path: "/project/.npmrc" } }),
+      JSON.stringify({ id: "02newer", ts: "2026-09-13T10:01:00Z", rule: "cred", severity: "low",
+        surface: "timeline", process: { exe: "/usr/bin/claude" }, file: { path: "/project/.git/config" } })
+    ].join("\n"))
+    var inc = Model.buildIncidents(alerts)[0]
+    compare(inc.state, "needsYou")
+    compare(inc.id, "01older", "actions target the unresolved alert")
+    compare(inc.head.file.path, "/project/.npmrc")
+    compare(inc.lastSeen, "2026-09-13T10:01:00Z", "history retains the latest observation")
+    compare(inc.alerts.length, 2, "all evidence remains available")
+    alerts.forEach(function(a) { if (a.id === "01older") a.acked = true })
+    var resolved = Model.buildIncidents(alerts)[0]
+    compare(resolved.head.id, "02newer")
+    compare(resolved.awaitingVerdict, false, "timeline observations are not queued for triage")
+  }
+
   // ------------------------------------------------- the feed keeps its objects
   //
   // Every poll is the whole window re-parsed, and one row in it is new. A row

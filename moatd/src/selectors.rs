@@ -570,6 +570,25 @@ spec:
     }
 
     #[test]
+    fn registry_reads_have_one_policy_while_project_secrets_remain_covered() {
+        let project: Value = serde_yaml::from_str(include_str!("../../policies/cred-project-token-read.yaml")).unwrap();
+        let registry: Value = serde_yaml::from_str(include_str!("../../policies/cred-registry-token-read.yaml")).unwrap();
+        let project = SelectorSet::parse(&project);
+        let registry = SelectorSet::parse(&registry);
+        for base in ["/home/dan", "/home/dan/project", "/tmp/plugin"] {
+            for suffix in [".npmrc", ".pypirc"] {
+                let path = format!("{base}/{suffix}");
+                assert!(project.validate("project", "security_file_post_open", Some(&path), "/usr/bin/claude").is_err());
+                assert!(registry.validate("registry", "file_post_open", Some(&path), "/usr/bin/claude").is_ok());
+            }
+            for suffix in [".env", ".git/config", ".yarnrc.yml", ".netrc"] {
+                let path = format!("{base}/{suffix}");
+                assert!(project.validate("project", "security_file_post_open", Some(&path), "/usr/bin/claude").is_ok());
+            }
+        }
+    }
+
+    #[test]
     fn every_shipped_policy_validates_its_own_selector_values() {
         // Whatever a policy names in an Equal/Postfix list must, by
         // construction, satisfy that policy. This catches a parser that reads

@@ -943,11 +943,15 @@ function buildIncidents(alerts, options, memo) {
   }
   for (var j = 0; j < order.length; j++) {
     var g = order[j]
-    // The newest member carries the incident: actions name an alert id, and the
-    // most recent one is the only member guaranteed to still have a live process.
+    // Show the newest unresolved question. A later timeline entry must not
+    // replace the evidence or action target of the alert that needs a decision.
     g.alerts.sort(compareAlertsNewestFirst)
     var head = g.alerts[0]
+    for (var h = 0; h < g.alerts.length; h++) {
+      if (alertState(g.alerts[h], set) === "needsYou") { head = g.alerts[h]; break }
+    }
     g.head = head
+    g.id = head.id
 
     // ------------------------------------------------------------- 3a
     //
@@ -996,7 +1000,9 @@ function buildIncidents(alerts, options, memo) {
     // "reading the evidence" beside a verdict it already has.
     g.awaitingVerdict = false
     for (var w = 0; w < g.alerts.length; w++) {
-      if (!g.alerts[w].triage) { g.awaitingVerdict = true; break }
+      if (alertState(g.alerts[w], set) === "needsYou" && !g.alerts[w].triage) {
+        g.awaitingVerdict = true; break
+      }
     }
     // An incident needs you if ANY member does. One resolved repeat out of 68
     // does not close the incident.
@@ -1972,6 +1978,10 @@ function ingestFeed(store, payload, options) {
     } else {
       alert = next
       row = { alert: alert, snap: feedSnapshot(next) }
+      // Socket rows have the daemon's surface but no client-only marker.
+      // Capture it before decoration, which otherwise falls back to severity
+      // and both resurrects timeline rows and hides surfaced low-severity rows.
+      alert.surfaceStamped = next.surface === SURFACE_ALERTS || next.surface === SURFACE_TIMELINE
     }
     kept[id] = row
     alerts.push(alert)

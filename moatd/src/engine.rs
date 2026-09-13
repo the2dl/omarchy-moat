@@ -2937,7 +2937,14 @@ impl Daemon {
         // an hour on 2026-09-07: the reported name is a SCRIPT, so the kernel
         // matched its interpreter -- which the selector does not exclude -- and
         // the selector and the match never disagreed at all.
-        if let Some(interp) = crate::util::interpreter_of(&m.reported) {
+        // Interpreter identity can explain a binary selector mismatch, never
+        // a file argument mismatch. JSON and sysfs files are not executables.
+        let interpreter = if m.clause.kind == "matchBinaries" {
+            crate::util::interpreter_of(&m.reported)
+        } else {
+            None
+        };
+        if let Some(interp) = interpreter {
             f.extra_evidence.push(format!(
                 "{} is a script: the kernel matched {}, which the selector above does not \
                  exclude, so the sensor and the selector do not actually disagree. An \
@@ -2950,9 +2957,9 @@ impl Daemon {
             if would_be.enforce == "deny" {
                 f.meta.severity = "high".into();
                 f.extra_evidence.push(format!(
-                    "{} refuses this operation in the kernel, so it WAS refused -- suppressing \
-                     its alert would have left a denial with nothing to explain it. That is why \
-                     this record is not low.",
+                    "{} is configured to refuse this operation in the kernel. This event alone \
+                     does not confirm that a denial occurred; the mismatch stays visible so \
+                     a possible denial is not hidden.",
                     m.policy
                 ));
             }
@@ -11434,6 +11441,35 @@ esac
         d.handle_line(line);
         let rules: Vec<String> = d.store.load().into_iter().map(|a| a.rule).collect();
         assert_eq!(rules, vec!["moat-cred-ssh-private-key-read"]);
+    }
+
+    #[test]
+    fn a_file_argument_mismatch_never_claims_the_file_is_an_interpreter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, _) = dev_daemon(dir.path());
+        for contents in ["{\"resources\":[]}", "#!/bin/sh\nexit 0\n"] {
+            let path = dir.path().join("serverresources.json");
+            std::fs::write(&path, contents).unwrap();
+            let reported = path.to_str().unwrap().to_string();
+            let m = Mismatch {
+                policy: "moat-cred-ssh-private-key-read".into(),
+                hook: "file_post_open".into(),
+                reported: reported.clone(),
+                clause: crate::selectors::Clause {
+                    kind: "matchArgs",
+                    index: Some(0),
+                    op: crate::selectors::Op::Equal,
+                    op_text: "Equal".into(),
+                    values: vec!["/a/decoy".into()],
+                },
+            };
+            let f = d.mismatch_finding(m, "cache-read", Default::default(), Some(reported));
+            assert_eq!(f.meta.severity, "low");
+            let evidence = f.extra_evidence.join("\n");
+            assert!(!evidence.contains("is a script"), "{evidence}");
+            assert!(!evidence.contains("WAS refused"), "{evidence}");
+            assert!(evidence.contains("matchArgs index 0"), "{evidence}");
+        }
     }
 
     /// `moat-net-suspicious-port-egress` fires for every process at medium;
