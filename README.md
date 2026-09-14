@@ -106,10 +106,13 @@ shell/          QML: service, bar widget, panel
 moatd/          Rust: moatd, moatctl, moat-feeds, moat-ship
 policies/       Tetragon TracingPolicy YAML — the detection rules
 sandbox/        bubblewrap wrapper + PATH shims for npm/pip/cargo/go/makepkg
+vm/             opt-in project VM prototype (not installed/enabled by the package)
 scanner/        pre-execution scanners: PKGBUILD/.install, npm, cargo, pip, go
 assets/         the mark, in SVG and PNG
 docs/           CONTRACT.md is the spec every component builds against
 ```
+
+For the experimental agent/MCP development VM, see [vm/README.md](vm/README.md).
 
 `docs/CONTRACT.md` before touching anything. `docs/BASELINE.md` for the learning
 and noise model, `docs/TETRAGON-NOTES.md` for what the sensor actually reports.
