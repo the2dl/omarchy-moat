@@ -137,6 +137,18 @@ spec:
         values: ["6"]
       matchActions:
       - action: Post
+  # Observe mv output even outside document roots. Cross-filesystem moves
+  # write their destination (often /tmp) before unlinking the source; without
+  # this evidence the daemon sees only the destructive half of a normal move.
+    - matchBinaries:
+      - operator: "In"
+        values: ["/usr/bin/mv"]
+      matchArgs:
+      - index: 1
+        operator: "Mask"
+        values: ["2"]
+      matchActions:
+      - action: Post
   # THE DESTROY HALF, three ways. Argument 0 is the parent directory (a
   # mount-aware path); argument 1 is the file itself as a bare dentry, which on
   # btrfs resolves only to its subvolume root (`/@home/dan/...`) -- moatd joins

@@ -731,7 +731,7 @@ still reaches the daemon and remains available in Now or the timeline according
 to its classification. A newly correlated incident or critical first-seen event
 can still notify immediately. The existing per-rule cooldown also applies.
 
-Release 185 also recognizes the Linux ` (deleted)` suffix for agent attribution
+Releases 185–186 also recognizes the Linux ` (deleted)` suffix for agent attribution
 so an updated, still-running agent can authenticate without being classified as
 its own credential thief. This does not establish binary trust or exempt its
 child tools. Version/help-only agent probes are not unattended tasks. Plain
