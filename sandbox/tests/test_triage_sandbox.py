@@ -68,6 +68,18 @@ class TriageSandboxTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             m.pin_mounts(cmd)
 
+    def test_mise_shim_resolves_native_latest_without_running_mise(self):
+        install = self.home / '.local/share/mise/installs/claude/latest'
+        install.mkdir(parents=True)
+        (install / 'claude').symlink_to('/usr/bin/bash')
+        with mock.patch.object(m.Path, 'home', return_value=self.home), \
+             mock.patch.dict(os.environ, {'MISE_DATA_DIR': str(self.home / '.local/share/mise')}), \
+             mock.patch.object(m.shutil, 'which', return_value='/usr/bin/mise'), \
+             mock.patch.object(m.subprocess, 'check_output') as execute:
+            cmd = m.command('claude', self.bundle, ['claude', '-p', 'test'])
+        self.assertEqual(cmd[-3:], ['/usr/bin/bash', '-p', 'test'])
+        execute.assert_not_called()
+
     def test_script_shim_does_not_widen_runtime_access(self):
         shim = self.root / 'claude'
         shim.write_text('#!/bin/bash\ntrue\n')

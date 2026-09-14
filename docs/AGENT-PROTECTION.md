@@ -208,7 +208,7 @@ and the [MCP stdio transport](https://modelcontextprotocol.io/specification/2025
 
 ## Automated triage and desktop notifications
 
-Release 0.1.0-180 moves unattended triage into `moat-triage-sandbox`. It exposes
+Release 0.1.0-181 moves unattended triage into `moat-triage-sandbox`. It exposes
 only the selected incident directory read-only, `/var/log/pacman.log`, system
 runtime files, the selected native agent installation, and that agent's own
 authentication files read-only. Its working directory is the incident directory.
@@ -220,7 +220,9 @@ insufficient, rather than a recursive search of the machine.
 The sandbox keeps network access for provider authentication and requests; it
 is not a destination filter. Only the selected provider API-key variable and
 proxy settings are passed, alongside a minimal runtime environment. This path
-requires native Claude/Codex executables; script shims fail closed and leave
+resolves Omarchy mise shims through their installed native `latest` link,
+without invoking mise or its maintenance hooks; other script
+shims fail closed and leave
 alerts pending. Each bundle is probed through the same sandbox before analysis.
 The optional `moat-agent claude` launcher remains separate and opt-in.
 

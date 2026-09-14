@@ -31,6 +31,11 @@ def command(agent, bundle, argv, probe=False):
     if not executable:
         raise ValueError('agent executable is unavailable: ' + agent)
     executable = Path(executable).resolve(strict=True)
+    if executable.name == 'mise':
+        # Omarchy's mise installs provide a latest link. Resolve it without
+        # invoking mise: even `mise which` may perform scheduled maintenance.
+        data = Path(os.environ.get('MISE_DATA_DIR', str(home / '.local/share/mise')))
+        executable = (data / 'installs' / agent / 'latest' / agent).resolve(strict=True)
     # Only native clients have a bounded, known runtime mount. Do not expose
     # all of a package manager's installation tree for an unknown script shim.
     with executable.open('rb') as f:
@@ -87,7 +92,7 @@ def main():
                 env[key] = os.environ[key]
         result = subprocess.run(cmd, env=env, close_fds=True, pass_fds=fds)
         return result.returncode if result.returncode >= 0 else 128 - result.returncode
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         parser.error(str(exc))
     finally:
         for fd in fds:
