@@ -140,7 +140,7 @@ impl UserRule for MassRead {
         // Staged or synthetic credential-shaped paths remain correlation
         // signals. Do not label a batch of external fixtures a host harvest.
         if distinct.iter().all(|path| !ctx.homes.iter().any(|home| path.starts_with(&format!("{home}/")))) {
-            f.meta.severity = "medium".into();
+            f.meta.severity = "low".into();
         }
         let sample: Vec<String> = distinct.iter().take(5).cloned().collect();
         f.hook = format!("userland: {} distinct files in {} s", distinct.len(), window_secs);

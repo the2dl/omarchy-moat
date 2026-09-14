@@ -3,7 +3,7 @@ kind: TracingPolicy
 metadata:
   name: moat-shell-reverse-shell-connect
   annotations:
-    moat.omarchy/severity: "critical"
+    moat.omarchy/severity: "medium"
     moat.omarchy/title: "Shell or netcat opened an outbound connection to the internet"
     moat.omarchy/enforce: "kill"
     moat.omarchy/actions: "kill,quarantine,ignore"
