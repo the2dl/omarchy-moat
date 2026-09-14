@@ -65,6 +65,9 @@ const SECRET_MARKERS: &[&str] = &[
     // Agent configuration can embed MCP tokens in env fields. Correlation
     // stores hashes and script references, never these configuration bytes.
     "/.mcp.json",
+    "/.codex/config.toml",
+    "/.gemini/settings.json",
+    "/opencode.json",
     "/.claude/settings.json",
     "/.claude/settings.local.json",
     "/.claude/hooks.json",
@@ -318,6 +321,7 @@ mod tests {
         for suffix in [".claude/.credentials.json", ".claude.json", ".codex/auth.json",
             ".config/openai/auth.json", ".gemini/oauth_creds.json", ".config/opencode/auth.json",
             ".local/share/amazon-q/credentials.json", ".mcp.json", ".claude/settings.json",
+            ".codex/config.toml", ".gemini/settings.json", "opencode.json",
             ".vscode/tasks.json"] {
             let path = format!("/home/dan/{suffix}");
             assert!(may_stage(&path, true, "ai").is_err(), "{path}");

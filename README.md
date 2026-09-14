@@ -77,6 +77,10 @@ Moat attributes agent descendants to a session, detects AI credential access by
 tools, and correlates executable workspace-configuration changes with script
 execution. `moat-agent-tool --workspace PATH -- COMMAND` provides opt-in tool
 isolation with a clean environment and no network by default.
+`moat-agent claude --workspace "$PWD"` optionally routes a Claude session
+through those isolated tools. Exit and run `claude` normally to turn it off;
+installation changes no agent defaults. Extra configuration formats are off
+until enabled, and first-seen configurations establish a quiet baseline.
 
 See [Agent protection](docs/AGENT-PROTECTION.md) for configuration, examples,
 and the boundaries of this first implementation.

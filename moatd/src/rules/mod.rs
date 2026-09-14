@@ -776,6 +776,7 @@ mod tests {
             ai_cli_headless: false,
             ai_credentials: false,
             agent_config_exec: false,
+            agent_config_extended: false,
             pkg_egress: false,
             net_first_contact: false,
             new_exec_ioc: false,

@@ -1,0 +1,218 @@
+#!/usr/bin/python3 -I
+"""Opt-in Claude session with commands routed through Moat's isolated MCP tool."""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import selectors
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+MAX_REQUEST = 131072
+MAX_OUTPUT = 65536
+PROTOCOLS = ('2024-11-05', '2025-03-26', '2025-06-18')
+
+
+def runner():
+    path = Path(__file__).resolve().with_name('moat-agent-tool')
+    loader = importlib.machinery.SourceFileLoader('moat_agent_tool', str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+class Broker:
+    def __init__(self, workspace, read_only=(), network=False, timeout=120):
+        self.tool = runner()
+        self.base = self.tool.command(workspace, ['/usr/bin/true'], read_only, network)
+        self.base = self.base[:self.base.index('--') + 1]
+        self.timeout = timeout
+        # Pin every grant for the broker lifetime. Later workspace/path changes
+        # cannot silently widen the grant, even between tool requests.
+        self.base, self.fds = self.tool.pin_mounts(self.base)
+
+    def close(self):
+        for fd in self.fds:
+            os.close(fd)
+        self.fds = []
+
+    def execute(self, args):
+        if not isinstance(args, dict) or set(args) != {'command'}:
+            raise ValueError('only command is accepted; grants are fixed by the launcher')
+        command = args['command']
+        if not isinstance(command, str) or not command.strip() or len(command) > 32768 or '\0' in command:
+            raise ValueError('command must be nonempty text, at most 32768 characters')
+        cmd = self.base + ['/usr/bin/bash', '--noprofile', '--norc', '-c', command]
+        output = bytearray()
+        reason = ''
+        with subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, env={'PATH': '/usr/bin:/bin'},
+                              close_fds=True, pass_fds=self.fds, start_new_session=True) as child:
+            try:
+                with selectors.DefaultSelector() as ready:
+                    ready.register(child.stdout, selectors.EVENT_READ)
+                    deadline = time.monotonic() + self.timeout
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            reason = 'Tool timed out; process group terminated.'
+                            break
+                        if not ready.select(min(remaining, 0.25)):
+                            continue
+                        chunk = os.read(child.stdout.fileno(), 8192)
+                        if not chunk:
+                            # stdout can close before the command finishes.
+                            try:
+                                child.wait(timeout=max(0.01, deadline - time.monotonic()))
+                            except subprocess.TimeoutExpired:
+                                reason = 'Tool timed out; process group terminated.'
+                            break
+                        space = MAX_OUTPUT - len(output)
+                        output.extend(chunk[:space])
+                        if len(chunk) > space:
+                            reason = 'Tool output limit reached; process group terminated.'
+                            break
+            finally:
+                # Clean up background children as well as a timed-out leader.
+                if child.poll() is None:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                child.wait()
+        text = output.decode('utf-8', errors='replace')
+        text += '\n' + (reason or f'Exit status: {child.returncode}')
+        return {'content': [{'type': 'text', 'text': text}],
+                'isError': bool(reason) or child.returncode != 0}
+
+    def dispatch(self, request):
+        if not isinstance(request, dict) or request.get('jsonrpc') != '2.0':
+            raise ValueError('expected a JSON-RPC 2.0 object')
+        method = request.get('method')
+        params = request.get('params', {})
+        if not isinstance(params, dict):
+            raise ValueError('params must be an object')
+        if method == 'initialize':
+            version = params.get('protocolVersion')
+            return {'protocolVersion': version if version in PROTOCOLS else PROTOCOLS[-1],
+                    'capabilities': {'tools': {}},
+                    'serverInfo': {'name': 'moat-isolated-tools', 'version': '1'}}
+        if method == 'ping':
+            return {}
+        if method == 'tools/list':
+            return {'tools': [{'name': 'shell',
+                    'description': 'Run a shell command in the launch-approved workspace. Host home and credentials are hidden. Network and read grants are fixed by the launcher. Use this tool to read, edit, search and test project files.',
+                    'inputSchema': {'type': 'object', 'properties': {'command': {'type': 'string', 'maxLength': 32768}},
+                                    'required': ['command'], 'additionalProperties': False}}]}
+        if method == 'tools/call':
+            if params.get('name') != 'shell':
+                raise ValueError('unknown tool')
+            return self.execute(params.get('arguments'))
+        raise LookupError('method not found')
+
+
+def serve(broker):
+    while True:
+        line = sys.stdin.buffer.readline(MAX_REQUEST + 1)
+        if not line:
+            return 0
+        if len(line) > MAX_REQUEST:
+            print('moat-agent: request exceeds size limit', file=sys.stderr)
+            return 2
+        request = None
+        try:
+            request = json.loads(line)
+            if isinstance(request, dict) and 'id' not in request:
+                # Notifications never execute tools and never receive responses.
+                continue
+            result = broker.dispatch(request)
+            response = {'jsonrpc': '2.0', 'id': request.get('id'), 'result': result}
+        except (ValueError, LookupError, OSError) as exc:
+            response = {'jsonrpc': '2.0', 'id': request.get('id') if isinstance(request, dict) else None,
+                        'error': {'code': -32601 if isinstance(exc, LookupError) else -32602,
+                                  'message': str(exc)}}
+        print(json.dumps(response), flush=True)
+
+
+def launch_plan(args, broker):
+    executable = shutil.which('claude')
+    if not executable:
+        raise ValueError('Claude Code is not installed')
+    executable = str(Path(executable).resolve(strict=True))
+    workspace = str(Path(args.workspace).resolve(strict=True))
+    script = str(Path(__file__).resolve())
+    if Path(script).is_relative_to(workspace) or Path(executable).is_relative_to(workspace):
+        raise ValueError('launcher and Claude must be outside the writable workspace; use the installed package')
+    identities = [(os.fstat(fd).st_dev, os.fstat(fd).st_ino) for fd in broker.fds]
+    server_args = ['-I', script, 'serve', '--workspace', workspace, '--timeout', str(args.timeout),
+                   '--expected-mounts', json.dumps(identities)]
+    for path in args.read_only:
+        server_args += ['--read-only', str(Path(path).resolve(strict=True))]
+    if args.network:
+        server_args += ['--network']
+    mcp = {'mcpServers': {'moat': {'type': 'stdio', 'command': '/usr/bin/python3', 'args': server_args}}}
+    settings = {'disableAllHooks': True, 'autoMemoryEnabled': False, 'enabledPlugins': {}}
+    cmd = [executable, '--restricted', '--tools', '', '--strict-mcp-config',
+           '--mcp-config', json.dumps(mcp), '--setting-sources', '',
+           '--settings', json.dumps(settings), '--disable-slash-commands', '--no-chrome',
+           '--allowedTools', 'mcp__moat__shell']
+    if args.model:
+        cmd += ['--model', args.model]
+    if args.prompt is not None:
+        cmd += ['--print', '--', args.prompt]
+    return cmd, workspace
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('mode', choices=['claude', 'serve'])
+    parser.add_argument('--workspace', required=True)
+    parser.add_argument('--read-only', action='append', default=[], metavar='PATH')
+    parser.add_argument('--network', action='store_true', help='grant tools broad network access for this session')
+    parser.add_argument('--timeout', type=int, default=120, help='tool time limit in seconds (1–600)')
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--model')
+    parser.add_argument('--expected-mounts', help=argparse.SUPPRESS)
+    parser.add_argument('--print', dest='prompt', metavar='PROMPT')
+    args = parser.parse_args()
+    if not 1 <= args.timeout <= 600:
+        parser.error('timeout must be between 1 and 600 seconds')
+    broker = None
+    try:
+        broker = Broker(args.workspace, args.read_only, args.network, args.timeout)
+        if args.expected_mounts is not None:
+            expected = json.loads(args.expected_mounts)
+            actual = [[os.fstat(fd).st_dev, os.fstat(fd).st_ino] for fd in broker.fds]
+            if expected != actual:
+                raise ValueError('mount sources changed since launch; start a fresh session')
+        if args.mode == 'serve':
+            if args.dry_run or args.model or args.prompt is not None:
+                parser.error('serve does not accept launcher options')
+            return serve(broker)
+        cmd, workspace = launch_plan(args, broker)
+        if args.dry_run:
+            print(json.dumps({'command': cmd, 'workspace': workspace, 'active': False}))
+            return 0
+        help_text = subprocess.run([cmd[0], '--help'], capture_output=True, text=True, timeout=15, check=True).stdout
+        for flag in ('--restricted', '--tools', '--strict-mcp-config', '--setting-sources', '--disable-slash-commands', '--no-chrome'):
+            if flag not in help_text:
+                raise ValueError('Claude lacks required flag ' + flag + '; refusing an unrestricted fallback')
+        print('[moat] Optional isolated Claude session: tools use only the selected workspace; network ' + ('allowed' if args.network else 'off') + '. Exit and run claude normally to turn this off.', file=sys.stderr)
+        env = dict(os.environ, ENABLE_CLAUDEAI_MCP_SERVERS='false')
+        result = subprocess.run(cmd, cwd=workspace, env=env, close_fds=True)
+        return result.returncode if result.returncode >= 0 else 128 - result.returncode
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        parser.error(str(exc))
+    finally:
+        if broker is not None:
+            broker.close()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

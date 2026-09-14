@@ -29,6 +29,11 @@ const CONFIGS: &[&str] = &[
     "CLAUDE.md",
     "AGENTS.md",
 ];
+const EXTENDED_CONFIGS: &[&str] = &[
+    ".codex/config.toml",
+    ".gemini/settings.json",
+    "opencode.json",
+];
 
 #[derive(Clone)]
 struct Snapshot {
@@ -42,6 +47,7 @@ struct State {
     last: u64,
     writer: Option<(u32, String)>,
     reported: BTreeSet<String>,
+    last_report: Option<u64>,
 }
 #[derive(Default)]
 pub struct AgentConfig {
@@ -65,7 +71,15 @@ fn snapshot(path: &Path, uid: u32, workspace: &Path) -> Option<Snapshot> {
     let mut scripts = BTreeSet::new();
     // Only structured command/args fields are executable configuration here.
     // Markdown instructions are fingerprinted, but not parsed as shell code.
-    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+    let parsed = if path.extension().and_then(|v| v.to_str()) == Some("toml") {
+        std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|text| toml::from_str::<toml::Value>(text).ok())
+            .and_then(|value| serde_json::to_value(value).ok())
+    } else {
+        serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+    };
+    if let Some(value) = parsed {
         references(&value, workspace, false, &mut scripts);
     }
     Some(Snapshot {
@@ -201,6 +215,7 @@ impl UserRule for AgentConfig {
             last: ctx.now,
             writer: None,
             reported: BTreeSet::new(),
+            last_report: None,
         });
         entry.writer = Some((p.pid, p.exe.clone()));
         entry.last = ctx.now;
@@ -241,7 +256,12 @@ impl UserRule for AgentConfig {
         }
         self.scanned.insert(scan_key, ctx.now);
         let metadata = self.meta();
-        for relative in CONFIGS {
+        let extra = if ctx.cfg.rules.agent_config_extended {
+            EXTENDED_CONFIGS
+        } else {
+            &[]
+        };
+        for relative in CONFIGS.iter().chain(extra.iter()) {
             let path = workspace.join(relative);
             let key = (proc.uid, path.display().to_string());
             let current = snapshot(&path, proc.uid, workspace);
@@ -255,6 +275,7 @@ impl UserRule for AgentConfig {
                 last: ctx.now,
                 writer: None,
                 reported: BTreeSet::new(),
+                last_report: None,
             });
             let changed = match (&state.fingerprint, &current) {
                 (Some(old), Some(new)) => old.hash != new.hash,
@@ -280,6 +301,11 @@ impl UserRule for AgentConfig {
                 .changed_at
                 .map(|t| ctx.now.saturating_sub(t) < WINDOW)
                 .unwrap_or(false)
+                || !state.verified_change
+                || state
+                    .last_report
+                    .map(|t| ctx.now.saturating_sub(t) < WINDOW)
+                    .unwrap_or(false)
                 || !current.scripts.contains(script)
                 || state.reported.contains(script)
             {
@@ -288,13 +314,6 @@ impl UserRule for AgentConfig {
             let Some(mut f) = ctx.finding(ID, metadata.clone(), id) else {
                 continue;
             };
-            if !state.verified_change {
-                f.meta.severity = "medium".into();
-                f.meta.title =
-                    "An agent ran a script referenced by newly observed workspace configuration"
-                        .into();
-                f.meta.why = "The script is referenced by workspace configuration Moat has only just observed. Review it before trusting its access; there is no older fingerprint proving a change.".into();
-            }
             f.file = Some(crate::alert::FileRef {
                 path: script.clone(),
                 sha256: None,
@@ -316,6 +335,7 @@ impl UserRule for AgentConfig {
             // Prevent staging a config containing embedded MCP credentials:
             // the target is the executed script, never the config contents.
             state.reported.insert(script.clone());
+            state.last_report = Some(ctx.now);
             result.push(f);
         }
         result
@@ -346,7 +366,15 @@ mod tests {
         });
     }
     fn exec(rule: &mut AgentConfig, table: &ProcTable, id: &str, now: u64) -> Vec<Finding> {
-        let config = Config::default();
+        exec_config(rule, table, id, now, &Config::default())
+    }
+    fn exec_config(
+        rule: &mut AgentConfig,
+        table: &ProcTable,
+        id: &str,
+        now: u64,
+        config: &Config,
+    ) -> Vec<Finding> {
         let feeds = crate::feeds::Feeds::default();
         let rarity = crate::rarity::RarityStore::default();
         let ctx = RuleCtx {
@@ -446,13 +474,72 @@ mod tests {
             "./setup.mjs",
         );
         let hits = exec(&mut rule, &table, "script", 101);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].meta.severity, "medium");
-        assert!(hits[0]
-            .extra_evidence
-            .iter()
-            .any(|line| line.contains("no prior content fingerprint")));
+        assert!(
+            hits.is_empty(),
+            "first observation establishes a quiet baseline"
+        );
+        assert!(
+            exec(&mut rule, &table, "script", 1000).is_empty(),
+            "expiry also establishes a quiet baseline"
+        );
     }
+    #[test]
+    fn extended_formats_are_opt_in_and_repeated_changes_are_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".codex")).unwrap();
+        let path = dir.path().join(".codex/config.toml");
+        std::fs::write(
+            &path,
+            "[mcp_servers.test]\ncommand = 'node'\nargs = ['./old.mjs']",
+        )
+        .unwrap();
+        let mut table = ProcTable::new(8, 60);
+        process(&mut table, dir.path(), "root", None, "");
+        let mut disabled = AgentConfig::default();
+        let mut enabled = AgentConfig::default();
+        let mut config = Config::default();
+        assert!(!config.rules.agent_config_extended);
+        config.rules.agent_config_extended = true;
+        exec(&mut disabled, &table, "root", 100);
+        exec_config(&mut enabled, &table, "root", 100, &config);
+        std::fs::write(
+            &path,
+            "[mcp_servers.test]\ncommand = 'node'\nargs = ['./setup.mjs']",
+        )
+        .unwrap();
+        process(
+            &mut table,
+            dir.path(),
+            "script",
+            Some("root"),
+            "./setup.mjs",
+        );
+        assert!(exec(&mut disabled, &table, "script", 101).is_empty());
+        let hits = exec_config(&mut enabled, &table, "script", 101, &config);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].meta.severity, "high");
+        for now in 102..202 {
+            std::fs::write(
+                &path,
+                format!(
+                    "# update {now}\n[mcp_servers.test]\ncommand = 'node'\nargs = ['./setup.mjs']"
+                ),
+            )
+            .unwrap();
+            assert!(exec_config(&mut enabled, &table, "script", now, &config).is_empty());
+        }
+        std::fs::write(
+            &path,
+            "[mcp_servers.test]\ncommand = 'node'\nargs = ['./next.mjs']",
+        )
+        .unwrap();
+        process(&mut table, dir.path(), "next", Some("root"), "./next.mjs");
+        assert_eq!(
+            exec_config(&mut enabled, &table, "next", 702, &config).len(),
+            1
+        );
+    }
+
     #[test]
     fn config_staging_rejects_symlinks_and_ignores_non_command_text() {
         let dir = tempfile::tempdir().unwrap();

@@ -148,6 +148,8 @@ pub struct RuleToggles {
     pub ai_cli_headless: bool,
     pub ai_credentials: bool,
     pub agent_config_exec: bool,
+    /// Opt-in additional Codex/Gemini/OpenCode configuration formats.
+    pub agent_config_extended: bool,
     pub pkg_egress: bool,
     /// `moat-net-first-contact`: an outbound connection to a destination this
     /// machine has never talked to. Low, timeline-only, and meaningful mainly
@@ -191,6 +193,7 @@ impl Default for RuleToggles {
             ai_cli_headless: true,
             ai_credentials: true,
             agent_config_exec: true,
+            agent_config_extended: false,
             pkg_egress: true,
             net_first_contact: true,
             new_exec_ioc: true,

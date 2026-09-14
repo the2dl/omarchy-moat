@@ -1,7 +1,8 @@
 # Agent protection on Omarchy
 
-Release 0.1.0-178 adds observed agent sessions, workspace-configuration execution
-correlation, narrower AI credential detection, and an opt-in isolated tool runner.
+Release 0.1.0-179 adds an opt-in Claude tool-broker launcher and quieter,
+optionally expanded configuration correlation to the agent-session and
+credential protections introduced in 0.1.0-178.
 These are local, deterministic features. They work without an AI triage provider.
 
 ## Agent sessions
@@ -66,14 +67,15 @@ under the observed agent workspace:
 
 For JSON configuration, it extracts literal in-workspace script paths from
 `command`, `args` and `program` fields. A subsequent matching script execution
-by the workspace's agent produces `moat-agent-config-executed`:
+by the workspace's agent produces a high `moat-agent-config-executed` finding
+only when the configuration hash differs from the recorded fingerprint. First
+observation, daemon restarts, and expired state establish a quiet baseline;
+they do not create a finding merely because a project already has a hook.
 
-- **High** when the configuration hash differs from the recorded fingerprint.
-- **Medium** on first observation, with an explicit statement that no older
-  fingerprint exists to prove modification.
-
-Unchanged repeated executions are deduplicated within the bounded observation
-window. Different workspaces stay separate. `node -e` text, shell expressions,
+Unchanged repeated executions are deduplicated. Even if a configuration changes
+repeatedly, it produces at most one finding per user/configuration path per ten
+minutes while its state is retained. This deliberately trades some repeated
+change visibility for a usable review queue. Different workspaces stay separate. `node -e` text, shell expressions,
 Markdown instructions and arbitrary argument mentions are not interpreted as
 proof that a script ran. The detector does not claim to prove prompt injection
 or that the configuration caused the execution.
@@ -83,9 +85,18 @@ window. Reads reject non-regular files, ownership mismatches and aliases into
 other paths. Non-script execs trigger at most one scan per workspace per second.
 The initial implementation supports literal absolute or `./` script paths with
 `.js`, `.mjs`, `.cjs`, `.py`, `.sh` or `.bash` extensions. It does not yet parse
-TOML agent settings, expand shell variables, resolve arbitrary package launchers,
-or validate a complete skill/plugin manifest. The `[rules] agent_config_exec`
+arbitrary TOML settings, expand shell variables, resolve arbitrary package
+launchers, or validate a complete skill/plugin manifest. The `[rules] agent_config_exec`
 toggle controls this detector independently of write telemetry.
+
+Additional `.codex/config.toml`, `.gemini/settings.json`, and `opencode.json`
+parsing is **off by default**. To try it, set `[rules] agent_config_extended = true`
+in `/etc/moat/moat.toml` and restart `moatd`. Set it back to `false` to turn it
+off. The existing `agent_config_exec = false` disables all configuration-to-exec
+correlation. Extended formats use the same change/execution requirement and
+cooldown; they add no kernel policies or write-only notifications. TOML support
+extracts literal command/args/program references, not arbitrary shell semantics.
+These additional configuration files are withheld from analysis artifacts too.
 
 ## Isolated tool execution
 
@@ -136,9 +147,64 @@ The **workspace itself is accessible**, including any `.env` or secrets already
 stored there. This is not a secret-content filter. The caller controls the chosen
 workspace and extra grants; configure those in a trusted launcher/tool adapter.
 The runner does not authorize its caller or prevent an unrestricted agent from
-choosing another host command. Routing all tools through an authenticated broker,
-a trusted grant UI, provider authentication proxying, and remote MCP control
-require further integrations. Existing agents are not silently reconfigured.
+choosing another host command. Use the optional launcher below to restrict the
+tool interface of a supported Claude session. Provider authentication proxying
+and control over remote MCP services are not implemented.
+
+## Optional Claude tool-broker session
+
+Nothing is enabled globally, no shell alias is replaced, and no agent settings
+are rewritten. Ordinary `claude` sessions behave as before. Opt in per session:
+
+```sh
+moat-agent claude --workspace "$PWD"
+# Inspect the launch configuration without starting Claude:
+moat-agent claude --workspace "$PWD" --dry-run
+```
+
+**To turn it off, exit this session and launch `claude` normally.** There is no
+service or persistent toggle to undo. Install the package first: the launcher
+refuses to run when itself or Claude lives inside the writable workspace.
+
+The launcher uses Claude's `--restricted`, an empty built-in tool list, and
+`--strict-mcp-config` to expose only Moat's local `shell` MCP tool. That tool
+reads, edits, searches, and tests through the existing Bubblewrap runner. User,
+project and local settings sources, hooks, skills and Chrome integration are
+disabled for the session. Claude retains its normal authentication; its tool
+children receive an empty environment and isolated home. Account-connected MCP
+servers are disabled. A Claude version missing required launch flags causes an
+error, never an unrestricted fallback.
+
+The broker's workspace and optional read/network grants are fixed at launch,
+pinned by file descriptor for its lifetime, and cannot be changed by a tool
+request. Mount identities are checked when Claude starts the broker so a path
+replacement between launcher and broker fails closed. Requests and output are
+bounded; tools time out after 120 seconds by default (configurable from 1–600).
+Timeouts/output overflow terminate the tool process group. Routine tool calls
+do not emit new Moat findings just because they are brokered.
+
+```sh
+# Explicit grants last for the whole session, not one command:
+moat-agent claude --workspace "$PWD" --network --timeout 300
+moat-agent claude --workspace "$PWD" --read-only /path/to/toolchain
+```
+
+Network access includes local services; workspace secrets remain accessible.
+Granting the shell tool permits writes throughout the selected workspace. Git
+identity, SSH authentication, tools installed under your home, network-dependent
+builds and existing hooks/plugins may need deliberate grants or a normal session.
+The launcher accepts a small set of options, not arbitrary Claude flag passthrough.
+`--model NAME` and `--print PROMPT` are supported; session resume is not yet exposed.
+
+This is an experimental **tool-interface integration**, not an OS sandbox around
+the authenticated Claude frontend. Claude and administrator-managed policy remain
+trusted. It does not protect against a compromised frontend, a same-user host
+process, frontend vulnerabilities, or a person changing the frontend's tool setup.
+Other clients can connect to `moat-agent serve --workspace PATH`, but that alone
+does not disable their other tools. Codex/Gemini launch adapters are not shipped.
+
+The integration follows [Claude's CLI controls](https://code.claude.com/docs/en/cli-reference)
+and the [MCP stdio transport](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports).
 
 ## Validation and rollout
 

@@ -14,7 +14,7 @@
 
 pkgname=omarchy-moat
 pkgver=0.1.0
-pkgrel=178
+pkgrel=179
 _tetragonver=1.7.1
 pkgdesc='eBPF supply-chain sensor for Omarchy: Tetragon policies, an alert daemon, a bubblewrap sandbox and pre-execution scanners for PKGBUILD, npm, cargo, pip and go'
 arch=('x86_64' 'aarch64')
@@ -300,7 +300,7 @@ check() {
 	# only package() is fakeroot'd, and this is not package().
 	cd "${srcdir}/${_tree}"
 	bash sandbox/tests/run.sh
-	python3 -m unittest discover -s sandbox/tests -p 'test_agent_tool.py'
+	python3 -m unittest discover -s sandbox/tests -p 'test_agent*.py'
 }
 
 package() {
@@ -384,6 +384,7 @@ package() {
 	install -Dm755 "${tree}/moatd/target/release/moatctl"    "${pkgdir}/usr/bin/moatctl"
 	install -Dm755 "${tree}/moatd/target/release/moat-feeds" "${pkgdir}/usr/bin/moat-feeds"
 	install -Dm755 "${tree}/moatd/target/release/moat-ship"  "${pkgdir}/usr/bin/moat-ship"
+	install -Dm755 "${tree}/sandbox/moat-agent" "${pkgdir}/usr/bin/moat-agent"
 	install -Dm755 "${tree}/sandbox/moat-agent-tool" "${pkgdir}/usr/bin/moat-agent-tool"
 	install -Dm755 "${tree}/sandbox/moat-sandbox"          "${pkgdir}/usr/bin/moat-sandbox"
 	install -Dm755 "${tree}/scanner/moat-scan-pkgbuild"    "${pkgdir}/usr/bin/moat-scan-pkgbuild"
