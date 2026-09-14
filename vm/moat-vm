@@ -1,0 +1,541 @@
+#!/usr/bin/python3 -I
+"""Opt-in project VM prototype. Nothing is enabled globally or at login."""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import select
+import shlex
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.request
+import uuid
+
+HERE = Path(__file__).resolve().parent
+IMAGE_URL = ('https://cloud-images.ubuntu.com/minimal/releases/noble/release-20260905/'
+             'ubuntu-24.04-minimal-cloudimg-amd64.img')
+IMAGE_SHA = '46b0dbaffa6950a7da5ff2dc5ed34c46084610b3b6d1fae8f1ec2d7e953984a3'
+NODE_URL = 'https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.xz'
+NODE_SHA = 'd60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307'
+MAX_BYTES = 512 * 1024 * 1024
+MAX_FILES = 20000
+SKIP_DIRS = {'.git', 'node_modules', '.venv', 'venv', 'target', '__pycache__', '.ssh', '.aws', '.gnupg'}
+SKIP_FILES = {'.netrc', '.npmrc', '.pypirc', 'auth.json', '.credentials.json', 'credentials.json',
+              'id_rsa', 'id_ed25519', '.DS_Store'}
+
+
+def run(argv, **kwargs):
+    return subprocess.run([str(x) for x in argv], check=True, **kwargs)
+
+
+def state_root():
+    root = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'moat/vms'
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if root.is_symlink() or root.stat().st_uid != os.getuid():
+        raise ValueError('VM state must be owned by this user and not a symlink')
+    root.chmod(0o700)
+    return root.resolve()
+
+
+def session(name):
+    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,39}', name):
+        raise ValueError('invalid session name')
+    p = state_root() / name
+    if p.is_symlink() or not (p / 'session.json').is_file():
+        raise ValueError('unknown VM; use list')
+    return p
+
+
+def metadata(p):
+    return json.loads((p / 'session.json').read_text())
+
+
+def save(p, data):
+    tmp = p / 'session.json.tmp'
+    tmp.write_text(json.dumps(data, indent=2) + '\n')
+    tmp.replace(p / 'session.json')
+
+
+@contextlib.contextmanager
+def locked(p):
+    with (p / 'lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
+def excluded(path):
+    p = PurePosixPath(path)
+    return (any(x in SKIP_DIRS for x in p.parts) or p.name in SKIP_FILES
+            or (p.name.startswith('.env') and p.name not in ('.env.example', '.env.sample'))
+            or p.suffix in ('.pem', '.key', '.p12', '.pfx'))
+
+
+def safe_name(name):
+    p = PurePosixPath(name)
+    return bool(name) and not p.is_absolute() and '..' not in p.parts and '\x00' not in name
+
+
+def snapshot(workspace, destination):
+    workspace = workspace.resolve(strict=True)
+    if not workspace.is_dir() or workspace in (Path('/'), Path.home(), Path('/tmp')):
+        raise ValueError('select a project directory, not home, root or /tmp')
+    result = subprocess.run(['/usr/bin/git', '-C', str(workspace), 'rev-parse', '--show-toplevel'],
+                            capture_output=True, text=True)
+    if result.returncode == 0:
+        if Path(result.stdout.strip()).resolve() != workspace:
+            raise ValueError('select the Git project root')
+        names = run(['/usr/bin/git', '-C', workspace, 'ls-files', '--cached', '--others',
+                     '--exclude-standard', '-z'], capture_output=True).stdout.decode().split('\x00')
+    else:
+        names = []
+        for root, dirs, files in os.walk(workspace, followlinks=False):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not (Path(root) / d).is_symlink()]
+            names += [str((Path(root) / n).relative_to(workspace)) for n in files]
+            if len(names) > MAX_FILES:
+                raise ValueError('project exceeds 20,000 files; use a smaller project')
+    total = 0
+    manifest, skipped = {}, []
+    with tarfile.open(destination, 'w') as archive:
+        for name in sorted(set(filter(None, names))):
+            if not safe_name(name) or excluded(name):
+                skipped.append(name)
+                continue
+            # Open every component without following symlinks, including a
+            # directory swapped while taking the snapshot. No link traversal.
+            fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                parts = PurePosixPath(name).parts
+                for component in parts[:-1]:
+                    nxt = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                    os.close(fd)
+                    fd = nxt
+                leaf = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                with os.fdopen(leaf, 'rb') as source:
+                    st = os.fstat(source.fileno())
+                    if not stat.S_ISREG(st.st_mode):
+                        skipped.append(name)
+                        continue
+                    if len(manifest) >= MAX_FILES or total + st.st_size > MAX_BYTES:
+                        raise ValueError('project exceeds snapshot limit (512 MiB / 20,000 files)')
+                    data = source.read(st.st_size + 1)
+                    if len(data) != st.st_size:
+                        raise ValueError('project changed while copying; retry')
+                    total += len(data)
+                    member = tarfile.TarInfo(name)
+                    member.size, member.mode = len(data), 0o755 if st.st_mode & 0o111 else 0o644
+                    archive.addfile(member, io.BytesIO(data))
+                    manifest[name] = hashlib.sha256(data).hexdigest()
+            except (FileNotFoundError, NotADirectoryError):
+                skipped.append(name)
+            except OSError as e:
+                if e.errno == 40:  # ELOOP: symbolic link, intentionally omitted
+                    skipped.append(name)
+                else:
+                    raise
+            finally:
+                os.close(fd)
+    return manifest, skipped
+
+
+def extract_review(archive_path, destination):
+    """Treat a compromised guest's export as hostile, never tar.extractall."""
+    destination.mkdir(mode=0o700, parents=False, exist_ok=False)
+    total, seen, manifest = 0, set(), {}
+    with tarfile.open(archive_path, 'r:') as archive:
+        for entry in archive:
+            name = entry.name.removeprefix('./')
+            if entry.isdir():
+                continue
+            if not safe_name(name) or not entry.isfile() or name in seen:
+                raise ValueError('guest export contains links, duplicate or unsafe paths')
+            if '.git' in PurePosixPath(name).parts:
+                raise ValueError('guest export must not contain Git metadata')
+            seen.add(name)
+            total += entry.size
+            if total > MAX_BYTES or len(seen) > MAX_FILES:
+                raise ValueError('guest export exceeds review limits')
+            out = destination / name
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with archive.extractfile(entry) as source, out.open('xb') as target:
+                data = source.read(MAX_BYTES + 1)
+                if len(data) != entry.size:
+                    raise ValueError('truncated guest file')
+                target.write(data)
+            # No executable permission: review files should not run by accident.
+            out.chmod(0o600)
+            manifest[name] = hashlib.sha256(data).hexdigest()
+    return manifest
+
+
+def doctor():
+    missing = [x for x in ('qemu-system-x86_64', 'qemu-img', 'mkisofs', 'bwrap', 'ssh', 'ssh-keygen', 'git')
+               if not Path('/usr/bin', x).exists()]
+    if missing:
+        raise ValueError('Missing: ' + ', '.join(missing) +
+                         '\nOn Omarchy: sudo pacman -S --needed qemu-system-x86 qemu-img cdrtools bubblewrap openssh git')
+    if os.uname().machine != 'x86_64' or not os.access('/dev/kvm', os.R_OK | os.W_OK):
+        raise ValueError('this prototype requires x86_64 and access to /dev/kvm; no slow emulation fallback')
+    print('Ready: KVM, QEMU, Bubblewrap and SSH available. No system service required.')
+
+
+def prepare(source=None):
+    root = state_root()
+    with locked(root):
+        image = root / 'ubuntu-20260905.qcow2'
+        if image.exists():
+            with image.open('rb') as stream:
+                if hashlib.file_digest(stream, 'sha256').hexdigest() == IMAGE_SHA:
+                    return image
+        tmp = root / 'image.download'
+        print('Preparing the pinned Ubuntu guest image (one-time download)...', flush=True)
+        if source:
+            shutil.copyfile(source, tmp)
+        else:
+            with urllib.request.urlopen(IMAGE_URL, timeout=60) as response, tmp.open('wb') as out:
+                shutil.copyfileobj(response, out)
+        with tmp.open('rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        if digest != IMAGE_SHA:
+            tmp.unlink()
+            raise ValueError('guest image checksum mismatch')
+        tmp.replace(image)
+        image.chmod(0o400)
+        return image
+
+
+def ssh_args(p):
+    m = metadata(p)
+    return ['/usr/bin/ssh', '-F', '/dev/null', '-i', str(p / 'client-key'),
+            '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none', '-o', 'ForwardAgent=no',
+            '-o', 'ForwardX11=no', '-o', 'ClearAllForwardings=yes', '-o', 'PermitLocalCommand=no',
+            '-o', 'StrictHostKeyChecking=yes', '-o', f'UserKnownHostsFile={p / "known_hosts"}',
+            '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
+            '-o', 'LogLevel=ERROR', '-p', str(m['port']), 'dev@127.0.0.1']
+
+
+def remote(p, command, **kwargs):
+    return run([*ssh_args(p), command], **kwargs)
+
+
+def alive(p):
+    result = subprocess.run(['/usr/bin/systemctl', '--user', 'is-active', unit(p)],
+                            capture_output=True, text=True)
+    return result.stdout.strip() in ('active', 'activating', 'deactivating')
+
+
+def unit(p):
+    return 'moat-vm-' + p.name + '.service'
+
+
+def stop(p):
+    if alive(p):
+        run(['/usr/bin/systemctl', '--user', 'stop', unit(p)])
+    print(f'Stopped {p.name}. Its disk is preserved; use resume or discard.')
+
+
+def qemu_command(p, m):
+    net = f'user,id=net0,restrict=on,ipv6=off,hostfwd=tcp:127.0.0.1:{m["port"]}-:22'
+    if not m['offline']:
+        net += ',guestfwd=tcp:10.0.2.100:3128-cmd:/usr/bin/python3 -I /opt/moat/web_proxy.py'
+    cmd = ['/usr/bin/qemu-system-x86_64', '-name', 'moat-' + p.name, '-enable-kvm',
+           '-machine', 'q35', '-cpu', 'host', '-smp', str(m['cpus']), '-m', str(m['memory']),
+           '-nodefaults', '-display', 'none', '-monitor', 'none',
+           '-chardev', 'ringbuf,id=serial0,size=1048576', '-serial', 'chardev:serial0',
+           '-no-reboot', '-drive', 'file=/vm/disk.qcow2,format=qcow2,if=virtio',
+           '-drive', 'file=/seed/seed.iso,format=raw,if=virtio,readonly=on',
+           '-device', 'virtio-net-pci,netdev=net0', '-netdev', net,
+           # libslirp's guestfwd helper calls setsid(), which QEMU groups under
+           # "elevateprivileges". NNP + zero capabilities are enforced outside
+           # QEMU by Bubblewrap/systemd instead; other seccomp groups stay on.
+           '-sandbox', 'on,obsolete=deny,elevateprivileges=allow,spawn=allow,resourcecontrol=deny']
+    # QEMU itself sees only runtime files and this VM's disk. Client keys and
+    # project source stay outside its filesystem. Guestfwd helpers inherit it.
+    wrap = ['/usr/bin/bwrap', '--die-with-parent', '--unshare-user', '--unshare-pid', '--unshare-uts', '--unshare-ipc',
+            '--new-session', '--cap-drop', 'ALL', '--ro-bind', '/usr', '/usr',
+            '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/lib', '/lib',
+            '--symlink', 'usr/lib', '/lib64', '--proc', '/proc', '--dev', '/dev',
+            '--dev-bind', '/dev/kvm', '/dev/kvm', '--tmpfs', '/tmp', '--tmpfs', '/run',
+            '--dir', '/home/vm', '--dir', '/etc', '--ro-bind', str(p / 'seed'), '/seed',
+            '--bind', str(p / 'runtime'), '/vm', '--ro-bind', str(state_root() / 'ubuntu-20260905.qcow2'), '/base.qcow2',
+            '--ro-bind', str(HERE / 'web_proxy.py'), '/opt/moat/web_proxy.py', '--chdir', '/vm']
+    for name in ('resolv.conf', 'hosts', 'nsswitch.conf', 'ld.so.cache', 'ssl', 'ca-certificates'):
+        source = Path('/etc') / name
+        if source.exists():
+            wrap += ['--ro-bind', str(source.resolve()), '/etc/' + name]
+    return wrap + ['--', *cmd]
+
+
+def boot(p, attempts=3):
+    m = metadata(p)
+    if alive(p):
+        raise ValueError('already running')
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        m['port'] = s.getsockname()[1]
+    hostkey = (p / 'host-key.pub').read_text().split()
+    (p / 'known_hosts').write_text(f'[127.0.0.1]:{m["port"]} {hostkey[0]} {hostkey[1]}\n')
+    ips = json.loads(run(['/usr/bin/ip', '-j', 'address'], capture_output=True).stdout)
+    env = {'HOME': '/home/vm', 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8',
+           'MOAT_VM_HOST_IPS': ','.join(a['local'] for i in ips for a in i.get('addr_info', []))}
+    # A transient user unit owns every VMM/proxy descendant. Stopping it cannot
+    # orphan a VM, and CPU/RAM/process limits also cover hostile proxy traffic.
+    launcher = ['/usr/bin/systemd-run', '--user', '--quiet', '--collect', '--unit', unit(p),
+                '-p', 'KillMode=control-group', '-p', 'TimeoutStopSec=10', '-p', 'Nice=10',
+                '-p', 'NoNewPrivileges=yes', '-p', 'LimitCORE=0',
+                '-p', f'MemoryMax={m["memory"] + 1024}M', '-p', 'TasksMax=128',
+                '-p', f'CPUQuota={m["cpus"] * 100}%',
+                '-p', 'StandardOutput=journal', '-p', 'StandardError=journal',
+                '-p', 'LogRateLimitIntervalSec=30s', '-p', 'LogRateLimitBurst=50']
+    # env -i also removes credentials inherited from the user systemd manager.
+    launcher += ['/usr/bin/env', '-i', *[f'{k}={v}' for k, v in env.items()], *qemu_command(p, m)]
+    try:
+        save(p, m)
+        run(launcher)
+        print(f'Booting {p.name} ({m["cpus"]} CPUs, {m["memory"]} MiB RAM)...', flush=True)
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            if not alive(p):
+                recent = subprocess.run(['/usr/bin/journalctl', '--user', '-u', unit(p),
+                                         '-n', '4', '-o', 'cat', '--no-pager'], capture_output=True, text=True)
+                # A rapid stop/start can race the release of the former VMM's
+                # disk lock. Retry only this known startup failure, bounded.
+                if attempts > 1 and 'Failed to get "write" lock' in recent.stdout:
+                    time.sleep(1)
+                    return boot(p, attempts - 1)
+                raise ValueError(f'VM failed to start; inspect: journalctl --user -u {unit(p)} -n 20')
+            probe = subprocess.run([*ssh_args(p), 'true'], capture_output=True)
+            if probe.returncode == 0:
+                return
+            time.sleep(2)
+        raise ValueError(f'boot timed out; inspect: journalctl --user -u {unit(p)} -n 20')
+    except BaseException:
+        if alive(p):
+            stop(p)
+        raise
+
+
+def node_setup():
+    return (f'curl -fsS --max-time 180 {NODE_URL} -o /tmp/moat-node.tar.xz && '
+            f'echo "{NODE_SHA}  /tmp/moat-node.tar.xz" | sha256sum -c - && '
+            'sudo mkdir -p /opt/node && sudo tar -xJf /tmp/moat-node.tar.xz '
+            '--strip-components=1 --no-same-owner -C /opt/node && '
+            'sudo ln -sfn /opt/node/bin/node /usr/local/bin/node && '
+            'sudo ln -sfn /opt/node/bin/npm /usr/local/bin/npm && '
+            'sudo ln -sfn /opt/node/bin/npx /usr/local/bin/npx && rm /tmp/moat-node.tar.xz')
+
+
+def create(args):
+    doctor()
+    image = prepare()
+    name = 'dev-' + uuid.uuid4().hex[:8]
+    p = state_root() / name
+    p.mkdir(mode=0o700)
+    try:
+        (p / 'seed').mkdir()
+        (p / 'runtime').mkdir()
+        print('Copying project files; ignored files, common secrets and links are omitted.', flush=True)
+        print('Secrets embedded in other project files will still be copied.', flush=True)
+        manifest, skipped = snapshot(Path(args.workspace), p / 'project.tar')
+        (p / 'manifest.json').write_text(json.dumps(manifest))
+        (p / 'omitted.json').write_text(json.dumps(skipped, indent=2))
+        for name in ('client-key', 'host-key'):
+            run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', p / name])
+        proxy = '' if args.offline else 'http://10.0.2.100:3128'
+        config = {
+            # Snap seeding otherwise waits for unrestricted network before
+            # cloud-final, delaying first boot in this deliberately restricted VM.
+            'bootcmd': [['systemctl', 'mask', '--now', 'snapd.service', 'snapd.socket',
+                         'snapd.seeded.service', 'snapd.autoimport.service']],
+            'users': [{'name': 'dev', 'shell': '/bin/bash', 'sudo': 'ALL=(ALL) NOPASSWD:ALL',
+                       'lock_passwd': True, 'ssh_authorized_keys': [(p / 'client-key.pub').read_text().strip()]}],
+            'ssh_pwauth': False, 'disable_root': True, 'ssh_deletekeys': True,
+            'ssh_keys': {'ed25519_private': (p / 'host-key').read_text(),
+                         'ed25519_public': (p / 'host-key.pub').read_text()},
+            'write_files': [
+                {'path': '/etc/environment', 'content': '\n'.join(f'{k}={proxy}' for k in
+                  ('http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY')) + '\n'},
+                {'path': '/etc/apt/apt.conf.d/80moat-proxy', 'content':
+                  f'Acquire::http::Proxy "{proxy}";\nAcquire::https::Proxy "{proxy}";\n' if proxy else ''},
+                {'path': '/etc/ssh/sshd_config.d/00-moat.conf', 'content':
+                 'AllowAgentForwarding no\nAllowTcpForwarding no\nX11Forwarding no\nPermitTunnel no\n'}],
+            'runcmd': [['mkdir', '-p', '/home/dev/project'], ['chown', 'dev:dev', '/home/dev/project']],
+        }
+        # JSON is valid YAML, avoiding a new cloud-config serialization dependency.
+        (p / 'seed/user-data').write_text('#cloud-config\n' + json.dumps(config))
+        (p / 'seed/meta-data').write_text(json.dumps({'instance-id': p.name, 'local-hostname': p.name}))
+        run(['/usr/bin/mkisofs', '-quiet', '-output', p / 'seed/seed.iso', '-volid', 'cidata',
+             '-joliet', '-rock', p / 'seed/user-data', p / 'seed/meta-data'])
+        run(['/usr/bin/qemu-img', 'create', '-q', '-f', 'qcow2', '-F', 'qcow2', '-b', image,
+             p / 'runtime/disk.qcow2', '16G'])
+        # The backing path must refer to the base inside the VMM filesystem.
+        run(['/usr/bin/qemu-img', 'rebase', '-u', '-f', 'qcow2', '-F', 'qcow2', '-b', '/base.qcow2',
+             p / 'runtime/disk.qcow2'])
+        save(p, {'workspace': str(Path(args.workspace).resolve()), 'offline': args.offline,
+                 'cpus': args.cpus, 'memory': args.memory, 'created': time.time(), 'initialized': False})
+        boot(p)
+        remote(p, 'cloud-init status --wait >/dev/null 2>&1 || test -d /home/dev/project', timeout=180)
+        with (p / 'project.tar').open('rb') as archive:
+            remote(p, 'tar -xf - -C /home/dev/project', stdin=archive)
+        if not args.offline:
+            print('Installing guest development tools (first launch only; may take several minutes)...\n'
+                  'Progress log: ' + str(p / 'setup.log'), flush=True)
+            with (p / 'setup.log').open('w') as log:
+                remote(p, 'sudo apt-get -qq update && sudo DEBIAN_FRONTEND=noninteractive apt-get -qq install --no-install-recommends '
+                       'git curl ca-certificates python3 python3-venv build-essential xz-utils && ' + node_setup(),
+                       stdout=log, stderr=subprocess.STDOUT, timeout=900)
+        m = metadata(p)
+        m['initialized'] = True
+        save(p, m)
+        print(f'Ready: {p.name}. Copied {len(manifest)} files; omitted {len(skipped)}.\n'
+              f'Open:    {HERE / "moat-vm"} shell {p.name}\n'
+              f'Review:  {HERE / "moat-vm"} export {p.name}\n'
+              f'Stop:    {HERE / "moat-vm"} stop {p.name}\n'
+              'Your original project is unchanged. Sign in to agents inside this VM; host credentials were not copied.')
+    except BaseException:
+        if (p / 'session.json').exists():
+            stop(p)
+        print('Incomplete VM retained for inspection at ' + str(p), file=sys.stderr)
+        raise
+
+
+def export(p):
+    if not alive(p):
+        raise ValueError('resume this VM before exporting')
+    review = p / ('review-' + time.strftime('%Y%m%d-%H%M%S'))
+    archive = p / 'export.tar'
+    # Bound stdout on disk even if the guest is compromised.
+    process = subprocess.Popen([*ssh_args(p), 'tar --exclude=.git --exclude=node_modules --exclude=.venv '
+                               '--exclude=target -cf - -C /home/dev/project .'], stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL)
+    try:
+        total = 0
+        deadline = time.monotonic() + 120
+        with archive.open('wb') as out:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                    raise ValueError('guest export timed out')
+                chunk = os.read(process.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_BYTES + 32 * 1024 * 1024:
+                    raise ValueError('guest export exceeded size limit')
+                out.write(chunk)
+        if process.wait(timeout=10):
+            raise ValueError('guest export failed')
+        after = extract_review(archive, review)
+        before = json.loads((p / 'manifest.json').read_text())
+        changes = {'added': sorted(after.keys() - before.keys()), 'deleted': sorted(before.keys() - after.keys()),
+                   'modified': sorted(k for k in before.keys() & after.keys() if before[k] != after[k])}
+        (review.parent / (review.name + '.json')).write_text(json.dumps(changes, indent=2))
+        print('Review copy: ' + str(review))
+        print(', '.join(f'{len(v)} {k}' for k, v in changes.items()) + '. Original project untouched.')
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        archive.unlink(missing_ok=True)
+
+
+def agent(p, name, install_only):
+    if not metadata(p).get('initialized'):
+        raise ValueError('VM setup is incomplete; create a new VM')
+    if metadata(p)['offline']:
+        raise ValueError('agent installation/login needs a VM with public web access')
+    package = {'claude': '@anthropic-ai/claude-code', 'codex': '@openai/codex'}[name]
+    print(f'Preparing {name} inside {p.name}; no desktop account settings are copied.', flush=True)
+    remote(p, f'test -x /home/dev/.local/bin/{name} || '
+           f'npm install --prefix /home/dev/.local --global {package}', timeout=300)
+    if install_only:
+        remote(p, f'/home/dev/.local/bin/{name} --version')
+    else:
+        os.execv('/usr/bin/ssh', [*ssh_args(p)[:-1], '-t', ssh_args(p)[-1],
+                                f'cd /home/dev/project && exec /home/dev/.local/bin/{name}'])
+
+
+def main():
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description='Moat project VM prototype — opt-in, no host project mounts')
+    sub = parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('doctor', help='check prerequisites; change nothing')
+    prep = sub.add_parser('prepare', help='download and verify the pinned guest image')
+    prep.add_argument('--image', help='use an already downloaded image with the pinned checksum')
+    up = sub.add_parser('up', help='copy a project and launch an isolated development VM')
+    up.add_argument('workspace')
+    up.add_argument('--offline', action='store_true', help='disable even the public web proxy')
+    up.add_argument('--cpus', type=int, choices=range(1, 5), default=2)
+    up.add_argument('--memory', type=int, choices=(2048, 4096, 8192), default=4096, help='MiB RAM (default 4096)')
+    sub.add_parser('list', help='show running and stopped VMs')
+    launch = sub.add_parser('agent', help='install/open a normal agent inside the VM')
+    launch.add_argument('name')
+    launch.add_argument('agent', choices=('claude', 'codex'))
+    launch.add_argument('--install-only', action='store_true')
+    for name in ('shell', 'exec', 'stop', 'resume', 'export', 'discard'):
+        cmd = sub.add_parser(name)
+        cmd.add_argument('name')
+        if name == 'exec':
+            cmd.add_argument('argv', nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    if args.command == 'doctor':
+        doctor()
+    elif args.command == 'prepare':
+        print(prepare(args.image))
+    elif args.command == 'up':
+        create(args)
+    elif args.command == 'list':
+        for p in sorted(state_root().iterdir()):
+            if p.is_dir() and (p / 'session.json').exists():
+                m = metadata(p)
+                print(p.name, 'running' if alive(p) else 'stopped',
+                      'offline' if m['offline'] else 'public web', m['workspace'])
+    else:
+        p = session(args.name)
+        with locked(p):
+            if args.command == 'stop':
+                stop(p)
+            elif args.command == 'resume':
+                doctor()
+                boot(p)
+                print('Ready: ' + p.name)
+            elif args.command == 'discard':
+                if alive(p):
+                    raise ValueError('stop the VM before discarding it')
+                shutil.rmtree(p)
+                print('Discarded ' + p.name)
+            elif args.command == 'export':
+                export(p)
+            elif args.command == 'agent':
+                if not alive(p):
+                    raise ValueError('VM is stopped; use resume')
+                agent(p, args.agent, args.install_only)
+            else:
+                if not alive(p):
+                    raise ValueError('VM is stopped; use resume')
+                if args.command == 'shell':
+                    print('Inside isolated VM. Skills and MCP run normally here. Exit leaves VM running.', flush=True)
+                    os.execv('/usr/bin/ssh', [*ssh_args(p)[:-1], '-t', ssh_args(p)[-1],
+                                            'cd /home/dev/project && exec bash -l'])
+                else:
+                    argv = args.argv[1:] if args.argv[:1] == ['--'] else args.argv
+                    if not argv:
+                        raise ValueError('exec requires a command after the VM name')
+                    remote(p, 'cd /home/dev/project && ' + shlex.join(argv))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        print('moat-vm: ' + str(error), file=sys.stderr)
+        sys.exit(1)
