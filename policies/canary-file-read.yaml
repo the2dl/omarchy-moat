@@ -3,21 +3,18 @@ kind: TracingPolicy
 metadata:
   name: moat-canary-file-read
   annotations:
-    moat.omarchy/severity: "critical"
+    moat.omarchy/severity: "medium"
     moat.omarchy/title: "A decoy file was read"
     moat.omarchy/enforce: "deny"
     moat.omarchy/actions: "kill,quarantine,ignore"
     moat.omarchy/namespace: "global"
     moat.omarchy/why: >-
-      These files are decoys. Moat wrote them, nothing else knows their names, no config
-      references them, and they hold nothing real. Nothing on this machine has a reason to
-      open one, so a program that just did was reading files it was not asked to read --
-      which is what credential theft looks like from the outside.
+      A program read a decoy planted by Moat. This can reveal credential discovery,
+      but editors, project search and indexers can also discover these files.
+      Review the reader and surrounding activity before concluding credential theft.
     moat.omarchy/expected: >-
-      Nothing. This is the one rule here with no legitimate reader: any program on the
-      exclusion list below is there because it reads EVERY file, not because it has business
-      with this one. A backup or a full-disk search will trip it, and that is the only
-      false positive this rule has.
+      Editors opening a directory, project-wide search, indexing, backup and security
+      tools can read decoys incidentally. A read alone does not prove malicious intent.
     moat.omarchy/fp-hint: "exe"
 spec:
   options:

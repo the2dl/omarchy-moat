@@ -790,14 +790,25 @@ impl ChainStore {
     /// Returns the chain it created or grew, or `None` — which is the answer
     /// almost every time, and has to stay cheap for that reason. The caller
     /// writes the returned chain onto every member alert.
-    pub fn note(&mut self, obs: Observation) -> Option<Chain> {
+    pub fn note(&mut self, mut obs: Observation) -> Option<Chain> {
         if !is_chain_family(&obs.family) {
             return None;
         }
         self.prune(obs.at);
-        let (tree, ancestor) = obs.agent_root.clone()
-            .filter(|(id, _)| !id.is_empty())
-            .or_else(|| tree_key(&obs.lineage))?;
+        // A long-lived coding agent is attribution, not a causal task root.
+        // Keep its children separate while preserving chains within each tool task.
+        let mut lineage = obs.lineage.clone();
+        if let Some((id, _)) = &obs.agent_root {
+            if let Some(node) = lineage.iter_mut().find(|n| &n.exec_id == id) {
+                node.sid = Some(node.pid);
+            }
+        }
+        let (tree, ancestor) = tree_key(&lineage)?;
+        // These hooks report requests/transitions, not confirmed privilege gains.
+        // Retain context without letting runtime setup manufacture attack chains.
+        if matches!(obs.rule.as_str(), "moat-priv-capability-gained" | "moat-priv-uid-transition") {
+            obs.silenced = true;
+        }
 
         // Growing an existing chain first: once a sequence is recognised,
         // everything else in that tree belongs to the story, silenced or not.
@@ -1091,21 +1102,28 @@ mod tests {
     }
 
     #[test]
-    fn cached_agent_roots_correlate_children_without_merging_sessions() {
+    fn agent_sessions_do_not_merge_independent_tasks() {
         let mut store = ChainStore::default();
-        let root = |id: &str| Some((id.into(), Ancestor::new(100, "/opt/claude".into())));
-        let mut read = obs("read", 100, "cred", "high", vec![node("reader", 201, "/usr/bin/node")]);
-        read.agent_root = root("agent-one");
-        assert!(store.note(read).is_none());
-        let mut unrelated = obs("other-network", 101, "net", "medium", vec![node("other", 301, "/usr/bin/curl")]);
-        unrelated.agent_root = root("agent-two");
-        assert!(store.note(unrelated).is_none());
-        let mut network = obs("network", 102, "net", "medium", vec![node("sender", 202, "/usr/bin/curl")]);
-        network.agent_root = root("agent-one");
-        let chain = store.note(network).expect("the observed session links cooperating descendants");
-        assert_eq!(chain.ancestor.pid, 100);
-        assert_eq!(chain.members.len(), 2);
-        assert!(!chain.members.iter().any(|id| id == "other-network"));
+        let lineage = |id: &str, task: &str| vec![node(id, 201, "/usr/bin/node"), node(task, 200, "/usr/bin/bash"), node("agent", 100, "/opt/claude")];
+        let observation = |id, family, task| {
+            let mut o = obs(id, 100, family, "medium", lineage(id, task));
+            o.agent_root = Some(("agent".into(), Ancestor::new(100, "/opt/claude".into())));
+            o
+        };
+        assert!(store.note(observation("read", "cred", "task-one")).is_none());
+        assert!(store.note(observation("other", "net", "task-two")).is_none());
+        let chain = store.note(observation("send", "net", "task-one")).expect("one tool subtree still correlates");
+        assert_eq!(chain.ancestor.pid, 200);
+        assert!(!chain.members.iter().any(|id| id == "other"));
+    }
+
+    #[test]
+    fn privilege_requests_are_context_not_proven_gains() {
+        let mut store = ChainStore::default();
+        let mut request = obs("request", 100, "priv", "medium", typed_at_a_shell(201));
+        request.rule = "moat-priv-capability-gained".into();
+        assert!(store.note(request).is_none());
+        assert!(store.note(obs("net", 101, "net", "medium", typed_at_a_shell(201))).is_none());
     }
 
     // ------------------------------------------------------------ the tree

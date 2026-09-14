@@ -259,6 +259,8 @@ impl AlertStore {
     }
 
     fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        let redacted = crate::privacy::json_line(line);
+        let line = redacted.as_str();
         if self.file.is_none() {
             self.reopen()?;
         }
@@ -270,7 +272,7 @@ impl AlertStore {
         // Keep the fold current rather than throw it away: this line is the
         // only thing that changed, and we are the ones who wrote it.
         if let Some(c) = self.cache_lock().as_mut() {
-            c.fold_line(line);
+            c.fold_line(&crate::privacy::json_line(line));
             c.stamp = Stamp::of(&self.path, &self.rotated);
         }
         if self.size >= self.max_bytes {
@@ -429,7 +431,7 @@ impl AlertStore {
     fn write_carried(&self, staging: &Path, carried: &[Alert]) -> std::io::Result<()> {
         let mut buf = String::new();
         for a in carried {
-            buf.push_str(&serde_json::to_string(a)?);
+            buf.push_str(&crate::privacy::json_line(&serde_json::to_string(a)?));
             buf.push('\n');
         }
         let mut f = OpenOptions::new()
@@ -483,7 +485,7 @@ impl AlertStore {
                 continue;
             };
             for line in text.lines() {
-                c.fold_line(line);
+                c.fold_line(&crate::privacy::json_line(line));
             }
         }
         c

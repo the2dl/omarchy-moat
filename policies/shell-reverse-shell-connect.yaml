@@ -8,13 +8,14 @@ metadata:
     moat.omarchy/enforce: "kill"
     moat.omarchy/actions: "kill,quarantine,ignore"
     moat.omarchy/why: >-
-      A shell process that opens a TCP socket is almost always a reverse shell: bash -i
-      over /dev/tcp, nc -e, or socat exec. Shells do not talk to the network on their
-      own, so the connection itself is the detection - the flags never have to be seen.
+      A shell or connection utility opened a public TCP connection. Reverse shells
+      can do this, but port checks and developer scripts do too. A connection alone
+      does not establish remote control. Keep this broad signal in monitor mode;
+      socket-to-stdio correlation provides stronger evidence.
     moat.omarchy/expected: >-
       Hand-written scripts that use bash /dev/tcp as a port check, and nc or socat used
       deliberately against a public host. Connections to RFC1918 and loopback addresses
-      are excluded in-kernel and never fire.
+      and shared address space are excluded in-kernel and never fire.
     moat.omarchy/fp-hint: "exe"
 spec:
   options:
@@ -58,6 +59,8 @@ spec:
       - index: 0
         operator: "NotDAddr"
         values:
+        # Shared address space includes IPv4 tailnets; retain LAN telemetry.
+        - "100.64.0.0/10"
         - "10.0.0.0/8"
         - "172.16.0.0/12"
         - "192.168.0.0/16"

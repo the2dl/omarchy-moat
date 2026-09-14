@@ -38,8 +38,8 @@ var COPY = {
     stake: "Those keys can create machines and read storage on your bill."
   },
   "moat-cred-vcs-token-read": {
-    title: "Something read your GitHub login",
-    stake: "It could push code to your repositories as you."
+    title: "A file used for Git credentials was read",
+    stake: "Check whether this was an account credential, a project file or a test fixture."
   },
   "moat-cred-registry-token-read": {
     title: "Something read your npm or PyPI login",
@@ -206,8 +206,8 @@ var COPY = {
     stake: "It appeared without being installed and is now talking to something."
   },
   "moat-shell-reverse-shell-connect": {
-    title: "A command prompt was opened to somewhere on the internet",
-    stake: "Someone else would be typing into this machine."
+    title: "A shell opened a network connection",
+    stake: "Port checks can do this too. Remote control needs more evidence."
   },
   "moat-shell-lan-connect": {
     title: "A command prompt reached out to another machine on your network",

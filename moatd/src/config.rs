@@ -310,7 +310,7 @@ impl Default for Thresholds {
             // Backup and indexing tools do, and they are a small, nameable
             // set: allowlist them once, which is a thing the user can see and
             // undo, rather than a threshold that silently disables the rule.
-            mass_read_files: 3,
+            mass_read_files: 8,
             mass_read_window_secs: 30,
             // 8 distinct files in 60 seconds.
             //
@@ -978,7 +978,7 @@ mod tests {
     fn missing_config_is_defaults() {
         let c = Config::load(Path::new("/nonexistent/moat.toml")).unwrap();
         assert_eq!(c.group, "moat");
-        assert_eq!(c.thresholds.mass_read_files, 3);
+        assert_eq!(c.thresholds.mass_read_files, 8);
     }
 
     #[test]

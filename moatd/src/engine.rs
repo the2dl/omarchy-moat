@@ -3231,6 +3231,23 @@ impl Daemon {
             )
         };
         let mut score = score;
+        // A filename match outside the account's actual credential location is
+        // evidence of a credential-shaped file, not proof of reading that login.
+        // Keep the signal and package-install escalation, without alarming on
+        // ordinary .netrc fixtures in local test runs.
+        if f.rule == "moat-cred-vcs-token-read" && f.ioc.is_none()
+            && f.context != context::Context::PkgInstall
+            && f.file.as_ref().map(|file| !self.homes.iter().any(|home| {
+                ["/.netrc", "/.git-credentials", "/.config/gh/hosts.yml", "/.config/glab-cli/config.yml"]
+                    .iter().any(|suffix| file.path == format!("{home}{suffix}"))
+            })).unwrap_or(false)
+        {
+            score.severity = "medium".into();
+            score.surface = "timeline".into();
+            score.severity_reason = "medium: credential-shaped file outside the account login location; content and intent unconfirmed".into();
+            score.pkg_install_escalation = false;
+        }
+
         if crate::rules::pkg_egress::attributed_go_registry(&f, &self.names, &self.queries, now)
             && crate::alert::severity_rank(&f.meta.severity) <= crate::alert::severity_rank("medium")
         {
@@ -4239,6 +4256,48 @@ impl Daemon {
             f.ancestry.iter().map(|p| (p.pid, p.exe.clone())).collect();
         let dir = self.incidents_dir();
         let file = f.file.as_ref().map(|x| x.path.clone());
+        // Retention is cheapest right after a capture, and it means the cap is
+        // enforced even on a machine that never restarts the daemon.
+        // Which incidents to pin. This is the SAME `is_protected()` predicate
+        // the feed window and carry-forward rotation use, so the incident
+        // keep-set cannot drift from what survives in `alerts.jsonl`: a row that
+        // is retained keeps its incident pinned, and a row that rotates out lets
+        // its snapshot be pruned. (Every incident-bearing row is protected by P4
+        // by construction, so an on-disk snapshot is pinned as long as its alert
+        // row lives — which is the whole point of the fix.)
+        let keep: std::collections::HashSet<String> = self
+            .store
+            .load()
+            .iter()
+            .filter(|a| a.is_protected())
+            // `dir` is the incident directory; its last component is the id
+            // that `prune` works in.
+            .filter_map(|a| {
+                a.incident.as_ref().and_then(|i| {
+                    std::path::Path::new(&i.dir)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                })
+            })
+            .collect();
+        for gone in incident::prune_reserving(
+            &dir,
+            self.cfg.incidents.retain_days,
+            self.cfg.incidents.retain_max,
+            util::unix_secs(),
+            &keep,
+            1,
+        ) {
+            log::info!("incident retention: removed {}", gone);
+        }
+        // Reserve capacity before capture, never evict the just-created incident
+        // before its alert has been persisted. Active leases can prevent pruning.
+        if self.cfg.incidents.retain_max > 0
+            && incident::ids(&dir).len() >= self.cfg.incidents.retain_max
+        {
+            log::warn!("incident capture deferred: retention capacity is occupied");
+            return None;
+        }
         let inc = incident::capture(&incident::Target {
             id,
             base: &dir,
@@ -4267,39 +4326,6 @@ impl Daemon {
             tree: &Self::tree_text(&rows),
             homes: &self.homes,
         });
-        // Retention is cheapest right after a capture, and it means the cap is
-        // enforced even on a machine that never restarts the daemon.
-        // Which incidents to pin. This is the SAME `is_protected()` predicate
-        // the feed window and carry-forward rotation use, so the incident
-        // keep-set cannot drift from what survives in `alerts.jsonl`: a row that
-        // is retained keeps its incident pinned, and a row that rotates out lets
-        // its snapshot be pruned. (Every incident-bearing row is protected by P4
-        // by construction, so an on-disk snapshot is pinned as long as its alert
-        // row lives — which is the whole point of the fix.)
-        let keep: std::collections::HashSet<String> = self
-            .store
-            .load()
-            .iter()
-            .filter(|a| a.is_protected())
-            // `dir` is the incident directory; its last component is the id
-            // that `prune` works in.
-            .filter_map(|a| {
-                a.incident.as_ref().and_then(|i| {
-                    std::path::Path::new(&i.dir)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                })
-            })
-            .collect();
-        for gone in incident::prune(
-            &dir,
-            self.cfg.incidents.retain_days,
-            self.cfg.incidents.retain_max,
-            util::unix_secs(),
-            &keep,
-        ) {
-            log::info!("incident retention: removed {}", gone);
-        }
         Some(inc)
     }
 

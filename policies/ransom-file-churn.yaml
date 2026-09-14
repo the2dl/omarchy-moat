@@ -63,6 +63,12 @@ spec:
       type: "file"
     - index: 1
       type: "int"
+    # FMODE_CREATED distinguishes a new O_RDWR scratch file from reading an
+    # existing document. Linux include/linux/fs.h defines it as bit 20.
+    - index: 0
+      type: "uint32"
+      resolve: "f_mode"
+      label: "file_mode"
     selectors:
     - matchBinaries:
       - operator: "NotIn"

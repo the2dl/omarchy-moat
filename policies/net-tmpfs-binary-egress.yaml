@@ -4,16 +4,19 @@ metadata:
   name: moat-net-tmpfs-binary-egress
   annotations:
     moat.omarchy/severity: "critical"
-    moat.omarchy/title: "Binary running from /tmp or /dev/shm connected to the internet"
+    moat.omarchy/title: "Temporary-directory binary attempted an internet connection"
     moat.omarchy/enforce: "deny"
     moat.omarchy/actions: "kill,quarantine,ignore"
     moat.omarchy/why: >-
-      A program that lives in a world-writable directory and then talks to a public
-      address is a dropped implant checking in. Legitimate software is installed, not
-      dropped in /tmp.
+      A binary in temporary storage attempted a connection to a non-private address.
+      Dropped malware can do this, but so can legitimate installers, build tools and
+      coding agents staging tools such as Helm. Location alone does not prove abuse;
+      review the binary's origin, destination and surrounding activity.
     moat.omarchy/expected: >-
-      Rare. A downloaded installer you unpacked into /tmp and ran on purpose, or a build
-      tool executing a temporary binary that fetches something. In enforce mode that
+      A downloaded installer you unpacked into /tmp and ran on purpose, or a build
+      tool or coding agent executing a temporary binary that fetches something.
+      Keep this rule in monitor mode for general developer workflows; enforcement
+      is an explicit opt-in for machines that prohibit this activity. In enforce mode that
       program's connection fails with "permission denied" and the program keeps running,
       so an expected one reports a network error rather than disappearing.
     moat.omarchy/fp-hint: "exe"
@@ -37,7 +40,7 @@ spec:
   # one you cannot.
   lsmhooks:
   - hook: "socket_connect"
-    message: "Temporary-directory binary connected to a non-private address"
+    message: "Temporary-directory binary attempted a connection to a non-private address"
     args:
     # security_socket_connect(struct socket *sock, struct sockaddr *address,
     #                         int addrlen) -- arg 1 is where it is going.
@@ -64,6 +67,8 @@ spec:
       - index: 1
         operator: "NotSAddr"
         values:
+        # Shared address space includes IPv4 tailnets; retain LAN telemetry.
+        - "100.64.0.0/10"
         - "10.0.0.0/8"
         - "172.16.0.0/12"
         - "192.168.0.0/16"

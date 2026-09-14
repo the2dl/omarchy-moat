@@ -388,7 +388,15 @@ impl UserRule for RansomChurn {
             }
             // A read wins when an open is both: O_RDWR on a file it has not
             // touched is a read of somebody's data, whatever else it is.
-            if is_read {
+            let created = h.ev.args.iter().any(|arg| {
+                arg.get("label").and_then(|v| v.as_str()) == Some("file_mode")
+                    && arg.get("uint_arg").or_else(|| arg.get("int_arg"))
+                        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                        .map(|mode| mode & (1 << 20) != 0).unwrap_or(false)
+            });
+            if created {
+                actor.note_write(path);
+            } else if is_read {
                 actor.note_read(now, path);
             } else {
                 actor.note_write(path);
@@ -428,6 +436,12 @@ impl UserRule for RansomChurn {
             _ => return Vec::new(),
         };
         if in_build_tree(&path) {
+            return Vec::new();
+        }
+        // Renaming a file first created/written by this actor promotes output;
+        // it does not rename an existing document away. Do not feed that into
+        // extension homogenisation either. Destruction of the original still counts.
+        if matches!(kind, Destroy::Renamed) && actor.wrote_first.remove(&path) {
             return Vec::new();
         }
         // An ATOMIC REPLACE promotes a hidden scratch name to a real one:
@@ -1018,6 +1032,21 @@ mod tests {
     /// target. `lake_staged_tail_manage` did this eight times in three seconds
     /// and was reported critical AFTER write tracking landed -- mkstemp opens
     /// O_RDWR, so the create looked like a read.
+    #[test]
+    fn created_rdwr_scratch_renames_are_not_ransomware() {
+        let t = table();
+        let c = cfg();
+        let mut rule = RansomChurn::default();
+        for i in 0..12 {
+            let temp = format!("/home/dan/Documents/sedABC{i:03}");
+            let dest = format!("/home/dan/Documents/source{i}.ts");
+            let mut opened = read(&temp);
+            opened.args.push(serde_json::json!({"uint_arg": 1 << 20, "label":"file_mode"}));
+            assert!(fire(&mut rule, &t, &c, &opened, "e-node", 100).is_empty());
+            assert!(fire(&mut rule, &t, &c, &rename(&temp, &dest), "e-node", 100).is_empty());
+        }
+    }
+
     #[test]
     fn an_atomic_replace_from_a_hidden_scratch_name_is_not_a_sweep() {
         let t = table();

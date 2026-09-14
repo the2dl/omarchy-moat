@@ -620,6 +620,15 @@ fn run_triage(resp: &Value, socket: &std::path::Path, dry_run: bool, json_out: b
                 continue;
             }
         };
+        let _evidence_lease = match std::path::Path::new(&bundle).parent()
+            .and_then(|dir| moatd::incident::lease(dir).ok())
+        {
+            Some(lease) if std::path::Path::new(&bundle).is_file() => lease,
+            _ => {
+                eprintln!("moatctl triage {id}: evidence unavailable; leaving pending");
+                continue;
+            }
+        };
         // Probe each explicitly mounted incident before spending an agent call.
         // The evidence sandbox does not expose the host filesystem, including
         // sibling incidents. A missing mount must leave the alert pending.
