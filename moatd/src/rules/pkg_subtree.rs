@@ -233,7 +233,7 @@ impl UserRule for Downloader {
             return Vec::new();
         };
         let comm = basename(&me.exe);
-        let matched = if DOWNLOADERS.contains(&comm) {
+        let matched = if DOWNLOADERS.contains(&comm) && (comm != "openssl" || matches!(me.args.split_whitespace().next(), Some("s_client" | "enc" | "base64"))) {
             format!("downloader/decoder `{}`", comm)
         } else if let Some(why) = inline_fetch(comm, &me.args) {
             why.to_string()
@@ -500,6 +500,15 @@ mod tests {
         assert!(run(&mut InterpreterSpawn::default(), &t, "e-npm", "monitor").is_empty());
         // And neither is a shell with no install above it.
         assert!(run(&mut InterpreterSpawn::default(), &t, "e-fish", "monitor").is_empty());
+    }
+
+    #[test]
+    fn certificate_generation_is_not_a_download_but_openssl_networking_is() {
+        let mut t = install_table();
+        for (args, detected) in [("req -newkey rsa:2048", false), ("x509 -req -in fixture.csr", false), ("s_client -connect example.com:443", true), ("enc -d -base64", true)] {
+            t.observe(&proc("openssl", 41250, "/usr/bin/openssl", args, Some("e-sh")));
+            assert_eq!(!run(&mut Downloader, &t, "openssl", "monitor").is_empty(), detected, "{args}");
+        }
     }
 
     #[test]

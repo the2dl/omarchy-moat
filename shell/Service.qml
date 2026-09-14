@@ -1253,21 +1253,15 @@ Item {
 
     FileView {
         id: rotatedFile
-
         path: root.rotatedPath
         watchChanges: true
-        // Legitimately absent until the first rotation.
+        preload: false
         printErrors: false
-        onFileChanged: reload()
-        onLoaded: {
-            Model.setLogPrefix(root._store, text());
-            root._rotatedSettled = true;
-            alertsFile.reload();
-        }
-        onLoadFailed: function(error) {
-            Model.setLogPrefix(root._store, "");
-            root._rotatedSettled = true;
-            alertsFile.reload();
+        // Watch only. Parsing both raw logs here can allocate gigabytes of
+        // QML objects before the compact daemon feed ever arrives.
+        onFileChanged: {
+            if (!alertsReloadTimer.running)
+                alertsReloadTimer.start();
         }
     }
 
@@ -1284,7 +1278,7 @@ Item {
 
         id: alertsReloadTimer
 
-        interval: 1000
+        interval: 2000
         repeat: false
         // `FileView` is kept as a change SIGNAL and nothing else: it is how we
         // learn an append happened, cheaply. What we must not do is call
@@ -1296,46 +1290,13 @@ Item {
 
     FileView {
         id: alertsFile
-
         path: root.alertsPath
         watchChanges: true
-        // The file legitimately does not exist before the package is installed and
-        // legitimately cannot be opened before the user joins the group. Neither is
-        // worth a console warning every reload; the panel says so in words instead.
+        preload: false
         printErrors: false
-        // text() is only guaranteed fresh in onLoaded, so onFileChanged asks for a
-        // re-read rather than parsing here -- coalesced, see alertsReloadTimer.
-        // Append-heavy files fire this often; the fold is incremental over what
-        // was appended, but the re-read is the whole file, capped at 20 MB by
-        // moatd.
         onFileChanged: {
             if (!alertsReloadTimer.running)
                 alertsReloadTimer.start();
-
-        }
-        // Nothing reads the content any more; see the timer above. Kept so a
-        // manual reload() during debugging still folds correctly, and as the
-        // fallback path if the socket is ever unreachable.
-        onLoaded: {
-            if (root._rotatedSettled)
-                root._ingest(text());
-
-        }
-        onLoadFailed: function(error) {
-            root.logReadable = false;
-            root.alerts = [];
-            root.receipts = [];
-            root.unacked = ({
-                "critical": 0,
-                "high": 0,
-                "medium": 0,
-                "low": 0,
-                "total": 0
-            });
-            root.lastError = "cannot read " + root.alertsPath;
-            // A failed open is the strongest signal we get that the group or the
-            // package is missing; re-probe rather than sit on a stale answer.
-            root.probe();
         }
     }
 

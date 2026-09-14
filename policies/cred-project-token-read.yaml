@@ -74,7 +74,6 @@ spec:
         operator: "Postfix"
         values:
         - "/.yarnrc.yml"
-        - "/.netrc"
       - index: 1
         operator: "Mask"
         values: ["4"]
@@ -137,7 +136,6 @@ spec:
         - "/.env.production.local"
         - "/.env.staging"
         - "/.env.test"
-        - "/.git-credentials"
         - "/.git/config"
       - index: 1
         operator: "Mask"

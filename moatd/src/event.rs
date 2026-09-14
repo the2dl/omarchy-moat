@@ -379,15 +379,20 @@ impl<'a> HookHit<'a> {
     /// Destination of a connection, from either a `sock_arg` (`tcp_connect`) or
     /// a `sockaddr_arg` (LSM `socket_connect`). NOTES §5.
     pub fn dest(&self) -> Option<(String, u16)> {
+        // socket_connect runs before the socket has a peer. Its sockaddr is
+        // the requested destination; the accompanying sock_arg can still be
+        // 0.0.0.0:0 or :::0, especially when the connection is refused.
+        for a in &self.ev.args {
+            if let Some(s) = a.get("sockaddr_arg") {
+                let ip = s.get("addr").and_then(|v| v.as_str())?.to_string();
+                let port = s.get("port").and_then(json_i64).unwrap_or(0) as u16;
+                return Some((ip, port));
+            }
+        }
         for a in &self.ev.args {
             if let Some(s) = a.get("sock_arg") {
                 let ip = s.get("daddr").and_then(|v| v.as_str())?.to_string();
                 let port = s.get("dport").and_then(json_i64).unwrap_or(0) as u16;
-                return Some((ip, port));
-            }
-            if let Some(s) = a.get("sockaddr_arg") {
-                let ip = s.get("addr").and_then(|v| v.as_str())?.to_string();
-                let port = s.get("port").and_then(json_i64).unwrap_or(0) as u16;
                 return Some((ip, port));
             }
         }
@@ -542,6 +547,22 @@ mod tests {
         assert_eq!(ip, "185.220.101.55");
         assert_eq!(port, 4444);
         assert!(h.action_is_kill());
+    }
+
+    #[test]
+    fn socket_connect_uses_requested_peer_before_unconnected_socket() {
+        for (empty, destination) in [("0.0.0.0", "203.0.113.10"), ("::", "2001:db8::10")] {
+            let line = serde_json::json!({"process_lsm": {
+                "function_name": "socket_connect",
+                "action": "KPROBE_ACTION_OVERRIDE",
+                "args": [
+                    {"sock_arg": {"daddr": empty, "dport": 0}},
+                    {"sockaddr_arg": {"addr": destination, "port": 443}}
+                ]
+            }}).to_string();
+            let ev = RawEvent::parse(&line).unwrap();
+            assert_eq!(ev.hook().unwrap().dest(), Some((destination.into(), 443)));
+        }
     }
 
     #[test]

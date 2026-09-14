@@ -283,7 +283,7 @@ sweep_secs = 86400
 # will trip this. They are a small nameable set and the alert offers to allow
 # them by binary, which is visible and reversible -- unlike a threshold set so
 # high the rule is off.
-mass_read_files = 3
+mass_read_files = 8
 mass_read_window_secs = 30
 
 # ransom-file-churn: this many DISTINCT files that one actor read and then

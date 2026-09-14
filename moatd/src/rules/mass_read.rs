@@ -56,7 +56,7 @@ impl UserRule for MassRead {
             ID,
             "cred",
             "high",
-            "One process read many private files in seconds",
+            "One process read many credential-shaped files in seconds",
             "Reading dozens of different dotfiles in a few seconds is not what a program \
              doing its job looks like; it is what a secret scanner looks like. Credential \
              stealers sweep ~/.ssh, ~/.aws, ~/.config and the browser profiles in one pass.",
@@ -137,17 +137,22 @@ impl UserRule for MassRead {
         let Some(mut f) = ctx.finding(ID, self.meta(), exec_id) else {
             return Vec::new();
         };
+        // Staged or synthetic credential-shaped paths remain correlation
+        // signals. Do not label a batch of external fixtures a host harvest.
+        if distinct.iter().all(|path| !ctx.homes.iter().any(|home| path.starts_with(&format!("{home}/")))) {
+            f.meta.severity = "medium".into();
+        }
         let sample: Vec<String> = distinct.iter().take(5).cloned().collect();
         f.hook = format!("userland: {} distinct files in {} s", distinct.len(), window_secs);
         f.what_override = Some(format!(
-            "{} read {} different private files in under {} seconds.",
+            "{} read {} different credential-shaped files in under {} seconds.",
             f.proc.comm(),
             distinct.len(),
             window_secs
         ));
         f.extra_evidence = vec![
             format!(
-                "threshold: more than {} distinct files under a home dotdir within {} s",
+                "threshold: at least {} distinct credential-shaped files within {} s",
                 threshold, window_secs
             ),
             format!("first files: {}", sample.join(", ")),
@@ -312,7 +317,7 @@ mod tests {
         assert_eq!(out.len(), 2, "N means N: {:?}", out.len());
         let f = &out[0];
         assert!(
-            f.what_override.as_ref().unwrap().contains("2 different private files"),
+            f.what_override.as_ref().unwrap().contains("2 different credential-shaped files"),
             "{:?}",
             f.what_override
         );

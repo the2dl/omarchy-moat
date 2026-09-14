@@ -47,11 +47,10 @@ use crate::util::basename;
 /// developer compiling their own code is not permanently inside an install.
 pub const PKG_ROOT_BINARIES: &[&str] = &[
     // JavaScript / TypeScript
-    "npm", "npx", "pnpm", "yarn", "bun", "corepack",
+    "npx", "corepack",
     // Python
     "pip", "pip3", "uv", "poetry", "pipx",
     // Rust
-    "cargo",
     // Arch / AUR
     "makepkg", "yay", "paru",
     // Perl: cpanm and cpan only ever install, and both run the distribution's
@@ -76,7 +75,7 @@ pub const PKG_ROOT_BINARIES: &[&str] = &[
 
 /// Script names that mean "this interpreter is running a package manager".
 /// Matched against the basename of each argument token.
-const SCRIPT_MARKERS: &[&str] = &["npm-cli.js", "npx-cli.js", "yarn.js"];
+const SCRIPT_MARKERS: &[&str] = &["npx-cli.js"];
 
 /// Tool names that mean a package manager even when they are an argument
 /// (`bash /usr/bin/makepkg`, `node …/pnpm/bin/pnpm.cjs`). Matched against the
@@ -97,7 +96,7 @@ const SCRIPT_MARKERS: &[&str] = &["npm-cli.js", "npx-cli.js", "yarn.js"];
 /// already states the principle — markers match per path segment, never as a
 /// bare substring — and a directory path ending in the name is the same error
 /// as `pnpm-lock.yaml`.
-const BARE_MARKERS: &[&str] = &["pnpm", "makepkg"];
+const BARE_MARKERS: &[&str] = &["makepkg"];
 
 /// `tool subcommand` markers: the tool must appear (as the binary or as an
 /// argument) and the first following non-flag word must be one of `subs`.
@@ -107,6 +106,10 @@ struct Verb {
 }
 
 const VERB_MARKERS: &[Verb] = &[
+    Verb { tool: "npm", subs: &["install", "i", "ci", "add", "update", "exec"] },
+    Verb { tool: "npm-cli", subs: &["install", "i", "ci", "add", "update", "exec"] },
+    Verb { tool: "pnpm", subs: &["install", "i", "add", "update", "dlx"] },
+    Verb { tool: "yarn", subs: &["install", "add", "up", "dlx"] },
     Verb {
         tool: "bun",
         subs: &["install", "add", "x"],
@@ -125,7 +128,7 @@ const VERB_MARKERS: &[Verb] = &[
     },
     Verb {
         tool: "cargo",
-        subs: &["build", "install", "run", "test", "add", "fetch", "update"],
+        subs: &["install", "add", "fetch", "update"],
     },
     // Go has no postinstall hook, but `go generate` runs arbitrary commands,
     // cgo compiles and links C from the module, and `go test` runs the module's
@@ -206,6 +209,13 @@ fn tool_name(token: &str) -> &str {
 /// The string is evidence text, so it names the thing that matched.
 pub fn root_reason(exe: &str, args: &str) -> Option<String> {
     let comm = basename(exe);
+    if comm.starts_with("build-script-") && exe.contains("/target/") {
+        return Some("Cargo dependency build script".into());
+    }
+    // Bare npm/yarn/pnpm means install for the latter two, help for npm.
+    if args.trim().is_empty() && matches!(comm, "yarn" | "pnpm") {
+        return Some("default install command".into());
+    }
     if PKG_ROOT_BINARIES.contains(&comm) {
         return Some(format!("binary basename `{}`", comm));
     }
@@ -316,6 +326,16 @@ mod tests {
     }
 
     #[test]
+    fn local_test_commands_are_not_installs_but_dependency_build_scripts_are() {
+        for (exe, args) in [("/usr/bin/cargo", "test --lib"), ("/usr/bin/cargo", "build"), ("/usr/bin/npm", "test"), ("/usr/bin/pnpm", "run test"), ("/usr/bin/node", "/usr/lib/npm/npm-cli.js run test"), ("/usr/bin/bash", "/usr/lib/moat/shims/cargo test --lib")] {
+            assert!(root_reason(exe, args).is_none(), "{exe} {args}");
+        }
+        assert!(root_reason("/project/target/debug/build/example/build-script-build", "").is_some());
+        assert!(root_reason("/usr/bin/cargo", "install example").is_some());
+        assert!(root_reason("/usr/bin/npm", "ci").is_some());
+    }
+
+    #[test]
     fn a_binary_basename_makes_a_root() {
         for exe in ["/usr/bin/npm", "/usr/bin/cargo", "/usr/bin/makepkg", "/usr/bin/yay"] {
             assert!(root_reason(exe, "install").is_some(), "{}", exe);
@@ -330,7 +350,7 @@ mod tests {
             "/home/dan/.local/share/mise/installs/node/26.5.0/bin/node",
             "/home/dan/.local/share/mise/installs/node/26.5.0/lib/node_modules/npm/bin/npm-cli.js install",
         );
-        assert_eq!(r.as_deref(), Some("argument `npm-cli.js`"));
+        assert_eq!(r.as_deref(), Some("arguments `npm-cli install`"));
 
         let t = table(&[
             ("e-term", 41100, "/usr/bin/alacritty", "", None),
@@ -347,7 +367,7 @@ mod tests {
         ]);
         let (root, why) = pkg_root_with_reason(&t, "e-node").unwrap();
         assert_eq!(root.pid, 41201);
-        assert!(why.contains("npm-cli.js"));
+        assert!(why.contains("npm-cli install"));
         assert!(in_pkg_subtree(&t, "e-sh"));
     }
 

@@ -85,3 +85,5 @@ pub mod util;
 
 /// Version reported by `status` and written into every alert-adjacent artifact.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub mod privacy;

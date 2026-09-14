@@ -370,7 +370,19 @@ impl PacmanDb {
     }
 
     pub fn owner(&self, path: &str) -> Option<&PkgInfo> {
-        self.owners.get(path).and_then(|i| self.pkgs.get(*i))
+        if let Some(i) = self.owners.get(path) {
+            return self.pkgs.get(*i);
+        }
+        // Only root-owned system directory aliases, never arbitrary symlinks in
+        // a user's workspace. Require the alias directory to resolve to /usr/bin.
+        for prefix in ["/usr/sbin/", "/sbin/", "/bin/"] {
+            if let Some(leaf) = path.strip_prefix(prefix) {
+                if !leaf.contains('/') && std::fs::canonicalize(prefix).ok().as_deref() == Some(Path::new("/usr/bin")) {
+                    return self.owners.get(&format!("/usr/bin/{leaf}")).and_then(|i| self.pkgs.get(*i));
+                }
+            }
+        }
+        None
     }
 
     /// `"coreutils 9.11-2"` for a local-database DIRECTORY, so a sweep walking
@@ -716,6 +728,10 @@ impl Classifier {
 
     /// Same thing straight off a process-table entry.
     pub fn classify_proc(&mut self, p: &crate::proctable::ProcInfo) -> Actor {
+        // A container path is not the host file with the same spelling.
+        if p.in_container == Some(true) {
+            return Actor::default();
+        }
         self.classify_actor(&p.exe, &p.args, &p.cwd)
     }
 }

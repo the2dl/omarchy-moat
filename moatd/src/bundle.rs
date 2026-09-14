@@ -603,7 +603,7 @@ pub fn write(dir: &Path, body: &str, group: &str) -> std::io::Result<std::path::
     let path = dir.join("bundle.md");
     // Group readable, as LEARNING §2 requires: the panel and the agent both run
     // as the user.
-    util::atomic_write(&path, body.as_bytes(), 0o640)?;
+    util::atomic_write(&path, crate::privacy::text(body).as_bytes(), 0o640)?;
     let _ = util::secure_path(&path, group, 0o640);
     Ok(path)
 }

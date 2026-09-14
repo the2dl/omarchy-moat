@@ -137,7 +137,7 @@ pub fn capture(t: &Target) -> Incident {
     step(
         &mut errors,
         "tree.txt",
-        util::atomic_write(&dir.join("tree.txt"), t.tree.as_bytes(), 0o640)
+        util::atomic_write(&dir.join("tree.txt"), crate::privacy::text(t.tree).as_bytes(), 0o640)
             .and_then(|_| util::secure_path(&dir.join("tree.txt"), t.group, 0o640)),
     );
 
@@ -309,7 +309,9 @@ fn step(errors: &mut Vec<String>, what: &str, r: std::io::Result<()>) {
 }
 
 fn write_json(path: &Path, v: &Value, group: &str) -> std::io::Result<()> {
-    let body = format!("{}\n", serde_json::to_string_pretty(v).unwrap_or_default());
+    let mut v = v.clone();
+    crate::privacy::value(&mut v);
+    let body = format!("{}\n", serde_json::to_string_pretty(&v).unwrap_or_default());
     util::atomic_write(path, body.as_bytes(), 0o640)?;
     let _ = util::secure_path(path, group, 0o640);
     Ok(())
@@ -434,7 +436,7 @@ const SECRET_KEY_PARTS: &[&str] = &[
 const SECRET_VALUE_PREFIXES: &[&str] = &[
     "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-", "sk-", "sk_live_",
     "sk_test_", "rk_live_", "npm_", "pypi-", "AKIA", "ASIA", "xox", "AIza", "hf_", "dop_v1_",
-    "eyJ", "-----BEGIN",
+    "eyJ", "-----BEGIN", "tskey-",
 ];
 
 pub fn secret_key(key: &str) -> bool {
@@ -829,9 +831,18 @@ pub fn prune(
     now: u64,
     keep: &std::collections::HashSet<String>,
 ) -> Vec<String> {
+    prune_reserving(base, retain_days, retain_max, now, keep, 0)
+}
+
+/// Reserve bounded space for a new capture; zero configured cap means unlimited.
+pub fn prune_reserving(
+    base: &Path, retain_days: u64, retain_max: usize, now: u64,
+    keep: &std::collections::HashSet<String>, reserve: usize,
+) -> Vec<String> {
     let all = ids(base);
     let mut doomed: Vec<String> = Vec::new();
-    if retain_max > 0 && all.len() > retain_max {
+    let limit = retain_max.saturating_sub(reserve);
+    if retain_max > 0 && all.len() > limit {
         // Oldest first, but answered incidents before unanswered ones.
         //
         // Straight oldest-first made this an evidence-destruction primitive:
@@ -839,7 +850,7 @@ pub fn prune(
         // 2026-09-04 exactly that happened by accident -- a test harness filled
         // the window and the one incident holding a real staged credential was
         // evicted. An attacker can do it deliberately for the price of a loop.
-        let mut over = all.len() - retain_max;
+        let mut over = all.len() - limit;
         for id in &all {
             if over == 0 {
                 break;
@@ -888,14 +899,32 @@ pub fn prune(
             }
         }
     }
-    doomed.retain(|id| match std::fs::remove_dir_all(base.join(id)) {
+    doomed.retain(|id| {
+        use std::os::fd::AsRawFd;
+        let Ok(lock) = std::fs::File::open(base.join(id)) else { return false };
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return false;
+        }
+        match std::fs::remove_dir_all(base.join(id)) {
         Ok(()) => true,
         Err(e) => {
             log::warn!("incident retention: {}: {}", id, e);
             false
         }
+        }
     });
     doomed
+}
+
+/// Hold a shared directory lock while an analyst reads an incident. Retention
+/// takes the exclusive lock on the same inode before removing any evidence.
+pub fn lease(dir: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(dir)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
 }
 
 /// The `incidents` socket command: what is on disk, newest last.
@@ -1112,6 +1141,23 @@ mod tests {
         let empty = pkg_json(&dir.path().to_string_lossy(), "/usr/bin/true", "/usr/bin/true");
         assert!(empty["package"].is_null());
         assert_eq!(empty["lockfiles"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn retention_cannot_delete_evidence_under_analysis() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let b = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        for id in [a, b] {
+            std::fs::create_dir(dir.path().join(id)).unwrap();
+            std::fs::write(dir.path().join(id).join("meta.json"), "{}").unwrap();
+        }
+        let active = lease(&dir.path().join(a)).unwrap();
+        prune(dir.path(), 1, 1, u64::MAX / 2, &HashSet::new());
+        assert!(dir.path().join(a).join("meta.json").exists());
+        drop(active);
+        prune(dir.path(), 1, 1, u64::MAX / 2, &HashSet::new());
+        assert!(!dir.path().join(a).exists());
     }
 
     #[test]

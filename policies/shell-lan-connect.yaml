@@ -74,6 +74,8 @@ spec:
       - index: 0
         operator: "DAddr"
         values:
+        # Shared address space includes IPv4 tailnets; retain LAN telemetry.
+        - "100.64.0.0/10"
         - "10.0.0.0/8"
         - "172.16.0.0/12"
         - "192.168.0.0/16"

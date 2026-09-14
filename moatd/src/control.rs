@@ -6020,7 +6020,7 @@ mod tests {
         }
 
         assert_eq!(set(&mut d, "mass_read_files", "not-a-number")["ok"], false);
-        assert_eq!(d.cfg.thresholds.mass_read_files, 3, "nothing was applied");
+        assert_eq!(d.cfg.thresholds.mass_read_files, 8, "nothing was applied");
     }
 
     #[test]

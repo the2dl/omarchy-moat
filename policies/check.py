@@ -332,7 +332,9 @@ def check_hook(p, where, kind, hook):
             p.add("%s.args[%d]" % (where, i), "type %r not in the verified type list" % (a.get("type"),))
         if a.get("index") is None:
             p.add("%s.args[%d]" % (where, i), "no index")
-        argtypes[a.get("index")] = a.get("type")
+        # Tetragon argIndexType selects the FIRST matching source index.
+        # Additional resolved fields may export that source argument again.
+        argtypes.setdefault(a.get("index"), a.get("type"))
 
     sels = hook.get("selectors", [])
     if not sels:
