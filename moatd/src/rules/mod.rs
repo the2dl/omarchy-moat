@@ -33,6 +33,8 @@
 
 pub mod exec_properties;
 pub mod ai_cli;
+pub mod ai_credentials;
+pub mod agent_config;
 pub mod mass_read;
 pub mod netmatch;
 pub mod net_domain_ioc;
@@ -295,6 +297,8 @@ pub trait UserRule: Send {
 pub fn all() -> Vec<Box<dyn UserRule>> {
     vec![
         Box::new(ai_cli::AiCliHeadless),
+        Box::new(ai_credentials::AiCredentials),
+        Box::new(agent_config::AgentConfig::default()),
         Box::new(pkg_egress::PkgEgress::default()),
         Box::new(net_first_contact::NetFirstContact::default()),
         Box::new(new_exec_ioc::NewExecIoc::default()),
@@ -759,17 +763,19 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), n, "rule ids must be unique");
         assert_eq!(
-            n, 16,
+            n, 18,
             "four gap rules, the four that replaced pkg policies, net-first-contact, \
              the three that read what the sensor already sends about privilege (memfd, \
              privileges raised, capability held), shell-stdio-socket, the two ransom \
-             rules (file-churn, snapshot-command), and net-domain-ioc"
+             rules (file-churn, snapshot-command), net-domain-ioc, and agent credential/config rules"
         );
 
         // Every rule must be switchable off, or `[rules]` is a lie.
         let mut off = cfg();
         off.rules = crate::config::RuleToggles {
             ai_cli_headless: false,
+            ai_credentials: false,
+            agent_config_exec: false,
             pkg_egress: false,
             net_first_contact: false,
             new_exec_ioc: false,

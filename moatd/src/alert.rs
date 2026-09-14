@@ -10,6 +10,8 @@ pub const ALERT_V: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProcessRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session: Option<crate::agent::AgentSession>,
     pub pid: u32,
     pub uid: u32,
     pub exe: String,
@@ -639,6 +641,7 @@ pub mod tests_support {
             title: "Private SSH key read by an unexpected program".into(),
             summary: "node (pid 41233) read /home/dan/.ssh/id_rsa.".into(),
             process: ProcessRef {
+                agent_session: None,
                 pid: 41233,
                 uid: 1000,
                 exe: "/usr/bin/node".into(),

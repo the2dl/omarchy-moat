@@ -1,0 +1,116 @@
+#!/usr/bin/python3 -I
+"""Run one agent tool with an explicit workspace and no inherited credentials."""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import stat
+import sys
+
+
+def command(workspace, argv, read_only=(), network=False):
+    home = Path.home().resolve()
+    workspace = Path(workspace).resolve(strict=True)
+    if not workspace.is_dir() or workspace == home or workspace in home.parents:
+        raise ValueError('workspace must be a specific project directory, not your home or a parent')
+    if workspace.stat().st_uid != os.getuid():
+        raise ValueError('workspace must be owned by the calling user')
+    if any(workspace == Path(p) or Path(p) in workspace.parents for p in ('/etc', '/usr', '/proc', '/sys', '/dev', '/run')):
+        raise ValueError('system directories cannot be workspaces')
+    if workspace.is_relative_to(home) and workspace.relative_to(home).parts[0].startswith('.'):
+        raise ValueError('a hidden home directory cannot be the workspace')
+    if not argv:
+        raise ValueError('a command is required after --')
+    bwrap = '/usr/bin/bwrap'
+    if not os.path.isfile(bwrap):
+        raise ValueError('bubblewrap is required; refusing to run without isolation')
+    cmd = [bwrap, '--unshare-all', '--die-with-parent', '--new-session', '--cap-drop', 'ALL',
+           '--clearenv', '--tmpfs', '/', '--ro-bind', '/usr', '/usr',
+           '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/lib', '/lib',
+           '--symlink', 'usr/lib', '/lib64', '--proc', '/proc', '--dev', '/dev',
+           '--tmpfs', '/tmp', '--tmpfs', '/run', '--dir', '/etc', '--dir', '/home/tool',
+           '--setenv', 'HOME', '/home/tool', '--setenv', 'PATH', '/usr/bin:/bin',
+           '--setenv', 'LANG', 'C.UTF-8', '--setenv', 'TERM', 'dumb',
+           '--setenv', 'MOAT_AGENT_TOOL', '1']
+    for path in ('/etc/ssl', '/etc/ca-certificates', '/etc/ld.so.cache', '/etc/nsswitch.conf', '/etc/hosts', '/etc/passwd', '/etc/group'):
+        if os.path.exists(path):
+            cmd += ['--ro-bind', str(Path(path).resolve(strict=True)), path]
+    if network:
+        cmd += ['--share-net']
+        if os.path.exists('/etc/resolv.conf'):
+            cmd += ['--ro-bind', str(Path('/etc/resolv.conf').resolve(strict=True)), '/etc/resolv.conf']
+    # Extra read mounts are explicit caller grants, scoped to this invocation.
+    # Their targets retain their real path so toolchains can find their assets.
+    for value in read_only:
+        path = Path(value).resolve(strict=True)
+        if path == home or path in home.parents or path == Path('/'):
+            raise ValueError('read grants must name a specific resource, not an entire home or root')
+        if path == workspace or path in workspace.parents or workspace in path.parents:
+            raise ValueError('read grants must not overlap the writable workspace')
+        if path.is_socket() or path.is_fifo() or not (path.is_file() or path.is_dir()):
+            raise ValueError('read grants must be regular files or directories')
+        cmd += ['--ro-bind', str(path), str(path)]
+    cmd += ['--bind', str(workspace), str(workspace), '--chdir', str(workspace), '--'] + list(argv)
+    return cmd
+
+
+def pin_mounts(cmd):
+    """Pin each granted source before bubblewrap starts; reject path swaps."""
+    cmd = list(cmd)
+    descriptors = []
+    try:
+        index = 1
+        while index < len(cmd) and cmd[index] != '--':
+            if cmd[index] in ('--bind', '--ro-bind'):
+                source = cmd[index + 1]
+                fd = os.open(source, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+                descriptors.append(fd)
+                mode = os.fstat(fd).st_mode
+                if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)) or os.readlink('/proc/self/fd/' + str(fd)) != source:
+                    raise ValueError('mount source changed or resolves through an alias: ' + source)
+                cmd[index] += '-fd'
+                cmd[index + 1] = str(fd)
+                index += 3
+            else:
+                index += 1
+        return cmd, descriptors
+    except BaseException:
+        for fd in descriptors:
+            os.close(fd)
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--workspace', required=True)
+    parser.add_argument('--read-only', action='append', default=[], metavar='PATH')
+    parser.add_argument('--network', action='store_true', help='grant network access for this invocation')
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('argv', nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    argv = args.argv[1:] if args.argv[:1] == ['--'] else args.argv
+    try:
+        cmd = command(args.workspace, argv, args.read_only, args.network)
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
+    if args.dry_run:
+        print(json.dumps(cmd))
+        return 0
+    print('[moat] agent tool: isolated workspace; network ' + ('allowed' if args.network else 'off'), file=sys.stderr)
+    # Popen closes inherited descriptors > 2. The environment is cleared before
+    # bubblewrap itself starts; MOAT_SANDBOX=0/ACTIVE and tokens cannot bypass it.
+    try:
+        cmd, descriptors = pin_mounts(cmd)
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
+    try:
+        result = subprocess.run(cmd, env={'PATH': '/usr/bin:/bin'}, close_fds=True, pass_fds=descriptors)
+    finally:
+        for fd in descriptors:
+            os.close(fd)
+    return result.returncode if result.returncode >= 0 else 128 - result.returncode
+
+
+if __name__ == '__main__':
+    sys.exit(main())

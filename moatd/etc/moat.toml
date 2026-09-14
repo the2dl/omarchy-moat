@@ -74,6 +74,9 @@ pacman = "/usr/bin/pacman"
 # in its ancestry, or started with a permission-skipping flag from inside a
 # package install.
 ai_cli_headless = true
+# Attribute credential readers and correlate executable agent configuration.
+ai_credentials = true
+agent_config_exec = true
 
 # A package-manager subtree connecting to an address that is neither private nor
 # in net.registry_cidrs below.

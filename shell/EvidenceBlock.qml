@@ -49,8 +49,14 @@ Rectangle {
         add("process", a.process ? a.process.exe : "");
         add("args", a.process ? a.process.args : "");
         add("working dir", a.process ? Model.shortenHome(a.process.cwd) : "");
+        var session = a.process ? a.process.agent_session : null;
+        if (session) {
+            add("agent session", String(session.agent || "") + " · pid " + String(session.root_pid || ""));
+            add("agent workspace", Model.shortenHome(String(session.workspace || "")));
+            add("session identity", String(session.id || ""));
+        }
         if (a.file)
-            add("wrote", Model.shortenHome(String(a.file.path || "")));
+            add("file", Model.shortenHome(String(a.file.path || "")));
 
         if (a.net) {
             add("connected to", String(a.net.dst_ip || "") + (a.net.dst_port ? ":" + a.net.dst_port : ""));

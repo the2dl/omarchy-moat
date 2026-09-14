@@ -71,6 +71,16 @@ zero telemetry, zero metrics, no machine identifiers, and no details about what
 you install or execute—nothing leaves your machine. The feed mirror can be
 changed or disabled entirely in `/etc/moat/feeds.toml`.
 
+## Agent protection
+
+Moat attributes agent descendants to a session, detects AI credential access by
+tools, and correlates executable workspace-configuration changes with script
+execution. `moat-agent-tool --workspace PATH -- COMMAND` provides opt-in tool
+isolation with a clean environment and no network by default.
+
+See [Agent protection](docs/AGENT-PROTECTION.md) for configuration, examples,
+and the boundaries of this first implementation.
+
 ## Install
 
 ```sh

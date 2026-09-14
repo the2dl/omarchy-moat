@@ -469,6 +469,7 @@ function normalizeAlert(record) {
       args: String(process.args || ""),
       cwd: String(process.cwd || ""),
       start_ts: String(process.start_ts || ""),
+      agent_session: process.agent_session && typeof process.agent_session === "object" ? process.agent_session : null,
       ancestry: Array.isArray(process.ancestry) ? process.ancestry.slice(0, 8) : []
     },
     file: r.file && typeof r.file === "object" ? r.file : null,
@@ -3049,6 +3050,10 @@ function rawFacts(alert) {
   add("args", p.args)
   add("cwd", p.cwd)
   add("start_ts", p.start_ts)
+  if (p.agent_session) {
+    add("agent session", p.agent_session.agent + " · " + p.agent_session.id)
+    add("agent workspace", p.agent_session.workspace)
+  }
   // NOT here any more: ProcessTree draws this properly, and printing the same
   // chain twice on one card -- once as a tree and once as a blob of "pid path"
   // lines -- is worse than either alone. `ancestryLines` stays because the

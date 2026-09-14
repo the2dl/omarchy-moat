@@ -146,6 +146,8 @@ pub fn severity_at_least(sev: &str, min: &str) -> bool {
 #[serde(default, deny_unknown_fields)]
 pub struct RuleToggles {
     pub ai_cli_headless: bool,
+    pub ai_credentials: bool,
+    pub agent_config_exec: bool,
     pub pkg_egress: bool,
     /// `moat-net-first-contact`: an outbound connection to a destination this
     /// machine has never talked to. Low, timeline-only, and meaningful mainly
@@ -187,6 +189,8 @@ impl Default for RuleToggles {
     fn default() -> Self {
         Self {
             ai_cli_headless: true,
+            ai_credentials: true,
+            agent_config_exec: true,
             pkg_egress: true,
             net_first_contact: true,
             new_exec_ioc: true,

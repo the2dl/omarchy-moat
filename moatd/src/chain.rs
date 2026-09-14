@@ -255,6 +255,9 @@ pub struct LineageNode {
 /// test without a daemon.
 #[derive(Debug, Clone)]
 pub struct Observation {
+    /// Cached sensor lineage survives intermediate exits and ancestry caps.
+    /// Never populated from a process environment variable or a client claim.
+    pub agent_root: Option<(String, Ancestor)>,
     pub alert: String,
     /// RFC3339, as written into the alert record.
     pub ts: String,
@@ -792,7 +795,9 @@ impl ChainStore {
             return None;
         }
         self.prune(obs.at);
-        let (tree, ancestor) = tree_key(&obs.lineage)?;
+        let (tree, ancestor) = obs.agent_root.clone()
+            .filter(|(id, _)| !id.is_empty())
+            .or_else(|| tree_key(&obs.lineage))?;
 
         // Growing an existing chain first: once a sequence is recognised,
         // everything else in that tree belongs to the story, silenced or not.
@@ -1071,6 +1076,7 @@ mod tests {
 
     fn obs(id: &str, at: u64, family: &str, sev: &str, lineage: Vec<LineageNode>) -> Observation {
         Observation {
+            agent_root: None,
             alert: id.into(),
             ts: crate::util::rfc3339_of(at),
             at,
@@ -1082,6 +1088,24 @@ mod tests {
             silenced: false,
             lineage,
         }
+    }
+
+    #[test]
+    fn cached_agent_roots_correlate_children_without_merging_sessions() {
+        let mut store = ChainStore::default();
+        let root = |id: &str| Some((id.into(), Ancestor::new(100, "/opt/claude".into())));
+        let mut read = obs("read", 100, "cred", "high", vec![node("reader", 201, "/usr/bin/node")]);
+        read.agent_root = root("agent-one");
+        assert!(store.note(read).is_none());
+        let mut unrelated = obs("other-network", 101, "net", "medium", vec![node("other", 301, "/usr/bin/curl")]);
+        unrelated.agent_root = root("agent-two");
+        assert!(store.note(unrelated).is_none());
+        let mut network = obs("network", 102, "net", "medium", vec![node("sender", 202, "/usr/bin/curl")]);
+        network.agent_root = root("agent-one");
+        let chain = store.note(network).expect("the observed session links cooperating descendants");
+        assert_eq!(chain.ancestor.pid, 100);
+        assert_eq!(chain.members.len(), 2);
+        assert!(!chain.members.iter().any(|id| id == "other-network"));
     }
 
     // ------------------------------------------------------------ the tree

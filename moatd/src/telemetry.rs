@@ -371,6 +371,9 @@ fn add_actor(m: &mut Map<String, Value>, table: &ProcTable, exec_id: &str) {
     m.insert("cwd".into(), cwd);
     let root = crate::rules::pkgtree::pkg_root_for(table, exec_id).map(|r| r.exe.clone());
     m.insert("pkg_root".into(), json!(root));
+    if let Some(session) = table.get(exec_id).and_then(|p| p.agent_session.as_ref()) {
+        m.insert("agent_session".into(), json!(session));
+    }
 }
 
 // ------------------------------------------------------------------- the file

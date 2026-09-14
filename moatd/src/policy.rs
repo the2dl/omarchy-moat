@@ -390,6 +390,7 @@ spec:
                 // records the asker and is never on the badge.
                 "moat-net-dns-query",
                 "moat-net-first-contact",
+                "moat-persist-agent-config-write",
                 "moat-persist-desktop-entry-write",
                 "moat-persist-omarchy-menu-extension-write",
                 "moat-persist-omarchy-plugin-write",
@@ -408,7 +409,7 @@ spec:
                 // if the rule were switched off.
                 "moat-ransom-file-churn",
             ],
-            "the tenth, moat-pkg-subtree-interpreter-spawn, is a userland rule"
+            "moat-pkg-subtree-interpreter-spawn is an additional userland signal"
         );
         // A building block must not be able to end a process on evidence it has
         // declared too weak for the badge. `check.py` says the same at build

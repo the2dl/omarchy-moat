@@ -67,7 +67,8 @@ config** — in that order, with a package install winning over all three:
 | Context | Meaning | Decided by |
 |---|---|---|
 | `pkg-install` | inside a package-manager subtree (section 1 of the daemon's pkgtree classifier) | npm/pnpm/yarn/bun/pip/uv/cargo/makepkg/yay/paru and their descendants. Checked first and wins outright, even when the install was typed in a terminal |
-| `interactive` | the user is driving it | **1.** a controlling terminal (`tty_nr` ≠ 0, read from /proc at exec time) on the acting process or any ancestor in the capped chain — whatever opened the pty; **2.** failing that, a name: a terminal (alacritty, foot, kitty, ghostty, wezterm), tmux/zellij, `sshd`/`login`, `su`/`sudo`, an editor or IDE (nvim, vim, code, zed, hx, emacs, jetbrains); **3.** failing that, `[context] interactive_roots` in moat.toml. An AI agent CLI (claude, codex, gemini, opencode, amp) is transparent to the name walk, so it inherits whatever root is above it |
+| `interactive` | the user is driving it | **1.** a controlling terminal (`tty_nr` ≠ 0, read from /proc at exec time) on the acting process or any ancestor in the capped chain — whatever opened the pty; **2.** failing that, a name: a terminal (alacritty, foot, kitty, ghostty, wezterm), tmux/zellij, `sshd`/`login`, `su`/`sudo`, an editor or IDE (nvim, vim, code, zed, hx, emacs, jetbrains); **3.** failing that, `[context] interactive_roots` in moat.toml. Recognized AI agent sessions and descendants are classified as `agent` before the terminal/name walk |
+| `agent` | observed AI agent session or descendant | cached sensor exec identity; independent of terminal presence, and never an authorization grant |
 | `service` | started without a human at a prompt | no pty anywhere in the chain, **and** a name: systemd, Hyprland/quickshell launchers, desktop entries, cron, timers, D-Bus activation — or `[context] service_roots` |
 | `unknown` | ancestry lost (pruned, or pre-dates the daemon) | |
 
@@ -118,6 +119,7 @@ Then the same event is scored by context. Examples that define the matrix:
 | AI CLI launched | nothing | **high** | medium unless parent is allowlisted (omarchy usage widgets) |
 
 Rules of the matrix:
+- `agent` context applies no context downgrade. Package-install precedence and provenance/locked-rule checks remain. See [Agent protection](AGENT-PROTECTION.md).
 - `pkg-install` context never gets a downgrade from provenance or from anything
   else. The postinstall script is the attack surface this whole project exists
   for.

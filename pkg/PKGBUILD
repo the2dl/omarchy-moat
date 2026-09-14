@@ -14,7 +14,7 @@
 
 pkgname=omarchy-moat
 pkgver=0.1.0
-pkgrel=177
+pkgrel=178
 _tetragonver=1.7.1
 pkgdesc='eBPF supply-chain sensor for Omarchy: Tetragon policies, an alert daemon, a bubblewrap sandbox and pre-execution scanners for PKGBUILD, npm, cargo, pip and go'
 arch=('x86_64' 'aarch64')
@@ -25,7 +25,7 @@ url='https://github.com/the2dl/omarchy-moat'
 license=('Apache-2.0' 'MIT')
 depends=(
 	'bash'          # moat-sandbox, the shims and shim-common.sh
-	'bubblewrap'    # moat-sandbox is a bwrap wrapper; hard dependency
+	'bubblewrap>=0.12.0' # descriptor-pinned agent-tool mounts; moat-sandbox is a bwrap wrapper; hard dependency
 	'python'        # the moat-scan-* scanners, stdlib only, python3
 )
 makedepends=('cargo')
@@ -300,6 +300,7 @@ check() {
 	# only package() is fakeroot'd, and this is not package().
 	cd "${srcdir}/${_tree}"
 	bash sandbox/tests/run.sh
+	python3 -m unittest discover -s sandbox/tests -p 'test_agent_tool.py'
 }
 
 package() {
@@ -383,6 +384,7 @@ package() {
 	install -Dm755 "${tree}/moatd/target/release/moatctl"    "${pkgdir}/usr/bin/moatctl"
 	install -Dm755 "${tree}/moatd/target/release/moat-feeds" "${pkgdir}/usr/bin/moat-feeds"
 	install -Dm755 "${tree}/moatd/target/release/moat-ship"  "${pkgdir}/usr/bin/moat-ship"
+	install -Dm755 "${tree}/sandbox/moat-agent-tool" "${pkgdir}/usr/bin/moat-agent-tool"
 	install -Dm755 "${tree}/sandbox/moat-sandbox"          "${pkgdir}/usr/bin/moat-sandbox"
 	install -Dm755 "${tree}/scanner/moat-scan-pkgbuild"    "${pkgdir}/usr/bin/moat-scan-pkgbuild"
 	# The npm/pnpm/yarn/bun shims call this before an install runs; without it
@@ -486,6 +488,8 @@ package() {
 	# reading the config needs them on disk.
 	install -Dm644 "${tree}/docs/BASELINE.md" \
 		"${pkgdir}/usr/share/doc/${pkgname}/BASELINE.md"
+	install -Dm644 "${tree}/docs/AGENT-PROTECTION.md" \
+		"${pkgdir}/usr/share/doc/${pkgname}/AGENT-PROTECTION.md"
 	install -Dm644 "${tree}/docs/LEARNING-AND-ANALYSIS.md" \
 		"${pkgdir}/usr/share/doc/${pkgname}/LEARNING-AND-ANALYSIS.md"
 	# moat-ship.service's Documentation= points here, and /etc/moat/ship.toml

@@ -86,7 +86,7 @@ impl MatrixRow {
             Context::Service => self.service,
             // No context, no adjustment: guessing here is how a rule that
             // predates the daemon gets silently softened.
-            Context::Unknown => Outcome::Unchanged,
+            Context::Unknown | Context::Agent => Outcome::Unchanged,
         }
     }
 }
@@ -726,7 +726,7 @@ fn generic_context_delta(family: &str, ctx: Context) -> i8 {
         Context::Service => 0,
         // "pkg-install never gets a downgrade."
         Context::PkgInstall => 0,
-        Context::Unknown => 0,
+        Context::Unknown | Context::Agent => 0,
     }
 }
 
@@ -940,6 +940,14 @@ mod tests {
         assert_eq!(classify_row(&f).unwrap().key, "exec-opaque-dir");
         f.file = Some("/home/dan/.cache/go-build/../../payload");
         assert_ne!(classify_row(&f).unwrap().key, "exec-go-cache-build");
+    }
+
+    #[test]
+    fn agent_context_does_not_treat_a_terminal_as_credential_approval() {
+        let f = EventFacts { file: Some("/home/dan/.aws/credentials"), ..facts("cred", "moat-cred-cloud-credentials-read") };
+        let result = score("high", &f, &official(), Context::Agent, true);
+        assert_eq!(result.severity, "high");
+        assert_eq!(generic_context_delta("cred", Context::Agent), 0);
     }
 
     // ---------------------------------------------------------------- scoring

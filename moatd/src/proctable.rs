@@ -15,6 +15,7 @@ use crate::event::{ExecEvent, ExitEvent, Process};
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProcInfo {
+    pub agent_session: Option<crate::agent::AgentSession>,
     pub exec_id: String,
     pub pid: u32,
     pub uid: u32,
@@ -157,7 +158,17 @@ impl ProcTable {
     pub fn observe(&mut self, p: &Process) -> Option<String> {
         let exec_id = p.exec_id.clone()?;
         let (sid, tty) = observed_session(p.pid.unwrap_or(0));
+        let inherited_agent = p.parent_exec_id.as_ref()
+            .and_then(|parent| self.map.get(parent))
+            .and_then(|parent| parent.agent_session.clone());
+        let agent_session = inherited_agent.or_else(|| {
+            crate::agent::invocation(p.exe(), p.args()).map(|agent| crate::agent::AgentSession {
+                id: exec_id.clone(), root_pid: p.pid.unwrap_or(0), agent,
+                executable: p.exe().to_string(), workspace: p.cwd.clone().unwrap_or_default(),
+            })
+        });
         let info = ProcInfo {
+            agent_session,
             exec_id: exec_id.clone(),
             pid: p.pid.unwrap_or(0),
             uid: p.uid.unwrap_or(0),
@@ -177,6 +188,9 @@ impl ProcTable {
         };
         match self.map.get_mut(&exec_id) {
             Some(existing) => {
+                if existing.agent_session.is_none() {
+                    existing.agent_session = info.agent_session;
+                }
                 // Never let a sparse `parent` block blank out a full record.
                 if !info.exe.is_empty() {
                     // A re-reported binary invalidates any resolution note we
@@ -594,5 +608,37 @@ mod tests {
         });
         assert_eq!(t.get(NODE).unwrap().exe, before.exe);
         assert_eq!(t.get(NODE).unwrap().cwd, before.cwd);
+    }
+}
+
+#[cfg(test)]
+mod agent_session_tests {
+    use super::*;
+    fn process(id: &str, pid: u32, exe: &str, parent: Option<&str>) -> Process {
+        Process { exec_id: Some(id.into()), pid: Some(pid), uid: Some(1000),
+            binary: Some(exe.into()), cwd: Some("/home/dan/project".into()),
+            parent_exec_id: parent.map(str::to_string), ..Default::default() }
+    }
+    #[test]
+    fn agent_identity_survives_deep_lineage_parent_exit_and_pid_reuse() {
+        let mut table = ProcTable::new(8, 60);
+        table.observe(&process("terminal", 10, "/usr/bin/kitty", None));
+        table.observe(&process("agent-a", 11, "/opt/claude", Some("terminal")));
+        table.observe(&process("agent-b", 12, "/opt/claude", Some("terminal")));
+        let mut parent = "agent-a".to_string();
+        for i in 0..20 {
+            let id = format!("child-{i}");
+            table.observe(&process(&id, 100+i, "/usr/bin/bash", Some(&parent)));
+            parent = id;
+        }
+        assert_eq!(table.get(&parent).unwrap().agent_session.as_ref().unwrap().id, "agent-a");
+        table.on_exit(&ExitEvent { process: Some(process("agent-a", 11, "/opt/claude", Some("terminal"))), ..Default::default() }, 1);
+        table.prune(100);
+        table.observe(&process("late-child", 130, "/usr/bin/node", Some(&parent)));
+        assert_eq!(table.get("late-child").unwrap().agent_session.as_ref().unwrap().id, "agent-a");
+        table.observe(&process("reused-pid", 11, "/opt/claude", Some("terminal")));
+        assert_eq!(table.get("reused-pid").unwrap().agent_session.as_ref().unwrap().id, "reused-pid");
+        assert_eq!(table.get("agent-b").unwrap().agent_session.as_ref().unwrap().id, "agent-b");
+        assert!(table.get("terminal").unwrap().agent_session.is_none());
     }
 }

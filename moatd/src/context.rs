@@ -9,6 +9,7 @@
 //! | context       | decided by                                                    |
 //! |---------------|---------------------------------------------------------------|
 //! | `pkg-install` | anything inside a package-manager subtree (`rules::pkgtree`)   |
+//! | `agent`       | cached observed agent lineage, outside package installs       |
 //! | `interactive` | a controlling terminal on the process or any ancestor; else a name |
 //! | `service`     | no pty anywhere, and a systemd/compositor/cron/D-Bus root      |
 //! | `unknown`     | the ancestry is lost (pruned, or older than the daemon)        |
@@ -44,11 +45,10 @@
 //! prompt: the postinstall script is the attack surface this project exists for,
 //! and "I typed `npm install`" says nothing about what the package then did.
 //!
-//! An **AI agent CLI** is deliberately transparent to the *name* walk. `claude`
-//! is not a root of its own; the walk continues past it, so an agent started
-//! from a terminal is `interactive` and the same agent started by a systemd
-//! unit is `service` — which is exactly what BASELINE §2b asks for ("an AI
-//! agent CLI that itself has an interactive root").
+//! Recognized AI agent lineage is classified before the terminal/name walk.
+//! Descendants retain `agent` context even with a controlling terminal: launching
+//! an agent does not imply human approval for each tool action. Package-install
+//! context still takes precedence. See AGENT-PROTECTION.md for identity limits.
 //!
 //! **A pty is not proof of a human**, and this module does not pretend
 //! otherwise. `python -c 'import pty; pty.spawn("/bin/bash")'` is the first
@@ -69,6 +69,7 @@ use crate::util::basename;
 #[serde(rename_all = "kebab-case")]
 pub enum Context {
     Interactive,
+    Agent,
     PkgInstall,
     Service,
     /// The ancestry is lost: no context adjustment is applied.
@@ -80,6 +81,7 @@ impl Context {
     pub fn as_str(self) -> &'static str {
         match self {
             Context::Interactive => "interactive",
+            Context::Agent => "agent",
             Context::PkgInstall => "pkg-install",
             Context::Service => "service",
             Context::Unknown => "unknown",
@@ -184,16 +186,20 @@ fn tty_holder<'a>(chain: &[&'a ProcInfo]) -> Option<(&'a ProcInfo, u32)> {
 /// Decision order, and the order is the design:
 ///
 /// 1. inside a package-manager subtree -> `pkg-install`, outright;
-/// 2. a controlling terminal on the acting process or ANY ancestor within the
+/// 2. cached agent lineage -> `agent`, without an implicit approval discount;
+/// 3. a controlling terminal on the acting process or ANY ancestor within the
 ///    capped chain -> `interactive`;
-/// 3. the name walk, nearest ancestor first, for the processes whose /proc was
+/// 4. the name walk, nearest ancestor first, for the processes whose /proc was
 ///    already gone — transparent names skipped, interactive names, service
 ///    names, then the `.desktop` argument heuristic;
-/// 4. `unknown`.
+/// 5. `unknown`.
 pub fn classify(table: &ProcTable, exec_id: &str, cfg: &ContextConfig) -> Context {
     // A package install wins outright, however it was started.
     if pkgtree::in_pkg_subtree(table, exec_id) {
         return Context::PkgInstall;
+    }
+    if table.get(exec_id).and_then(|p| p.agent_session.as_ref()).is_some() {
+        return Context::Agent;
     }
     let chain = chain_of(table, exec_id);
     // The kernel's own answer, and the only one that generalises: a person is
@@ -261,6 +267,7 @@ pub fn evidence(table: &ProcTable, exec_id: &str, ctx: Context, cfg: &ContextCon
                 _ => format!("context: {} — root of the process chain is {}", ctx, root),
             }
         }
+        Context::Agent => "context: agent — observed agent lineage; a terminal is not per-action approval".into(),
         Context::Unknown => {
             "context: unknown — the ancestry does not reach a terminal, a package manager or a \
              service manager, so no context adjustment was applied"
@@ -331,23 +338,19 @@ mod tests {
         ])
     }
 
-    /// (a) The bug this fix exists for. A session host moat has never heard of
-    /// sits between systemd and the user's shell; the shell has a pty, so the
-    /// person at the other end of it is what decides the context.
+    /// Agent lineage takes precedence over an inherited controlling terminal.
     #[test]
-    fn a_pty_anywhere_in_the_chain_is_a_person_whatever_opened_it() {
+    fn agent_lineage_takes_precedence_over_a_terminal() {
         for host in ["herdr", "some-session-host-written-last-week", "mprocs"] {
             let t = herdr_shape(host, Some(34821));
             assert_eq!(
                 classify(&t, "e-git", &dflt()),
-                Context::Interactive,
-                "{} -> bash(pts/5) -> claude -> git is a person typing",
+                Context::Agent,
+                "{} -> bash(pts/5) -> claude -> git retains agent attribution",
                 host
             );
-            // Nearest holder first: the git process itself.
-            let ev = evidence(&t, "e-git", Context::Interactive, &dflt());
-            assert!(ev.contains("controlling terminal (tty 34821)"), "{}", ev);
-            assert!(ev.contains("pid 11541 (git)"), "{}", ev);
+            let ev = evidence(&t, "e-git", Context::Agent, &dflt());
+            assert!(ev.contains("observed agent lineage"), "{}", ev);
         }
         // And the bash under the host, named as itself.
         let t = herdr_shape("herdr", Some(34821));
@@ -355,19 +358,17 @@ mod tests {
         assert!(ev.contains("pid 11311 (bash) has a controlling terminal (tty 34821)"), "{}", ev);
     }
 
-    /// (b) The same agent with no pty anywhere is still a service, which is
-    /// what BASELINE §2b asks for and what the old name walk got right.
+    /// Headless agents retain the same agent context.
     #[test]
-    fn an_agent_under_systemd_with_no_pty_is_still_a_service() {
+    fn an_agent_under_systemd_with_no_pty_retains_agent_context() {
         let t = table_tty(&[
             ("e-sd", 1, "/usr/lib/systemd/systemd", "", None, Some(1), Some(0)),
             ("e-claude", 102, "/usr/bin/claude", "-p fix", Some("e-sd"), Some(102), Some(0)),
             ("e-sh", 103, "/usr/bin/sh", "-c ls", Some("e-claude"), Some(102), Some(0)),
         ]);
-        assert_eq!(classify(&t, "e-sh", &dflt()), Context::Service);
-        let ev = evidence(&t, "e-sh", Context::Service, &dflt());
-        assert!(ev.contains("no controlling terminal anywhere in the chain"), "{}", ev);
-        assert!(ev.contains("root is systemd"), "{}", ev);
+        assert_eq!(classify(&t, "e-sh", &dflt()), Context::Agent);
+        let ev = evidence(&t, "e-sh", Context::Agent, &dflt());
+        assert!(ev.contains("observed agent lineage"), "{}", ev);
     }
 
     /// (c) A compositor plugin: `quickshell` reported tty 0 on this machine.
@@ -399,20 +400,22 @@ mod tests {
     fn a_configured_interactive_root_answers_when_the_tty_cannot() {
         // `herdr` itself needs no config: it reached this module through
         // `rules::INTERACTIVE`, which is the point of sharing that list.
-        assert_eq!(classify(&herdr_shape("herdr", None), "e-git", &dflt()), Context::Interactive);
+        assert_eq!(classify(&herdr_shape("herdr", None), "e-bash", &dflt()), Context::Interactive);
 
         // The next host, though, is on no list — and with no pty to read there
         // is nothing else to go on, so it falls through to systemd.
         let t = herdr_shape("hostd", None);
-        assert_eq!(classify(&t, "e-git", &dflt()), Context::Service, "no pty, no name: systemd wins");
+        assert_eq!(classify(&t, "e-bash", &dflt()), Context::Service);
+        assert_eq!(classify(&t, "e-git", &dflt()), Context::Agent, "agent attribution survives missing pty information");
 
         let cfg = ContextConfig {
             interactive_roots: vec!["hostd".into()],
             ..Default::default()
         };
-        assert_eq!(classify(&t, "e-git", &cfg), Context::Interactive);
-        assert!(evidence(&t, "e-git", Context::Interactive, &cfg)
-            .contains("root of the process chain is hostd"));
+        assert_eq!(classify(&t, "e-bash", &cfg), Context::Interactive);
+        assert_eq!(classify(&t, "e-git", &cfg), Context::Agent);
+        assert!(evidence(&t, "e-git", Context::Agent, &cfg)
+            .contains("observed agent lineage"));
 
         // And the mirror: a name that would otherwise read as interactive can
         // be declared a service.
@@ -506,21 +509,21 @@ mod tests {
     }
 
     #[test]
-    fn an_ai_cli_is_transparent_and_inherits_its_own_root() {
+    fn an_ai_cli_is_not_implicit_human_approval() {
         let interactive = table(&[
             ("e-term", 100, "/usr/bin/ghostty", "", None),
             ("e-fish", 101, "/usr/bin/fish", "", Some("e-term")),
             ("e-claude", 102, "/usr/bin/claude", "-p fix", Some("e-fish")),
             ("e-sh", 103, "/usr/bin/sh", "-c ls", Some("e-claude")),
         ]);
-        assert_eq!(classify(&interactive, "e-sh", &dflt()), Context::Interactive);
+        assert_eq!(classify(&interactive, "e-sh", &dflt()), Context::Agent);
 
         let headless = table(&[
             ("e-sd", 1, "/usr/lib/systemd/systemd", "", None),
             ("e-claude", 102, "/usr/bin/claude", "-p fix", Some("e-sd")),
             ("e-sh", 103, "/usr/bin/sh", "-c ls", Some("e-claude")),
         ]);
-        assert_eq!(classify(&headless, "e-sh", &dflt()), Context::Service);
+        assert_eq!(classify(&headless, "e-sh", &dflt()), Context::Agent);
     }
 
     #[test]

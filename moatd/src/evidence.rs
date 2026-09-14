@@ -57,6 +57,20 @@ const SECRET_MARKERS: &[&str] = &[
     "/.git-credentials",
     "/.config/gh/hosts.yml",
     "/.claude/.credentials.json",
+    "/.claude.json",
+    "/.config/openai/auth.json",
+    "/.gemini/oauth_creds.json",
+    "/.config/opencode/auth.json",
+    "/.local/share/amazon-q/credentials.json",
+    // Agent configuration can embed MCP tokens in env fields. Correlation
+    // stores hashes and script references, never these configuration bytes.
+    "/.mcp.json",
+    "/.claude/settings.json",
+    "/.claude/settings.local.json",
+    "/.claude/hooks.json",
+    "/.cursor/mcp.json",
+    "/.vscode/tasks.json",
+    "/.vscode/launch.json",
     "/.config/anthropic/",
     "/.codex/auth.json",
     "/etc/shadow",
@@ -299,6 +313,18 @@ mod tests {
     /// The one test that matters most: a credential must never be stageable,
     /// by any route. A false negative here uploads a private key to a cloud
     /// API from the tool that exists to stop credential theft.
+    #[test]
+    fn agent_auth_and_config_are_never_staged_even_as_context() {
+        for suffix in [".claude/.credentials.json", ".claude.json", ".codex/auth.json",
+            ".config/openai/auth.json", ".gemini/oauth_creds.json", ".config/opencode/auth.json",
+            ".local/share/amazon-q/credentials.json", ".mcp.json", ".claude/settings.json",
+            ".vscode/tasks.json"] {
+            let path = format!("/home/dan/{suffix}");
+            assert!(may_stage(&path, true, "ai").is_err(), "{path}");
+            assert!(may_stage(&path, true, "persist").is_err(), "{path}");
+        }
+    }
+
     #[test]
     fn credentials_are_never_stageable() {
         for p in [

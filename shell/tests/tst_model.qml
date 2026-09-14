@@ -36,6 +36,17 @@ TestCase {
     return String(request.responseText || "")
   }
 
+  function test_agent_session_survives_normalization() {
+    var alert = Model.normalizeAlert({id: "agent-event", process: {
+      exe: "/usr/bin/node", agent_session: {
+        id: "sensor-exec-123", root_pid: 123, agent: "claude", workspace: "/home/dan/project"
+      }
+    }})
+    compare(alert.process.agent_session.id, "sensor-exec-123")
+    compare(alert.process.agent_session.workspace, "/home/dan/project")
+    compare(Model.normalizeAlert({}).process.agent_session, null)
+  }
+
   function initTestCase() {
     suite.fixtureText = readFixture("alerts.jsonl")
     verify(suite.fixtureText.length > 0, "fixture alerts.jsonl is empty or unreadable")

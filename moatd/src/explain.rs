@@ -288,6 +288,7 @@ pub fn build_alert(f: &Finding, id: &str, ts: &str, allowlist_file: &str, allowl
         title: f.meta.title.clone(),
         summary: summary(f),
         process: ProcessRef {
+            agent_session: f.proc.agent_session.clone(),
             pid: f.proc.pid,
             uid: f.proc.uid,
             exe: f.proc.exe.clone(),

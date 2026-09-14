@@ -45,6 +45,7 @@
 //! | `telemetry` | selectable telemetry classes and `telemetry.jsonl`              |
 //! | `ship`      | `moat-ship`: NDJSON/syslog export, cursor, buffer, redaction    |
 
+pub mod agent;
 pub mod alert;
 pub mod allowlist;
 pub mod analysis;

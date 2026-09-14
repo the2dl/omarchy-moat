@@ -808,7 +808,14 @@ impl Daemon {
             return;
         }
         let ts = util::normalize_ts(time.unwrap_or_default());
-        if let Some(r) = crate::telemetry::exec_record(&self.cfg.telemetry, exec, &ts) {
+        if let Some(mut r) = crate::telemetry::exec_record(&self.cfg.telemetry, exec, &ts) {
+            if let Some(session) = exec.process.as_ref().and_then(|p| p.exec_id.as_deref())
+                .and_then(|id| self.table.get(id)).and_then(|p| p.agent_session.as_ref())
+            {
+                if let Some(record) = r.value.as_object_mut() {
+                    record.insert("agent_session".into(), serde_json::json!(session));
+                }
+            }
             self.write_telemetry(&r);
         }
     }
@@ -3182,6 +3189,12 @@ impl Daemon {
         // the most interesting fact moat knows would never be said out loud.
         self.report_modified_binary(&f.actor, &f.proc);
         f.context = context::classify(&self.table, &f.exec_id, &self.cfg.context);
+        if let Some(session) = &f.proc.agent_session {
+            f.extra_evidence.push(format!(
+                "agent session: {} (root pid {}, sensor identity {}), workspace {}; attribution does not imply approval",
+                session.agent, session.root_pid, session.id, session.workspace
+            ));
+        }
         f.extra_evidence.push(context::evidence(
             &self.table,
             &f.exec_id,
@@ -3632,6 +3645,9 @@ impl Daemon {
             })
             .collect();
         let Some(c) = self.chains.note(chain::Observation {
+            agent_root: f.proc.agent_session.as_ref().map(|s| (
+                s.id.clone(), crate::alert::Ancestor::new(s.root_pid, s.executable.clone())
+            )),
             alert: alert.id.clone(),
             ts: alert.ts.clone(),
             at: now,
@@ -6673,6 +6689,7 @@ fn persisted_u64(state: &Option<Value>, section: &str, key: &str) -> u64 {
 fn self_proc(about: &str) -> ProcInfo {
     let (sid, tty) = crate::proctable::read_session(std::process::id());
     ProcInfo {
+        agent_session: None,
         // moatd runs on the host. An alert moat raises about ITSELF must never
         // be quietened by the container switch, nor by the namespace step in
         // `scoring`.
@@ -6862,6 +6879,23 @@ pub fn run(daemon: Arc<Mutex<Daemon>>, opts: RunOptions) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn agent_tool_credential_alert_persists_session_identity_and_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.handle_line(r#"{"process_exec":{"process":{"exec_id":"agent-root","pid":99100,"uid":1000,"binary":"/opt/claude","cwd":"/home/dan/project"}}}"#);
+        d.handle_line(r#"{"process_exec":{"process":{"exec_id":"agent-tool","pid":99101,"uid":1000,"binary":"/usr/bin/node","arguments":"/tmp/mcp.js","cwd":"/home/dan/project","parent_exec_id":"agent-root"}}}"#);
+        d.handle_line(r#"{"process_lsm":{"function_name":"file_post_open","policy_name":"moat-cred-ai-credentials-read","process":{"exec_id":"agent-tool","pid":99101,"uid":1000,"binary":"/usr/bin/node","parent_exec_id":"agent-root"},"args":[{"file_arg":{"path":"/home/dan/.claude/.credentials.json"}},{"int_arg":4}]}}"#);
+        let rows = d.store.load();
+        let alert = rows.iter().find(|a| a.rule == "moat-cred-ai-credentials-read").expect("runtime credential read must be visible");
+        let session = alert.process.agent_session.as_ref().expect("session survives persistence");
+        assert_eq!(session.id, "agent-root");
+        assert_eq!(session.workspace, "/home/dan/project");
+        assert_eq!(alert.family, "cred");
+        assert_eq!(alert.context, crate::context::Context::Agent);
+        assert_eq!(alert.severity, "high");
+    }
 
     #[test]
     fn the_unspecified_address_is_never_a_containment_destination() {

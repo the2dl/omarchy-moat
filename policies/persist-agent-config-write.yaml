@@ -3,7 +3,8 @@ kind: TracingPolicy
 metadata:
   name: moat-persist-agent-config-write
   annotations:
-    moat.omarchy/severity: "medium"
+    moat.omarchy/severity: "low"
+    moat.omarchy/tier: "signal"
     moat.omarchy/title: "AI agent or editor task configuration written"
     moat.omarchy/enforce: "none"
     moat.omarchy/actions: "quarantine,ignore"
@@ -29,17 +30,7 @@ spec:
     - index: 1
       type: "int"
     selectors:
-    - matchBinaries:
-      - operator: "NotPostfix"
-        values:
-        - "/nvim"
-        - "/vim"
-        - "/nano"
-        - "/emacs"
-        - "/code"
-        - "/zed"
-        - "/hx"
-      matchArgs:
+    - matchArgs:
       - index: 0
         operator: "Postfix"
         values:
@@ -57,5 +48,3 @@ spec:
         values: ["2"]
       matchActions:
       - action: Post
-        rateLimit: "300s"
-        rateLimitScope: "process"
