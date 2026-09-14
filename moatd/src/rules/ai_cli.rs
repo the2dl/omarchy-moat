@@ -159,7 +159,9 @@ impl UserRule for AiCliHeadless {
         // in `exec bwrap`, so the process becomes bwrap and never appears as an
         // ancestor), and a path glob missed `/usr/bin/moatctl (deleted)` after
         // pacman replaced the binary mid-run.
-        if looks_like_a_tool_invocation(&proc.args) {
+        if looks_like_a_tool_invocation(&proc.args)
+            || matches!(proc.args.trim(), "--version" | "-V" | "--help" | "-h")
+        {
             log::debug!("{}: {} is running as a bundled tool, not as an agent", ID, proc.exe);
             return Vec::new();
         }
@@ -332,6 +334,15 @@ mod tests {
             names: &crate::rules::NO_NAMES,
         };
         AiCliHeadless.on_exec(&ExecEvent::default(), exec_id, &ctx)
+    }
+
+    #[test]
+    fn metadata_probe_is_not_an_unattended_agent_task() {
+        let mut t = table_headless();
+        t.observe(&proc("probe", 41990, "/opt/claude", "--version", None));
+        assert!(run(&t, "probe").is_empty());
+        t.observe(&proc("task", 41991, "/opt/claude", "--version -p task", None));
+        assert!(!run(&t, "task").is_empty());
     }
 
     #[test]

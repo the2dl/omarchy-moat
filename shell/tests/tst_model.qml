@@ -1850,6 +1850,24 @@ TestCase {
   readonly property var cooldown: ({ minNotifySeverity: "high", initialLoad: false,
                                      notifyCooldownMinutes: 10 })
 
+  function test_repeated_credential_workers_stay_quiet_but_escalation_notifies() {
+    var store = Model.createStore()
+    var a = burstAlert("a", "moat-cred-cloud-credentials-read")
+    a.file = { path: "/home/test/.aws/config" }
+    a.process = { exe: "/usr/bin/node", uid: 1000, cwd: "/project", pid: 1 }
+    compare(Model.notifyDecision(store, a, 1000000, suite.cooldown).toast, true)
+    a.id = "b"
+    a.process.pid = 2
+    compare(Model.notifyDecision(store, a, 1600001, suite.cooldown).reason, "credential-repeat")
+    a.file.path = "/home/test/.aws/credentials"
+    compare(Model.notifyDecision(store, a, 1600002, suite.cooldown).toast, true)
+    a.file.path = "/home/test/.aws/config"
+    a.chain = { id: "new-exfil", severity: "critical" }
+    compare(Model.notifyDecision(store, a, 1600003, suite.cooldown).toast, true)
+    a.chain = null
+    compare(Model.notifyDecision(store, a, 4600000, suite.cooldown).toast, true)
+  }
+
   function test_cooldown_blocks_the_second_toast_and_allows_the_next_window() {
     var store = Model.createStore()
     var t0 = 1000000

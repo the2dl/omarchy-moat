@@ -492,6 +492,22 @@ impl UserRule for RansomChurn {
         // `sh -c "node install.js"` is node, and the alert should say node.
         let folded_under = folded_under.filter(|_| members.len() > 1);
 
+        // Plain relocation by mv is a weak signal. Mixed tool chains, changed
+        // names, truncates and unlinks retain full severity and enforcement.
+        let routine_move = me.exe == "/usr/bin/mv"
+            && members.iter().all(|name| name == "mv")
+            && matches!(&shape, Shape::ReadThenDestroy(files) if files.iter().all(|d| match d.kind {
+                Destroy::Renamed => d.new_path.as_deref().is_some_and(|new| {
+                    new != d.path && basename(new) == basename(&d.path)
+                }),
+                // Cross-filesystem mv copies into a new file, then unlinks
+                // the original. Require observed output, not argv intent.
+                Destroy::Unlinked => actor.wrote_first.iter().any(|new| {
+                    new != &d.path && basename(new) == basename(&d.path)
+                }),
+                Destroy::Truncated => false,
+            }));
+
         let Some(mut f) = ctx.finding(ID, self.meta(), exec_id) else {
             return Vec::new();
         };
@@ -580,6 +596,13 @@ impl UserRule for RansomChurn {
                 shell.comm(),
                 shell.pid
             ));
+        }
+        if routine_move
+        {
+            f.meta.severity = "medium".into();
+            f.meta.tier = "signal".into();
+            f.meta.title = "Files moved to another directory".into();
+            f.what_override = Some(format!("mv relocated {} files while preserving their names. This alone does not establish encryption or data loss.", files.len()));
         }
         self.arm(&mut f, ctx, folded_under.as_ref());
         vec![f]
@@ -978,6 +1001,49 @@ mod tests {
         assert!(f.what_override.as_ref().unwrap().contains("node read 8 different files"), "{:?}", f.what_override);
         assert!(f.extra_evidence[1].contains("/home/dan/Documents/report-0.pdf (deleted)"), "{:?}", f.extra_evidence);
         assert!(f.hook.contains("8 distinct files read and then destroyed"));
+    }
+
+    #[test]
+    fn cross_filesystem_move_needs_observed_matching_output() {
+        for copied in [false, true] {
+            let mut t = table();
+            t.observe(&proc("move", 41999, "/usr/bin/mv", "", None));
+            let c = cfg();
+            let mut rule = RansomChurn::default();
+            let mut out = Vec::new();
+            for i in 0..8 {
+                let old = doc(i);
+                fire(&mut rule, &t, &c, &read(&old), "move", 100);
+                if copied {
+                    let mut output = read(&format!("/home/dan/backup/{}", basename(&old)));
+                    output.args[1] = serde_json::json!({"int_arg":2});
+                    fire(&mut rule, &t, &c, &output, "move", 100);
+                }
+                out.extend(fire(&mut rule, &t, &c, &unlink(&old), "move", 101));
+            }
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].meta.severity, if copied { "medium" } else { "critical" });
+        }
+    }
+
+    #[test]
+    fn plain_moves_are_signals_but_changed_names_remain_critical() {
+        for changed in [false, true] {
+            let mut t = table();
+            t.observe(&proc("move", 41999, "/usr/bin/mv", "", None));
+            let c = cfg();
+            let mut rule = RansomChurn::default();
+            let mut out = Vec::new();
+            for i in 0..8 {
+                let old = doc(i);
+                let new = format!("/home/dan/backup/{}{}", basename(&old), if changed { ".locked" } else { "" });
+                fire(&mut rule, &t, &c, &read(&old), "move", 100);
+                out.extend(fire(&mut rule, &t, &c, &rename(&old, &new), "move", 101));
+            }
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].meta.severity, if changed { "critical" } else { "medium" });
+            assert!(!out[0].request_kill);
+        }
     }
 
     #[test]
