@@ -1808,7 +1808,7 @@ TestCase {
 
   // BASELINE 4.2's deliberate exception: the noise guard's own alert is medium
   // but is the one thing the guard exists to put in front of the user.
-  function test_noisy_rule_alert_notifies_despite_being_medium() {
+  function test_noise_guard_stays_quiet_outside_now() {
     var alert = findAlert(alertsFromFixture(), "01J8ZK6B4Q3M7N9P2R5S8T1V4K")
     compare(alert.rule, "moat-x-noisy-rule")
     compare(alert.severity, "medium")
@@ -1817,8 +1817,8 @@ TestCase {
     verify(!Model.shouldNotify(findAlert(alertsFromFixture(), "01J8ZK6B4Q3M7N9P2R5S8T1V41"),
                                "high", false, suite.demoted))
     // ...this one is not, at any threshold.
-    verify(Model.shouldNotify(alert, "high", false, suite.demoted))
-    verify(Model.shouldNotify(alert, "critical", false, suite.demoted))
+    verify(!Model.shouldNotify(alert, "high", false, suite.demoted))
+    verify(!Model.shouldNotify(alert, "critical", false, suite.demoted))
 
     // The exception is only to the severity threshold. Everything else that
     // silences an alert still silences this one.
@@ -1979,7 +1979,7 @@ TestCase {
     compare(summaries[0].count, 2)
   }
 
-  function test_noisy_rule_alert_ignores_the_cooldown() {
+  function test_noise_guard_never_opens_a_notification_window() {
     var store = Model.createStore()
     var alert = findAlert(alertsFromFixture(), "01J8ZK6B4Q3M7N9P2R5S8T1V4K")
     compare(alert.rule, "moat-x-noisy-rule")
@@ -1988,8 +1988,8 @@ TestCase {
     // store's seen-set is what makes that once per alert.
     for (var i = 0; i < 3; i++) {
       var d = Model.notifyDecision(store, alert, i * 1000, suite.cooldown)
-      compare(d.toast, true)
-      compare(d.reason, "noisy-rule")
+      compare(d.toast, false)
+      compare(d.reason, "filtered")
     }
     compare(Model.notifyWindowState(store, "moat-x-noisy-rule"), null,
             "the noise guard's alert opens no window and collapses nothing")
@@ -3878,8 +3878,8 @@ TestCase {
     // not never.
     var guard = Model.foldText(JSON.stringify(incAlert({
       id: "01A", rule: "moat-x-noisy-rule", severity: "medium" })) + "\n")
-    verify(Model.shouldNotify(guard[0], "high", false, {}),
-           "the noise guard normally goes through at medium")
+    verify(!Model.shouldNotify(guard[0], "high", false, {}),
+           "the noise guard is outside the Now queue")
     verify(!Model.shouldNotify(guard[0], "high", false, { notifyMuted: true }))
     var critical = Model.foldText(JSON.stringify(incAlert({
       id: "01B", severity: "critical", rarity: "first_seen" })) + "\n")
@@ -4758,7 +4758,25 @@ TestCase {
   // Two things, and only two: moat acted, or the Now tab gained something
   // worth looking at. Everything else belongs in the panel.
 
-  function test_a_kill_notifies_whatever_its_severity() {
+  function test_notification_eligibility_matches_the_now_queue() {
+    var variants = [
+      { severity: "critical" },
+      { severity: "critical", surface: "timeline" },
+      { severity: "critical", acked: true },
+      { severity: "critical", action_taken: "denied" },
+      { severity: "critical", action_taken: "killed" },
+      { severity: "critical", suppressed_by: "test rule" },
+      { severity: "medium", rule: "moat-x-noisy-rule" }
+    ]
+    for (var i = 0; i < variants.length; i++) {
+      var alerts = Model.foldText(JSON.stringify(incAlert(variants[i])) + "\n")
+      var queue = Model.needsYouIncidents(Model.buildIncidents(alerts, {}))
+      compare(Model.shouldNotify(alerts[0], "low", false, {}), queue.length > 0,
+              "notification eligibility must agree with Now for case " + i)
+    }
+  }
+
+  function test_a_contained_kill_stays_quiet_outside_now() {
     // Before this, alertState returned "contained" for anything moat acted on
     // and the needs-you gate then dropped it -- so a SIGKILL was silent while a
     // build script running curl toasted.
@@ -4766,16 +4784,16 @@ TestCase {
       id: "01A", rule: "moat-shell-reverse-shell-connect", severity: "low",
       surface: "alerts", action_taken: "killed", ts: new Date().toISOString()
     }
-    verify(Model.shouldNotify(killed, "high", false, {}),
-           "moat killed something: that interrupts, whatever the severity")
+    verify(!Model.shouldNotify(killed, "high", false, {}),
+           "contained alerts are not in the Now queue")
   }
 
-  function test_a_kernel_deny_notifies() {
+  function test_a_contained_kernel_deny_stays_quiet() {
     var denied = {
       id: "01B", rule: "moat-cred-etc-shadow-read", severity: "medium",
       surface: "alerts", action_taken: "denied", ts: new Date().toISOString()
     }
-    verify(Model.shouldNotify(denied, "high", false, {}))
+    verify(!Model.shouldNotify(denied, "high", false, {}))
   }
 
   function test_the_user_undoing_a_quarantine_is_not_announced_back_at_them() {

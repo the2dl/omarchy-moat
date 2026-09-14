@@ -504,23 +504,8 @@ Item {
     // by a clock rather than by the next alert, because the tail of a burst is
     // exactly when no next alert arrives.
     function _flushCollapsed() {
-        var summaries = Model.flushCollapsed(root._store, Date.now());
-        for (var i = 0; i < summaries.length; i++) root._notifyCollapsed(summaries[i])
-    }
-
-    // 2h shape 3, the counted burst. Sent at `low` on purpose: a burst that has
-    // already been counted is by definition not news, and the whole point of
-    // counting it was to stop it interrupting anyone.
-    function _notifyCollapsed(summary) {
-        var argv = ["omarchy-notification-send", "--app-name", "Moat", "-u", Copy.notifyShapeUrgency(Copy.NOTIFY_BURST, "medium"), "-g", Model.notifyGlyphFor("medium")];
-        argv.push(root._notifyText(Copy.burstTitle(summary.program || summary.title, summary.count)));
-        argv.push(root._notifyText(Copy.BURST_BODY));
-        // The collapsed alerts are one incident in History, not one alert waiting
-        // on Now, so the click opens the tab rather than selecting an id.
-        argv.push("--exec", "omarchy-shell", "shell", "summon", root.pluginId, JSON.stringify({
-            "tab": "history"
-        }));
-        Util.execArgv(argv);
+        // Retire cooldown state without sending History-only burst popups.
+        Model.flushCollapsed(root._store, Date.now());
     }
 
     // omarchy-notification-send takes the headline as a positional after its

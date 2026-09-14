@@ -604,7 +604,6 @@ fn run_triage(resp: &Value, socket: &std::path::Path, dry_run: bool, json_out: b
     };
 
     let mut done = 0usize;
-    let mut checked_visibility: Option<bool> = None;
     for item in &pending {
         let id = item["id"].as_str().unwrap_or_default();
         if id.is_empty() {
@@ -621,24 +620,17 @@ fn run_triage(resp: &Value, socket: &std::path::Path, dry_run: bool, json_out: b
                 continue;
             }
         };
-        // The agent reads the bundle from inside the sandbox, which is not the
-        // same filesystem view this process has: moat-sandbox gives the child a
-        // private /tmp, so a bundle_dir under /tmp is invisible to it while
-        // being perfectly readable from here. Without this check that costs a
-        // full agent call and records a confident-sounding "no evidence was
-        // examined" verdict on a real alert. Checked once — the whole directory
-        // is either visible or it is not.
-        if checked_visibility.is_none() {
-            checked_visibility = Some(bundle_is_visible(sandbox.as_deref(), &agent, &bundle));
-        }
-        if checked_visibility == Some(false) {
+        // Probe each explicitly mounted incident before spending an agent call.
+        // The evidence sandbox does not expose the host filesystem, including
+        // sibling incidents. A missing mount must leave the alert pending.
+        if !bundle_is_visible(sandbox.as_deref(), &agent, &bundle) {
             eprintln!(
-                "moatctl triage: {} cannot be read inside moat-sandbox, so the agent would have no evidence to read. A bundle_dir under /tmp cannot work — the sandbox gives the child a private /tmp. Nothing was triaged.",
+                "moatctl triage: {} cannot be read inside the triage evidence sandbox, or the agent runtime is unsupported. Nothing was triaged. Check that moat-triage-sandbox and a native agent binary are installed.",
                 bundle
             );
             return ExitCode::from(2);
         }
-        let argv = match triage::launch_argv(&agent, &triage::preamble(&bundle), sandbox.as_deref()) {
+        let argv = match triage::launch_argv(&agent, &triage::preamble(&bundle), sandbox.as_deref(), &bundle) {
             Ok(a) => a,
             // An agent with no read-only headless mode is not run at all. This
             // is a per-machine fact, not a per-alert one, so stop rather than
@@ -746,12 +738,11 @@ impl Drop for TriageLock {
 /// what the child sees, and only the sandbox knows the result.
 fn bundle_is_visible(sandbox_bin: Option<&str>, agent: &str, bundle: &str) -> bool {
     let Some(bin) = sandbox_bin else {
-        // Unconfined: this process and the agent share a filesystem view, and
-        // the daemon just wrote the file.
-        return std::path::Path::new(bundle).exists();
+        // Unattended triage must never fall back to host filesystem access.
+        return false;
     };
-    let probe = vec!["test".to_string(), "-r".to_string(), bundle.to_string()];
-    let argv = moatd::analysis::sandbox_argv(agent, bin, &probe);
+    let mut argv = moatd::triage::evidence_sandbox_argv(agent, bin, bundle);
+    argv.push("--probe".into());
     Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(std::process::Stdio::null())

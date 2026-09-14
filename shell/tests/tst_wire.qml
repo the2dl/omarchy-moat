@@ -282,8 +282,8 @@ TestCase {
     // The guard's own alert is medium, and BASELINE 5 says a medium does not
     // notify — but this is the one deliberate exception: it is the announcement
     // that a detection just went quiet, and it toasts once.
-    compare(Model.shouldNotify(guard, "high", false, options), true,
-            "the noise guard announces itself once")
+    compare(Model.shouldNotify(guard, "high", false, options), false,
+            "noise-guard history does not interrupt")
     // Everything the flood produced stays silent, which is the point.
     var silenced = 0
     for (var k = 0; k < list.length; k++) {

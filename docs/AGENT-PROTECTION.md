@@ -206,6 +206,30 @@ does not disable their other tools. Codex/Gemini launch adapters are not shipped
 The integration follows [Claude's CLI controls](https://code.claude.com/docs/en/cli-reference)
 and the [MCP stdio transport](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports).
 
+## Automated triage and desktop notifications
+
+Release 0.1.0-180 moves unattended triage into `moat-triage-sandbox`. It exposes
+only the selected incident directory read-only, `/var/log/pacman.log`, system
+runtime files, the selected native agent installation, and that agent's own
+authentication files read-only. Its working directory is the incident directory.
+Host home files, other incidents, live project files, `/var/tmp`, and the Moat
+control socket are absent. Symlinks in staged evidence cannot grant access to
+unmounted host paths. The prompt asks for uncertainty when staged evidence is
+insufficient, rather than a recursive search of the machine.
+
+The sandbox keeps network access for provider authentication and requests; it
+is not a destination filter. Only the selected provider API-key variable and
+proxy settings are passed, alongside a minimal runtime environment. This path
+requires native Claude/Codex executables; script shims fail closed and leave
+alerts pending. Each bundle is probed through the same sandbox before analysis.
+The optional `moat-agent claude` launcher remains separate and opt-in.
+
+Desktop alert popups now require the same `needsYou` state used by the Now
+queue. Critical severity, containment actions, and noise-guard announcements do
+not bypass that requirement. History-only burst summaries no longer emit desktop
+popups. Existing notification mute, severity threshold, startup suppression and
+cooldown settings still apply. This does not acknowledge or delete alerts.
+
 ## Validation and rollout
 
 The package check runs Rust, policy, scanner, existing sandbox, and dedicated

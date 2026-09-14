@@ -2492,54 +2492,8 @@ function shouldNotify(alert, minSeverity, initialLoad, options) {
   // it greyed out (BASELINE 8). Toasting it would defeat the suppression.
   if (alert.suppressed_by) return false
 
-  // A demoted rule "still logged, never notifies" (BASELINE 4.1). That is a
-  // fact about the alert's SURFACE, which the daemon stamped and `alertState`
-  // below reads; it is no longer re-derived from the rule-wide list here,
-  // because that list silenced a chain the daemon had deliberately raised.
-  // The one thing the list still decides is whether the noise guard's OWN
-  // announcement has been demoted into silence: that alert is medium and so
-  // always on the timeline, so the surface cannot carry that fact for it.
-  if (String(alert.rule || "") === NOISY_RULE_ALERT
-      && isDemotedRule(alert.rule, options && options.demotedRules)) return false
-
-  // NOISY_RULE_NOTIFIES — the one deliberate exception to the severity table.
-  //
-  // moat-x-noisy-rule is medium, so BASELINE 5 says "no notify". But this alert
-  // is the noise guard announcing that it just stopped a rule from notifying:
-  // it is the single thing the guard exists to put in front of the user, and if
-  // it stays in the timeline the user never learns a detection went quiet. It
-  // therefore bypasses minNotifySeverity — and only that. Ack, suppression and
-  // demotion still silence it, and the store's seen-set means each such alert
-  // still toasts exactly once, never per repeat.
-  if (String(alert.rule || "") === NOISY_RULE_ALERT) return true
-
-  // MOAT ACTED. The one thing that interrupts unconditionally.
-  //
-  // `alertState` returns "contained" for any alert whose action_taken is set --
-  // a kill, a quarantine, a kernel deny -- and the needs-you gate below then
-  // dropped it, because a contained alert is by definition not needsYou. So
-  // moat could SIGKILL a process tree or have the kernel refuse a credential
-  // read and say nothing at all, while a build script running curl toasted.
-  // That is exactly backwards: being told what was stopped is the whole reason
-  // to run enforcement, and finding out from a panel you happened to open is
-  // not being told.
-  //
-  // Severity is not consulted. If moat acted, the user needs to know, whatever
-  // the number attached to it -- a low-severity thing that was killed is a more
-  // surprising event than a high-severity thing that was not.
-  //
-  // "restored" is excluded upstream: that is the user undoing an action, and
-  // announcing someone's own click back at them is noise.
-  if (alertState(alert, options && options.demotedRules) === "contained") return true
-
-  // 2h: three notification shapes, and ONLY needs-you may interrupt. An alert
-  // an unattended agent pass has already read and called benign is `explained`
-  // -- Moat decided, the user may look -- and interrupting for a decision that
-  // has already been made is how someone learns to dismiss the toast that
-  // matters. It is still in the panel, still counted, still in History.
-  //
-  // Checked after the noise guard so its own announcement keeps its exception,
-  // and after the demotion checks so the cautious answers still win.
+  // Popups belong only to the same unresolved queue shown by Now. Severity,
+  // containment and noise-guard announcements never bypass this gate.
   if (alertState(alert, options && options.demotedRules) !== "needsYou") return false
 
   // Effective severity is the max of the alert's OWN severity and the

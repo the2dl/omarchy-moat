@@ -1,0 +1,98 @@
+#!/usr/bin/python3 -I
+"""Run unattended triage with an explicit evidence filesystem, never the host root."""
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+
+def pin_mounts(cmd):
+    path = Path(__file__).resolve().with_name('moat-agent-tool')
+    loader = importlib.machinery.SourceFileLoader('moat_agent_tool', str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module.pin_mounts(cmd)
+
+
+def command(agent, bundle, argv, probe=False):
+    evidence = Path(bundle).resolve(strict=True)
+    if evidence.name != 'bundle.md' or not evidence.is_file():
+        raise ValueError('expected an incident bundle.md')
+    folder = evidence.parent
+    home = Path.home().resolve()
+    if folder in (Path('/'), home, Path('/tmp'), Path('/var'), Path('/var/lib'), Path('/etc'), Path('/usr'), Path('/home'), Path('/var/tmp')):
+        raise ValueError('evidence must be a specific incident directory')
+    executable = shutil.which(agent)
+    if not executable:
+        raise ValueError('agent executable is unavailable: ' + agent)
+    executable = Path(executable).resolve(strict=True)
+    # Only native clients have a bounded, known runtime mount. Do not expose
+    # all of a package manager's installation tree for an unknown script shim.
+    with executable.open('rb') as f:
+        if f.read(4) != b'\x7fELF':
+            raise ValueError('unattended triage requires a native agent executable; script shims are not supported')
+    if not probe and (not argv or argv[0] != agent):
+        raise ValueError('command must be the selected agent')
+    cmd = ['/usr/bin/bwrap', '--unshare-all', '--share-net', '--die-with-parent',
+           '--new-session', '--cap-drop', 'ALL', '--tmpfs', '/',
+           '--ro-bind', '/usr', '/usr', '--symlink', 'usr/bin', '/bin',
+           '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib', '/lib64',
+           '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp', '--tmpfs', '/run',
+           '--dir', '/etc', '--dir', str(home),
+           '--ro-bind', str(folder), str(folder), '--chdir', str(folder)]
+    for value in ('/etc/ssl', '/etc/ca-certificates', '/etc/ld.so.cache', '/etc/nsswitch.conf',
+                  '/etc/hosts', '/etc/resolv.conf', '/etc/passwd', '/etc/group', '/var/log/pacman.log'):
+        path = Path(value)
+        if path.exists():
+            cmd += ['--ro-bind', str(path.resolve(strict=True)), value]
+    if not executable.is_relative_to('/usr'):
+        # Native agent releases may carry sibling assets. The exact release
+        # directory is read-only; the rest of the host home remains absent.
+        if executable.parent == home or home.is_relative_to(executable.parent):
+            raise ValueError('agent must live in a dedicated installation directory')
+        cmd += ['--ro-bind', str(executable.parent), str(executable.parent)]
+    auth = home / ('.claude' if agent == 'claude' else '.codex')
+    if auth.is_dir():
+        cmd += ['--ro-bind', str(auth.resolve(strict=True)), str(auth)]
+    if agent == 'claude' and (home / '.claude.json').is_file():
+        cmd += ['--ro-bind', str((home / '.claude.json').resolve(strict=True)), str(home / '.claude.json')]
+    cmd += ['--'] + (['/usr/bin/test', '-r', str(evidence)] if probe else [str(executable), *argv[1:]])
+    return cmd
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--agent', required=True, choices=['claude', 'codex'])
+    parser.add_argument('--bundle', required=True)
+    parser.add_argument('--probe', action='store_true')
+    parser.add_argument('argv', nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    argv = args.argv[1:] if args.argv[:1] == ['--'] else args.argv
+    fds = []
+    try:
+        cmd = command(args.agent, args.bundle, argv, args.probe)
+        cmd, fds = pin_mounts(cmd)
+        # The frontend needs provider access. No host loader settings, shell
+        # startup variables, unrelated API tokens or runtime sockets are passed.
+        env = {'HOME': str(Path.home().resolve()), 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8',
+               'TERM': 'dumb', 'MOAT_AGENT_CONTEXT': '1', 'ENABLE_CLAUDEAI_MCP_SERVERS': 'false'}
+        auth_key = 'ANTHROPIC_API_KEY' if args.agent == 'claude' else 'OPENAI_API_KEY'
+        for key in (auth_key, 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY'):
+            if key in os.environ:
+                env[key] = os.environ[key]
+        result = subprocess.run(cmd, env=env, close_fds=True, pass_fds=fds)
+        return result.returncode if result.returncode >= 0 else 128 - result.returncode
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
