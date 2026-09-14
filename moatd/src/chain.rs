@@ -280,6 +280,12 @@ pub struct Observation {
 }
 
 impl Observation {
+    fn context_only(&self) -> bool {
+        self.silenced || matches!(self.rule.as_str(),
+            "moat-priv-capability-gained" | "moat-priv-uid-transition"
+            | "moat-net-tmpfs-binary-egress" | "moat-shell-lan-connect"
+            | "moat-shell-reverse-shell-connect")
+    }
     fn rank(&self) -> u8 {
         severity_rank(&self.severity)
     }
@@ -710,10 +716,8 @@ fn summarise(
         // Exact in both cases now: both numbers come from counters that keep
         // counting after `steps` stops growing, so there is no "at least".
         s.push_str(&format!(
-            " {} more {} already allowed on {} own.",
+            " {} more recorded as context.",
             silenced,
-            if silenced == 1 { "was" } else { "were" },
-            if silenced == 1 { "its" } else { "their" },
         ));
     }
     s
@@ -790,7 +794,7 @@ impl ChainStore {
     /// Returns the chain it created or grew, or `None` — which is the answer
     /// almost every time, and has to stay cheap for that reason. The caller
     /// writes the returned chain onto every member alert.
-    pub fn note(&mut self, mut obs: Observation) -> Option<Chain> {
+    pub fn note(&mut self, obs: Observation) -> Option<Chain> {
         if !is_chain_family(&obs.family) {
             return None;
         }
@@ -804,16 +808,10 @@ impl ChainStore {
             }
         }
         let (tree, ancestor) = tree_key(&lineage)?;
-        // These hooks report requests/transitions, not confirmed privilege gains.
-        // Retain context without letting runtime setup manufacture attack chains.
-        if matches!(obs.rule.as_str(), "moat-priv-capability-gained" | "moat-priv-uid-transition") {
-            obs.silenced = true;
-        }
-
         // Growing an existing chain first: once a sequence is recognised,
         // everything else in that tree belongs to the story, silenced or not.
         if let Some(i) = self.live.iter().position(|c| c.tree == tree) {
-            let step = obs.step(!obs.silenced);
+            let step = obs.step(!obs.context_only());
             let at = obs.at;
             let ts = step.ts.clone();
             let novel = obs.is_novel();
@@ -936,7 +934,7 @@ impl ChainStore {
         // lines is describing growth only.
         let steps: Vec<Step> = candidate
             .iter()
-            .map(|o| o.step(!o.silenced))
+            .map(|o| o.step(!o.context_only()))
             .collect();
         let total = steps.len();
         let formation_truncated = false;
@@ -947,7 +945,7 @@ impl ChainStore {
         // `candidate` is not capped, so this and `escalate(&steps)` agree here;
         // they stop agreeing the moment the chain grows, which is the point.
         let mut state = Escalation::default();
-        for o in candidate.iter().filter(|o| !o.silenced) {
+        for o in candidate.iter().filter(|o| !o.context_only()) {
             state.observe(&o.family, &o.severity, o.is_novel());
         }
         let (severity, severity_base, severity_reason) = escalate_state(&state);
@@ -1020,7 +1018,7 @@ impl ChainStore {
 /// time order. This is the whole false-positive surface of the feature, so it
 /// is one readable function rather than four scattered guards.
 fn qualifies(obs: &[Observation]) -> bool {
-    let triggers: Vec<&Observation> = obs.iter().filter(|o| !o.silenced).collect();
+    let triggers: Vec<&Observation> = obs.iter().filter(|o| !o.context_only()).collect();
     if triggers.len() < 2 {
         return false;
     }
@@ -1028,6 +1026,16 @@ fn qualifies(obs: &[Observation]) -> bool {
     families.sort_unstable();
     families.dedup();
     if families.len() < 2 {
+        return false;
+    }
+    // Launching code and opening a connection is ordinary application behavior.
+    // Require another family before surfacing a sequence; standalone IoC and
+    // stronger detections still alert independently.
+    if families.iter().all(|family| matches!(*family, "exec" | "net"))
+        && triggers.iter().all(|o| matches!(o.rule.as_str(),
+            "moat-exec-untrusted-home" | "moat-exec-untrusted-tmpfs"
+            | "moat-net-first-contact" | "moat-net-tmpfs-binary-egress"))
+    {
         return false;
     }
     if !triggers.iter().any(|o| o.rank() >= severity_rank("medium")) {
@@ -1115,6 +1123,18 @@ mod tests {
         let chain = store.note(observation("send", "net", "task-one")).expect("one tool subtree still correlates");
         assert_eq!(chain.ancestor.pid, 200);
         assert!(!chain.members.iter().any(|id| id == "other"));
+    }
+
+    #[test]
+    fn ordinary_temporary_execution_and_first_contact_need_more_evidence() {
+        let mut store = ChainStore::default();
+        let mut execution = obs("exec", 100, "exec", "medium", typed_at_a_shell(201));
+        execution.rule = "moat-exec-untrusted-tmpfs".into();
+        assert!(store.note(execution).is_none());
+        let mut connection = obs("net", 101, "net", "medium", typed_at_a_shell(201));
+        connection.rule = "moat-net-first-contact".into();
+        assert!(store.note(connection).is_none());
+        assert!(store.note(obs("cred", 102, "cred", "high", typed_at_a_shell(201))).is_some());
     }
 
     #[test]
@@ -1308,7 +1328,7 @@ mod tests {
         // The headline counts TRIGGERS -- what moat is actually saying
         // happened -- and the allowed step is reported in addition to it.
         assert!(c.summary.contains("2 things happened"), "{}", c.summary);
-        assert!(c.summary.contains("1 more was already allowed"), "{}", c.summary);
+        assert!(c.summary.contains("1 more recorded as context"), "{}", c.summary);
         assert_eq!(c.member_ids(), vec!["01A", "01B", "01C"]);
     }
 
@@ -1813,7 +1833,7 @@ mod tests {
             let mut o = obs(&format!("01ID{:03}", i), 1_000, fam, sev, tree());
             o.rarity = if i == 0 { Rarity::FirstSeen } else { Rarity::Common };
             o.silenced = i > 0 && i % 5 == 0 && i + 1 < n;
-            steps.push(o.step(!o.silenced));
+            steps.push(o.step(!o.context_only()));
             if let Some(c) = s.note(o) {
                 last = Some(c);
             }

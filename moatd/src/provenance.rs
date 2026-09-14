@@ -579,6 +579,15 @@ impl Classifier {
     /// the rest, so including it costs nothing and removes the easiest of the
     /// three to fake.
     pub fn classify_path(&mut self, path: &str) -> PathClass {
+        // Use the same canonical system path for ownership AND content checks.
+        // Resolving ownership alone would miss the package's recorded digest.
+        for prefix in ["/usr/sbin/", "/sbin/", "/bin/"] {
+            if let Some(leaf) = path.strip_prefix(prefix) {
+                if !leaf.contains('/') && std::fs::canonicalize(prefix).ok().as_deref() == Some(Path::new("/usr/bin")) {
+                    return self.classify_path(&format!("/usr/bin/{leaf}"));
+                }
+            }
+        }
         if path.is_empty() {
             return PathClass {
                 provenance: Provenance::Unknown,

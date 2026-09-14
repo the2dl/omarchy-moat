@@ -3,7 +3,7 @@ kind: TracingPolicy
 metadata:
   name: moat-shell-lan-connect
   annotations:
-    moat.omarchy/severity: "high"
+    moat.omarchy/severity: "medium"
     moat.omarchy/title: "Shell or netcat connected to a private address"
     moat.omarchy/enforce: "none"
     moat.omarchy/actions: "kill,ignore"

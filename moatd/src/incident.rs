@@ -1155,8 +1155,11 @@ mod tests {
         let active = lease(&dir.path().join(a)).unwrap();
         prune(dir.path(), 1, 1, u64::MAX / 2, &HashSet::new());
         assert!(dir.path().join(a).join("meta.json").exists());
+        // Even a one-slot store can reserve its next capture after release.
+        prune_reserving(dir.path(), 0, 1, 0, &HashSet::new(), 1);
+        assert!(dir.path().join(a).exists());
         drop(active);
-        prune(dir.path(), 1, 1, u64::MAX / 2, &HashSet::new());
+        prune_reserving(dir.path(), 0, 1, 0, &HashSet::new(), 1);
         assert!(!dir.path().join(a).exists());
     }
 

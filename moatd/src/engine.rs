@@ -3242,9 +3242,9 @@ impl Daemon {
                     .iter().any(|suffix| file.path == format!("{home}{suffix}"))
             })).unwrap_or(false)
         {
-            score.severity = "medium".into();
+            score.severity = "low".into();
             score.surface = "timeline".into();
-            score.severity_reason = "medium: credential-shaped file outside the account login location; content and intent unconfirmed".into();
+            score.severity_reason = "low: credential-shaped file outside the account login location; content and intent unconfirmed".into();
             score.pkg_install_escalation = false;
         }
 

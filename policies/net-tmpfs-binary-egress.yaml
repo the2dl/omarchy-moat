@@ -3,7 +3,7 @@ kind: TracingPolicy
 metadata:
   name: moat-net-tmpfs-binary-egress
   annotations:
-    moat.omarchy/severity: "critical"
+    moat.omarchy/severity: "medium"
     moat.omarchy/title: "Temporary-directory binary attempted an internet connection"
     moat.omarchy/enforce: "deny"
     moat.omarchy/actions: "kill,quarantine,ignore"
