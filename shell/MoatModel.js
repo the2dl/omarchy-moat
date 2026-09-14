@@ -2637,6 +2637,24 @@ function notifyDecision(store, alert, nowMs, options) {
     return { toast: true, collapsed: 0, reason: "chain" }
   }
 
+  // Worker PIDs change between test runs; the same reader/workspace/file is
+  // one ongoing credential investigation. Keep every read in Now, but limit
+  // repeat interruptions to hourly. Stronger chains above remain eligible.
+  var credentialKey = ""
+  if (rule.indexOf("moat-cred-") === 0 && alert.file && alert.file.path
+      && alert.process && alert.process.exe && !bypassesCooldown(alert)) {
+    credentialKey = JSON.stringify([rule, alert.process.exe, alert.process.uid,
+                                    alert.process.cwd, alert.file.path])
+    if (!store.notifiedCredentials) store.notifiedCredentials = {}
+    var prior = store.notifiedCredentials[credentialKey]
+    if (prior !== undefined && now >= prior && now - prior < 3600000)
+      return { toast: false, collapsed: 0, reason: "credential-repeat" }
+    for (var key in store.notifiedCredentials) {
+      if (now < store.notifiedCredentials[key] || now - store.notifiedCredentials[key] >= 3600000)
+        delete store.notifiedCredentials[key]
+    }
+  }
+
   var window = store.notifyWindows[rule]
   var reset = false
   if (window && _expired(window, now)) {
@@ -2662,6 +2680,7 @@ function notifyDecision(store, alert, nowMs, options) {
     } else {
       window.toasted = true
     }
+    if (credentialKey) store.notifiedCredentials[credentialKey] = now
     return { toast: true, collapsed: 0, reason: reset ? "window-reset" : "first" }
   }
 

@@ -14,7 +14,9 @@ pub struct AgentSession {
 /// Identify native agents and explicit runtime entrypoints. Generic Node/Bun
 /// invocations and arbitrary argv mentions are never agent invocations.
 pub fn invocation(exe: &str, args: &str) -> Option<String> {
-    let name = crate::util::basename(exe);
+    // Linux appends this marker when an update unlinks a running binary.
+    // Normalize attribution only; this is never an authenticity check.
+    let name = crate::util::basename(exe.strip_suffix(" (deleted)").unwrap_or(exe));
     if crate::rules::AI_CLIS.contains(&name) {
         // Bundled search applets are not a new agent session.
         if args
@@ -47,6 +49,12 @@ pub fn invocation(exe: &str, args: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replaced_native_agent_keeps_identity_without_identifying_tools() {
+        assert_eq!(invocation("/opt/claude (deleted)", "").as_deref(), Some("claude"));
+        assert!(invocation("/opt/claude (deleted)", "--files-with-matches secret").is_none());
+        assert!(invocation("/opt/claude (deleted)-fake", "").is_none());
+    }
     #[test]
     fn runtime_identity_requires_an_entrypoint_not_an_argv_mention() {
         assert_eq!(

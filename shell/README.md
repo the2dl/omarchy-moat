@@ -721,3 +721,21 @@ of them is faked:
 Stage 4 of `docs/design/PLAN.md` (incidents in the daemon, chain correlation) is
 someone else's work and lands behind the model API this panel already uses.
 
+
+### Repeated credential notifications
+
+Reads by the same executable and user, in the same workspace, of the same
+credential file produce at most one ordinary popup per hour while the shell
+service is running. Worker PID changes do not reset that interval. Every read
+still reaches the daemon and remains available in Now or the timeline according
+to its classification. A newly correlated incident or critical first-seen event
+can still notify immediately. The existing per-rule cooldown also applies.
+
+Release 185 also recognizes the Linux ` (deleted)` suffix for agent attribution
+so an updated, still-running agent can authenticate without being classified as
+its own credential thief. This does not establish binary trust or exempt its
+child tools. Version/help-only agent probes are not unattended tasks. Plain
+`/usr/bin/mv` relocation retains a medium timeline signal when filenames are
+preserved, including copy/unlink moves with observed newly written output;
+changed names, missing output, truncation and mixed-tool sequences retain their
+existing detection behavior.

@@ -119,6 +119,8 @@ mod tests {
             });
         };
         add("agent", 100, "/opt/claude", "", None);
+        add("replaced-agent", 105, "/opt/claude (deleted)", "", None);
+        add("replaced-child", 106, "/opt/claude (deleted)", "", Some("agent"));
         add("tool", 101, "/usr/bin/node", "/tmp/tool.js", Some("agent"));
         add("fake-agent-child", 102, "/opt/claude", "", Some("agent"));
         add(
@@ -169,13 +171,13 @@ mod tests {
                 &ctx,
             )
         };
-        for id in ["agent", "runtime-agent"] {
+        for id in ["agent", "runtime-agent", "replaced-agent"] {
             let f = run(id, ".claude/.credentials.json");
             assert_eq!(f.len(), 1);
             assert_eq!(f[0].meta.family, "ai");
             assert_eq!(f[0].meta.severity, "low");
         }
-        for id in ["tool", "fake-agent-child", "unknown-node"] {
+        for id in ["tool", "fake-agent-child", "unknown-node", "replaced-child"] {
             let f = run(id, ".claude/.credentials.json");
             assert_eq!(f.len(), 1);
             assert_eq!(f[0].meta.family, "cred", "{id}");
