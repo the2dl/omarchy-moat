@@ -245,3 +245,10 @@ policies are loaded. These features add no new kernel policies: 52 alerting
 policies remain. Existing armed rules retain their configuration. New credential
 and configuration detections are monitor-only; this release does not automatically
 arm them or rewrite historical alerts.
+
+Release 0.1.0-182 excludes the installed restricted triage workflow from the
+headless-agent launch rule. This requires adjacent sandbox and `moatctl triage`
+ancestors in the host mount and user namespaces, root-owned executables that
+are not writable by other users, and no package-manager ancestry. Unknown
+namespace evidence fails closed. Credential, decoy and other behavior rules
+still inspect these agents.

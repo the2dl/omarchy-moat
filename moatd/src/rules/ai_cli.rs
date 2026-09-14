@@ -77,6 +77,35 @@ fn looks_like_a_tool_invocation(args: &str) -> bool {
     args.split_whitespace().any(|t| TOOL_FLAGS.contains(&t))
 }
 
+// Only the installed, restricted triage workflow is expected automation. Do
+// not trust argv mentions or environment markers, nor host file metadata for
+// an executable reported from a different (or unknown) namespace.
+fn restricted_triage_chain(
+    chain: &[&crate::proctable::ProcInfo],
+    trusted_file: impl Fn(&str) -> bool,
+) -> bool {
+    let host = |p: &crate::proctable::ProcInfo| {
+        p.in_container == Some(false) && p.user_ns_host == Some(true)
+    };
+    chain.windows(2).any(|pair| {
+        let (sandbox, launcher) = (pair[0], pair[1]);
+        sandbox.exe == "/usr/bin/moat-triage-sandbox"
+            && launcher.exe == "/usr/bin/moatctl"
+            && launcher.args.split_whitespace().next() == Some("triage")
+            && host(sandbox)
+            && host(launcher)
+            && trusted_file(&sandbox.exe)
+            && trusted_file(&launcher.exe)
+    })
+}
+
+fn root_owned_executable(path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).is_ok_and(|m| {
+        m.is_file() && m.uid() == 0 && m.mode() & 0o022 == 0 && m.mode() & 0o111 != 0
+    })
+}
+
 #[derive(Default)]
 pub struct AiCliHeadless;
 
@@ -154,6 +183,11 @@ impl UserRule for AiCliHeadless {
             .cloned()
             .cloned();
         let pkg = pkgtree::pkg_root_for(ctx.table, exec_id).cloned();
+        if pkg.is_none() && restricted_triage_chain(&chain, root_owned_executable) {
+            log::debug!("{}: restricted Moat triage launch", ID);
+            return Vec::new();
+        }
+
 
         // "Is a human at the terminal" is a question the kernel already
         // answers: a controlling terminal on the agent or any ancestor means
@@ -242,6 +276,41 @@ mod tests {
     use crate::feeds::Feeds;
     use crate::rules::testkit::{cfg, proc, table_headless, table_with_install};
     use crate::proctable::ProcTable;
+
+    #[test]
+    fn restricted_triage_requires_exact_trusted_host_lineage() {
+        use crate::proctable::ProcInfo;
+        let sandbox = ProcInfo {
+            exe: "/usr/bin/moat-triage-sandbox".into(),
+            in_container: Some(false), user_ns_host: Some(true),
+            ..Default::default()
+        };
+        let launcher = ProcInfo {
+            exe: "/usr/bin/moatctl".into(), args: "triage --auto".into(),
+            in_container: Some(false), user_ns_host: Some(true),
+            ..Default::default()
+        };
+        assert!(restricted_triage_chain(&[&sandbox, &launcher], |_| true));
+        assert!(!restricted_triage_chain(&[&sandbox, &launcher], |_| false));
+        assert!(!restricted_triage_chain(&[&sandbox, &launcher], |p| p.ends_with("moatctl")));
+        assert!(!restricted_triage_chain(&[&sandbox], |_| true));
+        assert!(!restricted_triage_chain(&[&launcher, &sandbox], |_| true));
+        for exe in ["/tmp/moat-triage-sandbox", "/usr/bin/python3"] {
+            let fake = ProcInfo { exe: exe.into(), args: sandbox.exe.clone(), ..sandbox.clone() };
+            assert!(!restricted_triage_chain(&[&fake, &launcher], |_| true));
+        }
+        for args in ["analyze", "--help triage", "triage-evil"] {
+            let fake = ProcInfo { args: args.into(), ..launcher.clone() };
+            assert!(!restricted_triage_chain(&[&sandbox, &fake], |_| true));
+        }
+        for (container, user) in [(Some(true), Some(true)), (None, Some(true)),
+                                  (Some(false), Some(false)), (Some(false), None)] {
+            let fake = ProcInfo { in_container: container, user_ns_host: user, ..sandbox.clone() };
+            assert!(!restricted_triage_chain(&[&fake, &launcher], |_| true));
+            let fake = ProcInfo { in_container: container, user_ns_host: user, ..launcher.clone() };
+            assert!(!restricted_triage_chain(&[&sandbox, &fake], |_| true));
+        }
+    }
 
     fn run(table: &ProcTable, exec_id: &str) -> Vec<Finding> {
         run_with(&cfg(), table, exec_id)
