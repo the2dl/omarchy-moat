@@ -34,6 +34,7 @@
 pub mod exec_properties;
 pub mod ai_cli;
 pub mod ai_credentials;
+pub mod native_auth;
 pub mod agent_config;
 pub mod mass_read;
 pub mod netmatch;
@@ -509,6 +510,14 @@ pub fn sensor_throttled_meta(cgroup: &str) -> PolicyMeta {
 }
 
 pub fn protection_changed_meta(action: &str, who: &str) -> PolicyMeta {
+    if action.starts_with("clear ") && action.contains("alert") {
+        let mut receipt = meta(PROTECTION_CHANGED, "x", "low",
+            &format!("Alert review recorded: {}", action),
+            &format!("{} asked Moat to {}. Alert evidence remains recorded; enforcement was not changed.", who, action),
+            "Reviewing alerts or clearing a backlog after tuning.", &[], &[], "exe");
+        receipt.tier = "signal".into();
+        return receipt;
+    }
     meta(
         PROTECTION_CHANGED,
         "x",

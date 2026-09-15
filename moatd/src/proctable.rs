@@ -161,12 +161,22 @@ impl ProcTable {
         let inherited_agent = p.parent_exec_id.as_ref()
             .and_then(|parent| self.map.get(parent))
             .and_then(|parent| parent.agent_session.clone());
-        let agent_session = inherited_agent.or_else(|| {
-            crate::agent::invocation(p.exe(), p.args()).map(|agent| crate::agent::AgentSession {
+        // A different agent launched by an agent owns its authentication.
+        // Preserve delegation through parent_exec_id rather than calling Codex
+        // "Claude" forever. Same-agent child tools still inherit the root.
+        let invocation = crate::agent::invocation(p.exe(), p.args());
+        let agent_session = match (inherited_agent, invocation) {
+            (Some(parent), Some(agent)) if parent.agent != agent => Some(crate::agent::AgentSession {
                 id: exec_id.clone(), root_pid: p.pid.unwrap_or(0), agent,
                 executable: p.exe().to_string(), workspace: p.cwd.clone().unwrap_or_default(),
-            })
-        });
+            }),
+            (Some(parent), _) => Some(parent),
+            (None, Some(agent)) => Some(crate::agent::AgentSession {
+                id: exec_id.clone(), root_pid: p.pid.unwrap_or(0), agent,
+                executable: p.exe().to_string(), workspace: p.cwd.clone().unwrap_or_default(),
+            }),
+            _ => None,
+        };
         let info = ProcInfo {
             agent_session,
             exec_id: exec_id.clone(),

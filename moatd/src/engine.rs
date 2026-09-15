@@ -2816,6 +2816,32 @@ impl Daemon {
         // armed individually even while the daemon stays in monitor.
         f.mode = self.mode_for(name);
         f.kill_expected = hook.action_is_kill();
+        if name.starts_with("moat-cred-") && path.is_none()
+            && matches!(f.hook.as_str(), "file_post_open" | "security_file_post_open" | "file_open" | "security_file_open")
+            && f.meta.enforce == "none" && !f.kill_expected
+        {
+            // The sensor matched a selector, but supplied no usable file.
+            // Keep the observation without claiming a confirmed secret read
+            // or manufacturing a credential-to-network attack chain from it.
+            f.meta.family = "sensor".into();
+            f.meta.severity = "medium".into();
+            f.meta.tier = "signal".into();
+            f.meta.title = "Credential observation is missing its file path".into();
+            f.meta.rotate.clear();
+            f.meta.actions.clear();
+            f.what_override = Some(format!("The sensor reported {} for {}, but omitted the matching file path. Credential access cannot be verified from this event.", name, f.proc.comm()));
+            let fields: Vec<_> = hook.ev.args.iter().filter_map(|a| a.as_object())
+                .flat_map(|a| a.keys().cloned()).collect();
+            f.extra_evidence.push(format!("incomplete evidence: no usable file path; argument fields received: {}", fields.join(", ")));
+            for (index, arg) in hook.ev.args.iter().enumerate() {
+                if let Some(flags) = arg.get("file_arg").and_then(|v| v.get("flags")) {
+                    f.extra_evidence.push(format!("file argument {} flags: {}", index, flags));
+                }
+                if let Some(error) = arg.get("error") {
+                    f.extra_evidence.push(format!("argument {} error: {}", index, error));
+                }
+            }
+        }
         if name == "moat-priv-capability-gained" {
             if let Some((old, requested)) = hook.capability_request() {
                 f.extra_evidence.push(format!(
@@ -3203,6 +3229,7 @@ impl Daemon {
         ));
         // Before scoring: a domain-feed hit sets `ioc`, and the score reads it.
         self.enrich_names(&mut f, now);
+        crate::rules::native_auth::classify(&mut f, &self.homes);
 
         // --- 2. severity (BASELINE §2 and §2b) ------------------------------
         let build_tool = self.build_tool_in_chain(&f.exec_id);
@@ -11493,6 +11520,20 @@ esac
             !alerts.iter().any(|x| x.rule == "moat-cred-ssh-private-key-read"),
             "the policy alert itself must NOT be raised"
         );
+    }
+
+    #[test]
+    fn a_credential_event_without_a_path_reports_incomplete_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.handle_line(r#"{"process_lsm":{"process":{"exec_id":"missing-file","pid":99123,"uid":1000,"binary":"/usr/bin/node"},"function_name":"file_post_open","policy_name":"moat-cred-gnupg-keyring-read","args":[{"file_arg":{"path":""}},{"int_arg":4}]}}"#);
+        let rows = d.store.load();
+        let a = rows.iter().find(|a| a.rule == "moat-cred-gnupg-keyring-read").unwrap();
+        assert_eq!(a.family, "sensor");
+        assert_eq!(a.surface, "timeline");
+        assert!(a.file.is_none());
+        assert!(a.explain.what.contains("cannot be verified"));
+        assert!(!a.explain.evidence.is_empty());
     }
 
     #[test]

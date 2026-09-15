@@ -442,6 +442,7 @@ impl UserRule for RansomChurn {
         // it does not rename an existing document away. Do not feed that into
         // extension homogenisation either. Destruction of the original still counts.
         if matches!(kind, Destroy::Renamed) && actor.wrote_first.remove(&path) {
+            actor.reads.retain(|(_, p)| p != &path);
             return Vec::new();
         }
         // An ATOMIC REPLACE promotes a hidden scratch name to a real one:
@@ -470,6 +471,13 @@ impl UserRule for RansomChurn {
         // test and "did it ever write this" is not.
         let read_first =
             actor.read_recently(&path) && !actor.wrote_first.contains(&path) && !atomic_replace;
+        // A deleted or renamed-away path no longer names this file. Reclaim
+        // lifecycle state so long test runs cannot exhaust wrote_first with
+        // thousands of already-cleaned temporary outputs.
+        if matches!(kind, Destroy::Unlinked | Destroy::Renamed) {
+            actor.wrote_first.remove(&path);
+            actor.reads.retain(|(_, p)| p != &path);
+        }
         actor.note_destroyed(Destroyed {
             at: now,
             path,
@@ -1001,6 +1009,23 @@ mod tests {
         assert!(f.what_override.as_ref().unwrap().contains("node read 8 different files"), "{:?}", f.what_override);
         assert!(f.extra_evidence[1].contains("/home/dan/Documents/report-0.pdf (deleted)"), "{:?}", f.extra_evidence);
         assert!(f.hook.contains("8 distinct files read and then destroyed"));
+    }
+
+    #[test]
+    fn repeated_generated_file_cleanup_does_not_exhaust_creation_tracking() {
+        let t = table();
+        let c = cfg();
+        let mut rule = RansomChurn::default();
+        for i in 0..(MAX_READS_PER_ACTOR + 100) {
+            let path = doc(i);
+            let mut output = read(&path);
+            output.args[1] = serde_json::json!({"int_arg":2});
+            assert!(fire(&mut rule, &t, &c, &output, "e-node", 100).is_empty());
+            assert!(fire(&mut rule, &t, &c, &read(&path), "e-node", 100).is_empty());
+            assert!(fire(&mut rule, &t, &c, &unlink(&path), "e-node", 100).is_empty());
+        }
+        let actor = rule.actors.values().next().unwrap();
+        assert!(actor.wrote_first.is_empty());
     }
 
     #[test]

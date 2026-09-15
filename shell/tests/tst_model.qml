@@ -1858,14 +1858,21 @@ TestCase {
     compare(Model.notifyDecision(store, a, 1000000, suite.cooldown).toast, true)
     a.id = "b"
     a.process.pid = 2
-    compare(Model.notifyDecision(store, a, 1600001, suite.cooldown).reason, "credential-repeat")
+    compare(Model.notifyDecision(store, a, 1600001, suite.cooldown).reason, "incident-unresolved")
     a.file.path = "/home/test/.aws/credentials"
     compare(Model.notifyDecision(store, a, 1600002, suite.cooldown).toast, true)
     a.file.path = "/home/test/.aws/config"
     a.chain = { id: "new-exfil", severity: "critical" }
     compare(Model.notifyDecision(store, a, 1600003, suite.cooldown).toast, true)
     a.chain = null
-    compare(Model.notifyDecision(store, a, 4600000, suite.cooldown).toast, true)
+    compare(Model.notifyDecision(store, a, 4600000, suite.cooldown).toast, false)
+    Model.syncNotificationIncidents(store, [], false, suite.cooldown)
+    compare(Model.notifyDecision(store, a, 4600001, suite.cooldown).toast, true)
+    var restarted = Model.createStore()
+    Model.syncNotificationIncidents(restarted, [a], true, suite.cooldown)
+    compare(Model.notifyDecision(restarted, a, 9000000, suite.cooldown).toast, false)
+    a.severity = "critical"
+    compare(Model.notifyDecision(restarted, a, 9000001, suite.cooldown).reason, "incident-escalated")
   }
 
   function test_cooldown_blocks_the_second_toast_and_allows_the_next_window() {
@@ -3912,9 +3919,9 @@ TestCase {
       id: "01A", rule: "moat-ai-cli-in-pkg-subtree", severity: "high",
       process: { exe: "/usr/bin/claude" } })) + "\n")[0]
     var opts = { minNotifySeverity: "high", notifyCooldownMinutes: 10 }
-    compare(Model.notifyDecision(store, alert, 0, opts).toast, true)
-    Model.notifyDecision(store, alert, 1000, opts)
-    Model.notifyDecision(store, alert, 2000, opts)
+    compare(Model.notificationCooldownDecision(store, alert, 0, opts).toast, true)
+    Model.notificationCooldownDecision(store, alert, 1000, opts)
+    Model.notificationCooldownDecision(store, alert, 2000, opts)
     var due = Model.flushCollapsed(store, 11 * 60000)
     compare(due.length, 1)
     compare(due[0].program, "claude")

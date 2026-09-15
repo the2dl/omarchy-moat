@@ -119,6 +119,7 @@ mod tests {
             });
         };
         add("agent", 100, "/opt/claude", "", None);
+        add("delegated-codex", 107, "/opt/codex", "exec task", Some("agent"));
         add("replaced-agent", 105, "/opt/claude (deleted)", "", None);
         add("replaced-child", 106, "/opt/claude (deleted)", "", Some("agent"));
         add("tool", 101, "/usr/bin/node", "/tmp/tool.js", Some("agent"));
@@ -184,6 +185,8 @@ mod tests {
             assert_eq!(f[0].meta.severity, "high", "{id}");
         }
         assert_eq!(run("agent", ".codex/auth.json")[0].meta.family, "cred");
+        assert_eq!(run("delegated-codex", ".codex/auth.json")[0].meta.family, "ai");
+        assert_eq!(run("delegated-codex", ".claude/.credentials.json")[0].meta.family, "cred");
         assert_eq!(
             run("agent", "backup/.claude/.credentials.json")[0]
                 .meta

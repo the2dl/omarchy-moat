@@ -4387,6 +4387,9 @@ mod tests {
 
         dispatch(&mut d, &json!({"cmd":"ack","all":true}));
         assert!(changes(&d) > before, "clearing the whole backlog is recorded");
+        let receipt = d.store.load().into_iter().find(|a| a.rule == "moat-x-protection-changed").unwrap();
+        assert_eq!(receipt.surface, "timeline");
+        assert!(receipt.title.starts_with("Alert review recorded"));
     }
 
     /// `set kill` is a second switch on purpose: `contain` is whether moatd
