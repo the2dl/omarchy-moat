@@ -84,6 +84,13 @@ impl UserRule for MassRead {
                 return Vec::new();
             }
         }
+        // Opening a directory to enumerate names is not reading credential
+        // contents. Use event-time file type, never host stat of a container path.
+        if h.ev.args.iter().any(|arg| arg.get("file_arg")
+            .and_then(|file| file.get("permission"))
+            .and_then(|mode| mode.as_str()).is_some_and(|mode| mode.starts_with('d'))) {
+            return Vec::new();
+        }
         let Some(path) = h.file_path() else {
             return Vec::new();
         };
@@ -210,6 +217,24 @@ mod tests {
             "e1",
             &ctx,
         )
+    }
+
+    #[test]
+    fn directory_enumeration_does_not_count_as_credential_content_reads() {
+        let t = table();
+        let mut c = cfg();
+        c.thresholds.mass_read_files = 3;
+        let mut rule = MassRead::default();
+        for i in 0..12 {
+            let mut e = ev(&format!("/home/dan/.config/dir{i}"), 4, "moat-cred-dotfile-read");
+            e.args[0]["file_arg"]["permission"] = serde_json::json!("drwx------");
+            assert!(fire(&mut rule, &t, &c, &e, 100).is_empty());
+        }
+        let mut found = 0;
+        for i in 0..3 {
+            found += fire(&mut rule, &t, &c, &ev(&format!("/home/dan/.config/token{i}"), 4, "moat-cred-dotfile-read"), 101).len();
+        }
+        assert_eq!(found, 1, "regular credential files must still trigger");
     }
 
     #[test]
