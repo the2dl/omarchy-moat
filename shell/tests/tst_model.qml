@@ -1856,11 +1856,16 @@ TestCase {
     a.file = { path: "/home/test/.aws/config" }
     a.process = { exe: "/usr/bin/node", uid: 1000, cwd: "/project", pid: 1 }
     compare(Model.notifyDecision(store, a, 1000000, suite.cooldown).toast, true)
+    a.surface = "timeline"
+    a.surfaceStamped = true
+    Model.syncNotificationIncidents(store, [a], false, suite.cooldown)
+    a.surface = "alerts"
     a.id = "b"
     a.process.pid = 2
     compare(Model.notifyDecision(store, a, 1600001, suite.cooldown).reason, "incident-unresolved")
     a.file.path = "/home/test/.aws/credentials"
-    compare(Model.notifyDecision(store, a, 1600002, suite.cooldown).toast, true)
+    a.process.cwd = "/another-project"
+    compare(Model.notifyDecision(store, a, 1600002, suite.cooldown).reason, "incident-unresolved")
     a.file.path = "/home/test/.aws/config"
     a.chain = { id: "new-exfil", severity: "critical" }
     compare(Model.notifyDecision(store, a, 1600003, suite.cooldown).toast, true)
@@ -1873,6 +1878,15 @@ TestCase {
     compare(Model.notifyDecision(restarted, a, 9000000, suite.cooldown).toast, false)
     a.severity = "critical"
     compare(Model.notifyDecision(restarted, a, 9000001, suite.cooldown).reason, "incident-escalated")
+  }
+
+  function test_cloud_configuration_copy_does_not_claim_keys_were_observed() {
+    var a = burstAlert("config", "moat-cred-cloud-credentials-read")
+    a.file = { path: "/home/test/.aws/config" }
+    compare(Copy.titleFor(a), "Something read your AWS configuration")
+    verify(Copy.stakeFor(a).indexOf("can contain") >= 0)
+    a.file.path = "/home/test/.aws/credentials"
+    compare(Copy.titleFor(a), "Something read your cloud account keys")
   }
 
   function test_cooldown_blocks_the_second_toast_and_allows_the_next_window() {

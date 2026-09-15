@@ -2592,10 +2592,9 @@ function _expired(window, nowMs) {
 // correlation identity: a new evidence sequence must still be announced.
 function notificationIncidentKey(alert) {
   if (!alert || alert.chain || !alert.process || !alert.process.exe) return ""
-  var p = alert.process
-  var target = alert.file && alert.file.path ? alert.file.path
-             : alert.net ? String(alert.net.domain || alert.net.dst_ip || "") + ":" + alert.net.dst_port : ""
-  return JSON.stringify([alert.rule, p.exe, p.uid, p.cwd, target])
+  // Use the same identity as Now. Different worker PIDs, workspaces or files
+  // can add evidence to one card; they must not create extra interruptions.
+  return incidentKey(alert)
 }
 
 function notificationRank(alert) {
@@ -2610,7 +2609,9 @@ function syncNotificationIncidents(store, alerts, initialLoad, options) {
   var prior = store.notifiedIncidents || {}, active = {}
   for (var i = 0; i < alerts.length; i++) {
     var a = alerts[i]
-    if (!shouldNotify(a, options && options.minNotifySeverity, false, options)) continue
+    // A verdict, demotion or temporary notification mute is not an acknowledgement.
+    // Keep the interruption history until the user closes the incident.
+    if (!a || a.acked) continue
     var key = notificationIncidentKey(a)
     if (!key) continue
     if (prior[key] !== undefined) active[key] = prior[key]

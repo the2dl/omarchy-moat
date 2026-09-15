@@ -471,6 +471,8 @@ Item {
         // shouldNotify (BASELINE 5's table) is inside notifyDecision, together with
         // the per-rule cooldown: one call, one answer, one place the policy lives.
         var decision = Model.notifyDecision(root._store, alert, Date.now(), root.notifyOptions(initialLoad));
+        if (!initialLoad && (decision.toast || decision.reason === "incident-unresolved"))
+            console.log("moat: notification decision", alert.id, alert.rule, decision.reason);
         if (!decision.toast) {
             if (decision.reason === "cooldown" && decision.collapsed === 1)
                 console.log("moat: " + alert.rule + " is inside its notification cooldown, collapsing");
@@ -1247,6 +1249,7 @@ Item {
         root.loadBaselineExport();
     }
     Component.onCompleted: {
+        console.log("moat: notification policy revision 188 loaded");
         root.probe();
         // Once, at service start: the button label is the user's own default agent
         // and it does not change under us mid-session.

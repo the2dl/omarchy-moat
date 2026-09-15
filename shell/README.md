@@ -756,3 +756,18 @@ Plain mv relocation remains a timeline signal, including cross-filesystem
 moves with observed matching output. Destructive changes to pre-existing data
 remain detectable. Bulk acknowledgement receipts retain their audit history
 without being labelled as weakened enforcement.
+
+Release 188 covers npx shebang and symlink launch records as well as the direct
+`npx-cli.js` form when resolving a local executable. Package/version requests
+and unknown namespaces still receive conservative installation context.
+AWS `config` reads name configuration rather than asserting keys were present;
+Moat does not read that file's contents to decide whether it contains secrets.
+Notification history survives temporary demotion or muting until acknowledgement.
+After updating the plugin, verify the notification-policy revision in the shell
+startup log; if imports remain cached, restart the shell rather than assuming
+that matching files on disk prove the running service was updated.
+Standalone notification identity now matches the Now card (rule and program),
+so additional files and workspaces contribute evidence without additional
+popups. Severity escalation and separate correlated chains remain eligible.
+Notification decisions log the alert ID, rule and reason, without command lines
+or file paths, so a future duplicate can be traced to the actual running logic.

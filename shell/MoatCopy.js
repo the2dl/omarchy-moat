@@ -300,6 +300,8 @@ function titleFor(alert, raw) {
   if (raw === true) return rawTitleFor(alert)
   if (alert.family === "sensor" || alert.family === "auth") return rawTitleFor(alert)
   if (alert.rule === "moat-x-ai-cli-headless" && alert.tier === "signal") return rawTitleFor(alert)
+  if (alert.rule === "moat-cred-cloud-credentials-read" && alert.file
+      && /\/\.aws\/config$/.test(alert.file.path || "")) return "Something read your AWS configuration"
   if (alert.stake && alert.copyTitle) return oneLine(alert.copyTitle, 120)
   var c = copyFor(alert.rule)
   if (c) return c.title
@@ -328,6 +330,9 @@ function stakeFor(alert, raw) {
   if (raw === true) return oneLine(alert.summary || "", 400)
   if (alert.family === "sensor") return "The sensor did not provide enough evidence to identify the file."
   if (alert.family === "auth") return "An expected native authentication workflow; other credential access remains monitored."
+  if (alert.rule === "moat-cred-cloud-credentials-read" && alert.file
+      && /\/\.aws\/config$/.test(alert.file.path || ""))
+    return "AWS configuration can contain profiles, credential settings or secrets. Check whether this reader was expected."
   if (alert.stake) return oneLine(alert.stake, 200)
   var c = copyFor(alert.rule)
   return c ? c.stake : ""
