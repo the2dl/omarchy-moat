@@ -428,6 +428,8 @@ Item {
         if (result.reloaded)
             console.log("moat: alerts.jsonl rotated or truncated, re-folded");
 
+        Model.syncNotificationIncidents(root._store, result.alerts, result.initialLoad, root.notifyOptions(false));
+
         for (var i = 0; i < result.newIds.length; i++) {
             var alert = result.byId[result.newIds[i]];
             if (alert)

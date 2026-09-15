@@ -2588,7 +2588,54 @@ function _expired(window, nowMs) {
 // "window-reset" | "cooldown".
 //
 // options: { minNotifySeverity, initialLoad, demotedRules, notifyCooldownMinutes }.
+// Stable identity across worker restarts. Chains keep their separate
+// correlation identity: a new evidence sequence must still be announced.
+function notificationIncidentKey(alert) {
+  if (!alert || alert.chain || !alert.process || !alert.process.exe) return ""
+  var p = alert.process
+  var target = alert.file && alert.file.path ? alert.file.path
+             : alert.net ? String(alert.net.domain || alert.net.dst_ip || "") + ":" + alert.net.dst_port : ""
+  return JSON.stringify([alert.rule, p.exe, p.uid, p.cwd, target])
+}
+
+function notificationRank(alert) {
+  return severityRank(alert.chain && severityRank(alert.chain.severity) > severityRank(alert.severity)
+                      ? alert.chain.severity : alert.severity)
+}
+
+// Reconstruct unresolved state from the daemon on startup, and forget a key
+// once all of its alerts have been acknowledged. No private paths are written
+// to a second persistence file, and a shell reload cannot replay the backlog.
+function syncNotificationIncidents(store, alerts, initialLoad, options) {
+  var prior = store.notifiedIncidents || {}, active = {}
+  for (var i = 0; i < alerts.length; i++) {
+    var a = alerts[i]
+    if (!shouldNotify(a, options && options.minNotifySeverity, false, options)) continue
+    var key = notificationIncidentKey(a)
+    if (!key) continue
+    if (prior[key] !== undefined) active[key] = prior[key]
+    else if (initialLoad) active[key] = Math.max(active[key] || 0, notificationRank(a))
+  }
+  store.notifiedIncidents = active
+}
+
 function notifyDecision(store, alert, nowMs, options) {
+  var key = notificationIncidentKey(alert)
+  if (!store.notifiedIncidents) store.notifiedIncidents = {}
+  var prior = key ? store.notifiedIncidents[key] : undefined
+  if (prior !== undefined && shouldNotify(alert, options && options.minNotifySeverity,
+                                          options && options.initialLoad === true, options)) {
+    var rank = notificationRank(alert)
+    if (rank <= prior) return { toast: false, collapsed: 0, reason: "incident-unresolved" }
+    store.notifiedIncidents[key] = rank
+    return { toast: true, collapsed: 0, reason: "incident-escalated" }
+  }
+  var decision = notificationCooldownDecision(store, alert, nowMs, options)
+  if (decision.toast && key) store.notifiedIncidents[key] = notificationRank(alert)
+  return decision
+}
+
+function notificationCooldownDecision(store, alert, nowMs, options) {
   var opts = options || {}
   var now = Number(nowMs)
   if (!isFinite(now)) now = 0

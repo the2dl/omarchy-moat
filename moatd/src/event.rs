@@ -420,7 +420,7 @@ impl<'a> HookHit<'a> {
 fn arg_file_path(a: &Value) -> Option<String> {
     for key in ["file_arg", "path_arg", "linux_binprm_arg"] {
         if let Some(v) = a.get(key) {
-            if let Some(p) = v.get("path").and_then(|p| p.as_str()) {
+            if let Some(p) = v.get("path").and_then(|p| p.as_str()).filter(|p| !p.is_empty()) {
                 return Some(p.to_string());
             }
         }

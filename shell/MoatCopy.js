@@ -298,6 +298,8 @@ function copyFor(rule) {
 function titleFor(alert, raw) {
   if (!alert) return ""
   if (raw === true) return rawTitleFor(alert)
+  if (alert.family === "sensor" || alert.family === "auth") return rawTitleFor(alert)
+  if (alert.rule === "moat-x-ai-cli-headless" && alert.tier === "signal") return rawTitleFor(alert)
   if (alert.stake && alert.copyTitle) return oneLine(alert.copyTitle, 120)
   var c = copyFor(alert.rule)
   if (c) return c.title
@@ -324,6 +326,8 @@ function rawTitleFor(alert) {
 function stakeFor(alert, raw) {
   if (!alert) return ""
   if (raw === true) return oneLine(alert.summary || "", 400)
+  if (alert.family === "sensor") return "The sensor did not provide enough evidence to identify the file."
+  if (alert.family === "auth") return "An expected native authentication workflow; other credential access remains monitored."
   if (alert.stake) return oneLine(alert.stake, 200)
   var c = copyFor(alert.rule)
   return c ? c.stake : ""

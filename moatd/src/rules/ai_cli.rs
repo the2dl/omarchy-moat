@@ -255,6 +255,19 @@ impl UserRule for AiCliHeadless {
             }
         }
 
+        let delegator = if pkg.is_none() {
+            chain.iter().find(|p| p.agent_session.as_ref().is_some_and(|s| s.root_pid == p.pid)
+                && crate::agent::invocation(&p.exe, &p.args).is_some())
+        } else { None };
+        if let Some(parent) = delegator {
+            m.severity = "medium".into();
+            m.tier = "signal".into();
+            m.title = "An agent delegated a background task".into();
+            evidence.push(format!("delegated by observed agent root {} pid {}; attribution does not establish approval", parent.exe, parent.pid));
+            if let Some(flag) = flag {
+                evidence.push(format!("delegated task permission flag: {}; independent credential, persistence and network detections remain active", flag));
+            }
+        }
         let Some(mut f) = ctx.finding(ID, m, exec_id) else {
             return Vec::new();
         };
@@ -334,6 +347,19 @@ mod tests {
             names: &crate::rules::NO_NAMES,
         };
         AiCliHeadless.on_exec(&ExecEvent::default(), exec_id, &ctx)
+    }
+
+    #[test]
+    fn delegation_is_context_but_an_unrelated_headless_launch_still_alerts() {
+        let mut t = table_headless();
+        t.observe(&proc("delegator", 99191, "/opt/claude", "", None));
+        t.observe(&proc("delegate", 99192, "/opt/codex", "exec task", Some("delegator")));
+        let rows = run(&t, "delegate");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].meta.severity, "medium");
+        assert_eq!(rows[0].meta.tier, "signal");
+        t.observe(&proc("unrelated", 99193, "/opt/codex", "exec task", None));
+        assert_eq!(run(&t, "unrelated")[0].meta.severity, "high");
     }
 
     #[test]

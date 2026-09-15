@@ -722,20 +722,37 @@ Stage 4 of `docs/design/PLAN.md` (incidents in the daemon, chain correlation) is
 someone else's work and lands behind the model API this panel already uses.
 
 
-### Repeated credential notifications
+### Notifications and developer workflows (release 187)
 
-Reads by the same executable and user, in the same workspace, of the same
-credential file produce at most one ordinary popup per hour while the shell
-service is running. Worker PID changes do not reset that interval. Every read
-still reaches the daemon and remains available in Now or the timeline according
-to its classification. A newly correlated incident or critical first-seen event
-can still notify immediately. The existing per-rule cooldown also applies.
+Standalone unresolved incidents notify once per program, user, workspace and
+target. Worker PID changes and elapsed cooldowns do not send another reminder.
+The daemon's unresolved queue seeds this state after shell reloads. Once all
+matching alerts are acknowledged the incident can notify again. A severity
+increase or a new correlated chain remains eligible immediately; the existing
+per-rule cooldown still limits new ordinary incidents.
 
-Releases 185–186 also recognizes the Linux ` (deleted)` suffix for agent attribution
-so an updated, still-running agent can authenticate without being classified as
-its own credential thief. This does not establish binary trust or exempt its
-child tools. Version/help-only agent probes are not unattended tasks. Plain
-`/usr/bin/mv` relocation retains a medium timeline signal when filenames are
-preserved, including copy/unlink moves with observed newly written output;
-changed names, missing output, truncation and mixed-tool sequences retain their
-existing detection behavior.
+Nested agents from different providers receive their own session identity,
+while process ancestry retains delegation. Their own authentication is context;
+child tools and cross-provider credential reads remain detections. Headless
+agent delegation outside a package-install subtree is a timeline signal, not
+proof of approval. Unknown headless launchers and package-driven agent launches
+retain their detection behavior.
+
+A plain local npx command is execution context only when its bin exists under
+a node_modules/.bin directory in the workspace ancestry and the process is in
+the confirmed host namespace. Version/package requests, resolution-changing
+flags and unknown/container namespaces retain conservative install context.
+
+Verified native GKE authentication helpers and Docker buildx can read the same
+user's kubeconfig in the expected launch context without manufacturing an
+exfiltration chain. Other files, modified binaries and package-install contexts
+remain monitored. Credential observations with missing paths are explicitly
+recorded as incomplete sensor evidence, with available argument errors/flags;
+they no longer assert that a specific credential store was read.
+
+Generated-file tracking reclaims entries as files are deleted or renamed,
+preventing long test runs from filling the creation tracker with dead paths.
+Plain mv relocation remains a timeline signal, including cross-filesystem
+moves with observed matching output. Destructive changes to pre-existing data
+remain detectable. Bulk acknowledgement receipts retain their audit history
+without being labelled as weakened enforcement.

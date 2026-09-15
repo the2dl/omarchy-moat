@@ -261,9 +261,37 @@ pub fn root_reason(exe: &str, args: &str) -> Option<String> {
     None
 }
 
+// Resolve only a plain local npx command, in a confirmed host namespace.
+// Package/version requests and flags that change resolution remain installs.
+// This is execution context, never an allowlist for what the tool does.
+fn local_npx(p: &ProcInfo) -> bool {
+    if p.in_container != Some(false) || p.user_ns_host != Some(true) {
+        return false;
+    }
+    let mut args = p.args.split_whitespace();
+    if basename(&p.exe) != "npx" {
+        if !matches!(basename(&p.exe), "node" | "bun")
+            || args.next().map(basename) != Some("npx-cli.js") {
+            return false;
+        }
+    }
+    let Some(command) = args.next() else { return false };
+    if command.is_empty() || !command.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        || command.starts_with('-') {
+        return false;
+    }
+    let cwd = std::path::Path::new(&p.cwd);
+    cwd.is_absolute() && cwd.ancestors().take(16)
+        .any(|dir| dir.join("node_modules/.bin").join(command).is_file())
+}
+
+fn process_root_reason(p: &ProcInfo) -> Option<String> {
+    if local_npx(p) { None } else { root_reason(&p.exe, &p.args) }
+}
+
 /// Is this single process a package-manager root?
 pub fn is_pkg_root(p: &ProcInfo) -> bool {
-    root_reason(&p.exe, &p.args).is_some()
+    process_root_reason(p).is_some()
 }
 
 /// The outermost package-manager root at or above `exec_id`, with the reason it
@@ -274,13 +302,13 @@ pub fn pkg_root_with_reason<'a>(
 ) -> Option<(&'a ProcInfo, String)> {
     let mut best: Option<(&ProcInfo, String)> = None;
     if let Some(me) = table.get(exec_id) {
-        if let Some(r) = root_reason(&me.exe, &me.args) {
+        if let Some(r) = process_root_reason(me) {
             best = Some((me, r));
         }
     }
     // Nearest ancestor first, so the last hit is the outermost one.
     for p in table.ancestry(exec_id) {
-        if let Some(r) = root_reason(&p.exe, &p.args) {
+        if let Some(r) = process_root_reason(p) {
             best = Some((p, r));
         }
     }
@@ -323,6 +351,26 @@ mod tests {
             t.observe(&proc(id, *pid, exe, args, *parent));
         }
         t
+    }
+
+    #[test]
+    fn local_npx_is_execution_but_requested_packages_and_unknown_namespaces_are_not_exempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("node_modules/.bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("vitest"), "fixture").unwrap();
+        let mut p = ProcInfo { exe: "/usr/bin/npx".into(), args: "vitest run src/".into(),
+            cwd: dir.path().display().to_string(), in_container: Some(false), user_ns_host: Some(true), ..Default::default() };
+        assert!(!is_pkg_root(&p));
+        for args in ["--package evil vitest", "vitest@latest run", "missing-tool run", "--yes vitest"] {
+            p.args = args.into();
+            assert!(is_pkg_root(&p), "{args}");
+        }
+        p.args = "vitest run".into();
+        p.in_container = None;
+        assert!(is_pkg_root(&p));
+        p.in_container = Some(true);
+        assert!(is_pkg_root(&p));
     }
 
     #[test]
