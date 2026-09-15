@@ -771,3 +771,11 @@ so additional files and workspaces contribute evidence without additional
 popups. Severity escalation and separate correlated chains remain eligible.
 Notification decisions log the alert ID, rule and reason, without command lines
 or file paths, so a future duplicate can be traced to the actual running logic.
+
+Release 189 decodes omitted ProtoJSON `is_host: false` when the sensor supplies
+a nonzero namespace inode. Missing or empty namespace data remains unknown.
+This restores container classification and prevents container executables from
+being attributed to identically named host packages. The same decoding applies
+to user namespaces. Mass-read correlation excludes directory opens explicitly
+identified by the event-time file permission/type string; regular file reads
+and records without that type evidence remain eligible.

@@ -231,6 +231,15 @@ pub struct EnvVar {
     pub value: Option<String>,
 }
 
+impl Namespace {
+    fn host_identity(&self) -> Option<bool> {
+        // ProtoJSON omits the default false boolean. A populated namespace
+        // with an inode still answers the question; a missing/empty namespace
+        // does not. Never turn completely missing telemetry into an exemption.
+        self.is_host.or_else(|| self.inum.filter(|inum| *inum > 0).map(|_| false))
+    }
+}
+
 impl Process {
     /// Did this run in a container?
     ///
@@ -238,7 +247,7 @@ impl Process {
     /// event shape that carries no `ns`. The caller decides what silence means;
     /// this does not guess, because the two callers want opposite defaults.
     pub fn in_container(&self) -> Option<bool> {
-        self.ns.as_ref()?.mnt.as_ref()?.is_host.map(|host| !host)
+        self.ns.as_ref()?.mnt.as_ref()?.host_identity().map(|host| !host)
     }
 
     /// Was this in the HOST user namespace?
@@ -249,7 +258,7 @@ impl Process {
     /// `bwrap` does all day, which is why this is evidence and never a verdict
     /// (docs/LPE.md §3).
     pub fn user_ns_is_host(&self) -> Option<bool> {
-        self.ns.as_ref()?.user.as_ref()?.is_host
+        self.ns.as_ref()?.user.as_ref()?.host_identity()
     }
 
     /// Grave capabilities this process held at event time, sorted, or empty.
@@ -626,11 +635,22 @@ mod ns_tests {
     }
 
     #[test]
+    fn live_protojson_omits_false_namespace_flags() {
+        let p = parse(r#"{"ns":{"mnt":{"inum":4026533284},"user":{"inum":4026531837,"is_host":true}}}"#);
+        assert_eq!(p.in_container(), Some(true));
+        assert_eq!(p.user_ns_is_host(), Some(true));
+        let isolated = parse(r#"{"ns":{"user":{"inum":4026534000}}}"#);
+        assert_eq!(isolated.user_ns_is_host(), Some(false));
+        assert_eq!(parse(r#"{"ns":{"user":{}}}"#).user_ns_is_host(), None);
+    }
+
+    #[test]
     fn a_sensor_that_did_not_say_is_not_guessed_at() {
         // `--enable-process-ns` off, or an older daemon. The caller decides
         // what silence means; this must never invent an answer.
         assert_eq!(parse("{}").in_container(), None);
         assert_eq!(parse(r#"{"ns":{}}"#).in_container(), None);
-        assert_eq!(parse(r#"{"ns":{"mnt":{"inum":1}}}"#).in_container(), None);
+        assert_eq!(parse(r#"{"ns":{"mnt":{}}}"#).in_container(), None);
+        assert_eq!(parse(r#"{"ns":{"mnt":{"inum":0}}}"#).in_container(), None);
     }
 }
