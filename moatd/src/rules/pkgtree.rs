@@ -231,6 +231,9 @@ pub fn root_reason(exe: &str, args: &str) -> Option<String> {
     }
 
     let toks: Vec<&str> = args.split_whitespace().collect();
+    if matches!(comm, "node" | "bun") && toks.first().is_some_and(|arg| basename(arg) == "npx") {
+        return Some("npx interpreter entrypoint".into());
+    }
     for m in SCRIPT_MARKERS {
         if toks.iter().any(|t| basename(t) == *m) {
             return Some(format!("argument `{}`", m));
@@ -268,12 +271,19 @@ fn local_npx(p: &ProcInfo) -> bool {
     if p.in_container != Some(false) || p.user_ns_host != Some(true) {
         return false;
     }
-    let mut args = p.args.split_whitespace();
-    if basename(&p.exe) != "npx" {
-        if !matches!(basename(&p.exe), "node" | "bun")
-            || args.next().map(basename) != Some("npx-cli.js") {
-            return false;
+    let mut args = p.args.split_whitespace().peekable();
+    if basename(&p.exe) == "npx" {
+        // Tetragon reports both the shebang exec and its interpreter exec.
+        // mise's symlink is still called npx, not npx-cli.js, in argv.
+        if args.peek().is_some_and(|arg| matches!(basename(arg), "node" | "bun")) {
+            args.next();
+            if !args.next().is_some_and(|arg| matches!(basename(arg), "npx" | "npx-cli.js")) {
+                return false;
+            }
         }
+    } else if !matches!(basename(&p.exe), "node" | "bun")
+        || !args.next().is_some_and(|arg| matches!(basename(arg), "npx" | "npx-cli.js")) {
+        return false;
     }
     let Some(command) = args.next() else { return false };
     if command.is_empty() || !command.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
@@ -366,6 +376,17 @@ mod tests {
             p.args = args.into();
             assert!(is_pkg_root(&p), "{args}");
         }
+        for (exe, args) in [
+            ("/opt/node/bin/npx", "node /opt/node/bin/npx vitest run"),
+            ("/opt/node/bin/node", "/opt/node/bin/npx vitest run"),
+            ("/opt/node/bin/node", "/opt/node/lib/node_modules/npm/bin/npx-cli.js vitest run"),
+        ] {
+            p.exe = exe.into(); p.args = args.into();
+            assert!(!is_pkg_root(&p), "{exe} {args}");
+            p.args = args.replace("vitest run", "vitest@latest run");
+            assert!(is_pkg_root(&p), "versioned package: {exe}");
+        }
+        p.exe = "/usr/bin/npx".into();
         p.args = "vitest run".into();
         p.in_container = None;
         assert!(is_pkg_root(&p));

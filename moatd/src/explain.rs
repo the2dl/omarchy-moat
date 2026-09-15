@@ -469,6 +469,9 @@ fn what_sentence(f: &Finding) -> String {
 
 /// Turn a credential path into words a person recognises.
 pub fn describe_secret(path: &str) -> String {
+    if path.ends_with("/.aws/config") {
+        return "your AWS configuration (profiles and potentially credential settings)".into();
+    }
     let base = basename(path);
     let known: &[(&str, &str)] = &[
         ("/.ssh/", "your private SSH key"),
