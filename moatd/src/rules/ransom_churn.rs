@@ -33,7 +33,7 @@
 //! processes that each did one harmless step. Same structure as `mass_read`:
 //! bounded map, sliding window, fire once, then reset.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::config::Config;
 use crate::event::HookHit;
@@ -155,6 +155,9 @@ impl Destroyed {
 struct Actor {
     /// Recent read-opens, oldest first: `(when, path)`.
     reads: VecDeque<(u64, String)>,
+    // Membership checks dominate the file-open path. The queue preserves
+    // expiry order; this index avoids scanning up to 4096 paths per event.
+    read_paths: HashSet<String>,
     /// Paths this actor was seen WRITING BEFORE it ever read them -- its own
     /// scratch, not somebody's documents.
     ///
@@ -187,7 +190,9 @@ impl Actor {
     fn prune(&mut self, now: u64, window: u64) {
         while let Some((t, _)) = self.reads.front() {
             if now.saturating_sub(*t) >= window {
-                self.reads.pop_front();
+                if let Some((_, path)) = self.reads.pop_front() {
+                    self.read_paths.remove(&path);
+                }
             } else {
                 break;
             }
@@ -205,7 +210,7 @@ impl Actor {
     /// to the path: after a read, a write is what encrypting in place looks
     /// like, and excusing it would be the hole.
     fn note_write(&mut self, path: String) {
-        if self.reads.iter().any(|(_, p)| p == &path) {
+        if self.read_paths.contains(&path) {
             return;
         }
         if self.wrote_first.len() < MAX_READS_PER_ACTOR {
@@ -214,17 +219,26 @@ impl Actor {
     }
 
     fn note_read(&mut self, now: u64, path: String) {
-        if self.reads.iter().any(|(_, p)| p == &path) {
+        if self.read_paths.contains(&path) {
             return;
         }
         if self.reads.len() >= MAX_READS_PER_ACTOR {
-            self.reads.pop_front();
+            if let Some((_, old)) = self.reads.pop_front() {
+                self.read_paths.remove(&old);
+            }
         }
+        self.read_paths.insert(path.clone());
         self.reads.push_back((now, path));
     }
 
     fn read_recently(&self, path: &str) -> bool {
-        self.reads.iter().any(|(_, p)| p == path)
+        self.read_paths.contains(path)
+    }
+
+    fn forget_read(&mut self, path: &str) {
+        if self.read_paths.remove(path) {
+            self.reads.retain(|(_, p)| p != path);
+        }
     }
 
     fn note_destroyed(&mut self, d: Destroyed) {
@@ -442,7 +456,7 @@ impl UserRule for RansomChurn {
         // it does not rename an existing document away. Do not feed that into
         // extension homogenisation either. Destruction of the original still counts.
         if matches!(kind, Destroy::Renamed) && actor.wrote_first.remove(&path) {
-            actor.reads.retain(|(_, p)| p != &path);
+            actor.forget_read(&path);
             return Vec::new();
         }
         // An ATOMIC REPLACE promotes a hidden scratch name to a real one:
@@ -476,7 +490,7 @@ impl UserRule for RansomChurn {
         // thousands of already-cleaned temporary outputs.
         if matches!(kind, Destroy::Unlinked | Destroy::Renamed) {
             actor.wrote_first.remove(&path);
-            actor.reads.retain(|(_, p)| p != &path);
+            actor.forget_read(&path);
         }
         actor.note_destroyed(Destroyed {
             at: now,
@@ -1009,6 +1023,39 @@ mod tests {
         assert!(f.what_override.as_ref().unwrap().contains("node read 8 different files"), "{:?}", f.what_override);
         assert!(f.extra_evidence[1].contains("/home/dan/Documents/report-0.pdf (deleted)"), "{:?}", f.extra_evidence);
         assert!(f.hook.contains("8 distinct files read and then destroyed"));
+    }
+
+    #[test]
+    fn read_index_tracks_expiry_eviction_and_path_reuse() {
+        let mut actor = Actor::default();
+        for i in 0..=MAX_READS_PER_ACTOR { actor.note_read(100, doc(i)); }
+        assert!(!actor.read_recently(&doc(0)));
+        assert_eq!(actor.read_paths.len(), MAX_READS_PER_ACTOR);
+        actor.forget_read(&doc(1));
+        assert!(!actor.read_recently(&doc(1)));
+        actor.note_read(110, doc(1));
+        actor.prune(160, 60);
+        assert_eq!(actor.read_paths.len(), 1);
+        assert!(actor.read_recently(&doc(1)));
+        assert_eq!(actor.reads.len(), actor.read_paths.len());
+        actor.prune(170, 60);
+        assert!(actor.read_paths.is_empty());
+        actor.note_write(doc(1));
+        assert!(actor.wrote_first.contains(&doc(1)));
+    }
+
+    #[test]
+    #[ignore = "manual hot-path benchmark"]
+    fn benchmark_repeated_reads_at_capacity() {
+        let mut actor = Actor::default();
+        let paths: Vec<_> = (0..MAX_READS_PER_ACTOR).map(doc).collect();
+        for path in &paths { actor.note_read(100, path.clone()); }
+        let start = std::time::Instant::now();
+        for i in 0..200_000 {
+            actor.note_read(100, std::hint::black_box(paths[i % paths.len()].clone()));
+        }
+        eprintln!("200000 repeated reads: {:?}", start.elapsed());
+        assert_eq!(actor.reads.len(), MAX_READS_PER_ACTOR);
     }
 
     #[test]

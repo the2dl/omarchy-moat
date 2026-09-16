@@ -1068,3 +1068,22 @@ testdata/       sample.log, policies, templates, passwd, plus a fake pacman
 ```
 
 308 tests: unit tests beside each module, plus `tests/dev_run.rs`.
+
+### Release 190 event-path performance
+
+Repeated sensor reports reuse the process record's session and unchanged strings;
+`/proc/<pid>/stat` is read when that exec identity is first observed, rather than
+again for every file event and repeated ancestor. New exec identities (including
+PID reuse) still receive independent records, and late attribution/namespace
+updates remain supported. This preserves the prior first-observation semantics.
+
+The ransomware read window uses a bounded hash index alongside its expiry queue.
+Expiry, capacity eviction and deletion remove the corresponding index entries.
+The sensor excludes directory opens from this policy before export; regular-file
+reads/writes and all unlink, rename and truncate hooks retain their coverage.
+No event sampling, rate-limit reductions or program allowlists are introduced.
+
+Run the ignored `benchmark_repeated_reads_at_capacity` test with `--release
+-- --ignored --nocapture` to compare the repeated-read hot path. Live CPU comparisons
+must include event rate and workload: percentages from unrelated intervals are
+not a controlled speedup measurement.
