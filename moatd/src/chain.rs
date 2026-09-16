@@ -281,10 +281,13 @@ pub struct Observation {
 
 impl Observation {
     fn context_only(&self) -> bool {
+        // Connecting to a container API does not establish privilege gain.
+        // Retain it in the story; independent credential/dropper actions still trigger.
         self.silenced || matches!(self.rule.as_str(),
             "moat-priv-capability-gained" | "moat-priv-uid-transition"
             | "moat-net-tmpfs-binary-egress" | "moat-shell-lan-connect"
-            | "moat-shell-reverse-shell-connect")
+            | "moat-shell-reverse-shell-connect"
+            | "moat-priv-container-socket-connect")
     }
     fn rank(&self) -> u8 {
         severity_rank(&self.severity)
@@ -478,9 +481,11 @@ impl Escalation {
         }
         self.last = Some(family.to_string());
         match family {
-            "cred" => self.cred = true,
+            "cred" if rank >= severity_rank("medium") => self.cred = true,
             "net" if self.cred => self.cred_then_net = true,
-            "persist" if self.cred_then_net => self.cred_then_net_then_persist = true,
+            "persist" if self.cred_then_net && rank >= severity_rank("medium") => {
+                self.cred_then_net_then_persist = true;
+            }
             _ => {}
         }
     }
@@ -536,14 +541,16 @@ impl Escalation {
 ///
 /// | shape (in time order)          | result                                  |
 /// |--------------------------------|-----------------------------------------|
-/// | `cred` -> `net` -> `persist`   | `critical`: read, sent, and made durable |
+/// | `cred` -> `net` -> `persist`   | `critical`: suspicious read, network, persistence |
 /// | `cred` -> `net`                | one step up, at least `high`             |
 /// | `rootkit` or `priv` + anything | one step up                              |
 /// | anything -> `persist`          | one step up                              |
-/// | four or more families          | one step up                              |
+///
+/// Credential and persistence steps must each reach medium for the ordered rungs.
+/// Family count alone never raises severity: ordinary builds cross many families.
 ///
 /// Nothing here can raise a chain by more than one step except the first rung,
-/// which is the full theft shape and is `critical` by definition.
+/// which combines suspicious credential access with network and persistence findings.
 pub fn escalate_state(e: &Escalation) -> (String, String, String) {
     let base = e.max_rank;
     let base_name = severity_name(base).to_string();
@@ -557,8 +564,7 @@ pub fn escalate_state(e: &Escalation) -> (String, String, String) {
     let (rank, why, matched) = if e.cred_then_net_then_persist {
         (
             3,
-            "a credential was read, this tree then connected out, and then it \
-             arranged to run again"
+            "a suspicious credential read was followed by network activity and a persistence finding"
                 .to_string(),
             true,
         )
@@ -568,16 +574,7 @@ pub fn escalate_state(e: &Escalation) -> (String, String, String) {
             "a credential was read and the same process tree then connected out".to_string(),
             true,
         )
-    // The combination-only rungs additionally require the ESCALATING step to
-    // be at least `medium` -- the same floor `qualifies()` already applies to
-    // form a chain at all.
-    //
-    // Without it a `low` signal carries a whole rung on its own, which is how
-    // an ordinary package update reached critical: one setuid chmod that
-    // granted no privilege, beside the net and pkg families every source build
-    // produces. This does not touch the ORDERED rungs below `cred -> net`: a
-    // sequence is meaningful even when each step is ordinary, and that is the
-    // whole reason chains exist.
+    // Combination rungs also require the escalating step to be at least medium.
     } else if (has("rootkit") || has("priv")) && families.len() >= 2 && e.rung_is_real(&["rootkit", "priv"]) {
         (
             base.saturating_add(1),
@@ -595,12 +592,6 @@ pub fn escalate_state(e: &Escalation) -> (String, String, String) {
         (
             base.saturating_add(1),
             "the sequence ended by arranging to run again".to_string(),
-            true,
-        )
-    } else if families.len() >= 4 {
-        (
-            base.saturating_add(1),
-            format!("{} different kinds of behaviour in one process tree", families.len()),
             true,
         )
     } else {
@@ -1486,7 +1477,7 @@ mod tests {
     }
 
     #[test]
-    fn the_full_theft_shape_is_critical_whatever_its_members_were() {
+    fn low_credential_and_persistence_signals_do_not_establish_theft() {
         let steps = [
             ("cred", "low"),
             ("net", "low"),
@@ -1498,8 +1489,47 @@ mod tests {
         .collect::<Vec<_>>();
         let (sev, base, reason) = escalate(&steps);
         assert_eq!(base, "low");
-        assert_eq!(sev, "critical");
-        assert!(reason.starts_with("low -> critical:"), "{}", reason);
+        assert_eq!(sev, "low");
+        assert!(reason.contains("no escalating sequence"), "{}", reason);
+    }
+
+    #[test]
+    fn build_archive_docker_and_network_do_not_form_an_actionable_chain() {
+        let mut store = ChainStore::new();
+        for (i, (family, rule, severity)) in [
+            ("exec", "moat-exec-untrusted-home", "low"),
+            ("persist", "moat-persist-agent-config-write", "low"),
+            ("priv", "moat-priv-container-socket-connect", "medium"),
+            ("net", "moat-net-first-contact", "low"),
+        ].iter().enumerate() {
+            let mut o = obs(&format!("build-{i}"), 1000 + i as u64, family, severity, typed_at_a_shell(41233));
+            o.rule = (*rule).into();
+            assert!(store.note(o).is_none());
+        }
+        // The same tree accessing credentials still forms a real sequence.
+        let mut theft = obs("theft", 1005, "cred", "high", typed_at_a_shell(41233));
+        theft.rule = "moat-cred-harvest".into();
+        assert!(store.note(theft).is_some());
+        let c = store.note(obs("egress", 1006, "net", "medium", typed_at_a_shell(41233))).unwrap();
+        assert_eq!(c.severity, "critical");
+        assert!(c.steps.iter().any(|s| s.rule == "moat-priv-container-socket-connect" && !s.is_trigger()));
+    }
+
+    #[test]
+    fn category_count_and_low_persistence_do_not_raise_severity() {
+        let mut e = Escalation::default();
+        for (family, severity) in [("exec", "medium"), ("pkg", "low"), ("net", "low"), ("ai", "low")] {
+            e.observe(family, severity, true);
+        }
+        assert_eq!(escalate_state(&e).0, "medium");
+        let mut e = Escalation::default();
+        e.observe("cred", "medium", true);
+        e.observe("net", "low", true);
+        assert_eq!(escalate_state(&e).0, "high");
+        e.observe("persist", "low", true);
+        assert_eq!(escalate_state(&e).0, "high");
+        e.observe("persist", "medium", true);
+        assert_eq!(escalate_state(&e).0, "critical");
     }
 
     // ------------------------------------------- ordinary developer work

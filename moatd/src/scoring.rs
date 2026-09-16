@@ -428,6 +428,20 @@ pub fn classify_row(f: &EventFacts) -> Option<&'static MatrixRow> {
         }) {
             return row("exec-go-cache-build");
         }
+        // npm exec/npx installs packages here. Location alone is no more
+        // suspicious than a project's node_modules; subsequent credential,
+        // persistence and network actions are scored independently.
+        let npm_package = f.homes.iter().any(|home| {
+            path.strip_prefix(&format!("{}/.npm/_npx/", home.trim_end_matches('/')))
+                .is_some_and(|tail| {
+                    !tail.split('/').any(|part| part == ".." || part.is_empty())
+                        && tail.split_once("/node_modules/")
+                            .is_some_and(|(cache, package)| !cache.contains('/') && package.contains('/'))
+                })
+        });
+        if npm_package {
+            return row("exec-project-tree");
+        }
         if matches_any(path, PROJECT_TREE_MARKERS) {
             return row("exec-project-tree");
         }
@@ -909,6 +923,22 @@ mod tests {
             ..facts("cred", "moat-cred-ssh-private-key-read")
         })
         .is_none());
+    }
+
+    #[test]
+    fn npm_cached_packages_are_code_locations_not_dropper_evidence() {
+        let homes = vec!["/home/dan".to_string()];
+        for path in ["/home/dan/.npm/_npx/abc/node_modules/tsc/bin/tsc",
+            "/home/dan/.npm/_npx/abc/node_modules/@scope/tool/dist/index.js"] {
+            let f = EventFacts { file: Some(path), homes: &homes, ..facts("exec", "moat-exec-untrusted-home") };
+            assert_eq!(classify_row(&f).unwrap().key, "exec-project-tree");
+        }
+        for path in ["/home/dan/.npm/_npx/abc/payload", "/home/dan/.npm/_npx/abc/node_modules/../../payload", "/tmp/dropper"] {
+            let f = EventFacts { file: Some(path), homes: &homes, ..facts("exec", "moat-exec-untrusted-home") };
+            assert_eq!(classify_row(&f).unwrap().key, "exec-opaque-dir");
+        }
+        let f = EventFacts { file: Some("/home/dan/.aws/credentials"), homes: &homes, ..facts("cred", "moat-cred-cloud-credentials-read") };
+        assert_eq!(classify_row(&f).unwrap().key, "cred-cloud-read");
     }
 
     #[test]
