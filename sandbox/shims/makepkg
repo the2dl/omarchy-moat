@@ -44,7 +44,9 @@ run_scan() {
 	fi
 
 	local rc=0
-	moat-scan-pkgbuild . || rc=$?
+	# yay parses makepkg's stdout (--printsrcinfo / --packagelist). Scan
+	# diagnostics must not become part of that machine-readable response.
+	moat-scan-pkgbuild . >&2 || rc=$?
 
 	case $rc in
 	0) return 0 ;;

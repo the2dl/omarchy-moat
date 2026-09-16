@@ -361,6 +361,8 @@ mod tests {
         // registry on 127.0.0.1 is the ordinary case, and is what the old
         // `allow_private` default was really protecting.
         assert!(run(&t, &cfg(), &sock_event("127.0.0.1", 4873), "e-node").is_empty());
+        assert!(run(&t, &cfg(), &sock_event("::ffff:127.0.0.1", 39103), "e-node").is_empty());
+        assert_eq!(run(&t, &cfg(), &sock_event("::ffff:192.168.44.122", 4873), "e-node").len(), 1);
         let mut allowing = cfg();
         allowing.net.allow_private = true;
         assert!(run(&t, &allowing, &sock_event("127.0.0.1", 4873), "e-node").is_empty());

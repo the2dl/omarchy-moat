@@ -46,9 +46,44 @@ pub fn invocation(exe: &str, args: &str) -> Option<String> {
     None
 }
 
+/// Explicit native Claude session/daemon entrypoints own their authentication,
+/// even when launched from another Claude session. Bare same-name children and
+/// bundled applets remain tools. This is attribution, not binary verification.
+pub fn starts_nested_session(exe: &str, args: &str) -> bool {
+    if crate::util::basename(exe.strip_suffix(" (deleted)").unwrap_or(exe)) != "claude"
+        || invocation(exe, args).as_deref() != Some("claude")
+    {
+        return false;
+    }
+    let words: Vec<_> = args.split_whitespace().collect();
+    if words.starts_with(&["daemon", "run"]) {
+        return true;
+    }
+    // A prewarmed background worker is itself an agent, not the PTY host
+    // that launches it. Do not match flags embedded in the host's arguments.
+    if words.len() == 2 && words[0] == "--bg-spare" {
+        return words[1].starts_with("/tmp/cc-daemon-")
+            && words[1].ends_with(".claim.sock");
+    }
+    words.contains(&"--fork-session")
+        && words.windows(2).any(|w| w[0] == "--session-id" && !w[1].starts_with('-'))
+        && words.windows(2).any(|w| w[0] == "--resume" && !w[1].starts_with('-'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nested_session_requires_native_entrypoint_not_embedded_flags() {
+        assert!(starts_nested_session("/opt/claude", "daemon run --origin transient"));
+        assert!(starts_nested_session("/opt/claude", "--session-id x --fork-session --resume y"));
+        for args in ["", "--session-id x", "--fork-session --resume x", "--bg-spare /tmp/tool.sock",
+            "--bg-pty-host /tmp/pty.sock 200 50 -- /opt/claude --bg-spare /tmp/cc-daemon-1000/a.claim.sock",
+            "--files-with-matches --session-id x --fork-session --resume y"] {
+            assert!(!starts_nested_session("/opt/claude", args), "{args}");
+        }
+        assert!(!starts_nested_session("/usr/bin/node", "daemon run"));
+    }
     #[test]
     fn replaced_native_agent_keeps_identity_without_identifying_tools() {
         assert_eq!(invocation("/opt/claude (deleted)", "").as_deref(), Some("claude"));

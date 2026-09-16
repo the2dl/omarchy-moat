@@ -90,9 +90,11 @@ class ShimCase(unittest.TestCase):
         proc = subprocess.run(
             [os.path.join(SHIMS, name)] + args,
             cwd=cwd or self.proj, env=environ, stdin=subprocess.DEVNULL,
-            capture_output=True, text=True, timeout=60,
+            # Merge at the pipe so scan-before-exec assertions observe real
+            # ordering across stderr diagnostics and wrapped-command stdout.
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60,
         )
-        return proc.returncode, proc.stdout + proc.stderr
+        return proc.returncode, proc.stdout
 
 
 class TestScanContract(ShimCase):

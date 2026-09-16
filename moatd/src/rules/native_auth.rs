@@ -23,7 +23,9 @@ pub fn classify(f: &mut Finding, homes: &[String]) {
         "/usr/bin/gke-gcloud-auth-plugin" => f.ancestry.iter().any(|p| p.exe == "/usr/bin/kubectl"),
         "/usr/lib/docker/cli-plugins/docker-buildx" => {
             f.ancestry.first().is_some_and(|p| p.exe == "/usr/bin/docker")
-                && (f.proc.args.starts_with("buildx build ") || f.proc.args.starts_with("build "))
+                && (f.proc.args.starts_with("buildx build ") || f.proc.args.starts_with("build ")
+                    || f.proc.args.starts_with("buildx imagetools inspect ")
+                    || f.proc.args.starts_with("imagetools inspect "))
         }
         _ => false,
     };
@@ -54,6 +56,18 @@ mod tests {
         let mut yes = base.clone();
         classify(&mut yes, &homes);
         assert_eq!(yes.meta.family, "auth");
+        let mut buildx = base.clone();
+        buildx.proc.exe = "/usr/lib/docker/cli-plugins/docker-buildx".into();
+        buildx.ancestry[0].exe = "/usr/bin/docker".into();
+        for args in ["buildx imagetools inspect registry.example/project/image:tag", "imagetools inspect registry.example/project/image:tag"] {
+            let mut inspect = buildx.clone();
+            inspect.proc.args = args.into();
+            classify(&mut inspect, &homes);
+            assert_eq!(inspect.meta.family, "auth");
+        }
+        buildx.proc.args = "buildx imagetools create registry.example/project/image:tag".into();
+        classify(&mut buildx, &homes);
+        assert_ne!(buildx.meta.family, "auth");
         for case in 0..6 {
             let mut no = base.clone();
             match case {
