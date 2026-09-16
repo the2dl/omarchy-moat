@@ -70,6 +70,14 @@ spec:
       resolve: "f_mode"
       label: "file_mode"
     selectors:
+    # Directory enumeration is not file content. NoPost avoids exporting it
+    # while preserving the following file-open and all destruction selectors.
+    - matchArgs:
+      - index: 0
+        operator: "FileType"
+        values: ["dir"]
+      matchActions:
+      - action: NoPost
     - matchBinaries:
       - operator: "NotIn"
         values:

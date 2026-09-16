@@ -157,7 +157,10 @@ impl ProcTable {
     /// before the daemon did (Tetragon backfills them from procfs).
     pub fn observe(&mut self, p: &Process) -> Option<String> {
         let exec_id = p.exec_id.clone()?;
-        let (sid, tty) = observed_session(p.pid.unwrap_or(0));
+        // Known exec identities already retain their session. Compute agent
+        // attribution only when missing, including a parent learned later.
+        let needs_agent = self.map.get(&exec_id).is_none_or(|known| known.agent_session.is_none());
+        let agent_session = if needs_agent {
         let inherited_agent = p.parent_exec_id.as_ref()
             .and_then(|parent| self.map.get(parent))
             .and_then(|parent| parent.agent_session.clone());
@@ -177,6 +180,33 @@ impl ProcTable {
             }),
             _ => None,
         };
+        agent_session
+        } else { None };
+        if let Some(existing) = self.map.get_mut(&exec_id) {
+            if existing.agent_session.is_none() { existing.agent_session = agent_session; }
+            // Sparse parent records cannot erase evidence. Identical reports
+            // reuse owned strings instead of reallocating them on every hook.
+            if !p.exe().is_empty() && existing.exe != p.exe() {
+                existing.exe_note = None;
+                existing.exe.clear(); existing.exe.push_str(p.exe());
+            }
+            if !p.args().is_empty() && existing.args != p.args() {
+                existing.args.clear(); existing.args.push_str(p.args());
+            }
+            if let Some(cwd) = p.cwd.as_ref().filter(|s| !s.is_empty()) {
+                if &existing.cwd != cwd { existing.cwd.clone_from(cwd); }
+            }
+            if let Some(parent) = p.parent_exec_id.as_ref().filter(|s| !s.is_empty()) {
+                if existing.parent_exec_id.as_ref() != Some(parent) {
+                    existing.parent_exec_id = Some(parent.clone());
+                }
+            }
+            if existing.pid == 0 { existing.pid = p.pid.unwrap_or(0); }
+            if let Some(container) = p.in_container() { existing.in_container = Some(container); }
+            return Some(exec_id);
+        }
+        // Session lookup is per exec identity, never per repeated event or PID.
+        let (sid, tty) = observed_session(p.pid.unwrap_or(0));
         let info = ProcInfo {
             agent_session,
             exec_id: exec_id.clone(),
@@ -196,42 +226,7 @@ impl ProcTable {
             sid,
             tty,
         };
-        match self.map.get_mut(&exec_id) {
-            Some(existing) => {
-                if existing.agent_session.is_none() {
-                    existing.agent_session = info.agent_session;
-                }
-                // Never let a sparse `parent` block blank out a full record.
-                if !info.exe.is_empty() {
-                    // A re-reported binary invalidates any resolution note we
-                    // had for the previous one.
-                    if existing.exe != info.exe {
-                        existing.exe_note = None;
-                    }
-                    existing.exe = info.exe;
-                }
-                if !info.args.is_empty() {
-                    existing.args = info.args;
-                }
-                if !info.cwd.is_empty() {
-                    existing.cwd = info.cwd;
-                }
-                if info.parent_exec_id.is_some() {
-                    existing.parent_exec_id = info.parent_exec_id;
-                }
-                if existing.pid == 0 {
-                    existing.pid = info.pid;
-                }
-                // A sparse `parent` block carries no `ns`; never let it blank
-                // out an answer a full block already gave.
-                if info.in_container.is_some() {
-                    existing.in_container = info.in_container;
-                }
-            }
-            None => {
-                self.map.insert(exec_id.clone(), info);
-            }
-        }
+        self.map.insert(exec_id.clone(), info);
         Some(exec_id)
     }
 
