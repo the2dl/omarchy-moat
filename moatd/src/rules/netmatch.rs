@@ -80,7 +80,8 @@ fn bits_eq(a: &[u8], b: &[u8], prefix: u8) -> bool {
 pub fn is_always_local(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
-        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified()
+            || v4_mapped(v6).is_some_and(|v4| is_always_local(&IpAddr::V4(v4))),
     }
 }
 
@@ -164,6 +165,16 @@ mod tests {
         assert!(is_private(&ip("fe80::1")));
         assert!(is_private(&ip("::ffff:10.0.0.1")));
         assert!(!is_private(&ip("2001:db8::1")));
+    }
+
+    #[test]
+    fn mapped_loopback_is_local_but_mapped_lan_and_public_are_not() {
+        for address in ["127.0.0.1", "::1", "::ffff:127.0.0.1", "::ffff:127.1.2.3"] {
+            assert!(is_always_local(&ip(address)), "{address}");
+        }
+        for address in ["::ffff:192.168.44.122", "::ffff:10.0.0.1", "::ffff:1.1.1.1", "::127.0.0.1"] {
+            assert!(!is_always_local(&ip(address)), "{address}");
+        }
     }
 
     #[test]

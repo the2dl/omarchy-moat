@@ -124,6 +124,11 @@ mod tests {
         add("replaced-child", 106, "/opt/claude (deleted)", "", Some("agent"));
         add("tool", 101, "/usr/bin/node", "/tmp/tool.js", Some("agent"));
         add("fake-agent-child", 102, "/opt/claude", "", Some("agent"));
+        add("daemon", 108, "/opt/claude", "daemon run --origin transient", Some("agent"));
+        add("spare", 109, "/opt/claude", "--bg-spare /tmp/cc-daemon-1000/session/spare/worker.claim.sock", Some("daemon"));
+        add("forked", 110, "/opt/claude", "--session-id session-b --fork-session --resume /home/dan/session.jsonl", Some("agent"));
+        add("pty-host", 111, "/opt/claude", "--bg-pty-host /tmp/pty.sock 200 50 -- /opt/claude --bg-spare /tmp/cc-daemon-1000/worker.claim.sock", Some("daemon"));
+        add("daemon-tool", 112, "/usr/bin/node", "/tmp/tool.js", Some("daemon"));
         add(
             "unknown-node",
             103,
@@ -172,19 +177,20 @@ mod tests {
                 &ctx,
             )
         };
-        for id in ["agent", "runtime-agent", "replaced-agent"] {
+        for id in ["agent", "runtime-agent", "replaced-agent", "daemon", "spare", "forked"] {
             let f = run(id, ".claude/.credentials.json");
             assert_eq!(f.len(), 1);
             assert_eq!(f[0].meta.family, "ai");
             assert_eq!(f[0].meta.severity, "low");
         }
-        for id in ["tool", "fake-agent-child", "unknown-node", "replaced-child"] {
+        for id in ["tool", "fake-agent-child", "unknown-node", "replaced-child", "pty-host", "daemon-tool"] {
             let f = run(id, ".claude/.credentials.json");
             assert_eq!(f.len(), 1);
             assert_eq!(f[0].meta.family, "cred", "{id}");
             assert_eq!(f[0].meta.severity, "high", "{id}");
         }
         assert_eq!(run("agent", ".codex/auth.json")[0].meta.family, "cred");
+        assert_eq!(run("forked", ".codex/auth.json")[0].meta.family, "cred");
         assert_eq!(run("delegated-codex", ".codex/auth.json")[0].meta.family, "ai");
         assert_eq!(run("delegated-codex", ".claude/.credentials.json")[0].meta.family, "cred");
         assert_eq!(

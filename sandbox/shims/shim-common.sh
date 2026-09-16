@@ -223,7 +223,8 @@ shim_run_scan() {
 	fi
 
 	local rc=0
-	"$scanner" "$@" || rc=$?
+	# Preserve the wrapped command's stdout for callers that parse it.
+	"$scanner" "$@" >&2 || rc=$?
 
 	case $rc in
 	0) return 0 ;;

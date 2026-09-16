@@ -273,7 +273,10 @@ directory.
 ### `makepkg` scans first
 
 The `makepkg` shim runs `moat-scan-pkgbuild .` (scanner/, contract section 9)
-before doing anything. This is the ladder every shim's scan uses, via
+with scan diagnostics on stderr, preserving makepkg's stdout for callers such
+as yay that parse `--printsrcinfo` and `--packagelist`. Other scanning shims
+use the same stderr contract. Standalone scanner output is unchanged.
+The scan runs before makepkg. This is the ladder every shim's scan uses, via
 `shim_run_scan` in `shim-common.sh`:
 
 | Scanner exit | Shim behaviour |
