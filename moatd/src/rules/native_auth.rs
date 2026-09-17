@@ -33,11 +33,7 @@ fn classify_with(f: &mut Finding, homes: &[String], trusted: impl Fn(&str) -> bo
         "/usr/bin/gke-gcloud-auth-plugin" => f.ancestry.first().is_some_and(|p| p.exe == "/usr/bin/kubectl" && p.uid == f.proc.uid),
         "/usr/lib/docker/cli-plugins/docker-buildx" => {
             f.ancestry.first().is_some_and(|p| p.exe == "/usr/bin/docker" && p.uid == f.proc.uid)
-                && (f.proc.args.starts_with("buildx build ") || f.proc.args.starts_with("build ")
-                    || f.proc.args.starts_with("buildx imagetools inspect ")
-                    || f.proc.args.starts_with("imagetools inspect ")
-                    || matches!(f.proc.args.trim(), "buildx ls" | "ls")
-                    || f.proc.args.starts_with("buildx ls ") || f.proc.args.starts_with("ls "))
+
         }
         _ => false,
     };
@@ -97,7 +93,15 @@ mod tests {
         registry.file.as_mut().unwrap().path = format!("{}/.npmrc", homes[0]);
         classify(&mut registry, &homes);
         assert_eq!(registry.meta.family, "cred");
-        buildx.proc.args = "buildx imagetools create registry.example/project/image:tag".into();
+        // Buildx initializes authentication for read-only housekeeping too.
+        // The invariant is its own config + Docker launcher, not a command list.
+        for args in ["buildx prune -af", "buildx du", "buildx imagetools create registry.example/project/image:tag"] {
+            let mut native = buildx.clone();
+            native.proc.args = args.into();
+            classify(&mut native, &homes);
+            assert_eq!(native.meta.family, "auth");
+        }
+        buildx.ancestry[0].exe = "/usr/bin/bash".into();
         classify(&mut buildx, &homes);
         assert_ne!(buildx.meta.family, "auth");
         for case in 0..6 {
