@@ -3230,6 +3230,7 @@ impl Daemon {
         // Before scoring: a domain-feed hit sets `ioc`, and the score reads it.
         self.enrich_names(&mut f, now);
         crate::rules::native_auth::classify(&mut f, &self.homes);
+        let native_context = crate::rules::native_context::classify(&mut f, &self.homes);
 
         // --- 2. severity (BASELINE §2 and §2b) ------------------------------
         let build_tool = self.build_tool_in_chain(&f.exec_id);
@@ -3258,6 +3259,10 @@ impl Daemon {
             )
         };
         let mut score = score;
+        if native_context {
+            score = scoring::Score::unadjusted("low");
+            score.severity_reason = "expected native operation: retained as context".into();
+        }
         // A filename match outside the account's actual credential location is
         // evidence of a credential-shaped file, not proof of reading that login.
         // Keep the signal and package-install escalation, without alarming on
@@ -3689,6 +3694,7 @@ impl Daemon {
             })
             .collect();
         let Some(c) = self.chains.note(chain::Observation {
+            summary: alert.summary.clone(),
             agent_root: f.proc.agent_session.as_ref().map(|s| (
                 s.id.clone(), crate::alert::Ancestor::new(s.root_pid, s.executable.clone())
             )),
@@ -7627,6 +7633,7 @@ mod tests {
             .iter()
             .take(chain::MAX_STEPS)
             .map(|m| chain::Step {
+                summary: String::new(),
                 alert: m.clone(),
                 ts: "2026-09-10T10:00:00Z".into(),
                 family: "cred".into(),
@@ -10439,6 +10446,7 @@ esac
         let steps: Vec<crate::chain::Step> = alerts
             .iter()
             .map(|a| crate::chain::Step {
+                summary: String::new(),
                 alert: a.id.clone(),
                 ts: a.ts.clone(),
                 family: a.family.clone(),

@@ -1111,6 +1111,7 @@ mod tests {
             .iter()
             .take(crate::chain::MAX_STEPS)
             .map(|m| crate::chain::Step {
+                summary: String::new(),
                 alert: m.to_string(),
                 ts: "2026-09-10T10:00:00Z".into(),
                 family: "cred".into(),

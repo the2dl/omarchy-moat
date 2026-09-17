@@ -144,6 +144,9 @@ pub const MAX_RECENT: usize = 1024;
 /// One alert's place in the story.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
+    /// Event-time explanation survives rotation of the source alert.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
     /// The alert id this step is; `moatctl explain <id>` opens it.
     pub alert: String,
     pub ts: String,
@@ -255,6 +258,7 @@ pub struct LineageNode {
 /// test without a daemon.
 #[derive(Debug, Clone)]
 pub struct Observation {
+    pub summary: String,
     /// Cached sensor lineage survives intermediate exits and ancestry caps.
     /// Never populated from a process environment variable or a client claim.
     pub agent_root: Option<(String, Ancestor)>,
@@ -298,6 +302,7 @@ impl Observation {
     fn step(&self, trigger: bool) -> Step {
         let me = self.lineage.first();
         Step {
+            summary: self.summary.chars().take(1024).collect(),
             alert: self.alert.clone(),
             ts: self.ts.clone(),
             family: self.family.clone(),
@@ -1086,6 +1091,7 @@ mod tests {
 
     fn obs(id: &str, at: u64, family: &str, sev: &str, lineage: Vec<LineageNode>) -> Observation {
         Observation {
+            summary: String::new(),
             agent_root: None,
             alert: id.into(),
             ts: crate::util::rfc3339_of(at),
@@ -1098,6 +1104,20 @@ mod tests {
             silenced: false,
             lineage,
         }
+    }
+
+    #[test]
+    fn chain_keeps_event_time_explanation_without_the_original_record() {
+        let mut o = obs("evidence", 1000, "cred", "high", vec![]);
+        o.summary = "dockerd read /var/lib/docker/overlay2/layer/app/.env".into();
+        let step = o.step(true);
+        let back: Step = serde_json::from_str(&serde_json::to_string(&step).unwrap()).unwrap();
+        assert_eq!(back.summary, o.summary);
+        o.summary = "x".repeat(2048);
+        assert_eq!(o.step(true).summary.len(), 1024);
+        let mut old = serde_json::to_value(&step).unwrap();
+        old.as_object_mut().unwrap().remove("summary");
+        assert!(serde_json::from_value::<Step>(old).unwrap().summary.is_empty());
     }
 
     #[test]
