@@ -3,8 +3,15 @@ use crate::{context::Context, explain::Finding, provenance::Provenance};
 use std::os::unix::fs::MetadataExt;
 
 pub fn classify(f: &mut Finding, homes: &[String]) {
+    classify_with(f, homes, super::native_context::system_executable)
+}
+
+fn classify_with(f: &mut Finding, homes: &[String], trusted: impl Fn(&str) -> bool) {
     if f.rule != "moat-cred-cloud-credentials-read"
-        || f.actor.provenance != Provenance::Official
+        || !(f.actor.provenance == Provenance::Official
+            || (f.actor.provenance == Provenance::Foreign
+                && f.actor.package.as_deref().is_some_and(|p| p.starts_with("google-cloud-cli-component-gke-gcloud-auth-plugin "))
+                && trusted(&f.proc.exe)))
         || f.actor.modified.is_some()
         || f.proc.in_container != Some(false)
         || f.proc.user_ns_host != Some(true)
@@ -20,12 +27,14 @@ pub fn classify(f: &mut Finding, homes: &[String]) {
     });
     if !own_config { return; }
     let expected = match f.proc.exe.as_str() {
-        "/usr/bin/gke-gcloud-auth-plugin" => f.ancestry.iter().any(|p| p.exe == "/usr/bin/kubectl"),
+        "/usr/bin/gke-gcloud-auth-plugin" => f.ancestry.first().is_some_and(|p| p.exe == "/usr/bin/kubectl" && p.uid == f.proc.uid),
         "/usr/lib/docker/cli-plugins/docker-buildx" => {
-            f.ancestry.first().is_some_and(|p| p.exe == "/usr/bin/docker")
+            f.ancestry.first().is_some_and(|p| p.exe == "/usr/bin/docker" && p.uid == f.proc.uid)
                 && (f.proc.args.starts_with("buildx build ") || f.proc.args.starts_with("build ")
                     || f.proc.args.starts_with("buildx imagetools inspect ")
-                    || f.proc.args.starts_with("imagetools inspect "))
+                    || f.proc.args.starts_with("imagetools inspect ")
+                    || matches!(f.proc.args.trim(), "buildx ls" | "ls")
+                    || f.proc.args.starts_with("buildx ls ") || f.proc.args.starts_with("ls "))
         }
         _ => false,
     };
@@ -34,8 +43,8 @@ pub fn classify(f: &mut Finding, homes: &[String]) {
     f.meta.severity = "low".into();
     f.meta.tier = "signal".into();
     f.meta.title = "Native tool accessed its cluster configuration".into();
-    f.what_override = Some("A package-verified native authentication or build tool read its user's kubeconfig in its expected launch context. Other credential files and destinations remain monitored.".into());
-    f.extra_evidence.push("native authentication context: verified host executable, same-user kubeconfig and expected launcher; this is not permission for other tools".into());
+    f.what_override = Some("A package-owned native authentication or build tool read its user's kubeconfig in its expected launch context. Other credential files and destinations remain monitored.".into());
+    f.extra_evidence.push("native authentication context: package-owned host executable, same-user kubeconfig and expected launcher; this is not permission for other tools".into());
 }
 
 #[cfg(test)]
@@ -52,14 +61,24 @@ mod tests {
         let mut base = Finding::new("moat-cred-cloud-credentials-read", crate::policy::PolicyMeta::fallback("moat-cred-cloud-credentials-read"), p);
         base.actor.provenance = Provenance::Official;
         base.file = Some(crate::alert::FileRef { path: format!("{}/.kube/config", homes[0]), sha256: None });
-        base.ancestry.push(crate::proctable::ProcInfo { exe: "/usr/bin/kubectl".into(), ..Default::default() });
+        base.ancestry.push(crate::proctable::ProcInfo { exe: "/usr/bin/kubectl".into(), uid: unsafe { libc::geteuid() }, ..Default::default() });
         let mut yes = base.clone();
         classify(&mut yes, &homes);
         assert_eq!(yes.meta.family, "auth");
+        let mut foreign = base.clone();
+        foreign.actor.provenance = Provenance::Foreign;
+        foreign.actor.package = Some("google-cloud-cli-component-gke-gcloud-auth-plugin 584.0.0-1".into());
+        classify_with(&mut foreign, &homes, |_| true);
+        assert_eq!(foreign.meta.family, "auth");
+        let mut untrusted = base.clone();
+        untrusted.actor.provenance = Provenance::Foreign;
+        untrusted.actor.package = foreign.actor.package.clone();
+        classify_with(&mut untrusted, &homes, |_| false);
+        assert_ne!(untrusted.meta.family, "auth");
         let mut buildx = base.clone();
         buildx.proc.exe = "/usr/lib/docker/cli-plugins/docker-buildx".into();
         buildx.ancestry[0].exe = "/usr/bin/docker".into();
-        for args in ["buildx imagetools inspect registry.example/project/image:tag", "imagetools inspect registry.example/project/image:tag"] {
+        for args in ["buildx ls", "ls --format json", "buildx imagetools inspect registry.example/project/image:tag", "imagetools inspect registry.example/project/image:tag"] {
             let mut inspect = buildx.clone();
             inspect.proc.args = args.into();
             classify(&mut inspect, &homes);

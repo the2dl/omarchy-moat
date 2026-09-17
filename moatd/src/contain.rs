@@ -686,6 +686,7 @@ mod kill_tests {
 
     fn step(pid: u32, exe: &str, family: &str, role: &str) -> Step {
         Step {
+            summary: String::new(),
             alert: format!("01A{}", pid),
             ts: "2026-09-05T14:44:22Z".into(),
             family: family.into(),

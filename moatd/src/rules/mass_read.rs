@@ -94,6 +94,15 @@ impl UserRule for MassRead {
         let Some(path) = h.file_path() else {
             return Vec::new();
         };
+        // Owned application profiles and image storage are not independent
+        // credential stores. Filter before counting, not after a harvest fires.
+        if let Some(p) = ctx.table.get(exec_id) {
+            let ancestors = ctx.table.ancestry(exec_id);
+            if super::native_context::own_profile(p, &ancestors, &path, ctx.homes)
+                || super::native_context::docker_storage(p, &path) {
+                return Vec::new();
+            }
+        }
         // NOT gated on `in_home_dotdir` any more.
         //
         // The `moat-cred-*` policies above already decide what counts as a

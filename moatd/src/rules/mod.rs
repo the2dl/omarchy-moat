@@ -35,6 +35,7 @@ pub mod exec_properties;
 pub mod ai_cli;
 pub mod ai_credentials;
 pub mod native_auth;
+pub mod native_context;
 pub mod agent_config;
 pub mod mass_read;
 pub mod netmatch;
