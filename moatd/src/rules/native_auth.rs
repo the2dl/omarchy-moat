@@ -7,7 +7,7 @@ pub fn classify(f: &mut Finding, homes: &[String]) {
 }
 
 fn classify_with(f: &mut Finding, homes: &[String], trusted: impl Fn(&str) -> bool) {
-    if f.rule != "moat-cred-cloud-credentials-read"
+    if !matches!(f.rule.as_str(), "moat-cred-cloud-credentials-read" | "moat-cred-registry-token-read")
         || !(f.actor.provenance == Provenance::Official
             || (f.actor.provenance == Provenance::Foreign
                 && f.actor.package.as_deref().is_some_and(|p| p.starts_with("google-cloud-cli-component-gke-gcloud-auth-plugin "))
@@ -22,7 +22,10 @@ fn classify_with(f: &mut Finding, homes: &[String], trusted: impl Fn(&str) -> bo
     }
     let Some(file) = &f.file else { return };
     let own_config = homes.iter().any(|home| {
-        file.path == format!("{home}/.kube/config")
+        ((f.rule == "moat-cred-cloud-credentials-read" && file.path == format!("{home}/.kube/config"))
+                || (f.rule == "moat-cred-registry-token-read"
+                    && f.proc.exe == "/usr/lib/docker/cli-plugins/docker-buildx"
+                    && file.path == format!("{home}/.docker/config.json")))
             && std::fs::metadata(home).is_ok_and(|m| m.uid() == f.proc.uid)
     });
     if !own_config { return; }
@@ -42,9 +45,9 @@ fn classify_with(f: &mut Finding, homes: &[String], trusted: impl Fn(&str) -> bo
     f.meta.family = "auth".into();
     f.meta.severity = "low".into();
     f.meta.tier = "signal".into();
-    f.meta.title = "Native tool accessed its cluster configuration".into();
-    f.what_override = Some("A package-owned native authentication or build tool read its user's kubeconfig in its expected launch context. Other credential files and destinations remain monitored.".into());
-    f.extra_evidence.push("native authentication context: package-owned host executable, same-user kubeconfig and expected launcher; this is not permission for other tools".into());
+    f.meta.title = "Native tool accessed its authentication configuration".into();
+    f.what_override = Some("A package-owned native authentication or build tool read its user's authentication configuration in its expected launch context. Other credential files and destinations remain monitored.".into());
+    f.extra_evidence.push("native authentication context: package-owned host executable, same-user authentication configuration and expected launcher; this is not permission for other tools".into());
 }
 
 #[cfg(test)]
@@ -84,6 +87,16 @@ mod tests {
             classify(&mut inspect, &homes);
             assert_eq!(inspect.meta.family, "auth");
         }
+        let mut registry = buildx.clone();
+        registry.proc.args = "buildx ls".into();
+        registry.rule = "moat-cred-registry-token-read".into();
+        registry.file.as_mut().unwrap().path = format!("{}/.docker/config.json", homes[0]);
+        classify(&mut registry, &homes);
+        assert_eq!(registry.meta.family, "auth");
+        registry.meta.family = "cred".into();
+        registry.file.as_mut().unwrap().path = format!("{}/.npmrc", homes[0]);
+        classify(&mut registry, &homes);
+        assert_eq!(registry.meta.family, "cred");
         buildx.proc.args = "buildx imagetools create registry.example/project/image:tag".into();
         classify(&mut buildx, &homes);
         assert_ne!(buildx.meta.family, "auth");
