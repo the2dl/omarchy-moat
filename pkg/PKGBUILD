@@ -281,6 +281,7 @@ build() {
 }
 
 check() {
+	unset MOAT_SANDBOX MOAT_SANDBOX_ACTIVE
 	cd "${srcdir}/${_tree}/moatd"
 	export RUSTUP_TOOLCHAIN=stable
 	export CARGO_TARGET_DIR=target
