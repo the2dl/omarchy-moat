@@ -6886,7 +6886,7 @@ mod tests {
         let (mut d, _) = dev_daemon(dir.path());
         d.handle_line(r#"{"process_exec":{"process":{"exec_id":"agent-root","pid":99100,"uid":1000,"binary":"/opt/claude","cwd":"/home/dan/project"}}}"#);
         d.handle_line(r#"{"process_exec":{"process":{"exec_id":"agent-tool","pid":99101,"uid":1000,"binary":"/usr/bin/node","arguments":"/tmp/mcp.js","cwd":"/home/dan/project","parent_exec_id":"agent-root"}}}"#);
-        d.handle_line(r#"{"process_lsm":{"function_name":"file_post_open","policy_name":"moat-cred-ai-credentials-read","process":{"exec_id":"agent-tool","pid":99101,"uid":1000,"binary":"/usr/bin/node","parent_exec_id":"agent-root"},"args":[{"file_arg":{"path":"/home/dan/.claude/.credentials.json"}},{"int_arg":4}]}}"#);
+        d.handle_line(r#"{"process_lsm":{"function_name":"file_post_open","policy_name":"moat-cred-ai-credentials-read","process":{"exec_id":"agent-tool","pid":99101,"uid":1000,"binary":"/usr/bin/node","parent_exec_id":"agent-root"},"args":[{"file_arg":{"path":"/home/test/.claude/.credentials.json"}},{"int_arg":4}]}}"#);
         let rows = d.store.load();
         let alert = rows.iter().find(|a| a.rule == "moat-cred-ai-credentials-read").expect("runtime credential read must be visible");
         let session = alert.process.agent_session.as_ref().expect("session survives persistence");
