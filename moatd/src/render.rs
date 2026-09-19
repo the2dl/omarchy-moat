@@ -565,22 +565,71 @@ const LSM_KPROBE_SYMBOL: &[(&str, &str)] = &[
 
 /// Is BPF LSM usable on this kernel?
 ///
-/// Two ways to lose it and they are NOT the same failure:
+/// Three ways to lose it and they are NOT the same failure:
 ///
 /// * compiled in but absent from the active `lsm=` list -- the `bpf_lsm_*`
 ///   trampolines exist, so policies ATTACH and simply never fire. Enforcement
 ///   silently refuses nothing; detection is silently dead too.
 /// * `# CONFIG_BPF_LSM is not set` -- the symbols do not exist, attach fails,
 ///   and Tetragon reports the policy as failed to load.
+/// * `bpf` is in the active LSM list, but BPF trampolines or LSM attachment are
+///   unsupported by the kernel / architecture (e.g. Asahi Linux / arm64 kernels
+///   where CONFIG_BPF_LSM is enabled but BPF LSM trampolines are not yet available).
+///   Tetragon's probe fails with `detect modify return syscall` / `failed to attach LSM probe`.
 ///
-/// Both are answered by the same question, which is what this reads: is `bpf`
-/// in the kernel's ACTIVE LSM list. `/sys/kernel/security/lsm` is the list the
-/// kernel actually assembled, so a kernel that built the feature out cannot
-/// appear in it either way.
+/// The first check reads `/sys/kernel/security/lsm`. If `bpf` is absent, it is
+/// definitively unavailable. If `bpf` is present, when running as root we verify
+/// actual LSM attachment capability via `tetra probe` before trusting it.
 pub fn bpf_lsm_available() -> bool {
-    std::fs::read_to_string("/sys/kernel/security/lsm")
+    // Explicit override via MOAT_BPF_LSM environment variable
+    if let Ok(val) = std::env::var("MOAT_BPF_LSM") {
+        match val.to_ascii_lowercase().as_str() {
+            "0" | "false" | "no" | "off" => return false,
+            "1" | "true" | "yes" | "on" => return true,
+            _ => {}
+        }
+    }
+
+    let in_lsm = std::fs::read_to_string("/sys/kernel/security/lsm")
         .map(|s| s.split(',').any(|l| l.trim() == "bpf"))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !in_lsm {
+        return false;
+    }
+
+    // If running as root, verify that Tetragon can actually attach BPF LSM probes.
+    if unsafe { libc::geteuid() == 0 } {
+        if let Some(usable) = tetra_probe_lsm() {
+            return usable;
+        }
+    }
+
+    true
+}
+
+fn tetra_probe_lsm() -> Option<bool> {
+    let output = std::process::Command::new("/usr/bin/tetra")
+        .arg("probe")
+        .output()
+        .or_else(|_| std::process::Command::new("tetra").arg("probe").output())
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(val) = trimmed.strip_prefix("lsm:") {
+            match val.trim() {
+                "true" => return Some(true),
+                "false" => return Some(false),
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 /// Rewrite `lsmhooks:` as `kprobes:` for a kernel with no BPF LSM.
@@ -1381,6 +1430,15 @@ spec:
                 .expect("renders");
         let doc: serde_yaml::Value = serde_yaml::from_str(&body).expect("yaml");
         (name, doc, moved)
+    }
+
+    #[test]
+    fn bpf_lsm_available_honors_env_override() {
+        std::env::set_var("MOAT_BPF_LSM", "0");
+        assert!(!bpf_lsm_available());
+        std::env::set_var("MOAT_BPF_LSM", "1");
+        assert!(bpf_lsm_available());
+        std::env::remove_var("MOAT_BPF_LSM");
     }
 
     #[test]
