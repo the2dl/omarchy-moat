@@ -645,6 +645,28 @@ else
 	no "MOAT_SANDBOX=0 skips the PKGBUILD scan as well as the sandbox" "rc=$rc out=$out"
 fi
 
+# ...and query flags like --packagelist / --printsrcinfo skip the scan,
+# while -h / -V pass through unsandboxed.
+out=$(cd "$PROJ" && env PATH="$SHIMS:$PROJ:$SANDBOX_DIR:/usr/bin:/bin" HOME="$FAKE_HOME" \
+	XDG_CONFIG_HOME="$FAKE_HOME/.config" \
+	"$SHIMS/makepkg" --packagelist </dev/null 2>&1)
+rc=$?
+if ((rc == 0)) && [[ $out == *"REAL makepkg argv:--packagelist"* ]] && [[ $out != *"HIGH severity"* ]]; then
+	ok "makepkg --packagelist skips the scan so machine output is not polluted"
+else
+	no "makepkg --packagelist skips the scan so machine output is not polluted" "rc=$rc out=$out"
+fi
+
+out=$(cd "$PROJ" && env PATH="$SHIMS:$PROJ:$SANDBOX_DIR:/usr/bin:/bin" HOME="$FAKE_HOME" \
+	XDG_CONFIG_HOME="$FAKE_HOME/.config" \
+	"$SHIMS/makepkg" -h </dev/null 2>&1)
+rc=$?
+if ((rc == 0)) && [[ $out == *"REAL makepkg argv:-h"* ]] && [[ $out != *"sandboxed"* ]]; then
+	ok "makepkg -h is passed through unsandboxed"
+else
+	no "makepkg -h is passed through unsandboxed" "rc=$rc out=$out"
+fi
+
 rm -rf "$PROJ/PKGBUILD" "$PROJ/makepkg" "$PROJ/cargo" "$PROJ/go" "$PROJ/npm" \
 	"$PROJ/moat-scan-pkgbuild" "$PROJ/moat-scan-cargo" "$PROJ/moat-scan-go" "$NOSCAN_BIN"
 

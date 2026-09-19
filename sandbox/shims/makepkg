@@ -25,61 +25,41 @@ _shim_dir=${SHIM_SELF%/*}
 # shellcheck source-path=SCRIPTDIR source=shim-common.sh
 . "$_shim_dir/shim-common.sh"
 
-# --------------------------------------------------------------- PKGBUILD ---
+# Subcommands / flags that query or output machine-readable data on stdout,
+# and do not build or extract code.
+makepkg_is_passthrough() {
+	local arg
+	for arg in "$@"; do
+		case $arg in
+		-h | --help | -V | --version) return 0 ;;
+		esac
+	done
+	return 1
+}
 
-run_scan() {
-	# CONTRACT section 8: MOAT_SANDBOX=0 bypasses the shim, and both the
-	# refusal message below and moat-scan-pkgbuild's own "build anyway"
-	# hint tell the user exactly that. Scanning anyway made both of them lie:
-	# the escape hatch has to actually open.
-	#
-	# MOAT_SANDBOX_ACTIVE=1 deliberately does NOT skip the scan. A nested
-	# makepkg is usually in a different directory with a different PKGBUILD
-	# that the outer invocation never saw.
-	[[ ${MOAT_SANDBOX:-1} == 0 ]] && return 0
-	[[ -f ./PKGBUILD ]] || return 0
-	if ! command -v moat-scan-pkgbuild >/dev/null 2>&1; then
-		shim_warn "moat-scan-pkgbuild not found, skipping the PKGBUILD scan"
-		return 0
-	fi
+makepkg_scans() {
+	local arg
+	for arg in "$@"; do
+		case $arg in
+		--packagelist | --printsrcinfo | -g | --geninteg) return 1 ;;
+		esac
+	done
+	return 0
+}
 
-	local rc=0
-	moat-scan-pkgbuild . || rc=$?
-
-	case $rc in
-	0) return 0 ;;
-	1)
-		shim_warn "PKGBUILD scan: medium findings above. Continuing."
-		return 0
-		;;
-	2) ;;
-	*)
-		shim_warn "moat-scan-pkgbuild failed (exit $rc), continuing without a scan"
-		return 0
-		;;
-	esac
-
-	# High findings.
-	if ! shim_is_tty; then
-		printf '[moat] PKGBUILD scan found HIGH severity findings and this is not an interactive terminal. Refusing to build.\n' >&2
-		printf '[moat] Review the findings, then re-run from a terminal or set MOAT_SANDBOX=0 to bypass everything.\n' >&2
-		exit 1
-	fi
-	if command -v gum >/dev/null 2>&1; then
-		if gum confirm "Continue building anyway?"; then
-			shim_warn "continuing at your request despite HIGH findings"
+makepkg_target_file() {
+	local prev="" arg
+	for arg in "$@"; do
+		if [[ $prev == -p ]]; then
+			printf '%s' "$arg"
+			return 0
+		elif [[ $arg == -p* ]]; then
+			printf '%s' "${arg#-p}"
 			return 0
 		fi
-	else
-		local reply=""
-		read -r -p "[moat] HIGH findings. Continue building anyway? [y/N] " reply || reply=""
-		if [[ $reply == [yY]* ]]; then
-			shim_warn "continuing at your request despite HIGH findings"
-			return 0
-		fi
-	fi
-	printf '[moat] aborted.\n' >&2
-	exit 1
+		prev=$arg
+	done
+	printf 'PKGBUILD'
 }
 
 # ------------------------------------------------------- makepkg.conf paths ---
@@ -134,7 +114,19 @@ add_allow_for() {
 
 # ------------------------------------------------------------------- main ---
 
-run_scan
+if makepkg_is_passthrough "$@"; then
+	shim_resolve makepkg
+	PATH=$SHIM_PATH_REDUCED exec -- "$SHIM_REAL" "$@"
+fi
+
+_target=$(makepkg_target_file "$@")
+if makepkg_scans "$@" && [[ -f ./$_target ]]; then
+	if [[ $_target == PKGBUILD ]]; then
+		shim_run_scan PKGBUILD moat-scan-pkgbuild .
+	else
+		shim_run_scan PKGBUILD moat-scan-pkgbuild "$_target"
+	fi
+fi
 
 if [[ ${MOAT_SANDBOX:-1} != 0 && ${MOAT_SANDBOX_ACTIVE:-0} != 1 ]]; then
 	for key in SRCDEST PKGDEST SRCPKGDEST LOGDEST BUILDDIR; do
