@@ -85,6 +85,18 @@ name = "moat-cred-ai-credentials-read"
 exe = "/usr/share/omarchy/bin/omarchy-agent-usage-claude"
 file = "/home/*/.claude/.credentials.json"
 
+# omarchy-agent-usage-update runs usage helpers for configured agents from the shell.
+[[rule]]
+name = "moat-cred-ai-credentials-read"
+parent = "/usr/share/omarchy/bin/omarchy-agent-usage-update"
+file = "/home/*/.claude/.credentials.json"
+
+# omarchy-agent-usage-codex invokes codex app-server to collect rate limits and usage.
+[[rule]]
+name = "moat-cred-ai-credentials-read"
+parent = "/usr/share/omarchy/bin/omarchy-agent-usage-codex"
+file = "/home/*/.codex/auth.json"
+
 # quickshell's agent-usage bar widget reads the Claude credentials directly.
 [[rule]]
 name = "moat-cred-ai-credentials-read"

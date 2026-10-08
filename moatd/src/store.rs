@@ -169,9 +169,14 @@ pub struct AlertStore {
 /// The program is the interpreter's SCRIPT when there is one, so `gcloud` and
 /// `some-other.py` do not merge just because both ran through python3.
 fn incident_key(a: &Alert) -> String {
-    if let Some(chain) = a.chain.as_ref() {
-        if !chain.id.is_empty() {
-            return format!("chain\u{1}{}", chain.id);
+    let chain_id = a
+        .chain
+        .as_ref()
+        .map(|c| c.id.as_str())
+        .or(a.chain_id.as_deref());
+    if let Some(cid) = chain_id {
+        if !cid.is_empty() {
+            return format!("chain\u{1}{}", cid);
         }
     }
     let script = a.actor.script.as_deref().unwrap_or("");
@@ -1007,6 +1012,18 @@ mod tests {
         // The severity breakdown still counts ROWS: that is what it is for.
         let rows: u64 = s.unacked().values().sum();
         assert_eq!(rows, 78, "78 rows behind those three decisions");
+    }
+
+    #[test]
+    fn incident_key_groups_stripped_chain_members() {
+        let mut anchor = demo_alert("01C00000000000000000000000");
+        anchor.chain_id = Some("01CHAIN".into());
+        let mut member = demo_alert("01C00000000000000000000001");
+        member.rule = "moat-net-first-contact".into();
+        member.process.exe = "/usr/bin/curl".into();
+        member.chain_id = Some("01CHAIN".into());
+        assert_eq!(incident_key(&anchor), "chain\u{1}01CHAIN");
+        assert_eq!(incident_key(&member), "chain\u{1}01CHAIN");
     }
 
     #[test]

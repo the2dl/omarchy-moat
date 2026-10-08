@@ -1113,7 +1113,7 @@ file   = "*/.config/gcloud/*"
         };
         assert_eq!(
             al.len(),
-            10,
+            12,
             "omarchy-default.toml covers quickshell bar widgets (agent-usage, \
              weather, network-status), desktop/menu configuration writes, and \
              cargo plugin builds under ~/.config/omarchy/plugins — nothing wider."
@@ -1132,6 +1132,39 @@ file   = "*/.config/gcloud/*"
                 exe: "/usr/bin/quickshell",
                 file: Some("/home/dan/.claude/.credentials.json"),
                 parents: under_shell.clone(),
+                script: None,
+                domains: vec![],
+            })
+            .is_some()
+        );
+
+        // omarchy-agent-usage-update read of Claude credentials.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-cred-ai-credentials-read",
+                exe: "/usr/share/omarchy/bin/omarchy-agent-usage-claude",
+                file: Some("/home/dan/.claude/.credentials.json"),
+                parents: vec![
+                    "/usr/share/omarchy/bin/omarchy-agent-usage-update".to_string(),
+                    "/usr/bin/quickshell".to_string(),
+                ],
+                script: None,
+                domains: vec![],
+            })
+            .is_some()
+        );
+
+        // omarchy-agent-usage-codex read of Codex credentials.
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-cred-ai-credentials-read",
+                exe: "/home/dan/.local/share/mise/installs/codex/latest/bin/codex",
+                file: Some("/home/dan/.codex/auth.json"),
+                parents: vec![
+                    "/usr/share/omarchy/bin/omarchy-agent-usage-codex".to_string(),
+                    "/usr/share/omarchy/bin/omarchy-agent-usage-update".to_string(),
+                    "/usr/bin/quickshell".to_string(),
+                ],
                 script: None,
                 domains: vec![],
             })

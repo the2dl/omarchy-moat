@@ -126,7 +126,7 @@ if [ "$DO_BUILD" = 1 ]; then
 	say "Building the package"
 	# The PKGBUILD runs the full test suite in check(); a failure here means
 	# do not install this, so it is deliberately not skipped.
-	(cd "$HERE/pkg" && makepkg --force --syncdeps --noconfirm)
+	(cd "$HERE/pkg" && MOAT_SANDBOX=0 makepkg --force --syncdeps --noconfirm)
 fi
 
 # Ask makepkg where it put the package rather than guessing at the name.
@@ -137,7 +137,7 @@ fi
 # matches. Either way `makepkg` reports success and the install then says "no
 # package found", which reads as a build failure and is not one.
 PKG=""
-if PKG_LIST="$(cd "$HERE/pkg" && makepkg --packagelist 2>/dev/null)"; then
+if PKG_LIST="$(cd "$HERE/pkg" && MOAT_SANDBOX=0 makepkg --packagelist 2>/dev/null)"; then
 	# One line per split package; this PKGBUILD produces one.
 	for candidate in $PKG_LIST; do
 		[ -f "$candidate" ] && PKG="$candidate" && break
