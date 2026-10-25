@@ -439,7 +439,13 @@ pub fn classify_row(f: &EventFacts) -> Option<&'static MatrixRow> {
                             .is_some_and(|(cache, package)| !cache.contains('/') && package.contains('/'))
                 })
         });
-        if npm_package {
+        let pnpm_package = path
+            .split_once("/node_modules/.pnpm/")
+            .is_some_and(|(_, tail)| {
+                !tail.split('/').any(|part| part == ".." || part.is_empty())
+                    && tail.contains("/node_modules/")
+            });
+        if npm_package || pnpm_package {
             return row("exec-project-tree");
         }
         if matches_any(path, PROJECT_TREE_MARKERS) {
@@ -942,8 +948,11 @@ mod tests {
     #[test]
     fn npm_cached_packages_are_code_locations_not_dropper_evidence() {
         let homes = vec!["/home/dan".to_string()];
-        for path in ["/home/dan/.npm/_npx/abc/node_modules/tsc/bin/tsc",
-            "/home/dan/.npm/_npx/abc/node_modules/@scope/tool/dist/index.js"] {
+        for path in [
+            "/home/dan/.npm/_npx/abc/node_modules/tsc/bin/tsc",
+            "/home/dan/.npm/_npx/abc/node_modules/@scope/tool/dist/index.js",
+            "/home/dan/.cache/claude-work/lanes1022/sovereign-c07/node_modules/.pnpm/@esbuild+linux-x64@0.28.0/node_modules/@esbuild/linux-x64/bin/esbuild",
+        ] {
             let f = EventFacts { file: Some(path), homes: &homes, ..facts("exec", "moat-exec-untrusted-home") };
             assert_eq!(classify_row(&f).unwrap().key, "exec-project-tree");
         }

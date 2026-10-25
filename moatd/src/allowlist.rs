@@ -148,7 +148,7 @@ pub struct Allowlist {
 /// Deliberately NOT `Path::canonicalize`: this runs on attacker-chosen paths on
 /// the alert path, and canonicalising would follow symlinks and stat the disk
 /// for every candidate.
-fn normalize_lexical(path: &str) -> String {
+pub(crate) fn normalize_lexical(path: &str) -> String {
     let absolute = path.starts_with('/');
     let mut out: Vec<&str> = Vec::new();
     for part in path.split('/') {
@@ -1773,6 +1773,32 @@ mod cloud_cli_paths {
         assert!(
             matches("/opt/google-cloud-cli/lib/gcloud.py", "/home/dan/.config/gcloud/creds.db"),
             "Arch's google-cloud-cli layout"
+        );
+        assert!(
+            shipped()
+                .find(&Candidate {
+                    rule: "moat-cred-vcs-token-read",
+                    exe: "/usr/bin/python3.14",
+                    file: Some("/home/dan/.netrc"),
+                    parents: vec![],
+                    script: Some("/usr/bin/../../opt/google-cloud-cli/lib/gcloud.py"),
+                    domains: vec![],
+                })
+                .is_some(),
+            "gcloud's Python requests netrc probe is excused via normalized script path"
+        );
+        assert!(
+            shipped()
+                .find(&Candidate {
+                    rule: "moat-x-mass-read",
+                    exe: "/usr/bin/btrfs",
+                    file: None,
+                    parents: vec![],
+                    script: None,
+                    domains: vec![],
+                })
+                .is_some(),
+            "btrfs filesystem du extent walks are excused"
         );
     }
 

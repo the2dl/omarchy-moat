@@ -2749,7 +2749,14 @@ impl Daemon {
         // The daemon watching its own evidence-gathering is a loop, not a
         // detection, so it is cut here rather than in each policy's
         // matchBinaries, where the next rule would forget it.
-        if proc.pid == std::process::id() {
+        if proc.pid == std::process::id()
+            || (proc.exe == self.cfg.paths.tetra.to_string_lossy()
+                && self
+                    .table
+                    .ancestry(exec_id)
+                    .iter()
+                    .any(|p| p.pid == std::process::id()))
+        {
             return None;
         }
 

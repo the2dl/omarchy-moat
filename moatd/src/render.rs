@@ -608,28 +608,31 @@ pub fn bpf_lsm_available() -> bool {
 }
 
 fn tetra_probe_lsm() -> Option<bool> {
-    let output = std::process::Command::new("/usr/bin/tetra")
-        .arg("probe")
-        .output()
-        .or_else(|_| std::process::Command::new("tetra").arg("probe").output())
-        .ok()?;
+    static CACHED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let output = std::process::Command::new("/usr/bin/tetra")
+            .arg("probe")
+            .output()
+            .or_else(|_| std::process::Command::new("tetra").arg("probe").output())
+            .ok()?;
 
-    if !output.status.success() {
-        return None;
-    }
+        if !output.status.success() {
+            return None;
+        }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if let Some(val) = trimmed.strip_prefix("lsm:") {
-            match val.trim() {
-                "true" => return Some(true),
-                "false" => return Some(false),
-                _ => {}
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if let Some(val) = trimmed.strip_prefix("lsm:") {
+                match val.trim() {
+                    "true" => return Some(true),
+                    "false" => return Some(false),
+                    _ => {}
+                }
             }
         }
-    }
-    None
+        None
+    })
 }
 
 /// Rewrite `lsmhooks:` as `kprobes:` for a kernel with no BPF LSM.

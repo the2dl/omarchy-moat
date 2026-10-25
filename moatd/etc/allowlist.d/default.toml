@@ -91,6 +91,16 @@ exe = "/usr/bin/grep"
 name = "moat-x-mass-read"
 exe = "/usr/bin/rg"
 
+# btrfs filesystem du opens every file in a tree to query extent layouts via FIEMAP ioctl.
+[[rule]]
+name = "moat-cred-*"
+exe = "/usr/bin/btrfs"
+
+# btrfs filesystem du walking a home or worktree touches many dotfiles in seconds.
+[[rule]]
+name = "moat-x-mass-read"
+exe = "/usr/bin/btrfs"
+
 # Kernel internal threads (HID-BPF, scheduler extensions, net devices) have no
 # userspace executable and report `<kernel>`.
 [[rule]]
@@ -221,6 +231,67 @@ file   = "*/.config/gcloud/*"
 name   = "moat-cred-cloud-credentials-read"
 script = "/snap/google-cloud-sdk/lib/gcloud.py"
 file   = "*/.config/gcloud/*"
+
+# Python's requests library inside gcloud probes ~/.netrc for proxy/auth on every command.
+# under /opt (Arch google-cloud-cli)
+[[rule]]
+name   = "moat-cred-vcs-token-read"
+script = "/opt/google-cloud-cli/lib/gcloud.py"
+file   = "*/.netrc"
+
+# under /usr/lib (google-cloud-cli)
+[[rule]]
+name   = "moat-cred-vcs-token-read"
+script = "/usr/lib/google-cloud-cli/lib/gcloud.py"
+file   = "*/.netrc"
+
+# under /usr/share (google-cloud-cli)
+[[rule]]
+name   = "moat-cred-vcs-token-read"
+script = "/usr/share/google-cloud-cli/lib/gcloud.py"
+file   = "*/.netrc"
+
+# under /usr/local/share (google-cloud-cli)
+[[rule]]
+name   = "moat-cred-vcs-token-read"
+script = "/usr/local/share/google-cloud-cli/lib/gcloud.py"
+file   = "*/.netrc"
+
+# under /snap (google-cloud-cli)
+[[rule]]
+name   = "moat-cred-vcs-token-read"
+script = "/snap/google-cloud-cli/lib/gcloud.py"
+file   = "*/.netrc"
+
+# under /opt (google-cloud-sdk)
+[[rule]]
+name   = "moat-cred-vcs-token-read"
+script = "/opt/google-cloud-sdk/lib/gcloud.py"
+file   = "*/.netrc"
+
+# under /usr/lib (google-cloud-sdk)
+[[rule]]
+name   = "moat-cred-vcs-token-read"
+script = "/usr/lib/google-cloud-sdk/lib/gcloud.py"
+file   = "*/.netrc"
+
+# under /usr/share (google-cloud-sdk)
+[[rule]]
+name   = "moat-cred-vcs-token-read"
+script = "/usr/share/google-cloud-sdk/lib/gcloud.py"
+file   = "*/.netrc"
+
+# under /usr/local/share (google-cloud-sdk)
+[[rule]]
+name   = "moat-cred-vcs-token-read"
+script = "/usr/local/share/google-cloud-sdk/lib/gcloud.py"
+file   = "*/.netrc"
+
+# under /snap (google-cloud-sdk)
+[[rule]]
+name   = "moat-cred-vcs-token-read"
+script = "/snap/google-cloud-sdk/lib/gcloud.py"
+file   = "*/.netrc"
 
 # The AWS CLI v2 ships its own interpreter, so `exe` is usable there and this
 # is an `exe` rule rather than a `script` one -- named here beside the others

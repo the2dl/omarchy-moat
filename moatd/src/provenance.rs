@@ -618,7 +618,9 @@ impl Classifier {
         class
     }
 
-    fn classify_uncached(&self, path: &str) -> PathClass {
+    fn classify_uncached(&self, raw_path: &str) -> PathClass {
+        let norm = crate::allowlist::normalize_lexical(raw_path);
+        let path = norm.as_str();
         if let Some(pkg) = self.db.owner(path) {
             let trusted_repo = pkg.repo.is_some();
             // `%VALIDATION% none` means the package was installed without any
@@ -926,8 +928,12 @@ mod tests {
         assert_eq!(a.script.as_deref(), Some("/tmp/x.sh"));
         assert!(a.evidence().contains("interpreter takes the provenance"));
 
-        // Official bash running an official script stays official.
+        // Official bash running an official script stays official, even when
+        // invoked via a `..` launcher path like `/usr/bin/../../opt/...`.
         let a = c.classify_actor("/usr/bin/bash", "/usr/share/omarchy/bin/omarchy-x", "/");
+        assert_eq!(a.provenance, Provenance::Official);
+        assert_eq!(a.package.as_deref(), Some("omarchy-base 4.0-1"));
+        let a = c.classify_actor("/usr/bin/bash", "/usr/bin/../../usr/share/omarchy/bin/omarchy-x", "/");
         assert_eq!(a.provenance, Provenance::Official);
         assert_eq!(a.package.as_deref(), Some("omarchy-base 4.0-1"));
 

@@ -190,6 +190,9 @@ const TEMP_ROOTS: &[&str] = &["/tmp/", "/var/tmp/", "/dev/shm/"];
 /// trailing random-looking run -- so `/tmp/moat-sandbox-test.FkzONpNE/bin/x`
 /// keeps `bin/x`, which is the part that carries meaning.
 pub fn collapse_volatile(dir: &str) -> String {
+    if let Some(c) = collapse_ephemeral_worktree(dir) {
+        return c;
+    }
     let Some(root) = TEMP_ROOTS.iter().find(|r| dir.starts_with(**r)) else {
         return dir.to_string();
     };
@@ -202,6 +205,41 @@ pub fn collapse_volatile(dir: &str) -> String {
         Some(c) => format!("{}{}{}", root, c, tail),
         None => dir.to_string(),
     }
+}
+
+/// Collapse per-task git worktree and coding-lane directories under `/home/<user>`
+/// so parallel worktrees of the same repository share one rarity/triage tuple.
+fn collapse_ephemeral_worktree(dir: &str) -> Option<String> {
+    let rest = dir.strip_prefix("/home/")?;
+    let (user, after_user) = rest.split_once('/')?;
+    if user.is_empty() {
+        return None;
+    }
+    if let Some(after_cw) = after_user.strip_prefix(".cache/claude-work/") {
+        let (pool, after_pool) = after_cw.split_once('/')?;
+        if pool.starts_with("lanes") || pool.starts_with("codex-") {
+            let (lane, tail) = match after_pool.find('/') {
+                Some(i) => (&after_pool[..i], &after_pool[i..]),
+                None => (after_pool, ""),
+            };
+            if !lane.is_empty() && lane != "*" {
+                return Some(format!("/home/{}/.cache/claude-work/{}/*{}", user, pool, tail));
+            }
+        }
+    }
+    if let Some(after_proj) = after_user.strip_prefix("Projects/") {
+        let (repo_wt, after_wt) = after_proj.split_once('/')?;
+        if repo_wt.ends_with("-worktrees") && repo_wt.len() > "-worktrees".len() {
+            let (wt, tail) = match after_wt.find('/') {
+                Some(i) => (&after_wt[..i], &after_wt[i..]),
+                None => (after_wt, ""),
+            };
+            if !wt.is_empty() && wt != "*" {
+                return Some(format!("/home/{}/Projects/{}/*{}", user, repo_wt, tail));
+            }
+        }
+    }
+    None
 }
 
 /// `bun-dl-UfNh13` -> `bun-dl-*`, or `None` when nothing looks random.
@@ -288,7 +326,11 @@ fn random_run_start(seg: &str) -> Option<usize> {
     //    out of it: `.tmpAb12Cd` must not become `.*`.
     if run_start >= 2 && matches!(b[run_start - 1], b'-' | b'.') {
         let run = &seg[run_start..];
-        if is_random_run(run) || (b[run_start - 1] == b'.' && is_mkdtemp_suffix(run)) {
+        let hyphen_mkdtemp = b[run_start - 1] == b'-'
+            && (run.contains('_')
+                || seg[..run_start - 1].ends_with("-test")
+                || seg[..run_start - 1].ends_with("-tmp"));
+        if is_random_run(run) || ((b[run_start - 1] == b'.' || hyphen_mkdtemp) && is_mkdtemp_suffix(run)) {
             return Some(run_start);
         }
     }
@@ -782,6 +824,16 @@ mod tests {
         assert_eq!(dir_of("/tmp/moat-shim-test.agokzoqa/bin/x"), "/tmp/moat-shim-test.*/bin");
         assert_eq!(dir_of("/tmp/moat-build-shim-test._lfzuzkt/x"), "/tmp/moat-build-shim-test.*");
         assert_eq!(dir_of("/tmp/moat-linux-memfd-xdk1_5k5/x"), "/tmp/moat-linux-memfd-*");
+        assert_eq!(dir_of("/tmp/lake-health-build-test-agokzoqa/bin/x"), "/tmp/lake-health-build-test-*/bin");
+        assert_eq!(dir_of("/tmp/lake-health-build-test-f1xl1b_z/bin/x"), "/tmp/lake-health-build-test-*/bin");
+        assert_eq!(
+            dir_of("/home/dan/.cache/claude-work/lanes1022/sovereign-c07/apps/docs-site/node_modules/.bin/fumadocs-mdx"),
+            "/home/dan/.cache/claude-work/lanes1022/*/apps/docs-site/node_modules/.bin"
+        );
+        assert_eq!(
+            dir_of("/home/dan/Projects/nano-main-worktrees/regiontest-t52/node_modules/.pnpm/tsx/bin"),
+            "/home/dan/Projects/nano-main-worktrees/*/node_modules/.pnpm/tsx"
+        );
         // Only after a dot. A bare `-` plus eight lowercase letters is an
         // ordinary name, and there are real ones under /tmp.
         assert_eq!(dir_of("/tmp/gnome-software/x"), "/tmp/gnome-software");
