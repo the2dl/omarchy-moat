@@ -71,6 +71,14 @@ exe = "/usr/lib/systemd/systemd-coredump"
 name = "moat-priv-setuid-*"
 parent = "/usr/bin/pacman"
 
+# pacman extracts package-owned shell profile drop-ins (/etc/profile.d/jre.sh, etc.).
+# Post-install scripts run as /usr/bin/bash, not /usr/bin/pacman, so a script
+# modifying ~/.bashrc or /etc/profile.d still fires.
+[[rule]]
+name = "moat-persist-shell-rc-write"
+exe = "/usr/bin/pacman"
+file = "/etc/*"
+
 # nautilus file manager reads dotfiles and previews when browsing the home directory.
 [[rule]]
 name = "moat-cred-*"

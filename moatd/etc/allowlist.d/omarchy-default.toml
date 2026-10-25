@@ -121,11 +121,27 @@ name = "moat-priv-uid-transition"
 exe = "/usr/bin/ping"
 parent = "/usr/share/omarchy/bin/omarchy-network-status"
 
+# omarchy-network-status spawning ping can report the uid transition before ping's exec is observed.
+[[rule]]
+name = "moat-priv-uid-transition"
+exe = "/usr/share/omarchy/bin/omarchy-network-status"
+
 # omarchy-shell bar fetches weather status with curl.
 [[rule]]
 name = "moat-net-first-contact"
 exe = "/usr/bin/curl"
 parent = "/usr/bin/quickshell"
+
+# quickshell (or a fast-forked curl child attributed to quickshell) fetches weather status.
+[[rule]]
+name = "moat-net-first-contact"
+exe = "/usr/bin/quickshell"
+
+# quickshell (or a fast-forked curl child attributed to quickshell) opens known_hosts via libcurl.
+[[rule]]
+name = "moat-cred-ssh-recon-read"
+exe = "/usr/bin/quickshell"
+file = "/home/*/.ssh/known_hosts"
 
 # omarchy-agent-usage-claude queries Anthropic API for usage stats.
 [[rule]]

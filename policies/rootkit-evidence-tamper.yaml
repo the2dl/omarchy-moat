@@ -44,6 +44,7 @@ spec:
         - "/usr/bin/tetragon"
         - "/usr/bin/systemd-tmpfiles"
         - "/usr/lib/systemd/systemd"
+        - "/usr/lib/systemd/systemd-executor"
         - "/usr/bin/logrotate"
       matchArgs:
       # No trailing slash: the parent of /var/lib/moat/alerts.jsonl is
@@ -76,6 +77,7 @@ spec:
         - "/usr/bin/tetragon"
         - "/usr/bin/systemd-tmpfiles"
         - "/usr/lib/systemd/systemd"
+        - "/usr/lib/systemd/systemd-executor"
         - "/usr/bin/logrotate"
       matchArgs:
       - index: 0
@@ -109,6 +111,7 @@ spec:
         - "/usr/bin/tetragon"
         - "/usr/bin/systemd-tmpfiles"
         - "/usr/lib/systemd/systemd"
+        - "/usr/lib/systemd/systemd-executor"
         - "/usr/bin/logrotate"
       matchArgs:
       - index: 0

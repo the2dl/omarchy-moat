@@ -101,7 +101,16 @@ pub const INTERACTIVE: &[&str] = &[
 // root of a story" are different questions and `sudo` answers them differently.
 
 /// The AI CLIs CONTRACT §6.4 names.
-pub const AI_CLIS: &[&str] = &["claude", "codex", "gemini", "opencode", "q", "amp"];
+pub const AI_CLIS: &[&str] = &[
+    "claude",
+    "codex",
+    "gemini",
+    "opencode",
+    "q",
+    "amp",
+    "agy",
+    "antigravity",
+];
 
 /// Flags that hand an agent the keys.
 pub const SKIP_PERMISSION_FLAGS: &[&str] = &[

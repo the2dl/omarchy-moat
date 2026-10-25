@@ -76,10 +76,13 @@ impl UserRule for AiCredentials {
                         && (f.proc.args.starts_with("daemon run --origin transient --spawned-by ")
                             || (f.proc.args.contains("--fork-session")
                                 && f.proc.args.contains("--resume ")));
+                    let matches_owner = session.agent == owner
+                        || (owner == "gemini"
+                            && matches!(session.agent.as_str(), "agy" | "antigravity"));
                     (session_owner || native_claude_helper)
-                        && session.agent == owner
+                        && matches_owner
                         && crate::agent::invocation(&f.proc.exe, &f.proc.args).as_deref()
-                            == Some(owner)
+                            == Some(session.agent.as_str())
                         && !crate::rules::pkgtree::in_pkg_subtree(ctx.table, id)
                 })
                 .unwrap_or(false);

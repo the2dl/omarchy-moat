@@ -57,6 +57,7 @@ spec:
         - "/clamscan"
         - "/clamd"
         - "/freshclam"
+        - "/systemd-tmpfiles"
         - "/moatd"
         - "/moatctl"
       matchArgs:

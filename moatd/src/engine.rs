@@ -5628,33 +5628,46 @@ impl Daemon {
 
         let summary = if on {
             let homes = crate::util::human_homes(&self.cfg.paths.passwd);
-            let existing: Vec<String> = manifest.paths();
             let mut planted = 0usize;
             let now = crate::util::unix_secs();
-            for (kind, path) in crate::canary::plan(&homes, per_kind) {
-                if existing.iter().any(|p| p == &path.display().to_string()) {
-                    continue;
-                }
-                match crate::canary::plant(kind, &path, now) {
-                    Ok(c) => {
-                        manifest.canaries.push(c);
-                        planted += 1;
+            for c in &mut manifest.canaries {
+                let p = std::path::Path::new(&c.path);
+                if !p.exists() {
+                    match crate::canary::plant(c.kind, p, now) {
+                        Ok(replanted) => {
+                            c.planted = replanted.planted;
+                            planted += 1;
+                        }
+                        Err(e) => {
+                            log::warn!("canary: {}", e);
+                            failures.push(e);
+                        }
                     }
-                    // One unwritable directory is not a reason to abandon the
-                    // rest: /root may not exist, /var/tmp may be a read-only
-                    // mount, and decoys in the other four places are still
-                    // worth having.
-                    //
-                    // But it IS a reason to say so. The first cut only logged
-                    // this, and on 2026-09-10 `canary --on` planted two files
-                    // in /tmp, failed five times on EROFS, and reported "2
-                    // decoy file(s) planted" as a success -- a security feature
-                    // reporting that it was watching /etc and /root when it was
-                    // watching neither. A partial plant that looks like a whole
-                    // one is worse than a plant that fails outright.
-                    Err(e) => {
-                        log::warn!("canary: {}", e);
-                        failures.push(e);
+                }
+            }
+            if manifest.canaries.is_empty() {
+                for (kind, path) in crate::canary::plan(&homes, per_kind) {
+                    match crate::canary::plant(kind, &path, now) {
+                        Ok(c) => {
+                            manifest.canaries.push(c);
+                            planted += 1;
+                        }
+                        // One unwritable directory is not a reason to abandon the
+                        // rest: /root may not exist, /var/tmp may be a read-only
+                        // mount, and decoys in the other four places are still
+                        // worth having.
+                        //
+                        // But it IS a reason to say so. The first cut only logged
+                        // this, and on 2026-09-10 `canary --on` planted two files
+                        // in /tmp, failed five times on EROFS, and reported "2
+                        // decoy file(s) planted" as a success -- a security feature
+                        // reporting that it was watching /etc and /root when it was
+                        // watching neither. A partial plant that looks like a whole
+                        // one is worse than a plant that fails outright.
+                        Err(e) => {
+                            log::warn!("canary: {}", e);
+                            failures.push(e);
+                        }
                     }
                 }
             }

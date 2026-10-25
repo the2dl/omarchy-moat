@@ -122,7 +122,7 @@ pub const INTERACTIVE_EXTRA: &[&str] = &[
 /// Started without a human at a prompt. This is where persistence lives, which
 /// is why `service` never earns a downgrade.
 pub const SERVICE_ROOTS: &[&str] = &[
-    "systemd", "systemd-user", "init",
+    "systemd", "systemd-executor", "systemd-user", "init",
     "Hyprland", "hyprland", "quickshell", "uwsm", "hyprctl", "waybar", "sway", "river",
     "gdm", "gdm-session-worker", "sddm", "sddm-helper", "greetd", "ly", "lightdm",
     "cron", "crond", "anacron", "atd", "fcron",
@@ -132,7 +132,17 @@ pub const SERVICE_ROOTS: &[&str] = &[
 ];
 
 /// An AI agent CLI is transparent: it inherits whatever root is above it.
-pub const TRANSPARENT: &[&str] = &["claude", "codex", "gemini", "opencode", "amp", "q", "aider"];
+pub const TRANSPARENT: &[&str] = &[
+    "claude",
+    "codex",
+    "gemini",
+    "opencode",
+    "amp",
+    "q",
+    "aider",
+    "agy",
+    "antigravity",
+];
 
 /// What this NAME says, if anything.
 ///

@@ -1113,7 +1113,7 @@ file   = "*/.config/gcloud/*"
         };
         assert_eq!(
             al.len(),
-            12,
+            15,
             "omarchy-default.toml covers quickshell bar widgets (agent-usage, \
              weather, network-status), desktop/menu configuration writes, and \
              cargo plugin builds under ~/.config/omarchy/plugins — nothing wider."
@@ -1222,6 +1222,39 @@ file   = "*/.config/gcloud/*"
                 parents: under_shell.clone(),
                 script: None,
                 domains: vec!["wttr.in".to_string()],
+            })
+            .is_some()
+        );
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-net-first-contact",
+                exe: "/usr/bin/quickshell",
+                file: None,
+                parents: under_shell.clone(),
+                script: None,
+                domains: vec!["wttr.in".to_string()],
+            })
+            .is_some()
+        );
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-cred-ssh-recon-read",
+                exe: "/usr/bin/quickshell",
+                file: Some("/home/dan/.ssh/known_hosts"),
+                parents: under_shell.clone(),
+                script: None,
+                domains: vec![],
+            })
+            .is_some()
+        );
+        assert!(
+            al.find(&Candidate {
+                rule: "moat-priv-uid-transition",
+                exe: "/usr/share/omarchy/bin/omarchy-network-status",
+                file: None,
+                parents: under_shell.clone(),
+                script: None,
+                domains: vec![],
             })
             .is_some()
         );

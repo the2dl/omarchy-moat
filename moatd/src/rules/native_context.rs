@@ -102,6 +102,23 @@ fn classify_with(f: &mut Finding, homes: &[String], trusted: impl Fn(&str) -> bo
         && f.ancestry.iter().any(|p| p.uid == f.proc.uid && host(p)
             && p.exe == "/opt/google/chrome/chrome" && trusted(&p.exe)) {
         "Browser launched its Claude native messaging helper; headlessness alone does not establish agent abuse"
+    } else if f.rule == "moat-x-ai-cli-headless"
+        && f.proc.comm() == "codex"
+        && f.proc.args.trim() == "-s read-only -a on-request app-server"
+        && f.ancestry.iter().any(|p| p.uid == f.proc.uid && host(p)
+            && p.exe == "/usr/bin/quickshell"
+            && p.args == "-n -p /usr/share/omarchy/shell"
+            && trusted(&p.exe)) {
+        "Omarchy shell launched a read-only Codex app-server to query usage limits"
+    } else if matches!(f.rule.as_str(), "moat-priv-capability-gained" | "moat-rootkit-evidence-tamper")
+        && f.proc.uid == 0
+        && f.proc.exe == "/usr/lib/systemd/systemd-executor"
+        && trusted(&f.proc.exe)
+        && crate::util::is_systemd_executor_args(&f.proc.args)
+        && f.ancestry.first().is_some_and(|p| p.uid == 0 && matches!(p.exe.as_str(), "/usr/lib/systemd/systemd" | "<kernel>"))
+        && (f.rule == "moat-priv-capability-gained"
+            || f.file.as_ref().is_some_and(|file| file.path == "/var/lib/moat/feeds" || beneath(&file.path, "/var/lib/moat/feeds"))) {
+        "systemd-executor prepared a service unit's namespace or capability set before exec; service execution itself remains monitored"
     } else if f.rule == "moat-priv-ptrace-attach"
         && f.proc.exe == "/opt/google/chrome/chrome_crashpad_handler"
         && trusted(&f.proc.exe)
@@ -199,6 +216,32 @@ mod tests {
         crash.actor.modified = None;
         crash.proc.args = "--database=/tmp/other".into();
         assert!(!classify_with(&mut crash, &homes, |_| true));
+
+        let mut codex = finding(
+            "moat-x-ai-cli-headless",
+            "/home/user/.local/share/mise/installs/codex/latest/bin/codex",
+            "-s read-only -a on-request app-server",
+            uid,
+        );
+        codex.ancestry.push(finding("unused", "/usr/bin/quickshell", "-n -p /usr/share/omarchy/shell", uid).proc);
+        assert!(classify_with(&mut codex.clone(), &homes, |_| true));
+        codex.proc.args = "exec --full-auto".into();
+        assert!(!classify_with(&mut codex, &homes, |_| true));
+
+        let mut exec = finding(
+            "moat-priv-capability-gained",
+            "/usr/lib/systemd/systemd-executor",
+            "--deserialize 132 --log-level info --log-target journal-or-kmsg",
+            0,
+        );
+        exec.ancestry.push(finding("unused", "/usr/lib/systemd/systemd", "--system", 0).proc);
+        assert!(classify_with(&mut exec.clone(), &homes, |_| true));
+        let mut feeds = exec.clone();
+        feeds.rule = "moat-rootkit-evidence-tamper".into();
+        feeds.file = Some(crate::alert::FileRef { path: "/var/lib/moat/feeds".into(), sha256: None });
+        assert!(classify_with(&mut feeds.clone(), &homes, |_| true));
+        feeds.file.as_mut().unwrap().path = "/var/lib/moat/alerts.jsonl".into();
+        assert!(!classify_with(&mut feeds, &homes, |_| true));
     }
 
     #[test]

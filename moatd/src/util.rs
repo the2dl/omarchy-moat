@@ -411,6 +411,18 @@ pub fn is_proc_self_fd(exe: &str) -> bool {
     exe.starts_with(PROC_SELF_FD)
 }
 
+/// True when `args` matches the `--deserialize <fd> --log-level <lvl> --log-target <tgt>`
+/// invocation systemd passes when it `fexecve`s `/usr/lib/systemd/systemd-executor`.
+pub fn is_systemd_executor_args(args: &str) -> bool {
+    let words: Vec<&str> = args.split_whitespace().collect();
+    words.len() >= 6
+        && words[0] == "--deserialize"
+        && !words[1].is_empty()
+        && words[1].chars().all(|c| c.is_ascii_digit())
+        && words.windows(2).any(|w| w[0] == "--log-level")
+        && words.windows(2).any(|w| w[0] == "--log-target")
+}
+
 /// Recover the real path of a `/proc/self/fd/<n>` binary.
 ///
 /// Order of preference:

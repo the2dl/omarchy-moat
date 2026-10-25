@@ -145,7 +145,7 @@ pub fn agent_home_dir(agent: &str) -> Option<&'static str> {
     match agent.trim() {
         "claude" => Some("~/.claude"),
         "codex" => Some("~/.codex"),
-        "gemini" => Some("~/.gemini"),
+        "gemini" | "agy" | "antigravity" => Some("~/.gemini"),
         "opencode" => Some("~/.opencode"),
         _ => None,
     }

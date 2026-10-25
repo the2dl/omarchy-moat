@@ -291,13 +291,31 @@ impl ProcTable {
             return;
         }
         let reported = me.exe.clone();
-        let parent_args = me
+        let self_args = me.args.clone();
+        let self_cwd = me.cwd.clone();
+        let parent_info = me
             .parent_exec_id
             .clone()
             .and_then(|p| self.map.get(&p))
-            .map(|p| p.args.clone());
-        let (exe, note) =
-            crate::util::resolve_exec_binary(&reported, binprm, parent_args.as_deref());
+            .map(|p| (p.exe.clone(), p.args.clone(), p.uid));
+        let parent_args = parent_info.as_ref().map(|(_, a, _)| a.as_str());
+        let (mut exe, mut note) =
+            crate::util::resolve_exec_binary(&reported, binprm, parent_args);
+        if crate::util::is_proc_self_fd(&exe)
+            && self_cwd == "/"
+            && crate::util::is_systemd_executor_args(&self_args)
+            && parent_info.as_ref().is_some_and(|(pexe, _, puid)| {
+                matches!(pexe.as_str(), "/usr/lib/systemd/systemd" | "<kernel>")
+                    && (*puid == 0 || *puid == me.uid)
+            })
+        {
+            exe = "/usr/lib/systemd/systemd-executor".to_string();
+            note = Some(format!(
+                "binary reported as {} (executed from a file descriptor); resolved to \
+                 /usr/lib/systemd/systemd-executor from systemd's executor invocation",
+                reported
+            ));
+        }
         if let Some(me) = self.map.get_mut(exec_id) {
             me.exe = exe;
             me.exe_note = note;
@@ -661,6 +679,30 @@ mod tests {
         });
         t.resolve_fd_binary("e-fd", Some("/home/dan/proj/payload"));
         assert_eq!(t.get("e-fd").unwrap().exe, "/home/dan/proj/payload");
+
+        // systemd v256+ fexecve's /usr/lib/systemd/systemd-executor via /proc/self/fd/9.
+        t.observe(&Process {
+            exec_id: Some("e-pid1".into()),
+            pid: Some(1),
+            uid: Some(0),
+            binary: Some("/usr/lib/systemd/systemd".into()),
+            arguments: Some("--system".into()),
+            ..Default::default()
+        });
+        t.on_exec(&ExecEvent {
+            process: Some(Process {
+                exec_id: Some("e-exec".into()),
+                pid: Some(500),
+                uid: Some(0),
+                cwd: Some("/".into()),
+                binary: Some("/proc/self/fd/9".into()),
+                arguments: Some("--deserialize 202 --log-level info --log-target journal-or-kmsg".into()),
+                parent_exec_id: Some("e-pid1".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(t.get("e-exec").unwrap().exe, "/usr/lib/systemd/systemd-executor");
     }
 
     /// One read of /proc/<pid>/stat yields both fields. Asked of our own

@@ -138,3 +138,36 @@ parent = "*/sandbox/shims/*"
 name = "moat-exec-untrusted-tmpfs"
 file = "/tmp/moat-build-shim-test.*/*"
 parent = "*/sandbox/shims/*"
+
+# cargo test exercises canary/credential/git-config rules against tempdir fixtures.
+[[rule]]
+name = "moat-cred-vcs-token-read"
+exe = "*/target/*/deps/moatd-*"
+file = "/tmp/.tmp*/.netrc"
+
+[[rule]]
+name = "moat-cred-project-token-read"
+exe = "*/target/*/deps/moatd-*"
+file = "/tmp/.tmp*/.netrc"
+
+[[rule]]
+name = "moat-persist-git-config-write"
+exe = "*/target/*/deps/moatd-*"
+file = "/tmp/.tmp*/.git/config"
+
+# sandbox/tests/run.sh verifies that the fake home .netrc is untouched and runs
+# its fake scanner/probe directly from bash/env.
+[[rule]]
+name = "moat-cred-vcs-token-read"
+exe = "/usr/bin/grep"
+file = "/tmp/moat-sandbox-test.*/home/.netrc"
+
+[[rule]]
+name = "moat-exec-untrusted-tmpfs"
+exe = "/usr/bin/bash"
+file = "/tmp/moat-sandbox-test.*/home/proj/moat-scan-pkgbuild"
+
+[[rule]]
+name = "moat-exec-untrusted-tmpfs"
+exe = "/usr/bin/env"
+file = "/tmp/moat-sandbox-test.*/bin/moat-shim-probe"
