@@ -123,6 +123,20 @@ fn observed_session(_pid: u32) -> (Option<u32>, Option<u32>) {
     (None, None)
 }
 
+pub const MAX_PROCS: usize = 32_768;
+
+#[cfg(not(test))]
+fn live_pids_from_proc() -> Option<std::collections::HashSet<u32>> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let mut pids = std::collections::HashSet::new();
+    for entry in entries.flatten() {
+        if let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) {
+            pids.insert(pid);
+        }
+    }
+    (!pids.is_empty()).then_some(pids)
+}
+
 impl ProcInfo {
     pub fn comm(&self) -> &str {
         crate::util::basename(&self.exe)
@@ -131,6 +145,7 @@ impl ProcInfo {
 
 pub struct ProcTable {
     map: HashMap<String, ProcInfo>,
+    children: HashMap<String, Vec<String>>,
     pub max_depth: usize,
     pub prune_secs: u64,
 }
@@ -139,6 +154,7 @@ impl ProcTable {
     pub fn new(max_depth: usize, prune_secs: u64) -> ProcTable {
         ProcTable {
             map: HashMap::new(),
+            children: HashMap::new(),
             max_depth,
             prune_secs,
         }
@@ -198,17 +214,37 @@ impl ProcTable {
             if let Some(cwd) = p.cwd.as_ref().filter(|s| !s.is_empty()) {
                 if &existing.cwd != cwd { existing.cwd.clone_from(cwd); }
             }
+            let mut parent_changed = None;
             if let Some(parent) = p.parent_exec_id.as_ref().filter(|s| !s.is_empty()) {
                 if existing.parent_exec_id.as_ref() != Some(parent) {
-                    existing.parent_exec_id = Some(parent.clone());
+                    let old = existing.parent_exec_id.replace(parent.clone());
+                    parent_changed = Some((old, parent.clone()));
                 }
             }
             if existing.pid == 0 { existing.pid = p.pid.unwrap_or(0); }
             if let Some(container) = p.in_container() { existing.in_container = Some(container); }
+            if let Some((old_parent, new_parent)) = parent_changed {
+                if let Some(old) = old_parent {
+                    if let Some(kids) = self.children.get_mut(&old) {
+                        kids.retain(|k| k != &exec_id);
+                    }
+                }
+                let kids = self.children.entry(new_parent).or_default();
+                if !kids.contains(&exec_id) {
+                    kids.push(exec_id.clone());
+                }
+            }
             return Some(exec_id);
         }
         // Session lookup is per exec identity, never per repeated event or PID.
         let (sid, tty) = observed_session(p.pid.unwrap_or(0));
+        let parent_exec_id = p.parent_exec_id.clone().filter(|s| !s.is_empty());
+        if let Some(ref parent) = parent_exec_id {
+            let kids = self.children.entry(parent.clone()).or_default();
+            if !kids.contains(&exec_id) {
+                kids.push(exec_id.clone());
+            }
+        }
         let info = ProcInfo {
             agent_session,
             exec_id: exec_id.clone(),
@@ -218,7 +254,7 @@ impl ProcTable {
             args: p.args().to_string(),
             cwd: p.cwd.clone().unwrap_or_default(),
             start_time: p.start_time.clone().unwrap_or_default(),
-            parent_exec_id: p.parent_exec_id.clone().filter(|s| !s.is_empty()),
+            parent_exec_id,
             exited_at: None,
             exit_signal: None,
             exe_note: None,
@@ -292,12 +328,14 @@ impl ProcTable {
         if parent_exec_id.is_empty() {
             return Vec::new();
         }
-        let mut out: Vec<&ProcInfo> = self
-            .map
-            .values()
-            .filter(|p| {
-                p.parent_exec_id.as_deref() == Some(parent_exec_id) && p.exec_id != on_path
-            })
+        let Some(kids) = self.children.get(parent_exec_id) else {
+            return Vec::new();
+        };
+        let mut out: Vec<&ProcInfo> = kids
+            .iter()
+            .filter(|id| id.as_str() != on_path)
+            .filter_map(|id| self.map.get(id))
+            .filter(|p| p.parent_exec_id.as_deref() == Some(parent_exec_id))
             .collect();
         // Oldest first, so the order a person reads them in matches the order
         // they happened. HashMap iteration is arbitrary and would reshuffle the
@@ -400,9 +438,44 @@ impl ProcTable {
     }
 
     pub fn prune(&mut self, now: u64) {
+        // Any entry whose PID is no longer in /proc (for instance, a parent
+        // re-inserted by a descendant's event after its own exit was pruned,
+        // or a process whose exit event was lost on log rotation) is stamped
+        // as exited now so it ages out after `prune_secs` instead of living
+        // forever.
+        #[cfg(not(test))]
+        if let Some(live_pids) = live_pids_from_proc() {
+            for v in self.map.values_mut() {
+                if v.exited_at.is_none() && (v.pid == 0 || !live_pids.contains(&v.pid)) {
+                    v.exited_at = Some(now);
+                }
+            }
+        }
+        let before = self.map.len();
         let cutoff = self.prune_secs;
         self.map
             .retain(|_, v| v.exited_at.map(|t| now.saturating_sub(t) < cutoff).unwrap_or(true));
+        if self.map.len() > MAX_PROCS {
+            let target = MAX_PROCS - MAX_PROCS / 10;
+            let mut order: Vec<(String, bool, String)> = self
+                .map
+                .iter()
+                .map(|(k, v)| (k.clone(), v.exited_at.is_none(), v.start_time.clone()))
+                .collect();
+            // Evict exited entries first (false < true), then oldest start_time.
+            order.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)));
+            let to_remove = self.map.len().saturating_sub(target);
+            for (k, _, _) in order.into_iter().take(to_remove) {
+                self.map.remove(&k);
+            }
+        }
+        if self.map.len() != before || self.children.len() > self.map.len() {
+            let map = &self.map;
+            self.children.retain(|_, kids| {
+                kids.retain(|k| map.contains_key(k));
+                !kids.is_empty()
+            });
+        }
     }
 }
 
@@ -615,6 +688,24 @@ mod tests {
         });
         assert_eq!(t.get(NODE).unwrap().exe, before.exe);
         assert_eq!(t.get(NODE).unwrap().cwd, before.cwd);
+    }
+
+    #[test]
+    fn prune_enforces_max_procs_and_cleans_children_index() {
+        let mut t = ProcTable::new(8, 60);
+        for i in 0..(MAX_PROCS + 500) {
+            t.observe(&Process {
+                exec_id: Some(format!("e-{i}")),
+                pid: Some((i as u32) + 100),
+                binary: Some("/usr/bin/true".into()),
+                start_time: Some(format!("2026-09-03T00:00:{:08}", i)),
+                parent_exec_id: Some("root-sh".into()),
+                ..Default::default()
+            });
+        }
+        t.prune(1_000);
+        assert!(t.len() <= MAX_PROCS);
+        assert_eq!(t.other_children("root-sh", "").len(), t.len());
     }
 }
 

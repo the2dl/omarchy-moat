@@ -34,6 +34,7 @@ use crate::allowlist::{render_block, RuleSpec};
 
 pub const BASELINE_V: u32 = 1;
 pub const DAY: u64 = 86_400;
+pub const MAX_TUPLES: usize = 10_000;
 
 /// Rules moat raises about *itself*. Learning them would silence the machinery
 /// that reports the machinery.
@@ -358,7 +359,7 @@ impl Baseline {
             state.learning_until = state.installed_at + learning_days * DAY;
             dirty = true;
         }
-        Baseline {
+        let mut b = Baseline {
             state,
             path,
             group: group.to_string(),
@@ -369,7 +370,21 @@ impl Baseline {
             dirty,
             last_save: 0,
             save_every: 60,
+        };
+        let hour = now / 3_600;
+        let cutoff = hour.saturating_sub(23);
+        let win_before = b.state.windows.len();
+        b.state.windows.retain(|_, w| {
+            w.retain(|h, _| *h >= cutoff);
+            !w.is_empty()
+        });
+        if b.state.windows.len() != win_before {
+            b.dirty = true;
         }
+        if b.state.tuples.len() > MAX_TUPLES {
+            b.prune_tuples(None);
+        }
+        b
     }
 
     // ------------------------------------------------------------ the window
@@ -450,9 +465,12 @@ impl Baseline {
 
         let stat = e.clone();
         if !self.eligible(&stat) {
+            if self.state.tuples.len() > MAX_TUPLES {
+                self.prune_tuples(Some(&key));
+            }
             return Learned::None;
         }
-        if self.learning(o.now) {
+        let out = if self.learning(o.now) {
             let entry = self.state.tuples.get_mut(&key).expect("just inserted");
             entry.learned = true;
             self.state.learned.insert(
@@ -467,7 +485,7 @@ impl Baseline {
                 },
             );
             Learned::Entry {
-                key,
+                key: key.clone(),
                 toml: stat.toml(),
                 comment: stat.comment("learned"),
             }
@@ -486,11 +504,77 @@ impl Baseline {
                 first_seen: stat.first_seen.clone(),
                 last_seen: stat.last_seen.clone(),
                 toml: stat.toml(),
-                key,
+                key: key.clone(),
                 // The ordinary route: the baseline IS confident about this one.
                 reason: String::new(),
             });
             Learned::Proposed { id }
+        };
+        if self.state.tuples.len() > MAX_TUPLES {
+            self.prune_tuples(Some(&key));
+        }
+        out
+    }
+
+    /// Cap `state.tuples` at `MAX_TUPLES` with 10% hysteresis, preserving any
+    /// tuple that is learned, proposed, dismissed, or currently demoted, and
+    /// dropping single-sighting / non-learnable / oldest tuples first.
+    pub fn prune_tuples(&mut self, protect_key: Option<&str>) {
+        if self.state.tuples.len() <= MAX_TUPLES {
+            return;
+        }
+        let target = MAX_TUPLES - MAX_TUPLES / 10;
+        let to_drop = self.state.tuples.len().saturating_sub(target);
+        if to_drop == 0 {
+            return;
+        }
+        let proposed_keys: std::collections::HashSet<&str> =
+            self.state.proposals.iter().map(|p| p.key.as_str()).collect();
+        let mut candidates: Vec<(String, bool, usize, u64, String)> = self
+            .state
+            .tuples
+            .iter()
+            .filter(|(k, t)| {
+                Some(k.as_str()) != protect_key
+                    && !t.learned
+                    && !t.proposed
+                    && !t.dismissed
+                    && !self.state.learned.contains_key(*k)
+                    && !self.state.demoted_tuples.contains_key(*k)
+                    && !proposed_keys.contains(k.as_str())
+            })
+            .map(|(k, t)| {
+                let can_ever_learn = !NEVER_LEARN.contains(&t.rule.as_str())
+                    && t.provenance == "official"
+                    && t.max_base_rank <= crate::alert::severity_rank("medium")
+                    && t.max_rank < crate::alert::severity_rank("critical");
+                (
+                    k.clone(),
+                    can_ever_learn,
+                    t.days.len(),
+                    t.count,
+                    t.last_seen.clone(),
+                )
+            })
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.3.cmp(&b.3))
+                .then_with(|| a.4.cmp(&b.4))
+        });
+        let before = self.state.tuples.len();
+        for (k, _, _, _, _) in candidates.into_iter().take(to_drop) {
+            self.state.tuples.remove(&k);
+        }
+        if self.state.tuples.len() != before {
+            self.dirty = true;
+            log::warn!(
+                "baseline: at the {} tuple cap; dropped {} of {} coldest tuples",
+                MAX_TUPLES,
+                before - self.state.tuples.len(),
+                before
+            );
         }
     }
 
@@ -889,6 +973,14 @@ impl Baseline {
     pub fn clear_stale_demotions(&mut self, now: u64) -> Vec<String> {
         let hour = now / 3_600;
         let cutoff = hour.saturating_sub(23);
+        let win_before = self.state.windows.len();
+        self.state.windows.retain(|_, w| {
+            w.retain(|h, _| *h >= cutoff);
+            !w.is_empty()
+        });
+        if self.state.windows.len() != win_before {
+            self.dirty = true;
+        }
         let mut cleared = Vec::new();
         // Every demotion is pattern-scoped. Without this they would be
         // permanent, which is a worse promise than a circuit breaker.
@@ -1624,5 +1716,45 @@ mod tests {
         b.mark_revoked(&key, "the owning package is no longer official");
         assert!(b.learned_entries().is_empty());
         assert_eq!(b.status(NOW)["learned"], 0);
+    }
+
+    #[test]
+    fn tuple_and_window_caps_evict_ephemeral_noise_while_keeping_learned_and_official() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = baseline(dir.path(), NOW);
+        // Learn an official pattern first.
+        for d in 0..3 {
+            b.observe(&obs(d, "medium", "official", "common"));
+        }
+        assert_eq!(b.learned_entries().len(), 1);
+        let learned_key = b.learned_entries()[0].key.clone();
+
+        // Flood with ephemeral single-sighting tuples past MAX_TUPLES.
+        for i in 0..(MAX_TUPLES + 500) {
+            let dir_path = format!("/home/dan/Projects/worktree-{i}/target/debug");
+            b.observe(&Observation {
+                rule: "moat-x-sensor-mismatch",
+                exe: "/usr/bin/cargo",
+                parent: "/usr/bin/bash",
+                dir: &dir_path,
+                severity: "low",
+                severity_base: "low",
+                provenance: "user",
+                package: None,
+                context: "interactive",
+                rarity: "first_seen",
+                suppressed: false,
+                demoted: false,
+                ts: crate::util::rfc3339_of(NOW),
+                now: NOW,
+            });
+            b.note_alert("moat-x-sensor-mismatch", &dir_path, NOW);
+        }
+        assert!(b.state.tuples.len() <= MAX_TUPLES);
+        assert!(b.state.tuples.contains_key(&learned_key));
+
+        // Expired windows are removed completely on clear_stale_demotions.
+        b.clear_stale_demotions(NOW + 2 * DAY);
+        assert!(b.state.windows.is_empty());
     }
 }

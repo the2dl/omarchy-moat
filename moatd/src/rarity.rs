@@ -634,6 +634,10 @@ impl RarityStore {
         // So the cap is a cap: when the cheap pass cannot get under it, drop
         // the coldest by decayed weight until it does.
         if self.counters.len() > MAX_COUNTERS {
+            // Evict down to 90% of MAX_COUNTERS so a full store does not
+            // re-run this pass on every single subsequent event.
+            let target = MAX_COUNTERS - MAX_COUNTERS / 10;
+            let cut = self.counters.len().saturating_sub(target);
             let mut weights: Vec<f64> = self
                 .counters
                 .values()
@@ -642,10 +646,12 @@ impl RarityStore {
                     c.decayed * 0.5f64.powf(dt / hl)
                 })
                 .collect();
-            let cut = self.counters.len() - MAX_COUNTERS;
             // The cut-th smallest weight; everything at or below it goes.
-            weights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let threshold = weights[cut.min(weights.len() - 1)];
+            let idx = cut.min(weights.len() - 1);
+            let (_, threshold, _) = weights.select_nth_unstable_by(idx, |a, b| {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let threshold = *threshold;
             let over = self.counters.len();
             let mut dropped = 0usize;
             self.counters.retain(|_, c| {
