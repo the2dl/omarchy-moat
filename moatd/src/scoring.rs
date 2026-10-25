@@ -604,6 +604,20 @@ pub fn score(
         }
     }
 
+    // AWS config is read routinely by SDK discovery (including test workers).
+    // It can contain credential settings, so retain a medium chain step and
+    // keep package-install or IoC reads at their full severity. A direct read
+    // of .aws/credentials is still the high/critical rule above.
+    if facts.rule == "moat-cred-cloud-credentials-read"
+        && facts.file.is_some_and(|p| p.ends_with("/.aws/config"))
+        && ctx != Context::PkgInstall
+        && !facts.has_ioc
+        && severity_rank(&sev) > severity_rank("medium")
+    {
+        sev = "medium".into();
+        reasons.push("AWS profile configuration read outside a package install; retain as a chain step".into());
+    }
+
     // --- the namespace step -------------------------------------------------
     //
     // `render::split_container_enforcement` scopes every enforcing selector to
@@ -978,6 +992,19 @@ mod tests {
         let result = score("high", &f, &official(), Context::Agent, true);
         assert_eq!(result.severity, "high");
         assert_eq!(generic_context_delta("cred", Context::Agent), 0);
+    }
+
+    #[test]
+    fn aws_profile_config_is_a_medium_chain_step_outside_install() {
+        let f = EventFacts { file: Some("/home/dan/.aws/config"), ..facts("cred", "moat-cred-cloud-credentials-read") };
+        for context in [Context::Agent, Context::Unknown, Context::Service] {
+            let s = score("high", &f, &user_actor(), context, true);
+            assert_eq!(s.severity, "medium", "{context:?}");
+            assert_eq!(s.surface, "timeline");
+        }
+        assert_eq!(score("high", &f, &user_actor(), Context::PkgInstall, true).severity, "critical");
+        let ioc = EventFacts { has_ioc: true, ..f };
+        assert_eq!(score("high", &ioc, &user_actor(), Context::Agent, true).severity, "high");
     }
 
     // ---------------------------------------------------------------- scoring

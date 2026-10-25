@@ -2,6 +2,7 @@ import importlib.machinery
 import importlib.util
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -86,6 +87,20 @@ class TriageSandboxTests(unittest.TestCase):
         with mock.patch.object(m.shutil, 'which', return_value=str(shim)):
             with self.assertRaisesRegex(ValueError, 'native agent'):
                 m.command('claude', self.bundle, ['claude'])
+
+    def test_mise_npm_claude_shim_resolves_its_native_target(self):
+        modules = self.home / '.local/share/mise/installs/npm-anthropic-ai-claude-code/latest/node_modules'
+        shim = modules / '.bin/claude'
+        target = modules / '.mise/@anthropic-ai+claude-code@2.1.280/node_modules/@anthropic-ai/claude-code/bin/claude.exe'
+        shim.parent.mkdir(parents=True)
+        target.parent.mkdir(parents=True)
+        shim.write_text('#!/bin/sh\n# aube-bin-shim v2 target=../.mise/@anthropic-ai+claude-code@2.1.280/node_modules/@anthropic-ai/claude-code/bin/claude.exe\n')
+        shutil.copy2('/usr/bin/bash', target)
+        with mock.patch.object(m.Path, 'home', return_value=self.home), \
+             mock.patch.dict(os.environ, {'MISE_DATA_DIR': str(self.home / '.local/share/mise')}), \
+             mock.patch.object(m.shutil, 'which', return_value='/usr/bin/mise'):
+            cmd = m.command('claude', self.bundle, ['claude', '-p', 'test'])
+        self.assertEqual(cmd[-3:], [str(target), '-p', 'test'])
 
 
 if __name__ == '__main__':

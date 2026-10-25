@@ -128,6 +128,20 @@ if makepkg_scans "$@" && [[ -f ./$_target ]]; then
 	fi
 fi
 
+# fakeroot normally attempts the real chown before recording its simulated
+# ownership.  In moat-sandbox the user namespace maps only the calling uid;
+# uid/gid 0 are unmapped, so the kernel returns EINVAL instead of the EPERM
+# fakeroot expects.  libarchive then aborts extraction of root-owned entries
+# (notably the data archive in slack-desktop's upstream Debian package).
+#
+# This is fakeroot's supported switch for skipping that unnecessary real
+# syscall.  It still records uid/gid 0 in its database, so makepkg emits the
+# same package ownership metadata.  Keep the override tied to sandboxed runs:
+# MOAT_SANDBOX=0 remains a literal bypass with the caller's environment.
+if [[ ${MOAT_SANDBOX:-1} != 0 ]]; then
+	export FAKEROOTDONTTRYCHOWN=1
+fi
+
 if [[ ${MOAT_SANDBOX:-1} != 0 && ${MOAT_SANDBOX_ACTIVE:-0} != 1 ]]; then
 	for key in SRCDEST PKGDEST SRCPKGDEST LOGDEST BUILDDIR; do
 		add_allow_for "$key"

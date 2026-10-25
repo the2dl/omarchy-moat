@@ -549,13 +549,24 @@ fn run_triage(resp: &Value, socket: &std::path::Path, dry_run: bool, json_out: b
         }
         return ExitCode::SUCCESS;
     }
-    let agent = match moatd::analysis::default_agent() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("moatctl triage: {}", e);
-            return ExitCode::from(2);
+    let agent = if let Some(a) = resp["agent"].as_str().filter(|a| !a.trim().is_empty()) {
+        a.to_string()
+    } else {
+        match moatd::analysis::default_agent() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("moatctl triage: {}", e);
+                return ExitCode::from(2);
+            }
         }
     };
+    // Check the selected agent before bundling and probing evidence. Otherwise
+    // an unsupported default such as `agy` is reported as an unreadable bundle
+    // on every timer tick, hiding the actual configuration problem.
+    if let Err(e) = triage::headless_argv(&agent, "") {
+        eprintln!("moatctl triage: {e}");
+        return ExitCode::from(2);
+    }
     // The unattended path builds its own flags precisely so a config key cannot
     // relax them; say so rather than appearing to honour the setting.
     let cfg: BTreeMap<String, Vec<String>> =

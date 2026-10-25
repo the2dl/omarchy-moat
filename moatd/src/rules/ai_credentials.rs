@@ -69,7 +69,14 @@ impl UserRule for AiCredentials {
                 .agent_session
                 .as_ref()
                 .map(|session| {
-                    session.root_pid == f.proc.pid
+                    let session_owner = session.root_pid == f.proc.pid;
+                    let native_claude_helper = owner == "claude"
+                        && f.proc.pid != session.root_pid
+                        && f.proc.exe == session.executable
+                        && (f.proc.args.starts_with("daemon run --origin transient --spawned-by ")
+                            || (f.proc.args.contains("--fork-session")
+                                && f.proc.args.contains("--resume ")));
+                    (session_owner || native_claude_helper)
                         && session.agent == owner
                         && crate::agent::invocation(&f.proc.exe, &f.proc.args).as_deref()
                             == Some(owner)
@@ -83,13 +90,13 @@ impl UserRule for AiCredentials {
             f.meta.family = "ai".into();
             f.meta.severity = "low".into();
             f.meta.title = "Agent accessed its own authentication store".into();
-            f.meta.why = "The observed session root is authenticating to its own provider. Its tools and other agents do not receive this classification.".into();
+            f.meta.why = "The observed agent or its native session helper is authenticating to its own provider. Other tools do not receive this classification.".into();
             f.meta.tier = "signal".into();
-            f.what_override = Some("The observed agent session root accessed its own authentication file. This does not authorize its children to read that file.".into());
+            f.what_override = Some("The observed agent or its native session helper accessed its own authentication file.".into());
         }
         f.file = Some(crate::alert::FileRef { path, sha256: None });
         f.hook = h.hook_name();
-        f.extra_evidence.push(if own_auth { "reader is the observed session root; classification is behavioral, not proof of binary authenticity" } else { "reader is not the owning session root; runtime and ancestor names alone do not exempt it" }.into());
+        f.extra_evidence.push(if own_auth { "reader is the observed agent or a native session helper with the same executable; classification is behavioral, not proof of binary authenticity" } else { "reader is not the owning agent or a native session helper; runtime and ancestor names alone do not exempt it" }.into());
         vec![f]
     }
 }
@@ -120,6 +127,10 @@ mod tests {
         };
         add("agent", 100, "/opt/claude", "", None);
         add("delegated-codex", 107, "/opt/codex", "exec task", Some("agent"));
+        add("codex-root", 120, "/opt/codex", "resume session", None);
+        add("codex-exec", 121, "/mise/codex", "exec -C /workspace task", Some("codex-root"));
+        add("codex-daemon", 122, "/packages/codex", "app-server --listen unix:// --managed-daemon", Some("codex-root"));
+        add("codex-tool", 123, "/usr/bin/node", "/tmp/tool.js", Some("codex-root"));
         add("replaced-agent", 105, "/opt/claude (deleted)", "", None);
         add("replaced-child", 106, "/opt/claude (deleted)", "", Some("agent"));
         add("tool", 101, "/usr/bin/node", "/tmp/tool.js", Some("agent"));
@@ -143,6 +154,14 @@ mod tests {
             "/opt/node_modules/@anthropic-ai/claude-code/cli.js",
             None,
         );
+        add("native-claude", 113,
+            "/home/dan/.local/share/mise/installs/npm-anthropic-ai-claude-code/latest/node_modules/.mise/@anthropic-ai+claude-code@2.1.280/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+            "--resume session", None);
+        let native_exe = "/home/dan/.local/share/mise/installs/npm-anthropic-ai-claude-code/latest/node_modules/.mise/@anthropic-ai+claude-code@2.1.280/node_modules/@anthropic-ai/claude-code/bin/claude.exe";
+        add("native-daemon", 114, native_exe,
+            "daemon run --origin transient --spawned-by {\"label\":\"claude\",\"pid\":113}", Some("native-claude"));
+        add("native-fork", 115, native_exe,
+            "--session-id child --fork-session --resume /home/dan/session.jsonl", Some("native-claude"));
         let config = Config::default();
         let feeds = crate::feeds::Feeds::default();
         let rarity = crate::rarity::RarityStore::default();
@@ -177,12 +196,18 @@ mod tests {
                 &ctx,
             )
         };
-        for id in ["agent", "runtime-agent", "replaced-agent", "daemon", "spare", "forked"] {
+        for id in ["agent", "runtime-agent", "native-claude", "native-daemon", "native-fork", "replaced-agent", "daemon", "spare", "forked"] {
             let f = run(id, ".claude/.credentials.json");
             assert_eq!(f.len(), 1);
             assert_eq!(f[0].meta.family, "ai");
             assert_eq!(f[0].meta.severity, "low");
         }
+        for id in ["codex-root", "codex-exec", "codex-daemon"] {
+            let own = run(id, ".codex/auth.json");
+            assert_eq!(own[0].meta.family, "ai", "{id}");
+            assert_eq!(run(id, ".claude/.credentials.json")[0].meta.family, "cred");
+        }
+        assert_eq!(run("codex-tool", ".codex/auth.json")[0].meta.family, "cred");
         for id in ["tool", "fake-agent-child", "unknown-node", "replaced-child", "pty-host", "daemon-tool"] {
             let f = run(id, ".claude/.credentials.json");
             assert_eq!(f.len(), 1);

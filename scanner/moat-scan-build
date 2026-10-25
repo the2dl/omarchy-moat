@@ -2083,6 +2083,8 @@ def cargo_config_files(root: str) -> list[str]:
     here = os.path.abspath(root)
     home = os.path.abspath(os.path.expanduser("~"))
     for _ in range(MAX_CONFIG_ANCESTORS):
+        if here == home:
+            break
         for fn in ("config.toml", "config"):
             full = os.path.join(here, ".cargo", fn)
             if os.path.isfile(full):

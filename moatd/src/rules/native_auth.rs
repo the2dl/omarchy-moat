@@ -2,11 +2,117 @@
 use crate::{context::Context, explain::Finding, provenance::Provenance};
 use std::os::unix::fs::MetadataExt;
 
+fn ordinary_agent_git_config(f: &Finding) -> bool {
+    if f.rule != "moat-cred-project-token-read" || f.context != Context::Agent
+        || f.proc.in_container != Some(false) || f.proc.user_ns_host != Some(true)
+        || f.actor.modified.is_some() || f.ioc.is_some()
+        || f.kill_expected || f.denied || f.request_kill
+    { return false; }
+    let Some(session) = &f.proc.agent_session else { return false };
+    let Some(file) = &f.file else { return false };
+    let direct_agent = f.proc.pid == session.root_pid && f.proc.exe == session.executable;
+    let native_claude_fork = f.proc.pid != session.root_pid
+        && session.agent == "claude"
+        && f.proc.exe == session.executable
+        && f.proc.args.contains("--fork-session")
+        && f.proc.args.contains("--resume ");
+    let pulumi_child = f.proc.pid != session.root_pid
+        && f.proc.exe.ends_with("/pulumi/pulumi")
+        && f.proc.exe.contains("/.local/share/mise/installs/pulumi/")
+        && f.proc.args.split_whitespace().next().is_some_and(|arg| matches!(arg, "preview" | "import" | "up"));
+    if !(direct_agent || native_claude_fork || pulumi_child) || session.workspace.is_empty()
+        || file.path != format!("{}/.git/config", session.workspace.trim_end_matches('/'))
+    { return false; }
+    // A normal agent inspects its own repository metadata. Keep the full
+    // credential signal when the config itself contains an authenticated URL
+    // or a key whose purpose is to carry a secret.
+    let Ok(metadata) = std::fs::metadata(&file.path) else { return false };
+    if !metadata.is_file() || metadata.len() > 65_536 { return false; }
+    let Ok(contents) = std::fs::read_to_string(&file.path) else { return false };
+    !contents.lines().any(|line| {
+        let Some((key, value)) = line.trim().split_once('=') else { return false };
+        let key = key.trim().to_ascii_lowercase();
+        if ["extraheader", "authorization", "password", "token", "secret", "oauth"]
+            .iter().any(|part| key.contains(part)) { return true; }
+        if key != "url" && key != "pushurl" { return false; }
+        let value = value.trim();
+        value.split_once("://").is_some_and(|(_, rest)|
+            rest.split('/').next().is_some_and(|authority| authority.contains('@')))
+    })
+}
+
 pub fn classify(f: &mut Finding, homes: &[String]) {
     classify_with(f, homes, super::native_context::system_executable)
 }
 
 fn classify_with(f: &mut Finding, homes: &[String], trusted: impl Fn(&str) -> bool) {
+    if ordinary_agent_git_config(f) {
+        f.meta.family = "context".into();
+        f.meta.severity = "low".into();
+        f.meta.tier = "signal".into();
+        f.what_override = Some("An agent read the Git configuration of its own workspace; no embedded authentication setting was found.".into());
+        f.extra_evidence.push("agent, native Claude fork, or Pulumi child read its own workspace .git/config without an authenticated URL or secret-bearing key".into());
+        return;
+    }
+    // Our offline npm scanner reads .npmrc to discover registry hosts. Package
+    // shims also invoke it for commands such as `pnpm --version`, where the
+    // install context is absent even though the scanner is still the observer.
+    // Require the installed, root-controlled script and the user's own config;
+    // no other Python reader or registry credential path gets this treatment.
+    if f.rule == "moat-cred-registry-token-read"
+        && f.proc.exe == "/usr/bin/python3"
+        && f.actor.script.as_deref() == Some("/usr/bin/moat-scan-npm")
+        && f.actor.package.as_deref().is_some_and(|p| p.starts_with("omarchy-moat "))
+        && f.actor.modified.is_none()
+        && f.proc.in_container == Some(false)
+        && f.proc.user_ns_host == Some(true)
+        && f.ioc.is_none() && !f.kill_expected && !f.denied && !f.request_kill
+        && trusted("/usr/bin/moat-scan-npm")
+        && f.file.as_ref().is_some_and(|file| homes.iter().any(|home| {
+            file.path == format!("{home}/.npmrc")
+                && std::fs::metadata(home).is_ok_and(|m| m.uid() == f.proc.uid)
+        }) || (file.path == format!("{}/.npmrc", f.proc.cwd.trim_end_matches('/'))
+            && std::fs::metadata(&f.proc.cwd).is_ok_and(|m| m.uid() == f.proc.uid)))
+    {
+        f.meta.family = "auth".into();
+        f.meta.severity = "low".into();
+        f.meta.tier = "signal".into();
+        f.meta.title = "Moat scanner read npm registry configuration".into();
+        f.what_override = Some("Moat's installed npm scanner read registry settings to classify package sources during an install.".into());
+        f.extra_evidence.push("scanner context: root-controlled moat-scan-npm script read the user's own .npmrc".into());
+        return;
+    }
+    // Deno loads the user's npm configuration itself at startup. Without a
+    // read or network grant, a `run --no-prompt --no-remote` script cannot read
+    // that file or send its contents; keep the runtime read as context.
+    if f.rule == "moat-cred-registry-token-read"
+        && f.proc.exe == "/usr/bin/deno"
+        && f.actor.provenance == Provenance::Official
+        && f.actor.modified.is_none()
+        && f.proc.in_container == Some(false)
+        && f.proc.user_ns_host == Some(true)
+        && f.ioc.is_none() && !f.kill_expected && !f.denied && !f.request_kill
+        && trusted(&f.proc.exe)
+        && f.proc.args.split_whitespace().next() == Some("run")
+        && f.proc.args.split_whitespace().any(|arg| arg == "--no-prompt")
+        && f.proc.args.split_whitespace().any(|arg| arg == "--no-remote")
+        && !f.proc.args.split_whitespace().any(|arg| {
+            matches!(arg, "-A" | "--allow-all" | "-R" | "-N")
+                || arg.starts_with("--allow-read") || arg.starts_with("--allow-net")
+        })
+        && f.file.as_ref().is_some_and(|file| homes.iter().any(|home| {
+            file.path == format!("{home}/.npmrc")
+                && std::fs::metadata(home).is_ok_and(|m| m.uid() == f.proc.uid)
+        }))
+    {
+        f.meta.family = "auth".into();
+        f.meta.severity = "low".into();
+        f.meta.tier = "signal".into();
+        f.meta.title = "Deno loaded npm configuration at startup".into();
+        f.what_override = Some("Deno loaded the user's npm configuration while starting a local script without read or network permission.".into());
+        f.extra_evidence.push("official Deno runtime, no-prompt and no-remote, no read or network grant, same-user ~/.npmrc".into());
+        return;
+    }
     if !matches!(f.rule.as_str(), "moat-cred-cloud-credentials-read" | "moat-cred-registry-token-read")
         || !(f.actor.provenance == Provenance::Official
             || (f.actor.provenance == Provenance::Foreign
@@ -24,14 +130,14 @@ fn classify_with(f: &mut Finding, homes: &[String], trusted: impl Fn(&str) -> bo
     let own_config = homes.iter().any(|home| {
         ((f.rule == "moat-cred-cloud-credentials-read" && file.path == format!("{home}/.kube/config"))
                 || (f.rule == "moat-cred-registry-token-read"
-                    && f.proc.exe == "/usr/lib/docker/cli-plugins/docker-buildx"
+                    && matches!(f.proc.exe.as_str(), "/usr/lib/docker/cli-plugins/docker-buildx" | "/usr/lib/docker/cli-plugins/docker-compose")
                     && file.path == format!("{home}/.docker/config.json")))
             && std::fs::metadata(home).is_ok_and(|m| m.uid() == f.proc.uid)
     });
     if !own_config { return; }
     let expected = match f.proc.exe.as_str() {
         "/usr/bin/gke-gcloud-auth-plugin" => f.ancestry.first().is_some_and(|p| p.exe == "/usr/bin/kubectl" && p.uid == f.proc.uid),
-        "/usr/lib/docker/cli-plugins/docker-buildx" => {
+        "/usr/lib/docker/cli-plugins/docker-buildx" | "/usr/lib/docker/cli-plugins/docker-compose" => {
             f.ancestry.first().is_some_and(|p| p.exe == "/usr/bin/docker" && p.uid == f.proc.uid)
 
         }
@@ -49,6 +155,112 @@ fn classify_with(f: &mut Finding, homes: &[String], trusted: impl Fn(&str) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn agent_own_git_metadata_is_low_only_without_embedded_auth() {
+        let root = tempfile::tempdir().unwrap();
+        let git = root.path().join(".git");
+        std::fs::create_dir(&git).unwrap();
+        let config = git.join("config");
+        std::fs::write(&config, "[remote \"origin\"]\n url = git@github.com:example/repo.git\n").unwrap();
+        let exe = "/opt/example/claude";
+        let mut f = Finding::new("moat-cred-project-token-read", crate::policy::PolicyMeta::fallback("moat-cred-project-token-read"), crate::proctable::ProcInfo {
+            pid: 123, exe: exe.into(), in_container: Some(false), user_ns_host: Some(true),
+            agent_session: Some(crate::agent::AgentSession {
+                id: "session".into(), root_pid: 123, agent: "claude".into(),
+                executable: exe.into(), workspace: root.path().display().to_string(),
+            }), ..Default::default()
+        });
+        f.context = Context::Agent;
+        f.file = Some(crate::alert::FileRef { path: config.display().to_string(), sha256: None });
+        assert!(ordinary_agent_git_config(&f));
+        classify_with(&mut f, &[], |_| false);
+        assert_eq!(f.meta.severity, "low");
+        assert_eq!(f.meta.family, "context");
+        for text in [
+            "[remote \"origin\"]\n url = https://user:secret@example.com/repo.git\n",
+            "[http]\n extraheader = Authorization: Bearer secret\n",
+        ] {
+            std::fs::write(&config, text).unwrap();
+            assert!(!ordinary_agent_git_config(&f));
+        }
+        std::fs::write(&config, "[core]\n bare = false\n").unwrap();
+        f.proc.pid = 124;
+        assert!(!ordinary_agent_git_config(&f));
+        f.proc.args = "--session-id child --fork-session --resume session.jsonl".into();
+        assert!(ordinary_agent_git_config(&f));
+        f.proc.args = String::new();
+        f.proc.exe = "/home/dan/.local/share/mise/installs/pulumi/3.229.0/pulumi/pulumi".into();
+        f.proc.args = "preview --stack example".into();
+        assert!(ordinary_agent_git_config(&f));
+        f.proc.args = "login".into();
+        assert!(!ordinary_agent_git_config(&f));
+        f.proc.args = "up --yes".into();
+        std::fs::write(&config, "[http]\n extraheader = Authorization: Bearer secret\n").unwrap();
+        assert!(!ordinary_agent_git_config(&f));
+        std::fs::write(&config, "[core]\n bare = false\n").unwrap();
+        f.proc.pid = 123;
+        f.file.as_mut().unwrap().path = root.path().join("other/.git/config").display().to_string();
+        assert!(!ordinary_agent_git_config(&f));
+    }
+    #[test]
+    fn installed_npm_scanner_read_is_context_only() {
+        let home = tempfile::tempdir().unwrap();
+        let homes = vec![home.path().display().to_string()];
+        let p = crate::proctable::ProcInfo {
+            exe: "/usr/bin/python3".into(), uid: unsafe { libc::geteuid() },
+            in_container: Some(false), user_ns_host: Some(true), ..Default::default()
+        };
+        let mut base = Finding::new("moat-cred-registry-token-read", crate::policy::PolicyMeta::fallback("moat-cred-registry-token-read"), p);
+        base.context = Context::PkgInstall;
+        base.actor.provenance = Provenance::Foreign;
+        base.actor.package = Some("omarchy-moat 0.1.0-196".into());
+        base.actor.script = Some("/usr/bin/moat-scan-npm".into());
+        base.file = Some(crate::alert::FileRef { path: format!("{}/.npmrc", homes[0]), sha256: None });
+        classify_with(&mut base, &homes, |_| true);
+        assert_eq!(base.meta.family, "auth");
+        let mut version_probe = base.clone();
+        version_probe.meta.family = "cred".into();
+        version_probe.context = Context::Unknown;
+        classify_with(&mut version_probe, &homes, |_| true);
+        assert_eq!(version_probe.meta.family, "auth");
+        let project = tempfile::tempdir().unwrap();
+        let mut project_scan = base.clone();
+        project_scan.meta.family = "cred".into();
+        project_scan.proc.cwd = project.path().display().to_string();
+        project_scan.file.as_mut().unwrap().path = format!("{}/.npmrc", project_scan.proc.cwd);
+        classify_with(&mut project_scan, &homes, |_| true);
+        assert_eq!(project_scan.meta.family, "auth");
+        let mut other = base.clone();
+        other.meta.family = "cred".into();
+        other.actor.script = Some("/tmp/moat-scan-npm".into());
+        classify_with(&mut other, &homes, |_| true);
+        assert_eq!(other.meta.family, "cred");
+    }
+    #[test]
+    fn deno_startup_npm_config_requires_no_read_or_network_grant() {
+        let home = tempfile::tempdir().unwrap();
+        let homes = vec![home.path().display().to_string()];
+        let p = crate::proctable::ProcInfo {
+            exe: "/usr/bin/deno".into(), uid: unsafe { libc::geteuid() },
+            args: "run --no-prompt --no-remote /tmp/local.ts".into(),
+            in_container: Some(false), user_ns_host: Some(true), ..Default::default()
+        };
+        let mut base = Finding::new("moat-cred-registry-token-read", crate::policy::PolicyMeta::fallback("moat-cred-registry-token-read"), p);
+        base.actor.provenance = Provenance::Official;
+        base.file = Some(crate::alert::FileRef { path: format!("{}/.npmrc", homes[0]), sha256: None });
+        let mut safe = base.clone();
+        classify_with(&mut safe, &homes, |_| true);
+        assert_eq!(safe.meta.family, "auth");
+        for args in ["run --no-prompt --no-remote --allow-read /tmp/local.ts",
+            "run --no-prompt --no-remote -A /tmp/local.ts",
+            "run --no-prompt --no-remote --allow-net /tmp/local.ts",
+            "run --no-prompt /tmp/local.ts"] {
+            let mut risky = base.clone();
+            risky.proc.args = args.into();
+            classify_with(&mut risky, &homes, |_| true);
+            assert_eq!(risky.meta.family, "cred", "{args}");
+        }
+    }
     #[test]
     fn context_requires_verified_host_tool_own_config_and_launcher() {
         let home = tempfile::tempdir().unwrap();
@@ -89,6 +301,16 @@ mod tests {
         registry.file.as_mut().unwrap().path = format!("{}/.docker/config.json", homes[0]);
         classify(&mut registry, &homes);
         assert_eq!(registry.meta.family, "auth");
+        let mut compose = registry.clone();
+        compose.proc.exe = "/usr/lib/docker/cli-plugins/docker-compose".into();
+        compose.proc.args = "compose up -d dragonfly".into();
+        compose.meta.family = "cred".into();
+        classify_with(&mut compose, &homes, |_| true);
+        assert_eq!(compose.meta.family, "auth");
+        compose.meta.family = "cred".into();
+        compose.ancestry[0].exe = "/usr/bin/bash".into();
+        classify_with(&mut compose, &homes, |_| true);
+        assert_eq!(compose.meta.family, "cred");
         registry.meta.family = "cred".into();
         registry.file.as_mut().unwrap().path = format!("{}/.npmrc", homes[0]);
         classify(&mut registry, &homes);

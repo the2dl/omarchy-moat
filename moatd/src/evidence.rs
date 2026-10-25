@@ -36,6 +36,33 @@ use crate::util;
 /// Anything larger is listed but not staged. A model cannot usefully
 /// deobfuscate a 40 MB binary, and uploading one is pure cost and exposure.
 pub const MAX_STAGED_BYTES: u64 = 1024 * 1024;
+/// Identity evidence has a separate bound from bytes copied for analysis.
+const MAX_ACTOR_HASH_BYTES: u64 = 512 * 1024 * 1024;
+
+fn actor_identity_hash(path: &Path) -> Option<String> {
+    use std::io::Read;
+    use sha2::{Digest, Sha256};
+    let real = std::fs::canonicalize(path).ok()?;
+    may_stage(&real.display().to_string(), false, "context").ok()?;
+    let (mut file, opened) = util::open_suspect(&real).ok()?;
+    may_stage(&opened, false, "context").ok()?;
+    let before = file.metadata().ok()?;
+    if before.len() > MAX_ACTOR_HASH_BYTES { return None; }
+    let mut hash = Sha256::new();
+    let mut total = 0u64;
+    let mut bytes = [0u8; 65536];
+    loop {
+        let n = file.read(&mut bytes).ok()?;
+        if n == 0 { break; }
+        total += n as u64;
+        if total > MAX_ACTOR_HASH_BYTES { return None; }
+        hash.update(&bytes[..n]);
+    }
+    let after = file.metadata().ok()?;
+    if total != before.len() || after.len() != before.len()
+        || before.modified().ok()? != after.modified().ok()? { return None; }
+    Some(util::hex(&hash.finalize()))
+}
 
 /// Path shapes whose *contents* never leave the machine, whatever rule matched
 /// them and whatever family that rule is in.
@@ -242,6 +269,9 @@ pub fn stage(alert: &Alert, dir: &Path, max_bytes: u64, group: &str) -> Vec<Arti
                     a.withheld = Some("not a regular file".into());
                 }
                 Some(m) if m.len() > max_bytes => {
+                    if role == "actor" {
+                        a.sha256 = actor_identity_hash(p);
+                    }
                     a.withheld = Some(format!(
                         "{} bytes, over the {} byte staging limit",
                         m.len(),
@@ -312,6 +342,29 @@ fn copy_readonly_from(src: &mut std::fs::File, dest: &PathBuf, group: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn actor_hash_is_independent_of_copy_cap_and_refuses_secret_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("actor");
+        let bytes = vec![42u8; 2048];
+        std::fs::write(&binary, &bytes).unwrap();
+        assert_eq!(actor_identity_hash(&binary), Some(util::sha256_hex(&bytes)));
+        let link = dir.path().join("launcher");
+        std::os::unix::fs::symlink(&binary, &link).unwrap();
+        assert_eq!(actor_identity_hash(&link), Some(util::sha256_hex(&bytes)));
+        let secret = dir.path().join(".npmrc");
+        std::fs::write(&secret, "secret fixture").unwrap();
+        let bait = dir.path().join("bait");
+        std::os::unix::fs::symlink(&secret, &bait).unwrap();
+        assert!(actor_identity_hash(&bait).is_none());
+        assert!(actor_identity_hash(dir.path()).is_none());
+        let mut alert = crate::alert::tests_support::demo_alert("01HASH");
+        alert.process.exe = binary.display().to_string();
+        alert.file = None;
+        let staged = stage(&alert, dir.path(), 16, "");
+        assert_eq!(staged[0].sha256, Some(util::sha256_hex(&bytes)));
+        assert!(staged[0].staged_as.is_none());
+    }
 
     /// The one test that matters most: a credential must never be stageable,
     /// by any route. A false negative here uploads a private key to a cloud

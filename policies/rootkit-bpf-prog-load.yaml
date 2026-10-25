@@ -33,6 +33,10 @@ spec:
     args:
     - index: 0
       type: "int"
+    - index: 1
+      type: "uint32"
+      resolve: "prog_type"
+      label: "prog_type"
     selectors:
     - matchBinaries:
       - operator: "NotIn"

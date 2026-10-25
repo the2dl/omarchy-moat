@@ -506,6 +506,16 @@ pub fn render(i: &Input) -> String {
             r.process.pid,
             if r.is_suppressed() { " [suppressed]" } else { "" }
         ));
+        o.push_str(&format!("  Alert `{}`; observed program and arguments:\n{}", r.id,
+            data(&format!("{} {}", r.process.exe, r.process.args))));
+        if let Some(file) = &r.file {
+            o.push_str(&format!("  Target path (contents not included):\n{}", data(&file.path)));
+        }
+        o.push_str(&format!("  Observed summary:\n{}", data(&r.summary)));
+        if let Some(triage) = &r.triage {
+            o.push_str(&format!("  Prior triage (opinion, not approval):\n{}", data(&format!(
+                "{:?} / {:?}: {}", triage.result.verdict, triage.result.confidence, triage.result.summary))));
+        }
     }
     for r in i.related_receipts {
         o.push_str(&format!("\nInstall receipt `{}`:\n{}", r.id, data(&r.render())));
@@ -651,6 +661,9 @@ mod tests {
     fn the_bundle_carries_all_seven_sections_and_fences_every_process_string() {
         let mut a = demo_alert("01BBBBBBBBBBBBBBBBBBBBBBBB");
         a.process.args = "node_modules/evil/setup.mjs --now".into();
+        let mut related = demo_alert("01RELATED");
+        related.process.args = "exec -C /workspace task".into();
+        related.file = Some(crate::alert::FileRef { path: "/home/dan/.codex/auth.json".into(), sha256: None });
         let anc = vec![
             AncestryRow {
                 pid: 41201,
@@ -669,7 +682,7 @@ mod tests {
             alert: &a,
             mode: "monitor",
             ancestry: &anc,
-            related_alerts: &[],
+            related_alerts: &[related],
             related_receipts: &[receipt("01R", "/home/dan/proj", "/usr/bin/npm", &a.ts)],
             incident: None,
             incident_dir: None,
@@ -677,6 +690,10 @@ mod tests {
             version: "0.1.0",
             artifacts: &[],
         });
+
+        assert!(md.contains("01RELATED"));
+        assert!(md.contains("/home/dan/.codex/auth.json"));
+        assert!(md.contains("exec -C /workspace task"));
 
         for heading in [
             "# Moat alert 01BBBBBBBBBBBBBBBBBBBBBBBB",

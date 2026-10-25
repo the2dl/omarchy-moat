@@ -94,6 +94,14 @@ impl UserRule for MassRead {
         let Some(path) = h.file_path() else {
             return Vec::new();
         };
+        // pnpm's v10 store names package blobs by SHA-512. A package install
+        // reads many of these opaque blobs, and the broad credential policy
+        // can label them as credential-shaped. They are not separate user
+        // credential files. Keep counting actual secrets, including ones read
+        // by pnpm outside its content-addressed store.
+        if ctx.homes.iter().any(|home| pnpm_store_blob(&path, home)) {
+            return Vec::new();
+        }
         // Owned application profiles and image storage are not independent
         // credential stores. Filter before counting, not after a harvest fires.
         if let Some(p) = ctx.table.get(exec_id) {
@@ -177,6 +185,14 @@ impl UserRule for MassRead {
     }
 }
 
+fn pnpm_store_blob(path: &str, home: &str) -> bool {
+    let prefix = format!("{home}/.local/share/pnpm/store/v10/files/");
+    let Some(rest) = path.strip_prefix(&prefix) else { return false };
+    let Some((bucket, hash)) = rest.split_once('/') else { return false };
+    bucket.len() == 2 && bucket.bytes().all(|b| b.is_ascii_hexdigit())
+        && hash.len() == 126 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +260,24 @@ mod tests {
             found += fire(&mut rule, &t, &c, &ev(&format!("/home/dan/.config/token{i}"), 4, "moat-cred-dotfile-read"), 101).len();
         }
         assert_eq!(found, 1, "regular credential files must still trigger");
+    }
+
+    #[test]
+    fn pnpm_store_blobs_do_not_hide_real_credential_reads() {
+        let t = table();
+        let mut c = cfg();
+        c.thresholds.mass_read_files = 3;
+        let mut rule = MassRead::default();
+        for i in 0..8 {
+            let blob = format!("/home/dan/.local/share/pnpm/store/v10/files/{i:02x}/{}", "a".repeat(126));
+            assert!(fire(&mut rule, &t, &c, &ev(&blob, 4, "moat-cred-project-token-read"), 100).is_empty());
+        }
+        for i in 0..3 {
+            let secret = format!("/home/dan/project-{i}/.env");
+            let found = fire(&mut rule, &t, &c, &ev(&secret, 4, "moat-cred-project-token-read"), 100);
+            assert_eq!(found.len(), usize::from(i == 2));
+        }
+        assert!(!pnpm_store_blob("/home/dan/.local/share/pnpm/store/v10/files/aa/../../../.ssh/id_rsa", "/home/dan"));
     }
 
     #[test]

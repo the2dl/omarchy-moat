@@ -14,7 +14,7 @@
 
 pkgname=omarchy-moat
 pkgver=0.1.0
-pkgrel=196
+pkgrel=204
 _tetragonver=1.7.1
 pkgdesc='eBPF supply-chain sensor for Omarchy: Tetragon policies, an alert daemon, a bubblewrap sandbox and pre-execution scanners for PKGBUILD, npm, cargo, pip and go'
 arch=('x86_64' 'aarch64')
@@ -294,7 +294,11 @@ check() {
 	python3 policies/check.py policies
 
 	cd "${srcdir}/${_tree}/scanner"
-	python3 -m unittest discover tests
+	# Scanner behavior includes reading per-user registry configuration. Keep
+	# package checks deterministic and never inspect the builder's real tokens.
+	install -d "${srcdir}/test-home/.config"
+	HOME="${srcdir}/test-home" XDG_CONFIG_HOME="${srcdir}/test-home/.config" \
+		python3 -m unittest discover tests
 
 	# Real bubblewrap, unprivileged, entirely inside a mktemp directory.
 	# This works under makepkg because makepkg itself runs unprivileged;

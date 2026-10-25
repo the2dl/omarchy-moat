@@ -312,6 +312,12 @@ the scan is skipped and `makepkg` reports the problem itself.
 - **`makepkg` is not sandboxed against itself.** A PKGBUILD's `package()`
   writes into `$pkgdir` inside `$PWD`, which is writable. The scan is what
   catches a hostile PKGBUILD; the sandbox only limits the damage.
+- **fakeroot archive ownership.** The shim sets `FAKEROOTDONTTRYCHOWN=1` for
+  sandboxed builds. The sandbox's user namespace cannot perform a real
+  `chown(0, 0)`, but fakeroot does not need one: it still records the simulated
+  root ownership that makepkg writes into the finished package. This lets
+  `bsdtar` extract root-owned upstream archives without failing with
+  `Can't set user=0/group=0: Invalid argument`.
 
 ## Known gaps
 

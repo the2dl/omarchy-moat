@@ -505,6 +505,10 @@ pub struct AnalysisConfig {
     pub bundle_dir: PathBuf,
 
     // --- auto-triage -------------------------------------------------------
+    /// Optional supported agent for unattended triage. When unset, use the
+    /// desktop's default agent. This lets a user keep another interactive
+    /// default while selecting a read-only headless client for the timer.
+    pub triage_agent: Option<String>,
     /// `off` | `annotate` | `demote` (default `demote`).
     ///
     /// What an unattended agent run may do with an alert. The ceiling is
@@ -558,6 +562,7 @@ impl Default for AnalysisConfig {
         Self {
             agent_args,
             bundle_dir: d("/var/lib/moat/incidents"),
+            triage_agent: None,
             auto_triage: crate::triage::TriageMode::Demote,
             triage_demote_max_severity: "high".into(),
             triage_settle_secs: 20,

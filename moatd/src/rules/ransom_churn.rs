@@ -108,6 +108,9 @@ const MAX_READS_PER_ACTOR: usize = 4096;
 const MAX_DESTROYED_PER_ACTOR: usize = 4096;
 /// Actors tracked before the map is pruned (same figure as `mass_read`).
 const MAX_ACTORS: usize = 512;
+/// A single sweep is one incident. Re-arm a long-lived actor after a quiet
+/// interval so a later, separate sweep is still visible.
+const INCIDENT_COOLDOWN_SECS: u64 = 600;
 
 /// What was done to a file that stops it being what it was.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,6 +156,7 @@ impl Destroyed {
 
 #[derive(Default)]
 struct Actor {
+    last_fired: Option<u64>,
     /// Recent read-opens, oldest first: `(when, path)`.
     reads: VecDeque<(u64, String)>,
     // Membership checks dominate the file-open path. The queue preserves
@@ -382,9 +386,12 @@ impl UserRule for RansomChurn {
 
         let (key, folded_under) = actor_key(ctx.table, me);
         let by = me.comm().to_string();
-        let actor = self.actors.entry(key).or_default();
+        let actor = self.actors.entry(key.clone()).or_default();
         actor.last = now;
         actor.prune(now, window);
+        if actor.last_fired.is_some_and(|at| now.saturating_sub(at) < INCIDENT_COOLDOWN_SECS) {
+            return Vec::new();
+        }
         actor.members.insert(by.clone());
 
         if READ_HOOKS.contains(&hook.as_str()) {
@@ -504,12 +511,10 @@ impl UserRule for RansomChurn {
         let Some(shape) = evaluate(actor, threshold) else {
             return Vec::new();
         };
-        // Fired: reset so the next alert needs another full burst (the alert
-        // deduper would otherwise fold every subsequent event into a count).
-        // Reads are kept: they are context, not the thing counted.
+        // One burst from one actor is one incident, even if it touches thousands
+        // more files. The cooldown above also prevents the old every-eight-files
+        // flood from spawning hundreds of auto-triage jobs.
         let members: Vec<String> = actor.members.iter().cloned().collect();
-        actor.destroyed.clear();
-        actor.members.clear();
         // A fold is only worth naming when more than one program took part;
         // `sh -c "node install.js"` is node, and the alert should say node.
         let folded_under = folded_under.filter(|_| members.len() > 1);
@@ -546,6 +551,16 @@ impl UserRule for RansomChurn {
             Shape::ReadThenDestroy(files) => (files, None),
             Shape::Homogenised { ext, files } => (files, Some(ext.clone())),
         };
+        // Preserve a representative affected path. Without a `file`, a user
+        // cannot scope an allowlist entry to one disposable build tree: the
+        // only offered matcher is the broad `rm` executable or its shell.
+        // The evidence below still names the full sample and threshold.
+        if let Some(first_file) = files.first() {
+            f.file = Some(crate::alert::FileRef {
+                path: first_file.path.clone(),
+                sha256: None,
+            });
+        }
         let first = files.iter().map(|d| d.at).min().unwrap_or(now);
         let span = now.saturating_sub(first).max(1);
         let sample: Vec<String> = files
@@ -627,6 +642,13 @@ impl UserRule for RansomChurn {
             f.what_override = Some(format!("mv relocated {} files while preserving their names. This alone does not establish encryption or data loss.", files.len()));
         }
         self.arm(&mut f, ctx, folded_under.as_ref());
+        let actor = self.actors.get_mut(&key).expect("actor remains tracked");
+        actor.destroyed.clear();
+        actor.reads.clear();
+        actor.read_paths.clear();
+        actor.wrote_first.clear();
+        actor.members.clear();
+        actor.last_fired = Some(now);
         vec![f]
     }
 }
@@ -755,6 +777,12 @@ fn extension(path: &str) -> Option<String> {
 
 fn in_build_tree(path: &str) -> bool {
     BUILD_TREES.iter().any(|frag| path.contains(frag))
+        || (path.contains("/Projects/") && path.contains("-worktrees/")
+            && path.contains("/.state/"))
+        || (path.contains("/Projects/") && path.contains("-worktrees/")
+            && path.contains("/fixture-tmp/"))
+        || (path.contains("/Projects/") && path.contains("-worktrees/")
+            && path.contains("/worker-deployer.") && path.contains("/source/"))
 }
 
 /// The `i`th argument as a path, whichever of Tetragon's path-shaped
@@ -1006,20 +1034,31 @@ mod tests {
     }
 
     #[test]
+    fn worktree_build_state_is_regenerable_output() {
+        assert!(in_build_tree("/home/dan/Projects/nanosiem-worktrees/build-control/.state/control-context.abc/src/lib.rs"));
+        assert!(in_build_tree("/home/dan/Projects/nano-main-worktrees/deployer-a-state/worker-deployer.abc/source/nanosiem-core/src/lib.rs"));
+        assert!(in_build_tree("/home/dan/Projects/nanosiem-worktrees/worker-1/fixture-tmp/case/report.txt"));
+        assert!(!in_build_tree("/home/dan/Projects/nanosiem/src/lib.rs"));
+        assert!(!in_build_tree("/tmp/fixture-tmp/case/report.txt"));
+        assert!(!in_build_tree("/home/dan/Documents/.state/records.txt"));
+    }
+
+    #[test]
     fn a_process_that_reads_then_deletes_many_documents_fires_once_and_is_critical() {
         let t = table();
         let c = cfg();
         let mut rule = RansomChurn::default();
         let mut out = Vec::new();
         // Encrypt-to-a-new-file-then-unlink: read x, write x.locked, rm x.
-        for i in 0..12 {
+        for i in 0..1000 {
             assert!(fire(&mut rule, &t, &c, &read(&doc(i)), "e-node", 100 + i as u64).is_empty());
             out.extend(fire(&mut rule, &t, &c, &unlink(&doc(i)), "e-node", 100 + i as u64));
         }
-        assert_eq!(out.len(), 1, "fires on the 8th read-then-destroyed file, then resets");
+        assert_eq!(out.len(), 2, "one incident per cooldown, including a long-lived sweep");
         let f = &out[0];
         assert_eq!(f.meta.severity, "critical");
         assert_eq!(f.meta.family, "ransom");
+        assert_eq!(f.file.as_ref().map(|file| file.path.as_str()), Some("/home/dan/Documents/report-0.pdf"));
         assert!(f.what_override.as_ref().unwrap().contains("node read 8 different files"), "{:?}", f.what_override);
         assert!(f.extra_evidence[1].contains("/home/dan/Documents/report-0.pdf (deleted)"), "{:?}", f.extra_evidence);
         assert!(f.hook.contains("8 distinct files read and then destroyed"));

@@ -11,20 +11,43 @@ pub struct AgentSession {
     pub workspace: String,
 }
 
+/// Arguments used by bundled search/utility applets rather than by an agent
+/// launch. Multi-call native agent binaries can re-exec themselves as these
+/// tools, so this check must happen before assigning an agent identity.
+pub fn looks_like_tool_invocation(args: &str) -> bool {
+    const TOOL_FLAGS: &[&str] = &[
+        "--glob",
+        "--hidden",
+        "--no-config",
+        "--no-ignore",
+        "--files-with-matches",
+        "--line-number",
+        "--max-count",
+        "--type-add",
+        "--binary-files",
+        "--json-lines",
+    ];
+    args.split_whitespace().any(|arg| TOOL_FLAGS.contains(&arg))
+}
+
 /// Identify native agents and explicit runtime entrypoints. Generic Node/Bun
 /// invocations and arbitrary argv mentions are never agent invocations.
 pub fn invocation(exe: &str, args: &str) -> Option<String> {
     // Linux appends this marker when an update unlinks a running binary.
     // Normalize attribution only; this is never an authenticity check.
     let name = crate::util::basename(exe.strip_suffix(" (deleted)").unwrap_or(exe));
+    if looks_like_tool_invocation(args) {
+        return None;
+    }
+    // Recent Claude Code installs re-exec this bundled native binary after the
+    // `claude` launcher. Recognise the actual entrypoint, not an arbitrary
+    // program named claude.exe elsewhere on disk.
+    if name == "claude.exe"
+        && exe.contains("/@anthropic-ai/claude-code/bin/claude.exe")
+    {
+        return Some("claude".into());
+    }
     if crate::rules::AI_CLIS.contains(&name) {
-        // Bundled search applets are not a new agent session.
-        if args
-            .split_whitespace()
-            .any(|a| matches!(a, "--glob" | "--files-with-matches" | "--line-number"))
-        {
-            return None;
-        }
         return Some(name.to_string());
     }
     if !matches!(name, "node" | "bun") {
@@ -50,7 +73,15 @@ pub fn invocation(exe: &str, args: &str) -> Option<String> {
 /// even when launched from another Claude session. Bare same-name children and
 /// bundled applets remain tools. This is attribution, not binary verification.
 pub fn starts_nested_session(exe: &str, args: &str) -> bool {
-    if crate::util::basename(exe.strip_suffix(" (deleted)").unwrap_or(exe)) != "claude"
+    if invocation(exe, args).as_deref() == Some("codex") {
+        let words: Vec<_> = args.split_whitespace().collect();
+        return words.first().is_some_and(|word| matches!(*word, "exec" | "resume"))
+            || (words.first() == Some(&"app-server")
+                && words.contains(&"--managed-daemon")
+                && words.windows(2).any(|w| w == ["--listen", "unix://"]));
+    }
+    let name = crate::util::basename(exe.strip_suffix(" (deleted)").unwrap_or(exe));
+    if !matches!(name, "claude" | "claude.exe")
         || invocation(exe, args).as_deref() != Some("claude")
     {
         return false;
@@ -74,9 +105,22 @@ pub fn starts_nested_session(exe: &str, args: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn codex_sessions_are_explicit_and_managed_daemon_is_unix_only() {
+        for args in ["exec -C /workspace task", "exec resume session -", "resume session --yolo", "app-server --listen unix:// --managed-daemon"] {
+            assert!(starts_nested_session("/opt/codex", args), "{args}");
+        }
+        for args in ["", "--glob exec", "app-server --listen tcp://0.0.0.0:8080 --managed-daemon", "app-server --listen unix://", "--help exec", "exec-server"] {
+            assert!(!starts_nested_session("/opt/codex", args), "{args}");
+        }
+        assert!(!starts_nested_session("/usr/bin/node", "tool.js exec"));
+    }
+    #[test]
     fn nested_session_requires_native_entrypoint_not_embedded_flags() {
+        let native_exe = "/home/user/.local/share/mise/installs/npm-anthropic-ai-claude-code/latest/node_modules/.mise/@anthropic-ai+claude-code@2.1.285/node_modules/@anthropic-ai/claude-code/bin/claude.exe";
         assert!(starts_nested_session("/opt/claude", "daemon run --origin transient"));
         assert!(starts_nested_session("/opt/claude", "--session-id x --fork-session --resume y"));
+        assert!(starts_nested_session(native_exe, "--bg-spare /tmp/cc-daemon-1000/run/worker.claim.sock"));
+        assert!(starts_nested_session(native_exe, "daemon run --origin transient"));
         for args in ["", "--session-id x", "--fork-session --resume x", "--bg-spare /tmp/tool.sock",
             "--bg-pty-host /tmp/pty.sock 200 50 -- /opt/claude --bg-spare /tmp/cc-daemon-1000/a.claim.sock",
             "--files-with-matches --session-id x --fork-session --resume y"] {
@@ -89,6 +133,15 @@ mod tests {
         assert_eq!(invocation("/opt/claude (deleted)", "").as_deref(), Some("claude"));
         assert!(invocation("/opt/claude (deleted)", "--files-with-matches secret").is_none());
         assert!(invocation("/opt/claude (deleted)-fake", "").is_none());
+        assert_eq!(invocation(
+            "/home/user/.local/share/mise/installs/npm-anthropic-ai-claude-code/latest/node_modules/.mise/@anthropic-ai+claude-code@2.1.280/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+            "--resume session",
+        ).as_deref(), Some("claude"));
+        assert!(invocation(
+            "/home/user/.local/share/mise/installs/npm-anthropic-ai-claude-code/latest/node_modules/.mise/@anthropic-ai+claude-code@2.1.280/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+            "-G --ignore-files --hidden -I --exclude-dir node_modules -rl secret /home/user",
+        ).is_none());
+        assert!(invocation("/tmp/claude.exe", "--resume session").is_none());
     }
     #[test]
     fn runtime_identity_requires_an_entrypoint_not_an_argv_mention() {

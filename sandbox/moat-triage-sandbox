@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -35,7 +36,31 @@ def command(agent, bundle, argv, probe=False):
         # Omarchy's mise installs provide a latest link. Resolve it without
         # invoking mise: even `mise which` may perform scheduled maintenance.
         data = Path(os.environ.get('MISE_DATA_DIR', str(home / '.local/share/mise')))
-        executable = (data / 'installs' / agent / 'latest' / agent).resolve(strict=True)
+        candidates = [data / 'installs' / agent / 'latest' / agent]
+        if agent == 'claude':
+            candidates.append(data / 'installs/npm-anthropic-ai-claude-code/latest/node_modules/.bin/claude')
+        for candidate in candidates:
+            try:
+                executable = candidate.resolve(strict=True)
+                break
+            except FileNotFoundError:
+                continue
+        else:
+            raise ValueError('native agent installation is unavailable: ' + agent)
+    if agent == 'claude' and executable.name == 'claude':
+        # The npm-based Claude Code install uses an aube shell shim. Read its
+        # declared native target without executing the shim or mounting the
+        # entire npm installation into the evidence sandbox.
+        with executable.open('rb') as f:
+            header = f.read(512).decode('utf-8', errors='replace')
+        match = re.match(r'#!/bin/sh\n# aube-bin-shim v2 target=([^\s]+)\n', header)
+        if match:
+            target = (executable.parent / match.group(1)).resolve(strict=True)
+            if (target.name != 'claude.exe'
+                    or not target.is_relative_to(executable.parent.parent)
+                    or '/@anthropic-ai/claude-code/bin/' not in str(target)):
+                raise ValueError('Claude shim target is outside its native installation')
+            executable = target
     # Only native clients have a bounded, known runtime mount. Do not expose
     # all of a package manager's installation tree for an unknown script shim.
     with executable.open('rb') as f:

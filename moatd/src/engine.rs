@@ -2730,6 +2730,16 @@ impl Daemon {
             .map(|p| util::dentry_abs(p, &self.subvols));
         let hook_name = hook.hook_name();
 
+        // The kernel's Mask selector has posted ordinary chmods as setuid
+        // matches (observed mode 0100644 during pnpm staging). Verify the
+        // requested mode before claiming a privilege bit was set. A missing
+        // mode cannot support that claim either.
+        if name == "moat-priv-setuid-chmod"
+            && !hook.int_arg().is_some_and(|mode| mode & 0o6000 != 0)
+        {
+            return None;
+        }
+
         // Never alert on our own reads. Taking an incident snapshot means
         // reading /proc/<pid>/{environ,status,cmdline,fd} for the alerting
         // process and every live ancestor (incident.rs), and any file rule that
@@ -2850,6 +2860,15 @@ impl Daemon {
                 ));
             }
         }
+        if name == "moat-rootkit-bpf-prog-load" {
+            if let Some(kind) = hook.ev.args.iter().find(|a| a.get("label").and_then(|v| v.as_str()) == Some("prog_type"))
+                .and_then(|a| a.get("uint_arg").or_else(|| a.get("int_arg")))
+                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            {
+                f.hook_detail = Some(format!("BPF program type {kind}"));
+                f.extra_evidence.push(format!("sensor observed BPF program type {kind}; load request, not proof of successful attachment"));
+            }
+        }
         // Tetragon reports the CONFIGURED action in monitor mode too (NOTES
         // §7 says so for Sigkill, and Override is the same field). The kill
         // path waits for process_exit to prove it; a refusal has no such
@@ -2874,7 +2893,11 @@ impl Daemon {
         }
 
         if let Some(path) = path {
-            f.hook_detail = access_word(hook.int_arg());
+            f.hook_detail = if name == "moat-priv-setuid-chmod" {
+                hook.int_arg().map(|mode| format!("mode {:o}", mode))
+            } else {
+                access_word(hook.int_arg())
+            };
             // A setuid bit an unprivileged user sets on a file that user
             // already owns grants nothing.
             //
@@ -3262,6 +3285,15 @@ impl Daemon {
         if native_context {
             score = scoring::Score::unadjusted("low");
             score.severity_reason = "expected native operation: retained as context".into();
+        }
+        if ephemeral_rust_test_activity(&f) {
+            score.severity = "low".into();
+            score.surface = "timeline".into();
+            score.severity_reason = "unprivileged Rust test runner exercised a disposable /tmp fixture".into();
+            score.matrix_row = None;
+            score.pkg_install_escalation = false;
+            f.meta.tier = "signal".into();
+            f.extra_evidence.push("test context: host uid without grave capabilities, Rust test runner in Claude scratchpad, disposable /tmp fixture".into());
         }
         // A filename match outside the account's actual credential location is
         // evidence of a credential-shaped file, not proof of reading that login.
@@ -6648,6 +6680,22 @@ pub fn read_exclusions(
 /// The rules whose finding is "a setuid or setgid bit was set".
 fn is_setuid_rule(name: &str) -> bool {
     name == "moat-priv-setuid-chmod" || name == "moat-priv-setcap-xattr"
+}
+
+fn ephemeral_rust_test_activity(f: &Finding) -> bool {
+    matches!(f.rule.as_str(), "moat-priv-setuid-chmod" | "moat-exec-untrusted-tmpfs")
+        && f.proc.uid != 0
+        && f.proc.in_container == Some(false)
+        && f.proc.user_ns_host == Some(true)
+        && f.proc.caps.is_empty()
+        && f.proc.exe.starts_with("/tmp/claude-")
+        && f.proc.exe.contains("/scratchpad/")
+        && f.proc.args.split_whitespace().any(|arg| arg == "--test-threads")
+        && f.file.as_ref().is_some_and(|file| {
+            file.path.starts_with("/tmp/.tmp")
+                && file.path["/tmp/.tmp".len()..].contains('/')
+        })
+        && f.ioc.is_none() && !f.denied && !f.request_kill && !f.kill_expected
 }
 
 /// Why this setuid/setcap event grants no privilege, if it does not.
@@ -13093,6 +13141,53 @@ esac
         assert_eq!(access_word(Some(6)).unwrap(), "read+write");
         assert_eq!(access_word(Some(0)).unwrap(), "mask 0");
         assert!(access_word(None).is_none());
+    }
+
+    #[test]
+    fn setuid_alert_requires_a_setuid_or_setgid_mode_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("staged.js");
+        std::fs::write(&file, b"test").unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        let event = |pid: u32, mode: u32| format!(
+            r#"{{"process_lsm":{{"process":{{"exec_id":"chmod-{pid}","pid":{pid},"uid":{},"binary":"/usr/bin/chmod"}},"function_name":"path_chmod","policy_name":"moat-priv-setuid-chmod","args":[{{"path_arg":{{"path":"{}"}}}},{{"int_arg":{mode}}}]}}}}"#,
+            unsafe { libc::geteuid() }, file.display()
+        );
+        d.handle_line(&event(9100, 0o100644));
+        assert!(d.store.load().iter().all(|a| a.rule != "moat-priv-setuid-chmod"));
+        d.handle_line(&event(9101, 0o104755));
+        let matches: Vec<_> = d.store.load().into_iter()
+            .filter(|a| a.rule == "moat-priv-setuid-chmod").collect();
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].explain.evidence[0].contains("mode 104755"));
+    }
+
+    #[test]
+    fn rust_test_fixture_context_needs_unprivileged_runner_and_disposable_path() {
+        let mut f = Finding::new("moat-priv-setuid-chmod",
+            crate::policy::PolicyMeta::fallback("moat-priv-setuid-chmod"),
+            crate::proctable::ProcInfo {
+                uid: 1000, in_container: Some(false), user_ns_host: Some(true),
+                exe: "/tmp/claude-1000/project/scratchpad/final.bin".into(),
+                args: "--test-threads 64 release_runtime".into(),
+                ..Default::default()
+            });
+        f.file = Some(crate::alert::FileRef { path: "/tmp/.tmpABC/refused-2701".into(), sha256: None });
+        assert!(ephemeral_rust_test_activity(&f));
+        let dir = tempfile::tempdir().unwrap();
+        let (mut d, _) = dev_daemon(dir.path());
+        d.emit(f.clone());
+        let alert = d.store.load().into_iter()
+            .find(|a| a.rule == "moat-priv-setuid-chmod").unwrap();
+        assert_eq!(alert.severity, "low");
+        assert_eq!(alert.surface, "timeline");
+        f.rule = "moat-exec-untrusted-tmpfs".into();
+        assert!(ephemeral_rust_test_activity(&f));
+        f.proc.caps.push("CAP_SYS_ADMIN".into());
+        assert!(!ephemeral_rust_test_activity(&f));
+        f.proc.caps.clear();
+        f.file.as_mut().unwrap().path = "/home/dan/Documents/report.pdf".into();
+        assert!(!ephemeral_rust_test_activity(&f));
     }
 }
 

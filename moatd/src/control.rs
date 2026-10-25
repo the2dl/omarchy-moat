@@ -1108,6 +1108,7 @@ fn cmd_triage(d: &mut Daemon, req: &Value, id: &str) -> Value {
             ok(json!({
                 "mode": cfg.auto_triage.as_str(),
                 "timeout_secs": cfg.triage_timeout_secs,
+                "agent": cfg.triage_agent,
                 "agent_args": cfg.agent_args,
                 "inherited": inherited,
                 "pending": pending,

@@ -597,6 +597,11 @@ bundle_dir = "/var/lib/moat/incidents"
 # claude and codex work and the rest report why they do not.
 auto_triage = "demote"
 
+# Optional: choose a supported read-only headless agent for the timer without
+# changing Omarchy's interactive default. Unset uses `omarchy default agent`.
+# Supported today: claude, codex. For example, if the desktop default is agy:
+# triage_agent = "claude"
+
 # The highest severity a triage demotion may touch. `critical` is the one place
 # where being wrong is unrecoverable in the moment, so the default leaves it on
 # the badge and lets the agent explain it instead.

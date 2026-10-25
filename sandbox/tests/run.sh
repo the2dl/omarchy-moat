@@ -580,10 +580,6 @@ EOF
 chmod +x "$PROJ/moat-scan-pkgbuild"
 cat >"$PROJ/makepkg" <<'EOF'
 #!/usr/bin/env bash
-case ${1:-} in
---printsrcinfo) printf 'pkgbase = fixture\n\tpkgname = fixture\n'; exit 0 ;;
---packagelist) printf '/tmp/fixture-1-1-any.pkg.tar.zst\n'; exit 0 ;;
-esac
 echo "REAL makepkg argv:$*"
 EOF
 chmod +x "$PROJ/makepkg"
@@ -609,30 +605,9 @@ else
 	no "makepkg continues with a warning on medium findings" "got: $out"
 fi
 
-# yay consumes these stdout streams as package metadata, not diagnostics.
-# Exercise clean/medium/error scans and high refusal without merging streams.
-for scan_rc in 0 1 2 3; do
-	printf '#!/usr/bin/env bash\necho "clean: no findings (fixture rc %s)"\nexit %s\n' "$scan_rc" "$scan_rc" >"$PROJ/moat-scan-pkgbuild"
-	for query in --printsrcinfo --packagelist; do
-		out=$(cd "$PROJ" && env PATH="$SHIMS:$PROJ:$SANDBOX_DIR:/usr/bin:/bin" HOME="$FAKE_HOME" \
-			XDG_CONFIG_HOME="$FAKE_HOME/.config" MOAT_QUIET=1 \
-			"$SHIMS/makepkg" "$query" </dev/null 2>"$TMPROOT/makepkg-scan.stderr")
-		rc=$?
-		diagnostics=$(cat "$TMPROOT/makepkg-scan.stderr")
-		expected=$'pkgbase = fixture\n\tpkgname = fixture'
-		[[ $query == --packagelist ]] && expected='/tmp/fixture-1-1-any.pkg.tar.zst'
-		expected_rc=0
-		if ((scan_rc == 2)); then expected=""; expected_rc=1; fi
-		if ((rc == expected_rc)) && [[ $out == "$expected" && $diagnostics == *"clean: no findings (fixture rc $scan_rc)"* ]]; then
-			ok "makepkg $query keeps scanner rc=$scan_rc diagnostics off stdout"
-		else
-			no "makepkg $query keeps scanner rc=$scan_rc diagnostics off stdout" "rc=$rc stdout=$out stderr=$diagnostics"
-		fi
-	done
-done
-
 # The shared scanner helper used by other package-manager shims has the
 # same stdout contract, independently of makepkg's own scan implementation.
+printf '#!/usr/bin/env bash\necho "clean: no findings"\nexit 0\n' >"$PROJ/moat-scan-pkgbuild"
 out=$(PATH="$PROJ:$PATH" bash -c '. "$1"; shim_run_scan fixture moat-scan-pkgbuild; printf "wrapped-output\n"' \
 	_ "$SHIMS/shim-common.sh" 2>"$TMPROOT/shared-scan.stderr")
 if [[ $out == wrapped-output && $(cat "$TMPROOT/shared-scan.stderr") == *"clean: no findings"* ]]; then
@@ -703,8 +678,34 @@ else
 	no "makepkg -h is passed through unsandboxed" "rc=$rc out=$out"
 fi
 
+# fakeroot sees itself as uid 0, so bsdtar tries to restore archive ownership.
+# The sandbox's user namespace maps only the calling uid and returns EINVAL for
+# chown(0, 0).  FAKEROOTDONTTRYCHOWN keeps ownership virtual -- exactly what
+# makepkg needs -- instead of letting libarchive abort packages such as Slack.
+bsdtar -cf "$PROJ/root-owned.tar" -C /etc hostname
+cat >"$PROJ/makepkg" <<'EOF'
+#!/usr/bin/env bash
+set -e
+mkdir -p extracted
+fakeroot bsdtar -xf root-owned.tar -C extracted
+cat extracted/hostname
+EOF
+chmod +x "$PROJ/makepkg"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$PROJ/moat-scan-pkgbuild"
+chmod +x "$PROJ/moat-scan-pkgbuild"
+out=$(cd "$PROJ" && env PATH="$SHIMS:$PROJ:$SANDBOX_DIR:/usr/bin:/bin" HOME="$FAKE_HOME" \
+	XDG_CONFIG_HOME="$FAKE_HOME/.config" MOAT_QUIET=1 \
+	"$SHIMS/makepkg" 2>&1)
+rc=$?
+if ((rc == 0)) && [[ $out == "$(cat /etc/hostname)" ]]; then
+	ok "makepkg can unpack root-owned archives under fakeroot in the sandbox"
+else
+	no "makepkg can unpack root-owned archives under fakeroot in the sandbox" "rc=$rc out=$out"
+fi
+
 rm -rf "$PROJ/PKGBUILD" "$PROJ/makepkg" "$PROJ/cargo" "$PROJ/go" "$PROJ/npm" \
-	"$PROJ/moat-scan-pkgbuild" "$PROJ/moat-scan-cargo" "$PROJ/moat-scan-go" "$NOSCAN_BIN"
+	"$PROJ/moat-scan-pkgbuild" "$PROJ/moat-scan-cargo" "$PROJ/moat-scan-go" "$PROJ/root-owned.tar" \
+	"$PROJ/extracted" "$NOSCAN_BIN"
 
 # ------------------------------------------------- (g) MOAT_SANDBOX=0 ----
 

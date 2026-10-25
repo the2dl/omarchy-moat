@@ -17,6 +17,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from contextlib import redirect_stdout, redirect_stderr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -37,6 +38,19 @@ def _load_scanner():
 
 
 S = _load_scanner()
+
+
+class TestCargoConfigBoundary(unittest.TestCase):
+    def test_project_configs_are_scanned_but_global_config_is_not(self):
+        with tempfile.TemporaryDirectory() as home:
+            project = os.path.join(home, "project")
+            for directory in (home, project):
+                os.makedirs(os.path.join(directory, ".cargo"))
+                with open(os.path.join(directory, ".cargo", "config.toml"), "w") as config:
+                    config.write('[build]\nrustc-wrapper = "wrapper"\n')
+            with patch.object(S.os.path, "expanduser", return_value=home):
+                self.assertEqual(S.cargo_config_files(project), [os.path.join(project, ".cargo", "config.toml")])
+                self.assertEqual(S.cargo_config_files(home), [])
 
 
 def run(argv):

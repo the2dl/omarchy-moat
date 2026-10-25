@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCANNER_PATH = os.path.join(os.path.dirname(HERE), "moat-scan-npm")
@@ -38,7 +39,13 @@ S = _load_scanner()
 def run(argv):
     """Run main() with output captured. -> (exit code, stdout, stderr)."""
     out, err = io.StringIO(), io.StringIO()
-    with redirect_stdout(out), redirect_stderr(err):
+    # The scanner deliberately reads the user's npm configuration to discover
+    # private registries. Tests must not depend on, or trigger detections for,
+    # the developer's real ~/.npmrc.
+    with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+        os.environ,
+        {"HOME": home, "XDG_CONFIG_HOME": os.path.join(home, ".config")},
+    ), redirect_stdout(out), redirect_stderr(err):
         code = S.main(argv)
     return code, out.getvalue(), err.getvalue()
 

@@ -47,7 +47,9 @@ fn own_profile_with(p: &ProcInfo, ancestors: &[&ProcInfo], path: &str, homes: &[
         _ => return false,
     };
     trusted(app) && homes.iter().any(|home| own_home(p, home)
-        && roots.iter().any(|root| beneath(path, &format!("{home}/{root}"))))
+        && (roots.iter().any(|root| beneath(path, &format!("{home}/{root}")))
+            || path == format!("{home}/.pki/nssdb/cert9.db")
+            || path == format!("{home}/.local/share/pki/nssdb/cert9.db")))
 }
 
 pub fn docker_storage(p: &ProcInfo, path: &str) -> bool {
@@ -68,6 +70,22 @@ pub fn classify(f: &mut Finding, homes: &[String]) -> bool {
 }
 
 fn classify_with(f: &mut Finding, homes: &[String], trusted: impl Fn(&str) -> bool) -> bool {
+    // BPF is global even in containers. Only the captured cgroup-device type
+    // and a BuildKit runtime launch qualify; a runtime name alone does not.
+    if f.rule == "moat-rootkit-bpf-prog-load" && f.hook_detail.as_deref() == Some("BPF program type 15")
+        && f.proc.in_container == Some(true) && f.proc.exe == "/usr/bin/buildkit-runc"
+        && f.proc.args.split_whitespace().any(|a| a == "run")
+        && f.proc.args.split_whitespace().collect::<Vec<_>>().windows(2).any(|w|
+            w[0] == "--bundle" && w[1].starts_with("/var/lib/buildkit/runc-overlayfs/executor/"))
+        && f.ancestry.first().is_some_and(|p| p.exe == "/usr/bin/buildkitd" && p.uid == f.proc.uid && p.in_container == Some(true))
+        && f.actor.modified.is_none() && f.ioc.is_none() && !f.kill_expected && !f.denied && !f.request_kill
+    {
+        f.meta.family = "context".into();
+        f.meta.severity = "low".into();
+        f.meta.tier = "signal".into();
+        f.what_override = Some("BuildKit runtime requested a cgroup device-filter BPF program for a build container; other BPF program types remain monitored.".into());
+        return true;
+    }
     if f.ioc.is_some() || f.kill_expected || f.denied || f.request_kill
         || f.actor.modified.is_some() || f.context == Context::PkgInstall || !host(&f.proc) {
         return false;
@@ -105,6 +123,27 @@ fn classify_with(f: &mut Finding, homes: &[String], trusted: impl Fn(&str) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn buildkit_bpf_requires_captured_device_type_and_launch_context() {
+        let mut f = Finding::new("moat-rootkit-bpf-prog-load", crate::policy::PolicyMeta::fallback("moat-rootkit-bpf-prog-load"), ProcInfo {
+            exe: "/usr/bin/buildkit-runc".into(), in_container: Some(true),
+            args: "run --bundle /var/lib/buildkit/runc-overlayfs/executor/build --keep build".into(), ..Default::default()
+        });
+        f.ancestry.push(ProcInfo { exe: "/usr/bin/buildkitd".into(), in_container: Some(true), ..Default::default() });
+        assert!(!classify_with(&mut f.clone(), &[], |_| true));
+        f.hook_detail = Some("BPF program type 15".into());
+        assert!(classify_with(&mut f.clone(), &[], |_| false));
+        for kind in ["BPF program type 2", "BPF program type 26", "BPF program type 0"] {
+            let mut bad = f.clone(); bad.hook_detail = Some(kind.into());
+            assert!(!classify_with(&mut bad, &[], |_| true));
+        }
+        let mut bad = f.clone(); bad.proc.in_container = Some(false);
+        assert!(!classify_with(&mut bad, &[], |_| true));
+        let mut bad = f.clone(); bad.ancestry.clear();
+        assert!(!classify_with(&mut bad, &[], |_| true));
+        let mut bad = f.clone(); bad.denied = true;
+        assert!(!classify_with(&mut bad, &[], |_| true));
+    }
     fn finding(rule: &str, exe: &str, args: &str, uid: u32) -> Finding {
         Finding::new(rule, crate::policy::PolicyMeta::fallback(rule), ProcInfo {
             exe: exe.into(), args: args.into(), uid,
@@ -170,6 +209,8 @@ mod tests {
             in_container: Some(false), user_ns_host: Some(true), ..Default::default() };
         let path = format!("{}/.cache/spotify/Browser/Cookies", homes[0]);
         assert!(own_profile_with(&p, &[], &path, &homes, |_| true));
+        assert!(own_profile_with(&p, &[], &format!("{}/.pki/nssdb/cert9.db", homes[0]), &homes, |_| true));
+        assert!(!own_profile_with(&p, &[], &format!("{}/.pki/nssdb/key4.db", homes[0]), &homes, |_| true));
         for bad in [format!("{}/.config/google-chrome/Default/Cookies", homes[0]),
             format!("{}/.cache/spotify-other/Cookies", homes[0]),
             format!("{}/.cache/spotify/../secret", homes[0])] {

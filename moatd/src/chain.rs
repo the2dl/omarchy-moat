@@ -798,8 +798,13 @@ impl ChainStore {
         // A long-lived coding agent is attribution, not a causal task root.
         // Keep its children separate while preserving chains within each tool task.
         let mut lineage = obs.lineage.clone();
-        if let Some((id, _)) = &obs.agent_root {
-            if let Some(node) = lineage.iter_mut().find(|n| &n.exec_id == id) {
+        if let Some((id, root)) = &obs.agent_root {
+            // An agent launcher may re-exec a native binary in the same PID.
+            // The session retains the launch exec id while the lineage holds
+            // the new one. The sensor's root PID still identifies the boundary.
+            if let Some(node) = lineage.iter_mut().find(|n| {
+                &n.exec_id == id || (root.pid != 0 && n.pid == root.pid)
+            }) {
                 node.sid = Some(node.pid);
             }
         }
@@ -1034,6 +1039,14 @@ fn qualifies(obs: &[Observation]) -> bool {
     {
         return false;
     }
+    // Test runners and build tools execute local helpers and read their own
+    // cloud configuration. Two medium signals with no egress or persistence
+    // are context, not a new incident. A high credential read still qualifies.
+    if families == ["cred", "exec"]
+        && triggers.iter().all(|o| o.rank() <= severity_rank("medium"))
+    {
+        return false;
+    }
     if !triggers.iter().any(|o| o.rank() >= severity_rank("medium")) {
         return false;
     }
@@ -1066,6 +1079,19 @@ fn is_novelty_exempt(rule: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn medium_exec_plus_config_read_stays_in_timeline() {
+        let tree = typed_at_a_shell(201);
+        assert!(!qualifies(&[
+            obs("exec", 100, "exec", "medium", tree.clone()),
+            obs("config", 101, "cred", "medium", tree.clone()),
+        ]));
+        assert!(qualifies(&[
+            obs("exec", 100, "exec", "medium", tree.clone()),
+            obs("secret", 101, "cred", "high", tree),
+        ]));
+    }
 
     /// A node that reports its session, for the boundary tests.
     fn node_sid(exec_id: &str, pid: u32, exe: &str, sid: u32) -> LineageNode {
@@ -1132,6 +1158,25 @@ mod tests {
         assert!(store.note(observation("read", "cred", "task-one")).is_none());
         assert!(store.note(observation("other", "net", "task-two")).is_none());
         let chain = store.note(observation("send", "net", "task-one")).expect("one tool subtree still correlates");
+        assert_eq!(chain.ancestor.pid, 200);
+        assert!(!chain.members.iter().any(|id| id == "other"));
+    }
+
+    #[test]
+    fn reexeced_agent_root_still_separates_tool_tasks() {
+        let mut store = ChainStore::default();
+        let observation = |id, family, task| {
+            let mut o = obs(id, 100, family, "medium", vec![
+                node(id, 201, "/usr/bin/node"),
+                node(task, 200, "/usr/bin/bash"),
+                node("native-reexec", 100, "/opt/claude.exe"),
+            ]);
+            o.agent_root = Some(("launcher-exec".into(), Ancestor::new(100, "/opt/claude".into())));
+            o
+        };
+        assert!(store.note(observation("read", "cred", "task-one")).is_none());
+        assert!(store.note(observation("other", "net", "task-two")).is_none());
+        let chain = store.note(observation("send", "net", "task-one")).expect("same task correlates");
         assert_eq!(chain.ancestor.pid, 200);
         assert!(!chain.members.iter().any(|id| id == "other"));
     }

@@ -62,19 +62,7 @@ pub const ID: &str = "moat-x-ai-cli-headless";
 /// A real agent launch is `claude -p "..."`, `claude --resume <id>`, or bare;
 /// none of them pass `--glob`, `--hidden`, `-e <pattern>` or `--no-config`.
 fn looks_like_a_tool_invocation(args: &str) -> bool {
-    const TOOL_FLAGS: &[&str] = &[
-        "--glob",
-        "--hidden",
-        "--no-config",
-        "--no-ignore",
-        "--files-with-matches",
-        "--line-number",
-        "--max-count",
-        "--type-add",
-        "--binary-files",
-        "--json-lines",
-    ];
-    args.split_whitespace().any(|t| TOOL_FLAGS.contains(&t))
+    crate::agent::looks_like_tool_invocation(args)
 }
 
 // Only the installed, restricted triage workflow is expected automation. Do
