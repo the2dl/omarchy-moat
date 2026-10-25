@@ -817,6 +817,7 @@ function incidentProgram(alert) {
 function incidentKey(alert) {
   var chain = alert && alert.chain ? alert.chain : null
   if (chain && chain.id) return "chain\u0000" + chain.id
+  if (alert && alert.chain_id) return "chain\u0000" + alert.chain_id
   return String(alert && alert.rule ? alert.rule : "") + "\u0000" + incidentProgram(alert)
 }
 
